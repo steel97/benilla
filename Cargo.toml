@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "mobile"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,7 +14,7 @@ authors = ["sam <samuv.eth@gmail.com>"]
 # and a workspace default-features choice can't be subtracted from downstream.
 [workspace.dependencies]
 anyhow = "1.0.102"
-bevy = "0.18.1"
+bevy = { version = "0.18.1", features = ["android-game-activity"] }
 clap = { version = "4.6.1", features = ["derive"] }
 
 # No `[patch.crates-io]`: the WoW format + protocol stack is fully in-repo (decision 0021), so there
