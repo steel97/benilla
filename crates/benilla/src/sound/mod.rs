@@ -99,7 +99,7 @@ impl Default for SoundConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            muted: true,
+            muted: false,
             master: 1.0,
             sfx: 1.0,
             music: 0.4,

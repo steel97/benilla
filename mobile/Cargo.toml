@@ -14,3 +14,8 @@ crate-type = ["lib", "cdylib"]
 [dependencies]
 benilla = { version = "0.1.0", path = "../crates/benilla" }
 bevy.workspace = true
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-ui-kit = "0.3.2"
