@@ -250,6 +250,13 @@ const SPAWN_XY: (f32, f32) = (-8949.95, -132.49);
 /// ([`build_id`]) — passed in as plain data so the sha lives in the shim's fingerprint, not
 /// this crate's, and a commit stops recompiling the app (decision 0993).
 pub fn run(build: BuildId) -> AppExit {
+    let builtin_dir = std::env::var("WOW_BUILTIN");
+    let path = match builtin_dir {
+        Ok(val) => std::path::PathBuf::from(val),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
+    };
+
+    let assets_path = path.join("assets");
     // `WOW_CAPTURE=list` just prints the harness scenario names (the source of truth `scripts/visual.sh`
     // reads) and exits before any window/asset setup.
     // `WOW_HOVER_LOG_REPORT=<csv>` re-reads a recorded run and prints its report, then exits —
@@ -410,7 +417,7 @@ pub fn run(build: BuildId) -> AppExit {
             // right under `cargo run` from any package, and a bare `target/debug/benilla`
             // now finds its shaders too. Machine-local, like any dev build (decision 0993).
             .set(bevy::asset::AssetPlugin {
-                file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets").into(),
+                file_path: assets_path.to_str().unwrap().into(),
                 ..default()
             })
             // Quiet wgpu/naga; our own crates stay at info. (This filter once also quieted the
