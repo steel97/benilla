@@ -10,3 +10,7 @@
 5. Click `Signing & Capabilities`
 6. Change your `Team` and `Bundle Identifier`
 7. Click "Run" (both device & simulator work)
+
+# Joystick
+
+LICENSE: https://github.com/SergioRibera/virtual_joystick/blob/main/LICENSE-MIT

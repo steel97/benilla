@@ -4,10 +4,13 @@ use bevy::prelude::bevy_main;
 
 use crate::{
     helpers::{postprocess_env, transform_path},
+    hooks::register_hooks,
     runner::run_benilla,
 };
 
 pub mod helpers;
+pub mod hooks;
+pub mod joystick;
 pub mod runner;
 
 #[bevy_main]
@@ -22,5 +25,6 @@ pub fn main() {
     }
 
     postprocess_env();
+    register_hooks();
     run_benilla();
 }

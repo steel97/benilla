@@ -897,9 +897,35 @@ pub fn main() -> AppExit {
     if std::env::var("WOW_FPS_JOURNAL").is_ok() {
         app.add_plugins(perf::FpsJournalPlugin);
     }
+    execute_hooks(&mut app);
 
     // Return the app's own exit status instead of dropping it: a failed capture writes
     // `AppExit::error()` (see `capture::drive_capture`), and discarding it made the process exit 0
     // with no PNG on disk — which is how a sweep carried on around a missing shot (decision 0743).
     app.run()
+}
+
+// hooks
+use std::cell::RefCell;
+thread_local! {
+    static HOOKS: RefCell<Vec<Box<dyn Fn(&mut App) + 'static>>> = RefCell::new(Vec::new());
+}
+
+pub fn register_hook<F>(f: F)
+where
+    F: Fn(&mut App) + 'static,
+{
+    HOOKS.with(|hooks| {
+        let mut guard = hooks.borrow_mut();
+        guard.push(Box::new(f));
+    });
+}
+
+fn execute_hooks(app: &mut App) {
+    HOOKS.with(|hooks| {
+        let mut guard = hooks.borrow_mut();
+        for (_i, hook) in guard.iter_mut().enumerate() {
+            hook(app);
+        }
+    });
 }

@@ -98,7 +98,7 @@ impl SoundConfig {
 impl Default for SoundConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             muted: false,
             master: 1.0,
             sfx: 1.0,
