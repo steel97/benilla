@@ -23,7 +23,10 @@ pub use characters::{
 mod creatures;
 mod dbc;
 mod unit_blood;
-pub use creatures::{load_creature_catalog, CreatureCatalog, CreatureModel, NpcAppearance};
+pub use creatures::{
+    load_creature_catalog, CreatureCatalog, CreatureModel, FootprintParams, NpcAppearance,
+};
+pub use dbc::load_macro_icons;
 pub use unit_blood::{load_blood_catalog, BloodCatalog};
 mod itemsets;
 pub use itemsets::{load_item_sets, ItemSetCatalog, ItemSetInfo};
@@ -55,6 +58,11 @@ pub use lock::{
 };
 mod lock_type;
 pub use lock_type::{load_lock_type_catalog, LockTypeCatalog};
+mod pet_stats;
+pub use pet_stats::{
+    load_pet_loyalty_names, load_pet_personalities, PetHappiness, PetLoyaltyNames,
+    PetPersonalities, PetPersonality, FALLBACK_PERSONALITY,
+};
 mod items;
 pub use items::{load_item_display_catalog, ItemDisplay, ItemDisplayCatalog};
 mod item_sounds;
@@ -98,7 +106,7 @@ pub use emotes::{load_emote_sound_catalog, EmoteSoundCatalog};
 mod environmental_damage;
 pub use environmental_damage::{load_environmental_damage, EnvironmentalDamageTable};
 mod footsteps;
-pub use footsteps::{load_footstep_catalog, FootstepCatalog};
+pub use footsteps::{load_footprint_textures, load_footstep_catalog, FootstepCatalog};
 mod sound_entries;
 pub use sound_entries::{load_sound_kit_catalog, sound_kit_flags, SoundKit, SoundKitCatalog};
 mod sound_provider;
@@ -145,7 +153,7 @@ pub use particles::{
     ParticleEmitterDef, ParticleShape, SplineData,
 };
 mod ribbons;
-pub use ribbons::{parse_m2_ribbon_emitters, RibbonEmitterDef};
+pub use ribbons::{parse_m2_ribbon_emitters, RibbonEmitterDef, RibbonVisibility};
 mod value_track;
 pub use value_track::{TrackValue, ValueTrack};
 mod models;
@@ -169,7 +177,7 @@ pub use models::{
     ModelAnimation, ModelBlend, ParentArm, ParentBasis, PlayableAnim, RenderSubmesh, RgbAnim,
     ScalarAnim, Skeleton, SkeletonBone, StringAnchors, UvAnim, WmoBatchClass, WmoDoodad,
     WmoDoodadSet, WmoFog, WmoGroupHeader, WmoGroupInfo, WmoLight, WmoPortalInfo, WmoPortalRef,
-    WmoPortals, WmoRoot, OWNER_RUNG_BUCKETS,
+    WmoPortals, WmoRoot, NO_GROUP_LIQUID, OWNER_RUNG_BUCKETS,
 };
 mod terrain;
 pub use terrain::{

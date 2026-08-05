@@ -36,6 +36,20 @@ const FIELD_GAMEOBJECT_LEVEL: u16 = 22;
 /// real client turns an idle unit's body to *face* this target (there is no wire facing for a
 /// stationary re-face — vmangos `SetInFront` is server-only); benilla mirrors that (`face_target`).
 const FIELD_UNIT_TARGET: u16 = 16;
+/// `UNIT_FIELD_SUMMON` (idx 8, `OBJECT_END(6) + 0x2`, a 2-field guid, PUBLIC — VERIFIED vmangos
+/// `UpdateFields_1_12_1.h:42`) — the **inverse** of [`FIELD_UNIT_SUMMONEDBY`] below: the unit this
+/// one has summoned. On our own descriptor it is the pet, and so the anchor of the `"pet"` unit
+/// token; the pet action bar reads its own guid off `SMSG_PET_SPELLS` instead, which is why the
+/// two can legitimately disagree for a beat around a summon (decision 0982).
+const FIELD_UNIT_SUMMON: u16 = 8;
+/// `UNIT_FIELD_CHARMEDBY` (idx 10, `OBJECT_END(6) + 0x4`, a 2-field guid — vmangos
+/// `UpdateFields_1_12_1.h`) — whoever is currently charming this unit, `0` when nobody is.
+/// Byte-verified client-side as `[unit+0x110]+0x10`: the shared attack-start validator
+/// `0x612df0` reads it at `0x612e33` and refuses the swing when it is nonzero and is **not** the
+/// active player's own guid (`ERR_ATTACK_CHARMED`), and the owner-guid pair in both `0x5ee5a0`
+/// and the `PET_ATTACK_*` callback `0x5ff580` prefers it over their respective fallbacks
+/// (wow-re `object-layer/scratch/pet-command-validators.md` §1/§2/§4).
+const FIELD_UNIT_CHARMEDBY: u16 = 10;
 /// `UNIT_FIELD_SUMMONEDBY` (idx 12, `OBJECT_END(6) + 0x6`, a 2-field guid — vmangos
 /// `UpdateFields_1_12_1.h`) — the summoner of a pet/guardian/totem. With CREATEDBY below, the
 /// combat-text source-ownership classifier's "owned by me" test (wow-re `0x5efea0`).
@@ -98,6 +112,17 @@ const FIELD_UNIT_MOUNTDISPLAYID: u16 = 133;
 /// client decides a creature has **no** classification (rank forced to 0), so no elite dragon, no
 /// ELITE/BOSS tooltip word and no world-boss skull on an enslaved mob.
 const FIELD_UNIT_PETNUMBER: u16 = 139;
+/// `UNIT_FIELD_PETEXPERIENCE` (idx 141) / `UNIT_FIELD_PETNEXTLEVELEXP` (142) — a hunter pet's XP
+/// bar, the `(currXP, nextXP)` pair `GetPetExperience 0x4be840` returns in that order.
+/// Byte-verified client-side at `[unit+0x110]+0x21c` / `+0x220` (wow-re
+/// `ui/scratch/pet-action-bar-api.md` §11b); the client converts each with `fild qword` off a
+/// **zero-extended** dword, so neither can read negative however large it gets.
+const FIELD_UNIT_PETEXPERIENCE: u16 = 141;
+const FIELD_UNIT_PETNEXTLEVELEXP: u16 = 142;
+/// `UNIT_TRAINING_POINTS` (idx 149) — **two `u16`s packed into one dword**, byte-verified at
+/// `[unit+0x110]+0x23c` / `+0x23e`: `GetPetTrainingPoints 0x4be790` pushes the **high** word first
+/// and the low word second, which `PetPaperDollFrame.lua` names `totalPoints, spent`.
+const FIELD_UNIT_TRAINING_POINTS: u16 = 149;
 const FIELD_UNIT_DYNAMIC_FLAGS: u16 = 143;
 /// `UNIT_CHANNEL_SPELL` (idx 144, `OBJECT_END(6) + 0x8A`, PUBLIC — VERIFIED vmangos
 /// `UpdateFields_1_12_1.h:89`) — the spell id a unit is channeling (`0` = not channeling).
@@ -213,6 +238,10 @@ impl UnitAuraSlot {
 // appearance decode `0x5fb200` + corpse cross-check). The PLAYER block starts at field 188.
 const FIELD_PLAYER_BYTES: u16 = 193;
 const FIELD_PLAYER_BYTES_2: u16 = 194;
+// PLAYER_BYTES_3 = UNIT_END(188) + 0x7: the low u16 packs `gender | (drunk & 0xFFFE)` (vmangos
+// `Player::SetDrunkValue`), so byte 1 is the drunk value's high byte — exactly the byte the
+// reference client reads at `[[unit+0xe68]+0x1d]` (wow-re `drunk_fraction_5e2a90`).
+const FIELD_PLAYER_BYTES_3: u16 = 195;
 // PLAYER_QUEST_LOG_1_1 = UNIT_END(188) + 0xA = 198 (vmangos `UpdateFields_1_12_1.h:128`; this block
 // precedes the CONTAINER-onward hex-comment drift — enum arithmetic and hex comment agree here, and
 // decision 0088 §4 live-verified an accepted quest id landing on 198 + 3·slot). 20 slots
@@ -583,6 +612,8 @@ impl ObjectFields {
 
 mod player;
 mod unit;
+
+pub use unit::OwnerFallback;
 
 #[cfg(test)]
 mod tests;

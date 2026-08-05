@@ -675,6 +675,20 @@ pub fn m2bones(chain: &mut Chain, internal_path: &str) -> Result<()> {
                     );
                 }
             }
+            // Scale keys. A bone whose ONLY channel is scale — the pulsing card a spell
+            // effect hangs off a billboard, the freezing trap's ice shard — printed nothing
+            // here at all: the header row said `S2` and no detail line followed, so "how big
+            // does this thing actually get, and in which sequence" could not be answered from
+            // the dump. Non-uniform scale is exactly the interesting case (a square card
+            // stretched into a column), so all three components print.
+            if !bk.scale.is_empty() && bk.scale.len() <= 8 {
+                let keys: Vec<String> = bk
+                    .scale
+                    .iter()
+                    .map(|(t, v)| format!("{t:.3}s ({:.3}, {:.3}, {:.3})", v[0], v[1], v[2]))
+                    .collect();
+                println!("       seq{si} (anim {}) S: {}", s.anim_id, keys.join("  "));
+            }
         }
     }
     eprintln!("{} bones", m.bones.len());
@@ -897,6 +911,12 @@ pub fn m2batch(chain: &mut Chain, internal_path: &str) -> Result<()> {
         }
         if s.billboard.is_some() {
             flags.push("BILLBOARD");
+        }
+        // This batch's texcoords are GENERATED (`texture_unit_lookup > 2`), so the `uv` line below
+        // reports the authored UVs the runtime does *not* read — a degenerate span there is the
+        // asset saying "supply these", not a defect in the model.
+        if s.env_map {
+            flags.push("ENV-MAP");
         }
         if s.alpha_anim.is_some() {
             flags.push("alpha-anim");
@@ -1220,7 +1240,18 @@ pub fn m2alpha(chain: &mut Chain, internal_path: &str) -> Result<()> {
 /// (each is a [`benilla_formats::ParticleEmitterDef`] predicate), plus any bit the loader maps
 /// to nothing — an unmapped bit on a model that looks wrong is a lead, not noise.
 fn part_flags(flags: u32) -> String {
-    const NAMED: [(u32, &str); 11] = [
+    const NAMED: [(u32, &str); 13] = [
+        // The reference has NO "lit" bit — 0x1 is the UNLIT flag, the inverse of the wiki lore
+        // (wow-re `part-scene-multipliers.md` §1). Naming it the way the binary reads it is the
+        // point: an emitter WITHOUT this bit is the one that takes the scene's light, and that
+        // silent majority-of-one is what a dump has to make visible.
+        (0x0001, "unlit"),
+        // Runtime `rt+0x1ac` bit 0x10 (loader `0x70fd13` → `0x7b5d00`): the emitter's live
+        // particles are heap-sorted back-to-front on view depth before the quad writer runs
+        // (`0x7b3a10`), instead of drawn in pool order. NOT YET IMPLEMENTED — we draw pool
+        // order for every emitter; harmless where a cloud is one flat colour (alpha coverage is
+        // order-independent), visible where it is not.
+        (0x0002, "depthSortParticles(TODO)"),
         (0x0010, "modelSpace"),
         (0x0020, "sizeByInstanceScale"),
         (0x0040, "inheritEmitterMotion"),
@@ -1287,7 +1318,7 @@ pub fn m2part(chain: &mut Chain, internal_path: &str) -> Result<()> {
     for (i, e) in emitters.iter().enumerate() {
         let [px, py, pz] = e.position;
         println!(
-            "\n#{i:<3} bone {:<4} pos ({px:.3}, {py:.3}, {pz:.3})  {:?} · {:?} · {}",
+            "\n#{i:<3} bone {:<4} pos ({px:.3}, {py:.3}, {pz:.3})  {:?} · {:?} · {} · {}",
             e.bone,
             e.shape,
             e.blend,
@@ -1295,7 +1326,11 @@ pub fn m2part(chain: &mut Chain, internal_path: &str) -> Result<()> {
                 0 => "head",
                 1 => "tail",
                 _ => "head+tail",
-            }
+            },
+            // The scene-light verdict the renderer will take (`ParticleEmitterDef::lit`) — the
+            // difference between "this sheet is shaded by the world" and "this sheet is a
+            // full-white cutout", which no other line here shows.
+            if e.lit { "LIT" } else { "unlit" }
         );
         println!(
             "     texture {}  atlas {}x{}  flags 0x{:04x} [{}]",

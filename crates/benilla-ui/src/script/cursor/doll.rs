@@ -101,7 +101,12 @@ pub(super) fn pickup_inventory_item(model: &mut Model, id: u32) -> bool {
             queue_lock_changed(model, held.bag, held.slot);
             true
         }
-        Some(other @ (CursorPayload::Spell(_) | CursorPayload::Action(_))) => {
+        Some(
+            other @ (CursorPayload::Spell(_)
+            | CursorPayload::Action(_)
+            | CursorPayload::Macro(_)
+            | CursorPayload::PetAction(_)),
+        ) => {
             model.cursor = Some(other);
             false
         }

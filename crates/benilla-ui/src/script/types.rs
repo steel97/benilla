@@ -296,18 +296,6 @@ pub struct ExtractedQuad {
     pub scale: f32,
 }
 
-/// One Era atlas member (decision 0950): the resolved paint `SetAtlas`/`atlas=` apply. The app
-/// builds these from `WoW-era/_extracted_ui/manifest.json` — `file` is an app-resolvable texture
-/// path (the `era:` scheme), `uv` the normalized `[left, right, top, bottom]` sub-rect
-/// ([`TexCoords::Rect`] order), `size` the member's nominal draw size in UI units (what
-/// `useAtlasSize` applies).
-#[derive(Clone, Debug, PartialEq)]
-pub struct EraAtlasEntry {
-    pub file: String,
-    pub uv: [f32; 4],
-    pub size: [f32; 2],
-}
-
 /// The visual state of a region leaf (`Texture`/`FontString`), stored beside the arena because
 /// [`crate::widget::Region`] models only structure (kind/owner/layer), not paint. See [`object`]'s
 /// `SetTexture`/`SetVertexColor`/`SetText`.
@@ -334,10 +322,6 @@ pub(crate) struct RegionData {
     pub(crate) alpha: Option<f32>,
     /// A texture path (`SetTexture("Interface\\...")`).
     pub(crate) texture: Option<String>,
-    /// The Era atlas member this texture was last set from (`SetAtlas`, decision 0950) — what
-    /// `GetAtlas` reports. Bookkeeping only: `texture`/`tex_coords`/`size` carry the resolved
-    /// paint; any later `SetTexture` clears it (an ordinary region again).
-    pub(crate) atlas: Option<String>,
     /// A color: a solid fill (`SetTexture(r,g,b,a)`) or a vertex tint (`SetVertexColor`).
     pub(crate) color: Option<[f32; 4]>,
     /// This region is a **portrait**: draw its texture masked to the inscribed circle (set by
@@ -412,8 +396,25 @@ pub(crate) struct RegionData {
 /// A cached host measurement of a FontString's laid-out text (see [`RegionData::measured`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct MeasuredText {
+    /// The extent of the text **as laid out** — wrapped inside the region's declared width, if it
+    /// has one. The auto-size input, and what `GetWidth`/`GetHeight` echo.
     pub(crate) w: f32,
     pub(crate) h: f32,
+    /// The extent the text would take with **no wrap constraint** — what `GetStringWidth` reports,
+    /// and a different number from [`Self::w`] for exactly those regions that carry a declared width.
+    ///
+    /// The reference keeps only this one (`GetStringWidth 0x79e510` → `0x772890`, cached at
+    /// `+0xfc`): it measures the raw text with **no wrap constraint**, so "Lua sees the natural,
+    /// unwrapped, un-truncated width at the DRAWN size" (wow-re `fontstring-overflow.md`, "The
+    /// measurement echo", VERIFIED). benilla needs both, because its auto-size path reads the
+    /// laid-out extent off this same cache.
+    ///
+    /// Serving the laid-out width to `GetStringWidth` instead is a **feedback loop**, not a rounding
+    /// difference: any kit that sizes a box from `GetStringWidth` and then sets a width on the string
+    /// — which is what the reference's own `PanelTemplates_TabResize` does — reads its own output
+    /// back as its next input. The macro window's character tab changed width every single frame for
+    /// exactly this reason (decision 0997).
+    pub(crate) natural_w: f32,
     /// Hash of (text, font path, font height bits, wrap-width bits) — mismatch ⇒ re-measure.
     pub(crate) key: u64,
 }

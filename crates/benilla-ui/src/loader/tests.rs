@@ -784,7 +784,7 @@ mod loader_tests {
             .iter()
             .map(|r| (r.id, 30.0, 12.0, r.key))
             .collect();
-        s.set_measured_text(&answers);
+        s.set_measured_text_unwrapped(&answers);
         s.resolve();
 
         let quads = s.extract();
@@ -846,6 +846,87 @@ mod loader_tests {
             "the dead 18-unit header must not capture"
         );
         assert!(s.hit_test(14.0, 20.0).is_some(), "the art band still hits");
+    }
+    /// **`text=` is a GLOBAL-STRING LOOKUP, not a literal** (wow-re rf28 l.36/l.115 →
+    /// `FrameScript_GetText 0x703bf0`). Every arm of [`Loader::resolve_text`] in one document:
+    /// a `<Button text=>`, a `<ButtonText text=>` and a `<FontString text=>` all resolve through
+    /// the VM's globals; a value with no matching global falls back to the LITERAL (benilla's own
+    /// divergence, so its plain-English FrameXML keeps working); and a **key-shaped** miss warns,
+    /// which is the tripwire that "CREATE_MACROS" across a title bar never had.
+    #[test]
+    fn a_text_attribute_resolves_through_the_global_strings() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        // The reference boots GlobalStrings.lua before any XML; so does the app.
+        s.run(r#"DELETE = "Delete" EXIT_GAME = "Exit Game" TITLE = "The Title""#)
+            .unwrap();
+
+        let doc = parse(
+            r#"<Ui>
+                <Frame name="Holder">
+                    <Layers>
+                        <Layer level="ARTWORK">
+                            <FontString name="$parentTitle" text="TITLE"/>
+                            <FontString name="$parentProse" text="No results found."/>
+                        </Layer>
+                    </Layers>
+                    <Frames>
+                        <Button name="$parentDelete" text="DELETE"/>
+                        <Button name="$parentQuit">
+                            <ButtonText name="$parentText" text="EXIT_GAME"/>
+                        </Button>
+                        <Button name="$parentGhost" text="NO_SUCH_KEY"/>
+                    </Frames>
+                </Frame>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let texts: Vec<String> = s
+            .eval(
+                "return HolderTitle:GetText(), HolderProse:GetText(), HolderDelete:GetText(), \
+                 HolderQuit:GetText(), HolderGhost:GetText()",
+            )
+            .map(|(a, b, c, d, e): (String, String, String, String, String)| vec![a, b, c, d, e])
+            .unwrap();
+        assert_eq!(
+            texts,
+            vec![
+                // The key's VALUE, on all three element shapes…
+                "The Title",
+                // …a non-key literal untouched (the divergence that keeps our own XML working)…
+                "No results found.",
+                "Delete",
+                "Exit Game",
+                // …and a key-shaped MISS keeps its key on screen rather than blanking.
+                "NO_SUCH_KEY",
+            ]
+        );
+        // Exactly one warning, and it names the miss — the plain-English literal must not warn.
+        assert_eq!(
+            report
+                .warnings
+                .iter()
+                .filter(|w| w.contains("GlobalStrings key"))
+                .count(),
+            1,
+            "warnings: {:?}",
+            report.warnings
+        );
+        assert!(report.warnings.iter().any(|w| w.contains("NO_SUCH_KEY")));
+    }
+
+    /// The key SHAPE test itself: `SCREAMING_SNAKE`, two characters or more. The floor is what
+    /// keeps a close button's `text="X"` from being reported as a missing string.
+    #[test]
+    fn key_shape_is_screaming_snake_of_two_or_more() {
+        for yes in ["DELETE", "EXIT_GAME", "CHARACTER_POINTS1_COLON", "AB", "A1"] {
+            assert!(is_global_string_key(yes), "{yes} is key-shaped");
+        }
+        for no in ["X", "", "Send Mail", "No results found.", "Okay", "1", "12"] {
+            assert!(!is_global_string_key(no), "{no} is not key-shaped");
+        }
     }
 }
 
@@ -999,86 +1080,5 @@ mod region_template_tests {
             report.warnings
         );
         assert_eq!(s.eval::<String>("return Label:GetText()").unwrap(), "hello");
-    }
-
-    /// `atlas=` on a Button/CheckButton state texture and on a Slider `<ThumbTexture>` — the Era
-    /// dialect (0950) extended to the widget texture paths (0957): the slot is created empty and
-    /// resolved through SetAtlas, so the region answers GetAtlas and (with `useAtlasSize`) wears
-    /// the member's nominal size. The byte-verified 1.12 loader tables know only file=/<Color>.
-    #[test]
-    fn state_textures_and_the_thumb_take_the_atlas_attr() {
-        let mut s = UiScript::new().unwrap();
-        s.set_screen_size(800.0, 600.0);
-        s.set_era_atlases([
-            (
-                "checkbox-minimal".to_string(),
-                crate::script::EraAtlasEntry {
-                    file: "era:textures/4614134.blp".to_string(),
-                    uv: [1.0 / 64.0, 31.0 / 64.0, 1.0 / 64.0, 30.0 / 64.0],
-                    size: [30.0, 29.0],
-                },
-            ),
-            (
-                "checkmark-minimal".to_string(),
-                crate::script::EraAtlasEntry {
-                    file: "era:textures/4614134.blp".to_string(),
-                    uv: [1.0 / 64.0, 31.0 / 64.0, 32.0 / 64.0, 61.0 / 64.0],
-                    size: [30.0, 29.0],
-                },
-            ),
-            (
-                "minimal_sliderbar_button".to_string(),
-                crate::script::EraAtlasEntry {
-                    file: "era:textures/4567914.blp".to_string(),
-                    uv: [1.0 / 128.0, 21.0 / 128.0, 20.0 / 128.0, 39.0 / 128.0],
-                    size: [20.0, 19.0],
-                },
-            ),
-        ]);
-        let doc = parse(
-            r#"<Ui>
-                <CheckButton name="Box">
-                    <Size><AbsDimension x="30" y="29"/></Size>
-                    <Anchors><Anchor point="TOPLEFT" relativePoint="TOPLEFT"/></Anchors>
-                    <NormalTexture atlas="checkbox-minimal"/>
-                    <CheckedTexture atlas="checkmark-minimal"/>
-                </CheckButton>
-                <Slider name="Bar" orientation="HORIZONTAL" minValue="0" maxValue="1">
-                    <Size><AbsDimension x="200" y="19"/></Size>
-                    <Anchors><Anchor point="TOPLEFT" relativePoint="TOPLEFT"/></Anchors>
-                    <ThumbTexture atlas="minimal_sliderbar_button" useAtlasSize="true"/>
-                </Slider>
-            </Ui>"#,
-        )
-        .expect("valid FrameXML");
-        let report = load(&s, &doc, &no_files);
-        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
-        assert_eq!(
-            s.eval::<String>("return Box:GetNormalTexture():GetAtlas()")
-                .unwrap(),
-            "checkbox-minimal"
-        );
-        assert_eq!(
-            s.eval::<String>("return Box:GetCheckedTexture():GetAtlas()")
-                .unwrap(),
-            "checkmark-minimal"
-        );
-        assert_eq!(
-            s.eval::<String>("return Bar:GetThumbTexture():GetAtlas()")
-                .unwrap(),
-            "minimal_sliderbar_button"
-        );
-        // useAtlasSize rode along — the thumb wears the member's nominal 20×19 (what the
-        // engine's thumb-travel math reads).
-        assert_eq!(
-            s.eval::<f64>("return Bar:GetThumbTexture():GetWidth()")
-                .unwrap(),
-            20.0
-        );
-        assert_eq!(
-            s.eval::<f64>("return Bar:GetThumbTexture():GetHeight()")
-                .unwrap(),
-            19.0
-        );
     }
 }

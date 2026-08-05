@@ -231,11 +231,9 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
                     Value::String(s) if s.to_str()?.is_empty() => {
                         data.texture = None;
                         data.color = None;
-                        data.atlas = None;
                     }
                     Value::String(s) => {
                         data.texture = Some(s.to_str()?.to_string());
-                        data.atlas = None;
                     }
                     Value::Number(_) | Value::Integer(_) => {
                         data.color = Some([
@@ -250,7 +248,6 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
                     Value::Nil => {
                         data.texture = None;
                         data.color = None;
-                        data.atlas = None;
                     }
                     _ => {}
                 }
@@ -274,7 +271,6 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
             data.texture = Some(path);
             data.circular = true;
             data.portrait_unit = None;
-            data.atlas = None;
             Ok(())
         })?,
     )?;
@@ -422,9 +418,34 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
         let h = m.map(|m| m.h).or(size.map(|s| s.1)).unwrap_or(0.0);
         Ok((w, h))
     }
+    // GetStringWidth is the **natural, unwrapped** extent — never the declared box, and never the
+    // wrapped one (wow-re `fontstring-overflow.md`, "The measurement echo": the reference's getter
+    // re-measures the raw text with NO wrap constraint). Unlike `GetWidth` below it deliberately
+    // does NOT fall back to an explicit `SetSize`: the declared width is the very thing a caller
+    // asks this to be independent of. A kit that sizes a box from this number and then sets a width
+    // on the string — which is what the reference's own `PanelTemplates_TabResize` does — would
+    // otherwise read its own output back as its next input and never settle (decision 0997, the
+    // macro window's character tab changing width every frame). `0` until measured, as ever.
+    fn natural_w(lua: &Lua, this: &Table) -> mlua::Result<f32> {
+        let rh = region_handle_of(lua, this)?;
+        let model = lua.app_data_ref::<Model>().expect("model");
+        let Some(d) = model.region_data.get(&rh) else {
+            return Ok(0.0);
+        };
+        let scale = model
+            .arena
+            .region(rh)
+            .and_then(|r| model.arena.frame(r.owner))
+            .map(|f| f.effective_scale)
+            .unwrap_or(1.0);
+        Ok(d.measured
+            .filter(|m| m.key == d.measure_key(scale))
+            .map(|m| m.natural_w)
+            .unwrap_or(0.0))
+    }
     m.set(
         "GetStringWidth",
-        lua.create_function(|lua, this: Table| Ok(measured_wh(lua, &this)?.0))?,
+        lua.create_function(|lua, this: Table| natural_w(lua, &this))?,
     )?;
     m.set(
         "GetStringHeight",
@@ -638,54 +659,6 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
                 .map(|tc| tc.edges())
                 .unwrap_or([0.0, 1.0, 0.0, 1.0]);
             Ok((l, r, t, b))
-        })?,
-    )?;
-    // SetAtlas(name[, useAtlasSize]) — the Era atlas resolve (decision 0950): one call sets the
-    // sheet texture + UV sub-rect from the app-pushed table ([`super::UiScript::set_era_atlases`],
-    // baked offline from the UiTextureAtlas DB2s by scripts/era-extract.py), and with
-    // useAtlasSize the member's nominal size too. The reference's SetAtlas hard-errors on an
-    // unknown name; ours blanks the region and records a warn-once miss instead
-    // ([`super::UiScript::take_era_atlas_misses`]) — a stale extraction must not kill the whole
-    // XML load, but it must name itself.
-    m.set(
-        "SetAtlas",
-        lua.create_function(
-            |lua, (this, name, use_size): (Table, String, Option<bool>)| {
-                let rh = region_handle_of(lua, &this)?;
-                let mut model = lua.app_data_mut::<Model>().expect("model");
-                let key = name.to_ascii_lowercase();
-                let Some(entry) = model.era_atlas.get(&key).cloned() else {
-                    model.era_atlas_missing.insert(key);
-                    let d = model.region_data.entry(rh).or_default();
-                    d.texture = None;
-                    d.atlas = None;
-                    return Ok(());
-                };
-                let d = model.region_data.entry(rh).or_default();
-                d.circular = false;
-                d.portrait_unit = None;
-                d.texture = Some(entry.file);
-                d.tex_coords = Some(TexCoords::Rect(entry.uv));
-                d.atlas = Some(key);
-                if use_size.unwrap_or(false) {
-                    let new = Some((entry.size[0], entry.size[1]));
-                    let changed = !size_bits_eq(d.size, new);
-                    d.size = new;
-                    if changed {
-                        model.touch_layout();
-                    }
-                }
-                Ok(())
-            },
-        )?,
-    )?;
-    // GetAtlas() → the member name the last SetAtlas applied (nil for an ordinary texture).
-    m.set(
-        "GetAtlas",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let model = lua.app_data_ref::<Model>().expect("model");
-            Ok(model.region_data.get(&rh).and_then(|d| d.atlas.clone()))
         })?,
     )?;
     // SetFontObject("GameFontNormal") — re-point this FontString at a named virtual Font object: its

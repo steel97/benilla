@@ -4,6 +4,17 @@
 
 use super::*;
 
+/// Which field [`ObjectFields::unit_owner`] falls back to when `CHARMEDBY` is clear — the one
+/// thing the client's two owner-guid readers do differently. Named rather than defaulted because
+/// picking the wrong one is invisible until a totem or a guardian behaves like a pet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerFallback {
+    /// `UNIT_FIELD_CREATEDBY` — what `0x5ee5a0` ("resolve my own pet") uses.
+    CreatedBy,
+    /// `UNIT_FIELD_SUMMONEDBY` — what the `PET_ATTACK_*` callback `0x5ff580` uses.
+    SummonedBy,
+}
+
 impl ObjectFields {
     /// `OBJECT_FIELD_SCALE_X` — the per-object size multiplier.
     pub fn object_scale_x(&self) -> Option<f32> {
@@ -32,10 +43,35 @@ impl ObjectFields {
     pub fn unit_channel_spell(&self) -> u32 {
         self.get_u32(FIELD_UNIT_CHANNEL_SPELL).unwrap_or(0)
     }
+    /// `UNIT_FIELD_SUMMON` — the guid of the unit this one has summoned, or `None`. On our own
+    /// descriptor that is **our pet**, and so the anchor of the `"pet"` unit token (decision 0982).
+    /// The inverse of [`Self::unit_summoned_by`].
+    pub fn unit_summon(&self) -> Option<u64> {
+        self.get_guid(FIELD_UNIT_SUMMON).filter(|&g| g != 0)
+    }
     /// `UNIT_FIELD_SUMMONEDBY` — the summoner's guid (pet/guardian/totem), or `None` (absent or
     /// explicit 0 — an unowned unit).
     pub fn unit_summoned_by(&self) -> Option<u64> {
         self.get_guid(FIELD_UNIT_SUMMONEDBY).filter(|&g| g != 0)
+    }
+    /// `UNIT_FIELD_CHARMEDBY` — whoever is charming this unit, or `None` when nobody is.
+    pub fn unit_charmed_by(&self) -> Option<u64> {
+        self.get_guid(FIELD_UNIT_CHARMEDBY).filter(|&g| g != 0)
+    }
+    /// The unit's **owner** as the client's own two owner-guid readers compute it:
+    /// `charmedBy` when set, else the caller's fallback field.
+    ///
+    /// Both readers are `(charmedBy != 0) ? charmedBy : <fallback>` and **they disagree on the
+    /// fallback**, which is why this takes it rather than picking one. `0x5ee5a0` — "resolve my own
+    /// pet" — falls back to `CREATEDBY` (`0x5ee62f`: `fields+0x10` else `fields+0x20`); the
+    /// `PET_ATTACK_*` field-change callback `0x5ff580` falls back to `SUMMONEDBY` (`0x5ff769`:
+    /// `+0x10` else `+0x18`). Reading one where the reference reads the other silently changes
+    /// which units count as yours (wow-re `object-layer/scratch/pet-command-validators.md` §1, §4).
+    pub fn unit_owner(&self, fallback: OwnerFallback) -> Option<u64> {
+        self.unit_charmed_by().or_else(|| match fallback {
+            OwnerFallback::CreatedBy => self.unit_created_by(),
+            OwnerFallback::SummonedBy => self.unit_summoned_by(),
+        })
     }
     /// `UNIT_FIELD_CREATEDBY` — the creator's guid (totems and created objects), or `None`.
     pub fn unit_created_by(&self) -> Option<u64> {
@@ -134,6 +170,30 @@ impl ObjectFields {
     /// the descriptor's zero-initialized default.
     pub fn unit_stand_state(&self) -> u8 {
         (self.get_u32(FIELD_UNIT_BYTES_1).unwrap_or(0) & 0xff) as u8
+    }
+    /// `UNIT_FIELD_BYTES_1` byte 1 — a hunter pet's **loyalty level**, `1..=8`, and `0` for a unit
+    /// that has none (VERIFIED vmangos `UNIT_BYTES_1_OFFSET_PET_LOYALTY = 1`; byte-verified
+    /// client-side as `[unit+0x110]+0x211`, the byte `GetPetLoyalty 0x4be700` indexes
+    /// `PetLoyalty.dbc` with). `0` is the binding's **nil**, not level 1.
+    pub fn unit_loyalty_level(&self) -> u8 {
+        ((self.get_u32(FIELD_UNIT_BYTES_1).unwrap_or(0) >> 8) & 0xff) as u8
+    }
+    /// `UNIT_FIELD_PETEXPERIENCE` / `UNIT_FIELD_PETNEXTLEVELEXP` — `GetPetExperience`'s
+    /// `(currXP, nextXP)`, in that order. Absent fields read `0`, which is the binding's own
+    /// gate-failure value: this pair is numbers on every path, never nil.
+    pub fn unit_pet_experience(&self) -> (u32, u32) {
+        (
+            self.get_u32(FIELD_UNIT_PETEXPERIENCE).unwrap_or(0),
+            self.get_u32(FIELD_UNIT_PETNEXTLEVELEXP).unwrap_or(0),
+        )
+    }
+    /// `UNIT_TRAINING_POINTS` split as the client splits it — `(total, spent)`, **high word
+    /// first**. The order is the load-bearing half: both are small numbers of the same magnitude,
+    /// so swapping them yields a pet that looks like it has spent everything or nothing, with no
+    /// error anywhere.
+    pub fn unit_training_points(&self) -> (u16, u16) {
+        let packed = self.get_u32(FIELD_UNIT_TRAINING_POINTS).unwrap_or(0);
+        ((packed >> 16) as u16, (packed & 0xffff) as u16)
     }
     /// `UNIT_FIELD_BYTES_1` byte 3's `UNIT_VIS_FLAGS_CREEP (0x2)` — the sneaking visual, set by
     /// `SPELL_AURA_MOD_STEALTH` (vmangos `SpellAuras.cpp:3610`,

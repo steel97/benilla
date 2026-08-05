@@ -38,6 +38,7 @@ pub mod opcode;
 mod opcode_names;
 mod packet;
 mod parse;
+mod pet;
 mod pose;
 mod progression;
 mod quest;
@@ -128,6 +129,14 @@ pub use movement::{JumpInfo, MoveMode, MovementInfo, SpeedKind, TransportPose};
 pub use opcode_names::opcode_name;
 pub use packet::{CreatureQueryInfo, MonsterMoveFacing, ServerPacket};
 pub use parse::parse_server;
+pub use pet::{
+    pet_action, pet_cancel_aura, pet_set_action, pet_stop_attack, PetActionEntry, PetMode,
+    PetSpellCooldown, PetSpells, PET_ACTION_SLOTS, PET_ACT_COMMAND, PET_ACT_DISABLED,
+    PET_ACT_ENABLED, PET_ACT_PASSIVE, PET_ACT_REACTION, PET_AUTOCAST_ALLOWED, PET_AUTOCAST_ON,
+    PET_COMMAND_ATTACK, PET_COMMAND_DISMISS, PET_COMMAND_FOLLOW, PET_COMMAND_STAY,
+    PET_COOLDOWN_PERMANENT, PET_REACT_AGGRESSIVE, PET_REACT_DEFENSIVE, PET_REACT_PASSIVE,
+    PET_STATE_BAR_DISABLED, PET_TYPE_SPELL_FIRST, PET_TYPE_SPELL_LAST, PET_UNUSABLE_UNIT_FLAGS,
+};
 pub use pose::{set_sheathed, stand_state_change};
 pub use progression::{learn_talent, ExplorationXp, LevelUpInfo, XpGain};
 pub use quest::{
@@ -167,7 +176,7 @@ pub use trade::{
 };
 pub use trainer::{train_fail, trainer_buy_spell, trainer_list, trainer_spell_state, TrainerSpell};
 pub use update_object::{
-    quest_slot_state, CreateSpline, MovementBlock, Object, ObjectFields, ObjectType,
+    quest_slot_state, CreateSpline, MovementBlock, Object, ObjectFields, ObjectType, OwnerFallback,
     PlayerSkillSlot, QuestLogSlot, UnitAuraSlot, AURA_FLAG_CANCELABLE, AURA_FLAG_EFF_INDEX_MASK,
     PLAYER_EXPLORED_ZONES_SLOTS, PLAYER_QUEST_LOG_SLOTS, PLAYER_SKILL_SLOTS,
     UNIT_AURA_POSITIVE_SLOTS, UNIT_AURA_SLOTS,
