@@ -720,6 +720,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "benilla_mobile"
+version = "0.0.0"
+dependencies = [
+ "benilla",
+ "bevy",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "objc2-ui-kit 0.3.2",
+]
+
+[[package]]
 name = "bevy"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1513,17 +1524,6 @@ name = "bevy_mikktspace"
 version = "0.17.0-dev"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef8e4b7e61dfe7719bb03c884dc270cd46a82efb40f93e9933b990c5c190c59"
-
-[[package]]
-name = "bevy_mobile_example"
-version = "0.0.0"
-dependencies = [
- "benilla",
- "bevy",
- "objc2 0.6.4",
- "objc2-foundation 0.3.2",
- "objc2-ui-kit 0.3.2",
-]
 
 [[package]]
 name = "bevy_pbr"
