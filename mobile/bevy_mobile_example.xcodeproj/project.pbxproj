@@ -209,6 +209,7 @@
 				ENABLE_BITCODE = NO;
 				INFOPLIST_FILE = "ios-src/Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 12.0;
+				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = org.ivanyv.benilla;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = iphoneos;
@@ -299,7 +300,7 @@
 				79E3C28F06346EA58420A93D /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Debug;
+			defaultConfigurationName = Release;
 		};
 		E714A1AEAAE517C348B5BD27 /* Build configuration list for PBXNativeTarget "bevy_mobile_example" */ = {
 			isa = XCConfigurationList;
@@ -308,7 +309,7 @@
 				5B14EC4ADC81FBF1F8CF20E9 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Debug;
+			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
 	};

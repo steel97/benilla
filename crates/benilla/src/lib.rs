@@ -387,7 +387,7 @@ pub fn main_shared() -> AppExit {
             // warcraft-rs parsers `wow_m2`/`wow_blp` — retired in-repo by decision 0021; the
             // in-repo parsers don't log, so those entries were dead and are gone.)
             .set(bevy::log::LogPlugin {
-                filter: "wgpu=error,naga=warn".into(),
+                filter: "wgpu=error,naga=warn,winit=error".into(),
                 ..default()
             })
             // Asset streaming is this client's load bottleneck: every M2/WMO/BLP read decompresses
