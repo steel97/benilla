@@ -1,6 +1,10 @@
 use benilla_app::register_hook;
 use bevy::{
-    input::{InputSystems, mouse::AccumulatedMouseMotion},
+    input::{
+        ButtonState, InputSystems,
+        keyboard::{Key, KeyboardInput, NativeKey},
+        mouse::AccumulatedMouseMotion,
+    },
     prelude::*,
     window::PrimaryWindow,
 };
@@ -9,6 +13,8 @@ use crate::joystick::*;
 
 pub fn register_hooks() {
     register_hook(|app: &mut App| {
+        println!("[benilla-mobile] registered mobile systems");
+
         // override logging (commented out, not possible to override at runtime..)
         /*println!("[benilla-mobile] override logging");
         app.add_plugins(DefaultPlugins.set(bevy::log::LogPlugin {
@@ -17,16 +23,63 @@ pub fn register_hooks() {
             ..default()
         }));*/
 
+        // enable sound
+        app.init_state::<UnmuteSoundState>();
+        app.add_systems(PreUpdate, unmute_sound_system.after(InputSystems));
+
         // virtual joystick
         app.add_plugins(VirtualJoystickPlugin::<String>::default())
+            .add_message::<KeyboardInput>()
             .add_systems(Startup, init_joystick)
-            .add_systems(PreUpdate, update_joystick.after(InputSystems));
+            .add_systems(Update, update_joystick.after(InputSystems));
 
         // virtual input
-        println!("[benilla-mobile] registered virtual input");
         app.init_state::<VirtualInput>();
         app.add_systems(PreUpdate, emulate_input_system.after(InputSystems));
     });
+}
+
+// unmute
+#[derive(States, Debug, Clone, Eq, PartialEq, Hash)]
+pub enum UnmuteSoundState {
+    Value(i32),
+}
+
+impl Default for UnmuteSoundState {
+    fn default() -> Self {
+        UnmuteSoundState::Value(0)
+    }
+}
+
+pub fn unmute_sound_system(
+    mut input: ResMut<ButtonInput<KeyCode>>,
+    state: Res<State<UnmuteSoundState>>,
+    mut next_state: ResMut<NextState<UnmuteSoundState>>,
+) {
+    let UnmuteSoundState::Value(state) = **state;
+    let mut cur_state = state;
+
+    if cur_state > 2 {
+        return;
+    }
+
+    if cur_state == 0 {
+        input.press(KeyCode::ControlLeft);
+        input.press(KeyCode::ShiftLeft);
+    }
+
+    if cur_state > 0 {
+        input.press(KeyCode::KeyM);
+    }
+
+    if cur_state > 1 {
+        input.release(KeyCode::ControlLeft);
+        input.release(KeyCode::ShiftLeft);
+        input.release(KeyCode::KeyM);
+    }
+
+    cur_state += 1;
+    next_state.set(UnmuteSoundState::Value(cur_state));
 }
 
 // joystick
@@ -56,29 +109,87 @@ fn init_joystick(mut cmd: bevy::prelude::Commands, asset_server: Res<AssetServer
 
 fn update_joystick(
     mut reader: MessageReader<VirtualJoystickMessage<String>>,
-    mut input: ResMut<ButtonInput<KeyCode>>,
+    mut keyboard_writer: MessageWriter<KeyboardInput>,
 ) {
     for joystick in reader.read() {
         let axis = joystick.snap_axis(Some(0.3_f32));
         let x = axis.x;
         let y = axis.y;
 
+        println!("JOYSTICK: {}x{}", x, y);
+
         if x < 0.0_f32 {
-            input.press(KeyCode::KeyA);
+            keyboard_writer.write(KeyboardInput {
+                key_code: KeyCode::KeyA,
+                logical_key: Key::Unidentified(NativeKey::Unidentified),
+                state: ButtonState::Pressed,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
         } else if x > 0.0_f32 {
-            input.press(KeyCode::KeyD);
+            keyboard_writer.write(KeyboardInput {
+                key_code: KeyCode::KeyD,
+                logical_key: Key::Unidentified(NativeKey::Unidentified),
+                state: ButtonState::Pressed,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
         } else {
-            input.release(KeyCode::KeyA);
-            input.release(KeyCode::KeyD);
+            keyboard_writer.write(KeyboardInput {
+                key_code: KeyCode::KeyA,
+                logical_key: Key::Unidentified(NativeKey::Unidentified),
+                state: ButtonState::Released,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+            keyboard_writer.write(KeyboardInput {
+                key_code: KeyCode::KeyD,
+                logical_key: Key::Unidentified(NativeKey::Unidentified),
+                state: ButtonState::Released,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
         }
 
         if y > 0.0_f32 {
-            input.press(KeyCode::KeyW);
+            keyboard_writer.write(KeyboardInput {
+                key_code: KeyCode::KeyW,
+                logical_key: Key::Unidentified(NativeKey::Unidentified),
+                state: ButtonState::Pressed,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
         } else if y < 0.0_f32 {
-            input.press(KeyCode::KeyS);
+            keyboard_writer.write(KeyboardInput {
+                key_code: KeyCode::KeyS,
+                logical_key: Key::Unidentified(NativeKey::Unidentified),
+                state: ButtonState::Pressed,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
         } else {
-            input.release(KeyCode::KeyW);
-            input.release(KeyCode::KeyS);
+            keyboard_writer.write(KeyboardInput {
+                key_code: KeyCode::KeyW,
+                logical_key: Key::Unidentified(NativeKey::Unidentified),
+                state: ButtonState::Released,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+            keyboard_writer.write(KeyboardInput {
+                key_code: KeyCode::KeyS,
+                logical_key: Key::Unidentified(NativeKey::Unidentified),
+                state: ButtonState::Released,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
         }
     }
 }
