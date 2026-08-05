@@ -1,4 +1,4 @@
-use benilla::register_hook;
+use benilla_app::register_hook;
 use bevy::{
     input::{InputSystems, mouse::AccumulatedMouseMotion},
     prelude::*,

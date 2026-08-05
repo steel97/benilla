@@ -1,17 +1,16 @@
 //! A 3d Scene with a button and playing sound.
 
+use benilla_app::BuildId;
 use bevy::prelude::bevy_main;
 
 use crate::{
     helpers::{postprocess_env, transform_path},
     hooks::register_hooks,
-    runner::run_benilla,
 };
 
 pub mod helpers;
 pub mod hooks;
 pub mod joystick;
-pub mod runner;
 
 #[bevy_main]
 pub fn main() {
@@ -26,5 +25,10 @@ pub fn main() {
 
     postprocess_env();
     register_hooks();
-    run_benilla();
+    benilla_app::run(BuildId {
+        sha: env!("BENILLA_GIT_SHA"),
+        short: env!("BENILLA_GIT_SHORT"),
+        date: env!("BENILLA_GIT_DATE"),
+        profile: env!("BENILLA_PROFILE"),
+    });
 }

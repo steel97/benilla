@@ -15,28 +15,3 @@ fn main() -> benilla_app::AppExit {
         profile: env!("BENILLA_PROFILE"),
     })
 }
-
-// hooks
-use std::cell::RefCell;
-thread_local! {
-    static HOOKS: RefCell<Vec<Box<dyn Fn(&mut App) + 'static>>> = RefCell::new(Vec::new());
-}
-
-pub fn register_hook<F>(f: F)
-where
-    F: Fn(&mut App) + 'static,
-{
-    HOOKS.with(|hooks| {
-        let mut guard = hooks.borrow_mut();
-        guard.push(Box::new(f));
-    });
-}
-
-fn execute_hooks(app: &mut App) {
-    HOOKS.with(|hooks| {
-        let mut guard = hooks.borrow_mut();
-        for (_i, hook) in guard.iter_mut().enumerate() {
-            hook(app);
-        }
-    });
-}

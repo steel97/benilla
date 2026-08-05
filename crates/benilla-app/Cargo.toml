@@ -86,7 +86,7 @@ rand = "0.8"
 # not do: it speaks `wlr-data-control`, a privileged manager protocol GNOME/Mutter deliberately
 # doesn't implement. `raw-window-handle` (pinned to the 0.6 already in the tree via bevy_window, so
 # this adds no crate) is only needed to read the `wl_display` out of bevy's `RawHandleWrapper`.
-[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 raw-window-handle = "0.6"
 smithay-clipboard = "0.7"
 

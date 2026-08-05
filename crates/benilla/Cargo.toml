@@ -5,10 +5,6 @@ edition.workspace = true
 license.workspace = true
 description = "The launcher: build.rs stamps the git build id, main() hands it to benilla-app. A shim, so the stamp's every-commit rebuild dirties this package and not the app crate (decision 0993)"
 
-[lib]
-path = "src/main.rs"
-crate-type = ["staticlib", "rlib", "cdylib"]
-
 [features]
 # Forwarded profiling switches, so `cargo run --features tracy -p benilla` keeps working.
 tracy = ["benilla-app/tracy"]

@@ -12,7 +12,7 @@ name = "benilla_mobile"
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
-benilla = { version = "0.1.0", path = "../crates/benilla" }
+benilla-app = { version = "0.1.0", path = "../crates/benilla-app" }
 bevy.workspace = true
 variadics_please = "2.0.0"
 

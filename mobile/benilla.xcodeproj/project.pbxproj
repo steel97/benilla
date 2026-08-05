@@ -7,13 +7,13 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		2C71624A30238C8400E5D279 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 2C71624930238C8000E5D279 /* assets */; };
+		2C761E3B302398F2003B0638 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 2C761E3A302398EE003B0638 /* assets */; };
 		57CD630E253C80EC0098CD4A /* WoW in Resources */ = {isa = PBXBuildFile; fileRef = 57CD630A253C7F5F0098CD4A /* WoW */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		2C53B96F3022AB5600486C99 /* benilla.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = benilla.entitlements; sourceTree = "<group>"; };
-		2C71624930238C8000E5D279 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = "<group>"; };
+		2C761E3A302398EE003B0638 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; name = assets; path = "../crates/benilla-app/assets"; sourceTree = SOURCE_ROOT; };
 		55EAC02897847195D2F44C15 /* benilla.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = benilla.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		57CD630A253C7F5F0098CD4A /* WoW */ = {isa = PBXFileReference; lastKnownFileType = folder; name = WoW; path = ../../WoW; sourceTree = "<group>"; };
 		8EE7F1E3B0303533925D7E33 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
@@ -31,7 +31,7 @@
 		4F1D6F28B8A5D1927AB0ADED /* ios-src */ = {
 			isa = PBXGroup;
 			children = (
-				2C71624930238C8000E5D279 /* assets */,
+				2C761E3A302398EE003B0638 /* assets */,
 				57CD630A253C7F5F0098CD4A /* WoW */,
 				8EE7F1E3B0303533925D7E33 /* Info.plist */,
 			);
@@ -104,7 +104,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				57CD630E253C80EC0098CD4A /* WoW in Resources */,
-				2C71624A30238C8400E5D279 /* assets in Resources */,
+				2C761E3B302398F2003B0638 /* assets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

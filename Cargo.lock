@@ -729,7 +729,7 @@ dependencies = [
 name = "benilla_mobile"
 version = "0.0.0"
 dependencies = [
- "benilla",
+ "benilla-app",
  "bevy",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
