@@ -769,7 +769,7 @@
     <Frame name="BenillaActionBar">
         <Size><AbsDimension x="1024" y="53"/></Size>
         <Anchors>
-            <Anchor point="BOTTOM" relativePoint="BOTTOM"><Offset><AbsDimension x="0" y="100"/></Offset></Anchor>
+            <Anchor point="BOTTOM" relativePoint="BOTTOM"><Offset><AbsDimension x="0" y="50"/></Offset></Anchor>
         </Anchors>
         <Frames>
             <!--
