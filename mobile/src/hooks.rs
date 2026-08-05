@@ -59,28 +59,26 @@ fn update_joystick(
     mut input: ResMut<ButtonInput<KeyCode>>,
 ) {
     for joystick in reader.read() {
-        let Vec2 { x, y } = joystick.axis();
-        let zone = 0.3f32;
-        if *x != 0.0_f32 {
-            if *x < zone {
-                input.press(KeyCode::KeyA);
-            } else if *x > zone {
-                input.press(KeyCode::KeyD);
-            } else {
-                input.release(KeyCode::KeyA);
-                input.release(KeyCode::KeyD);
-            }
+        let axis = joystick.snap_axis(Some(0.3_f32));
+        let x = axis.x;
+        let y = axis.y;
+
+        if x < 0.0_f32 {
+            input.press(KeyCode::KeyA);
+        } else if x > 0.0_f32 {
+            input.press(KeyCode::KeyD);
+        } else {
+            input.release(KeyCode::KeyA);
+            input.release(KeyCode::KeyD);
         }
 
-        if *y != 0.0_f32 {
-            if *y > zone {
-                input.press(KeyCode::KeyW);
-            } else if *y < zone {
-                input.press(KeyCode::KeyS);
-            } else {
-                input.release(KeyCode::KeyW);
-                input.release(KeyCode::KeyS);
-            }
+        if y > 0.0_f32 {
+            input.press(KeyCode::KeyW);
+        } else if y < 0.0_f32 {
+            input.press(KeyCode::KeyS);
+        } else {
+            input.release(KeyCode::KeyW);
+            input.release(KeyCode::KeyS);
         }
     }
 }
