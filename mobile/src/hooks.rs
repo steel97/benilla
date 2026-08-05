@@ -12,7 +12,9 @@ use bevy::{
 
 use crate::joystick::*;
 
-const JOYSTICK_SIZE: f32 = 150.0;
+// TO-DO: apply scaling
+const KNOB_SIZE: f32 = 55.0;
+const JOYSTICK_SIZE: f32 = 110.0;
 
 pub fn register_hooks() {
     register_hook(|app: &mut App| {
@@ -33,13 +35,14 @@ pub fn register_hooks() {
         // virtual joystick
         app.add_plugins(VirtualJoystickPlugin::<String>::default())
             .add_message::<KeyboardInput>()
+            .add_message::<JoystickState>()
             .add_systems(Startup, init_joystick)
             .add_systems(Update, update_joystick.after(InputSystems));
 
         // virtual input
         app.init_state::<VirtualInput>();
         app.insert_resource(TapOffset(0.0));
-        app.add_systems(PreUpdate, emulate_input_system.after(InputSystems));
+        app.add_systems(Update, emulate_input_system.after(update_joystick));
     });
 }
 
@@ -52,6 +55,45 @@ pub enum UnmuteSoundState {
 impl Default for UnmuteSoundState {
     fn default() -> Self {
         UnmuteSoundState::Value(0)
+    }
+}
+
+#[derive(Message, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JoystickState {
+    consumed: bool,
+    consumed_touch_id: u64,
+}
+pub struct BaseAction {}
+
+impl VirtualJoystickAction<String> for BaseAction {
+    fn on_start_drag(
+        &self,
+        _id: String,
+        _data: VirtualJoystickState,
+        world: &mut World,
+        _entity: Entity,
+    ) {
+        let Some(touch_state) = _data.touch_state else {
+            return;
+        };
+
+        world.write_message(JoystickState {
+            consumed_touch_id: touch_state.id,
+            consumed: true,
+        });
+    }
+
+    fn on_end_drag(
+        &self,
+        _id: String,
+        _data: VirtualJoystickState,
+        world: &mut World,
+        _entity: Entity,
+    ) {
+        world.write_message(JoystickState {
+            consumed_touch_id: 0,
+            consumed: false,
+        });
     }
 }
 
@@ -96,18 +138,19 @@ fn init_joystick(mut cmd: bevy::prelude::Commands, asset_server: Res<AssetServer
         None,
         None,
         Some(Color::srgba(1.0, 0.27, 0.0, 0.0)),
-        Vec2::new(75., 75.),
+        Vec2::new(KNOB_SIZE, KNOB_SIZE),
         Vec2::new(JOYSTICK_SIZE, JOYSTICK_SIZE),
         Node {
             width: Val::Px(JOYSTICK_SIZE),
             height: Val::Px(JOYSTICK_SIZE),
             position_type: PositionType::Absolute,
-            right: Val::Px(JOYSTICK_SIZE),
-            bottom: Val::Percent(15.),
+            left: Val::Px(JOYSTICK_SIZE / 2.),
+            // TO-DO: calculate based on height and joystick size
+            bottom: Val::Percent(35.),
             ..default()
         },
         (JoystickInvisible, JoystickFixed),
-        NoAction,
+        BaseAction {},
     );
 }
 
@@ -119,8 +162,6 @@ fn update_joystick(
         let axis = joystick.snap_axis(Some(0.3_f32));
         let x = axis.x;
         let y = axis.y;
-
-        println!("JOYSTICK: {}x{}", x, y);
 
         if x < 0.0_f32 {
             keyboard_writer.write(KeyboardInput {
@@ -205,6 +246,9 @@ pub struct VirtualInput {
     pub left_click_consumed: bool,
     pub left_click_touch_id: u64,
     pub release_click_on_next_frame: bool,
+    // joystick
+    pub consumed: bool,
+    pub consumed_touch_id: u64,
 }
 
 impl Default for VirtualInput {
@@ -214,6 +258,8 @@ impl Default for VirtualInput {
             left_click_consumed: false,
             left_click_touch_id: 0,
             release_click_on_next_frame: false,
+            consumed: false,
+            consumed_touch_id: 0,
         }
     }
 }
@@ -221,11 +267,14 @@ impl Default for VirtualInput {
 #[derive(Resource)]
 pub struct TapOffset(f32);
 
-pub fn check_touch(ww: f32, wh: f32, touch: &Touch) -> bool {
-    println!("touch {} and {}", touch.position().x, ww);
-    let bad_x = touch.position().x > ww - JOYSTICK_SIZE - JOYSTICK_SIZE / 2.;
+pub fn check_touch(ww: f32, wh: f32, touch: &Touch, consumed: bool, touch_id: u64) -> bool {
+    /*let bad_x = touch.position().x > ww - JOYSTICK_SIZE - JOYSTICK_SIZE / 2.;
     let bad_y = touch.position().y > wh - JOYSTICK_SIZE - JOYSTICK_SIZE / 2.;
-    if bad_x && bad_y {
+    if bad_x && bad_y && consumed {
+        return false;
+    }*/
+
+    if touch.id() == touch_id && consumed {
         return false;
     }
 
@@ -241,22 +290,49 @@ pub fn emulate_input_system(
     mut next_vinp_state: ResMut<NextState<VirtualInput>>,
     mut tap_offset: ResMut<TapOffset>,
     time: Res<Time>,
+    mut reader: MessageReader<JoystickState>,
 ) {
     let Ok(mut window) = window.single_mut() else {
         return;
     };
     let mut cur_state = vinp_state.get().clone();
 
+    let prev_consumed = cur_state.consumed;
+
+    for joystick in reader.read() {
+        cur_state.consumed = joystick.consumed;
+        cur_state.consumed_touch_id = joystick.consumed_touch_id;
+    }
+
+    println!(
+        "consume state {}, tid = {}",
+        cur_state.consumed, cur_state.consumed_touch_id
+    );
+    let lmb: MouseButton = match cur_state.consumed {
+        true => MouseButton::Left,
+        false => MouseButton::Right,
+    };
+    let rmb = match cur_state.consumed {
+        true => MouseButton::Right,
+        false => MouseButton::Left,
+    };
+
     if cur_state.release_click_on_next_frame {
         cur_state.release_click_on_next_frame = false;
-        mouse_input.release(MouseButton::Left);
+        mouse_input.release(lmb);
     }
 
     // if two touches pressed at the same time, simulate right click
     let mut right_touches: Vec<u64> = Vec::new();
 
     for touch in touches.iter() {
-        if !check_touch(window.width(), window.height(), touch) {
+        if !check_touch(
+            window.width(),
+            window.height(),
+            touch,
+            cur_state.consumed,
+            cur_state.consumed_touch_id,
+        ) {
             continue;
         }
         if touches.just_pressed(touch.id()) {
@@ -275,13 +351,13 @@ pub fn emulate_input_system(
     cur_state.right_click_track = touch_consumed;
 
     if right_touches.len() >= 2 {
-        mouse_input.press(MouseButton::Left);
+        mouse_input.press(lmb);
         cur_state.right_click_track = right_touches[..2].to_vec();
     } else if prev_len > 0 {
         let consumed = cur_state.right_click_track.len() > 0;
 
         if !consumed {
-            mouse_input.release(MouseButton::Left);
+            mouse_input.release(lmb);
         } else {
             for touch in touches.iter() {
                 if touch.id() == cur_state.right_click_track[0] {
@@ -294,7 +370,13 @@ pub fn emulate_input_system(
     }
 
     for touch in touches.iter() {
-        if !check_touch(window.width(), window.height(), touch) {
+        if !check_touch(
+            window.width(),
+            window.height(),
+            touch,
+            cur_state.consumed,
+            cur_state.consumed_touch_id,
+        ) {
             continue;
         }
 
@@ -308,35 +390,43 @@ pub fn emulate_input_system(
                 tap_offset.0 = 0.0;
 
                 cur_state.release_click_on_next_frame = true;
-                mouse_input.press(MouseButton::Left);
+                mouse_input.press(lmb);
             } else {
                 window.set_cursor_position(Some(touch.position()));
                 tap_offset.0 = now;
                 cur_state.left_click_consumed = true;
                 cur_state.left_click_touch_id = touch.id();
 
-                mouse_input.release(MouseButton::Left);
-                mouse_input.press(MouseButton::Right);
+                mouse_input.release(lmb);
+                mouse_input.press(rmb);
             }
         }
     }
 
     if cur_state.left_click_consumed {
         if let Some(touch) = touches.get_pressed(cur_state.left_click_touch_id) {
+            // check mode change
+            if cur_state.consumed != prev_consumed {
+                window.set_cursor_position(Some(touch.position()));
+
+                mouse_input.release(lmb);
+                mouse_input.press(rmb);
+            }
+
             motion.delta += touch.delta();
         }
     }
 
     for touch in touches.iter_just_released() {
         if touches.just_released(touch.id()) && cur_state.left_click_consumed {
-            mouse_input.release(MouseButton::Right);
+            mouse_input.release(rmb);
             cur_state.left_click_consumed = false;
         }
     }
 
     for touch in touches.iter_just_canceled() {
         if touches.just_canceled(touch.id()) && cur_state.left_click_consumed {
-            mouse_input.release(MouseButton::Right);
+            mouse_input.release(rmb);
             cur_state.left_click_consumed = false;
         }
     }
