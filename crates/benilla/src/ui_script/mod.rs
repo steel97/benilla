@@ -398,7 +398,13 @@ pub(crate) fn is_emote_token_line(line: &str) -> bool {
 /// function entirely unless `WOW_CAPTURE_UI=1`.
 fn load_default_ui(script: &UiScript) -> Vec<String> {
     let mut failures = Vec::new();
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ui");
+    let builtin_dir = std::env::var("WOW_BUILTIN");
+    let path = match builtin_dir {
+        Ok(val) => std::path::PathBuf::from(val),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
+    };
+
+    let dir = path.join("assets/ui");
     // Provider for FrameXML/Lua references: try the path as given and by basename (Blizzard-style
     // backslash paths, dir-relative), resolved against our own assets/ui dir.
     let provider = |req: &str| -> Option<String> {

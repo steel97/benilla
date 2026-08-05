@@ -8,10 +8,10 @@ use std::path::PathBuf;
 pub fn transform_path_ios(relative_path: &str) -> PathBuf {
     if let Ok(mut exe_path) = std::env::current_exe() {
         if exe_path.pop() {
-            return exe_path.join("wow").join(relative_path);
+            return exe_path.join(relative_path);
         }
     }
-    PathBuf::from("wow").join(relative_path)
+    PathBuf::from("").join(relative_path)
 }
 
 #[cfg(target_os = "ios")]
@@ -79,7 +79,8 @@ pub fn main() {
         std::env::set_var("WOW_USER", "ivan");
         std::env::set_var("WOW_PASS", "changeme");
 
-        std::env::set_var("WOW_DATA", transform_path_ios("Data").to_str().unwrap());
+        std::env::set_var("WOW_DATA", transform_path_ios("WoW/Data").to_str().unwrap());
+        std::env::set_var("WOW_BUILTIN", transform_path_ios("").to_str().unwrap());
     }
     main_shared();
 }
