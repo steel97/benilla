@@ -6,6 +6,7 @@ license.workspace = true
 description = "The Bevy app: terrain viewer -> integrated debug client"
 
 [lib]
+path = "src/main.rs"
 crate-type = ["staticlib", "rlib", "cdylib"]
 
 [features]
