@@ -42,7 +42,7 @@ jobs:
       - name: Fakesign app
         run: |
           cd mobile
-          ldid -benilla.entitlements benilla.xcarchive/Products/Applications/benilla.app/benilla
+          ldid -Sbenilla.entitlements benilla.xcarchive/Products/Applications/benilla.app/benilla
       - name: Build ipa
         run: |
           cd mobile
