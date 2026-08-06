@@ -28,6 +28,7 @@ jobs:
           -project benilla.xcodeproj \
           -scheme benilla \
           -sdk iphoneos \
+          -verbose \
           archive -archivePath ./benilla.xcarchive \
           CODE_SIGNING_REQUIRED=NO \
           AD_HOC_CODE_SIGNING_ALLOWED=YES \
