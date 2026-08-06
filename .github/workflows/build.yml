@@ -1,0 +1,56 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ios-test
+  pull_request:
+    branches:
+      - ios-test
+
+jobs:
+  ios:
+    name: ios
+    runs-on: macos-latest
+    environment: ios
+    env:
+      build_package_name: benilla_ios
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Build executable
+        run: |
+          cd mobile
+          xcodebuild \
+          -project benilla.xcodeproj \
+          -scheme benilla \
+          -sdk iphoneos \
+          archive -archivePath ./benilla.xcarchive \
+          CODE_SIGNING_REQUIRED=NO \
+          AD_HOC_CODE_SIGNING_ALLOWED=YES \
+          CODE_SIGNING_ALLOWED=NO \
+          DEVELOPMENT_TEAM=XYZ0123456 \
+          ORG_IDENTIFIER=org.benilla | xcpretty && exit ${PIPESTATUS[0]}
+      - name: Fakesign app
+        run: |
+          cd mobile
+          ldid -benilla.entitlements benilla.xcarchive/Products/Applications/benilla.app/benilla
+      - name: Build ipa
+        run: |
+          cd mobile
+          mkdir Payload
+          mkdir Payload/benilla.app
+          cp -R benilla.xcarchive/Products/Applications/benilla.app/ Payload/benilla.app/
+          zip -r ../app-release.ipa Payload
+      - name: Cleanup
+        run: |
+          cd mobile
+          rm -fr benilla.xcarchive
+          rm -fr Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.build_package_name }}
+          path: app-release.ipa
