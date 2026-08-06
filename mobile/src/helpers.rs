@@ -1,14 +1,3 @@
-use std::path::PathBuf;
-
-pub fn transform_path(relative_path: &str) -> PathBuf {
-    if let Ok(mut exe_path) = std::env::current_exe() {
-        if exe_path.pop() {
-            return exe_path.join(relative_path);
-        }
-    }
-    PathBuf::from("").join(relative_path)
-}
-
 #[cfg(target_os = "ios")]
 #[unsafe(no_mangle)]
 pub extern "C" fn get_dim_ios() -> *mut std::os::raw::c_char {
