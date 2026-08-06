@@ -23,6 +23,7 @@ jobs:
           toolchain: 1.97.1
       - name: Build executable
         run: |
+          rustup target add aarch64-apple-ios
           cd mobile
           xcodebuild \
           -project benilla.xcodeproj \
