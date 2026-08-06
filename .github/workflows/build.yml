@@ -21,6 +21,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
+      - name: Install dependencies
+        run: |
+          brew install ldid
       - name: Build executable
         run: |
           rustup target add aarch64-apple-ios
