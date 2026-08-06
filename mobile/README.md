@@ -9,7 +9,9 @@
 7. put `Data` folder on your device (open Files, navigate to `benilla` put it there)
    Data is inside `WoW/Data`
    _folder names are case-sensetive_
-8. edit `config.json` inside `benilla` app dir (change server address, username and password)
+8. put `assets` folder to your device (same as with `Data`)
+   Data is inside `crates/benilla-app/assets`
+9. edit `config.json` inside `benilla` app dir (change server address, username and password)
 
 # Joystick
 

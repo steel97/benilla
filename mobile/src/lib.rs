@@ -20,7 +20,7 @@ pub fn main() {
 
     unsafe {
         std::env::set_var("WOW_DATA", transform_path("Data").to_str().unwrap());
-        std::env::set_var("WOW_BUILTIN", transform_path_pkg("").to_str().unwrap());
+        std::env::set_var("WOW_BUILTIN", transform_path("").to_str().unwrap());
     }
 
     postprocess_env();
