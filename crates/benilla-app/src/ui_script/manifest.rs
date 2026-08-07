@@ -295,7 +295,12 @@ const UI_MANIFEST: &[&str] = &[
 /// half; calling it after `Fonts.xml` alone is a nil-global error, not a no-op.
 fn load_ui_files(script: &UiScript, files: &[&str], bootstrap_positions: bool) -> Vec<String> {
     let mut failures = Vec::new();
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ui");
+    let builtin_dir = std::env::var("WOW_BUILTIN");
+    let path = match builtin_dir {
+        Ok(val) => std::path::PathBuf::from(val),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
+    };
+    let dir = path.join("assets/ui");
     // Provider for FrameXML/Lua references: try the path as given and by basename (Blizzard-style
     // backslash paths, dir-relative), resolved against our own assets/ui dir.
     let provider = |req: &str| -> Option<String> {
