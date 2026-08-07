@@ -1159,3 +1159,504 @@ fn defaults_resets_the_controls_page_to_registered_defaults() {
         .unwrap());
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
+
+/// Drive the window a few frames so the frame-late fits (the scroll body, the tab widths)
+/// converge: rects resolve after Lua runs, so OptionsScroll_Fit answers one frame behind.
+fn settle(s: &mut UiScript) {
+    for _ in 0..4 {
+        s.resolve();
+        s.tick(0.016);
+    }
+    s.resolve();
+}
+
+/// B217: a search that matches across categories chains five group heads and every matched row
+/// into one column — ~150 units past the page area, which before the page scrolled drew straight
+/// out through the dialog border onto the world. Now the body is the scroll child: it grows to the
+/// content, the bar and its trough appear, and everything past the fold is CLIPPED to the page
+/// rect until scrolled to.
+#[test]
+fn a_broad_search_scrolls_the_page_instead_of_overflowing_it() {
+    let mut s = harness_on(audio_harness());
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    settle(&mut s);
+
+    // Control first: a settled page fits, so there is no scroll and no bar at all — and the body
+    // sits exactly on the page rect, the seat every page's XML anchors were authored against.
+    assert_eq!(
+        s.eval::<f32>("return OptionsFrameContainerScroll:GetVerticalScrollRange()")
+            .unwrap(),
+        0.0,
+        "the Controls page fits its area"
+    );
+    for f in [
+        "OptionsFrameContainerScrollBar",
+        "OptionsFrameContainerScrollBarTrough",
+    ] {
+        assert!(
+            !s.eval::<bool>(&format!("return {f}:IsVisible()")).unwrap(),
+            "{f} stays away while the page fits"
+        );
+    }
+    let page_h: f32 = s
+        .eval("return OptionsFrameContainerScroll:GetHeight()")
+        .unwrap();
+    assert!(
+        (s.eval::<f32>("return OptionsFrameContainerBody:GetHeight()")
+            .unwrap()
+            - page_h)
+            .abs()
+            < 0.5,
+        "the body is the page rect when nothing overflows"
+    );
+
+    // Now the broad search: every category surfaces, and the column outruns the page.
+    s.run("OptionsFrameSearchBox:SetText(\"e\")").unwrap();
+    settle(&mut s);
+    let range: f32 = s
+        .eval("return OptionsFrameContainerScroll:GetVerticalScrollRange()")
+        .unwrap();
+    assert!(
+        range > 100.0,
+        "the results outrun the page, so there is something to scroll (range {range})"
+    );
+    for f in [
+        "OptionsFrameContainerScrollBar",
+        "OptionsFrameContainerScrollBarTrough",
+    ] {
+        assert!(
+            s.eval::<bool>(&format!("return {f}:IsVisible()")).unwrap(),
+            "{f} appears with the overflow"
+        );
+    }
+
+    // THE SYMPTOM: nothing under the page draws past its bottom edge any more. Every quad the
+    // page's own content emits carries the page rect as its clip (the engine's ScrollFrame
+    // mechanism), so the deepest DRAWN pixel is the page's own bottom — while the content's own
+    // rects still reach far below it, which is exactly the spill that used to be on screen.
+    let quads = s.extract();
+    let clip = quads
+        .iter()
+        .find_map(|q| q.clip)
+        .expect("the page clips its content");
+    assert!(
+        quads.iter().all(|q| q.clip.is_none_or(|c| c == clip)),
+        "one clip in play: the page area"
+    );
+    let deepest_rect = quads
+        .iter()
+        .filter(|q| q.clip.is_some())
+        .filter_map(|q| q.rect)
+        .map(|r| r.bottom)
+        .fold(f32::INFINITY, f32::min);
+    assert!(
+        deepest_rect < clip.bottom - 100.0,
+        "there is a real fold to make: the results reach {deepest_rect} against a page bottom of {}",
+        clip.bottom
+    );
+    let deepest_drawn = quads
+        .iter()
+        .filter_map(|q| Some((q.rect?, q.clip?)))
+        .map(|(r, c)| r.bottom.max(c.bottom))
+        .fold(f32::INFINITY, f32::min);
+    assert!(
+        deepest_drawn >= clip.bottom - 0.01,
+        "…and it is folded AT the page bottom, not spilling ({deepest_drawn} vs {})",
+        clip.bottom
+    );
+
+    // The last result is reachable: scrolling to the end brings it inside the page rect. (Widget
+    // coordinates here, not the extract's screen px — the window carries ERA_WINDOW_SCALE.)
+    let sf_bottom: f32 = s
+        .eval("return OptionsFrameContainerScroll:GetBottom()")
+        .unwrap();
+    let tail = |s: &UiScript| -> f32 { s.eval("return OptionsScroll_ContentBottom()").unwrap() };
+    assert!(
+        tail(&s) < sf_bottom,
+        "the tail starts below the fold ({} vs {sf_bottom})",
+        tail(&s)
+    );
+    s.run(&format!("OptionsFrameContainerScrollBar:SetValue({range})"))
+        .unwrap();
+    settle(&mut s);
+    assert!(
+        tail(&s) >= sf_bottom - 0.5,
+        "scrolling to the end brings the tail into the page ({} vs {sf_bottom})",
+        tail(&s)
+    );
+
+    // Clearing the search puts the page — and the bar with its trough — back.
+    s.run("OptionsFrameSearchBox:SetText(\"\")").unwrap();
+    settle(&mut s);
+    assert_eq!(
+        s.eval::<f32>("return OptionsFrameContainerScroll:GetVerticalScrollRange()")
+            .unwrap(),
+        0.0
+    );
+    for f in [
+        "OptionsFrameContainerScrollBar",
+        "OptionsFrameContainerScrollBarTrough",
+    ] {
+        assert!(
+            !s.eval::<bool>(&format!("return {f}:IsVisible()")).unwrap(),
+            "{f} goes away with the results"
+        );
+    }
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The bar's TROUGH — the recessed channel it rides in, the "background and border" a bare
+/// arrows-and-knob bar was missing. It is the shared kit's template on 1.12's own
+/// UI-Character-ScrollBar channel art over the ref's black backing, and it seats ITSELF on its bar
+/// at the ref's hang: 31 wide against the bar's 16, 8 units left, and — the part B224 caught —
+/// overhanging the bar by 21 above and 20 below, which is what drops each arrow button into the
+/// 16-tall SOCKET the art carries for it. (The Keybindings page's own bar wears the same one —
+/// keybindings_tests, where the harness has a real binding registry to overflow the list with.)
+#[test]
+fn the_page_scroll_bar_wears_the_trough_with_its_arrows_in_the_sockets() {
+    let mut s = harness_on(audio_harness());
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameSearchBox:SetText(\"e\")").unwrap();
+    settle(&mut s);
+
+    let bar = "OptionsFrameContainerScrollBar";
+    let trough = "OptionsFrameContainerScrollBarTrough";
+    let g = |f: &str, m: &str| s.eval::<f32>(&format!("return {f}:{m}()")).unwrap();
+    assert!(
+        (g(trough, "GetWidth") - 31.0).abs() < 0.01,
+        "the trough is the 31-wide channel"
+    );
+    assert!(
+        (g(bar, "GetWidth") - 16.0).abs() < 0.01,
+        "against a 16-wide bar"
+    );
+    assert!(
+        (g(bar, "GetLeft") - g(trough, "GetLeft") - 8.0).abs() < 0.01,
+        "the trough hangs the ref's 8 units left of the bar, so the bar rides it centred"
+    );
+    // THE SOCKET LAW (BenillaScrollTrough_Seat): the trough overhangs the bar by 21/20 — not the
+    // arrow-to-arrow 16/16 that B224 reported, which sat both arrows 4 units OUT of their sockets,
+    // riding the caps with bare socket showing beside them. Ref: ReputationFrame's trough at the
+    // scroll frame's +5/-4 against a UIPanelScrollBarTemplate bar at -16/+16.
+    assert!(
+        (g(trough, "GetTop") - g(bar, "GetTop") - 21.0).abs() < 0.01,
+        "trough top 21 above the bar"
+    );
+    assert!(
+        (g(bar, "GetBottom") - g(trough, "GetBottom") - 20.0).abs() < 0.01,
+        "trough bottom 20 below the bar"
+    );
+    // Read the same law off the ARROWS, which is what the eye actually judges: 5 units of top cap
+    // above the up arrow, 4 of bottom cap below the down arrow, and the 16-tall sockets between.
+    let up = format!("{bar}ScrollUpButton");
+    let down = format!("{bar}ScrollDownButton");
+    assert!((g(&up, "GetHeight") - 16.0).abs() < 0.01, "16-tall arrows");
+    assert!((g(&down, "GetHeight") - 16.0).abs() < 0.01);
+    assert!(
+        (g(trough, "GetTop") - g(&up, "GetTop") - 5.0).abs() < 0.01,
+        "the cap shows 5 above the up arrow"
+    );
+    assert!(
+        (g(&down, "GetBottom") - g(trough, "GetBottom") - 4.0).abs() < 0.01,
+        "and 4 below the down arrow"
+    );
+    // …and on THIS page the whole channel lands on the page rect: the scroll frame is the page
+    // area, so the bar takes the 21/20 inset rather than the trough poking out through the header
+    // divider above and the container's bottom below.
+    let sf = "OptionsFrameContainerScroll";
+    assert!((g(trough, "GetTop") - g(sf, "GetTop")).abs() < 0.01);
+    assert!((g(trough, "GetBottom") - g(sf, "GetBottom")).abs() < 0.01);
+
+    // The art: three channel slices from the one 1.12 file — top cap, stretched run, bottom cap —
+    // each spanning the channel's full width, stacked with no gap and no overlap.
+    let mut slices: Vec<_> = s
+        .extract()
+        .into_iter()
+        .filter_map(|q| match &q.content {
+            QuadContent::Texture { path: Some(p), .. } if p.contains("UI-Character-ScrollBar") => {
+                q.rect
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(slices.len(), 3, "top cap, stretched run, bottom cap");
+    slices.sort_by(|a, b| b.top.total_cmp(&a.top));
+    assert!(
+        slices
+            .windows(2)
+            .all(|w| (w[0].bottom - w[1].top).abs() < 0.01),
+        "the three stack flush into one channel: {slices:?}"
+    );
+    let width = slices[0].right - slices[0].left;
+    assert!(
+        slices
+            .iter()
+            .all(|r| (r.right - r.left - width).abs() < 0.01),
+        "…all at the channel's own width: {slices:?}"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+// ── B223 · the row tooltips (decision 1054) ─────────────────────────────────────────────────────
+
+/// Hover the middle of a named row's LABEL half (left of the control column) — the surface the
+/// reporter's cursor was on when the row lit and said nothing. Callers pin `ERA_WINDOW_SCALE = 1`
+/// first (the wash test's own idiom): frame rects are in the frame's scale space, the pointer is
+/// in the screen's, and at scale 1 the two are the same numbers.
+fn hover_label(s: &mut UiScript, frame: &str) {
+    s.resolve();
+    let g = |s: &mut UiScript, verb: &str| -> f32 {
+        s.eval(&format!("return {frame}:{verb}()")).unwrap()
+    };
+    let (l, t, b) = (g(s, "GetLeft"), g(s, "GetTop"), g(s, "GetBottom"));
+    s.mouse_move(l + 60.0, (t + b) * 0.5);
+}
+
+/// A hovered row raises its 1.12 description, on the era's seat, and drops it on leave — the row
+/// itself, its checkbox, and (B223's report) the label the cursor actually crosses. The string
+/// resolves by KEY at hover, so seeding it AFTER the window loaded still paints: that is the
+/// property the 1.12 panel's own `getglobal("OPTION_TOOLTIP_"..key)` lookup buys.
+#[test]
+fn a_hovered_row_raises_its_1_12_description_on_the_era_seat() {
+    let mut s = harness_on(audio_harness());
+    s.run("OPTION_TOOLTIP_GAMEFIELD_DESELECT = \"Checking this will prevent the deselection.\"")
+        .unwrap();
+    s.run("ERA_WINDOW_SCALE = 1").unwrap();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+
+    let row = "OptionsFrameContainerBodyControlsRowStickyTarget";
+    hover_label(&mut s, row);
+    s.resolve();
+    assert!(
+        s.eval::<bool>("return GameTooltip:IsVisible()").unwrap(),
+        "the label half raises the plate — the reported gap"
+    );
+    assert_eq!(
+        s.eval::<String>("return GameTooltipTextLeft1:GetText()")
+            .unwrap(),
+        "Checking this will prevent the deselection."
+    );
+    assert_eq!(
+        s.eval::<i64>("return GameTooltip:NumLines()").unwrap(),
+        1,
+        "the description ALONE — the era's white name line is cut (1054)"
+    );
+    // The era seat: BOTTOMLEFT on the label region's TOPRIGHT, hung 10 back over the control
+    // column (DefaultTooltipMixin's ANCHOR_RIGHT / x -10).
+    let owned: bool = s
+        .eval(&format!("return GameTooltip:IsOwned({row}Tip)"))
+        .unwrap();
+    assert!(owned, "owned by the row's $parentTip region");
+    let (tip_right, tip_top): (f32, f32) = (
+        s.eval(&format!("return {row}Tip:GetRight()")).unwrap(),
+        s.eval(&format!("return {row}Tip:GetTop()")).unwrap(),
+    );
+    let (left, bottom): (f32, f32) = (
+        s.eval("return GameTooltip:GetLeft()").unwrap(),
+        s.eval("return GameTooltip:GetBottom()").unwrap(),
+    );
+    assert!(
+        (left - (tip_right - 10.0)).abs() < 0.01 && (bottom - tip_top).abs() < 0.01,
+        "plate at ({left}, {bottom}); the era seat is ({}, {tip_top})",
+        tip_right - 10.0
+    );
+
+    // Crossing onto the checkbox keeps it up (one seam lights the wash and raises the plate, so
+    // the row's OnLeave and the box's OnEnter cancel out inside the one move).
+    let (bl, br, bt, bb): (f32, f32, f32, f32) = (
+        s.eval(&format!("return {row}Check:GetLeft()")).unwrap(),
+        s.eval(&format!("return {row}Check:GetRight()")).unwrap(),
+        s.eval(&format!("return {row}Check:GetTop()")).unwrap(),
+        s.eval(&format!("return {row}Check:GetBottom()")).unwrap(),
+    );
+    s.mouse_move((bl + br) * 0.5, (bt + bb) * 0.5);
+    assert!(
+        s.eval::<bool>("return GameTooltip:IsVisible()").unwrap(),
+        "the plate survives the crossing onto the control"
+    );
+
+    // Leaving the row puts it away.
+    s.mouse_move(5.0, 5.0);
+    assert!(
+        !s.eval::<bool>("return GameTooltip:IsVisible()").unwrap(),
+        "OnLeave drops the plate"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The row with no 1.12 string raises NOTHING — not a plate echoing the label under the cursor,
+/// and not the LAST row's description left standing over it. Auto Loot is that row: 1.12 has no
+/// Auto Loot setting, so no `OPTION_TOOLTIP_*` for it. The second leg is the live probe's find: a
+/// hover driven without the outgoing row's OnLeave (1054) must still put the neighbour away.
+#[test]
+fn a_row_with_no_1_12_string_raises_no_plate() {
+    let mut s = harness_on(audio_harness());
+    s.run("OPTION_TOOLTIP_GAMEFIELD_DESELECT = \"Sticky's own description.\"")
+        .unwrap();
+    s.run("ERA_WINDOW_SCALE = 1").unwrap();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    hover_label(&mut s, "OptionsFrameContainerBodyControlsRowAutoLoot");
+    s.resolve();
+    assert!(
+        !s.eval::<bool>("return GameTooltip:IsVisible()").unwrap(),
+        "no 1.12 description, no plate"
+    );
+    assert!(
+        s.eval::<bool>("return OptionsFrameContainerBodyControlsRowAutoLootHover:IsVisible()")
+            .unwrap(),
+        "…but the row still lights: the wash is not gated on the string"
+    );
+
+    // Sticky's plate up, then straight into the mute row with no OnLeave in between.
+    s.run("OptionsRow_Hover(OptionsFrameContainerBodyControlsRowStickyTarget, 1)")
+        .unwrap();
+    assert!(s.eval::<bool>("return GameTooltip:IsVisible()").unwrap());
+    s.run("OptionsRow_Hover(OptionsFrameContainerBodyControlsRowAutoLoot, 1)")
+        .unwrap();
+    assert!(
+        !s.eval::<bool>("return GameTooltip:IsVisible()").unwrap(),
+        "the mute row puts the neighbour's description away — it never describes THIS row"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The RUNTIME leg on the real client data (`ui_quest`'s pattern): every key the rows carry
+/// resolves to a non-empty string in the shipped 1.12 `GlobalStrings.lua` — the guard against a
+/// typo'd key degrading a description to silence — and the ONE row without a key is Auto Loot.
+/// Pins the reporter's own row end to end (B223's screenshot text). Skips without client data.
+#[test]
+fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
+    let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
+    if !data.is_dir() {
+        eprintln!("skipping: vanilla client not present at {}", data.display());
+        return;
+    }
+    let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+    let src = chain
+        .read_file("Interface\\FrameXML\\GlobalStrings.lua")
+        .expect("GlobalStrings.lua in the chain");
+    let strings = UiScript::new().expect("VM");
+    strings
+        .run(&String::from_utf8_lossy(&src))
+        .expect("GlobalStrings runs clean");
+
+    // The mapping, read off the LIVE rows so a page added later can't slip the check.
+    let s = harness();
+    let listing: String = s
+        .eval(
+            "local out = {} \
+             for page, rows in pairs(OPTIONS_PAGE_ROWS) do \
+               for _, rkey in ipairs(rows) do \
+                 local row = getglobal(\"OptionsFrameContainerBody\" .. page .. rkey) \
+                 table.insert(out, page .. rkey .. \"=\" .. (row.tip or \"\")) \
+               end \
+             end \
+             return table.concat(out, \",\")",
+        )
+        .unwrap();
+
+    let mut untipped = vec![];
+    let mut checked = 0;
+    for entry in listing.split(',') {
+        let (row, key) = entry.split_once('=').expect("row=key");
+        if key.is_empty() {
+            untipped.push(row.to_string());
+            continue;
+        }
+        assert!(
+            key.starts_with("OPTION_TOOLTIP_"),
+            "{row}: {key} is not a 1.12 option-tooltip key"
+        );
+        let text: String = strings
+            .lua()
+            .globals()
+            .get::<String>(key)
+            .unwrap_or_default();
+        assert!(
+            !text.is_empty() && text != "PLACE_HOLDER",
+            "{row}: {key} resolves to nothing in the real GlobalStrings"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 14, "every row but one carries a live 1.12 key");
+    assert_eq!(
+        untipped,
+        vec!["ControlsRowAutoLoot".to_string()],
+        "Auto Loot is the only row 1.12 never had"
+    );
+
+    // The reporter's row, byte for byte off the MPQ chain.
+    assert_eq!(
+        strings
+            .lua()
+            .globals()
+            .get::<String>("OPTION_TOOLTIP_GAMEFIELD_DESELECT")
+            .unwrap(),
+        "Checking this will prevent the deselection of targets by clicking on the gamefield.  \
+         Targets can only be cleared by pressing escape or clicking another target."
+    );
+}
+
+/// EVERY row on every page, all three control flavors: hovering it raises a plate exactly when
+/// the row carries a 1.12 key, and no row's hover errors. The teeth are the per-template
+/// `$parentTip` seat — a flavor missing that region would take `SetOwner(nil, …)` and print a red
+/// line instead of a plate, which no key-mapping check would ever see.
+#[test]
+fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
+    let mut s = harness_on(audio_harness());
+    // Stand-in strings for every key the rows name (the real texts are the data test's job).
+    s.run(
+        "for page, rows in pairs(OPTIONS_PAGE_ROWS) do \
+           for _, rkey in ipairs(rows) do \
+             local row = getglobal(\"OptionsFrameContainerBody\" .. page .. rkey) \
+             if row.tip then setglobal(row.tip, \"described: \" .. rkey) end \
+           end \
+         end",
+    )
+    .unwrap();
+    s.run("ERA_WINDOW_SCALE = 1").unwrap();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+
+    let mut raised = 0;
+    for page in ["Controls", "Audio", "Graphics", "Nameplates"] {
+        s.run(&format!("OptionsFrameCategoryListRow{page}:Click()"))
+            .unwrap();
+        let rows: String = s
+            .eval(&format!(
+                "return table.concat(OPTIONS_PAGE_ROWS.{page}, \",\")"
+            ))
+            .unwrap();
+        for rkey in rows.split(',') {
+            let row = format!("OptionsFrameContainerBody{page}{rkey}");
+            hover_label(&mut s, &row);
+            s.resolve();
+            let tipped: bool = s.eval(&format!("return {row}.tip ~= nil")).unwrap();
+            let shown: bool = s.eval("return GameTooltip:IsVisible()").unwrap();
+            assert_eq!(
+                shown, tipped,
+                "{row}: plate shown {shown}, has key {tipped}"
+            );
+            if tipped {
+                assert_eq!(
+                    s.eval::<String>("return GameTooltipTextLeft1:GetText()")
+                        .unwrap(),
+                    format!("described: {rkey}"),
+                    "{row}: the plate reads ITS OWN row's description"
+                );
+                assert!(
+                    s.eval::<bool>(&format!("return GameTooltip:IsOwned({row}Tip)"))
+                        .unwrap(),
+                    "{row}: seated on its own $parentTip region"
+                );
+                raised += 1;
+            }
+            s.mouse_move(5.0, 5.0);
+        }
+        assert!(
+            s.errors().is_empty(),
+            "{page}: script errors: {:?}",
+            s.errors()
+        );
+    }
+    assert_eq!(raised, 14, "14 of the 15 rows have a 1.12 description");
+}

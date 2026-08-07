@@ -173,6 +173,14 @@ const COL_CHANNEL_INTERRUPT_FLAGS: usize = 23;
 const COL_POWER_TYPE: usize = 31;
 const COL_MANA_COST: usize = 32;
 const COL_MANA_COST_PCT: usize = 156;
+/// `manaCostPerlevel` (33) / `manaPerSecond` (34) — the vmangos field order between `manaCost`
+/// 32 and `manaPerSecondPerLevel` 35. The per-level column is `0x6e31b0`'s
+/// `(level − spellLevel) · perLevel` term (72 nonzero rows, all creature spells); the
+/// per-second column is the tooltip's `_PER_TIME` composite (Health Funnel 755 reads 5).
+/// Column 35 is all-zero across the whole 5875 file (the catalog test's scan) and stays
+/// unparsed. (1074)
+const COL_MANA_COST_PER_LEVEL: usize = 33;
+const COL_MANA_PER_SECOND: usize = 34;
 /// `rangeIndex` (`SpellRec+0x90`, `0x90/4 == 36`) — the `SpellRange.dbc` row the byte-verified
 /// `GetMinMaxRange 0x6e3480` resolves (wow-re `wave-cooldown.md`). Same empirical pin (Auto
 /// Shot/Aimed Shot 114, Throw 74, Charge 95, Fireball 35).
@@ -251,7 +259,14 @@ const COL_EFFECT_MISC_1: usize = 106;
 const COL_EFFECT_TRIGGER_1: usize = 109;
 /// `SpellEffects` value `36` — `SPELL_EFFECT_LEARN_SPELL`: a trainer's learn wrapper carries it, and
 /// its `EffectTriggerSpell` is the ability the player ends up with (decision 0247's taught spell).
-const SPELL_EFFECT_LEARN_SPELL: u32 = 36;
+pub const SPELL_EFFECT_LEARN_SPELL: u32 = 36;
+/// `SpellEffects` value `57` — `SPELL_EFFECT_LEARN_PET_SPELL`, the learn wrapper's pet twin. The
+/// trainer's **icon** law accepts either in its three-slot wrapper scan (byte-verified: the paired
+/// `cmp ecx,0x24` / `cmp ecx,0x39` at `0x4d8ff5`/`0x4d8ffa`, wow-re
+/// `system/ui/scratch/spell-icon-substitution-law.md` §1). [`SpellCatalog::learned_spell`]'s
+/// **display** hop deliberately stays 36-only — that is decision 0247's verified grouping hop, and
+/// widening it is a separate question nothing has asked.
+pub const SPELL_EFFECT_LEARN_PET_SPELL: u32 = 57;
 
 /// `SpellEffects` value `SPELL_EFFECT_OPEN_LOCK` — the lock-opening effect the GameObject
 /// interact-cast matches (decision 0239; RE `cursor-system.md` §8, the client's
@@ -356,7 +371,13 @@ const ATTR_DO_NOT_DISPLAY: u32 = 0x80;
 /// `Attributes` bit `0x20` — `SPELL_ATTR_IS_TRADESKILL` (cmangos `SpellDefines.h`): profession /
 /// recipe spells the client diverts to a name-only path, never a book slot (decision 0227). See
 /// [`SpellDisplay::in_spellbook`].
-const ATTR_IS_TRADESKILL: u32 = 0x20;
+///
+/// Public because four separate surfaces test this one bit and each had grown its own copy of the
+/// literal: the spellbook's add-gate here, the TradeSkill and Craft admission filters, and — since
+/// the trainer TOOLTIP law landed — the gate that decides whether a trainer service renders an ITEM
+/// tooltip instead of a spell one (`SetTrainerService 0x5338b0` at `0x533a1b`, and again inside the
+/// spell builder's own redirect at `0x52e6d2`).
+pub const SPELL_ATTR_IS_TRADESKILL: u32 = 0x20;
 /// `AttributesEx` bit `0x10000000` — vmangos `SPELL_ATTR_EX_NO_AURA_ICON` ("Client doesn't display
 /// these spells in aura bar"): the other display-filter bit. All three warrior stances carry it
 /// (extracted 5875 `Spell.dbc`: 2457 `AttributesEx 0x90000000`, 71/2458 `0x10000000`).
@@ -393,6 +414,9 @@ const ATTR_ON_NEXT_SWING: u32 = 0x404;
 /// `combat-feel-law.md` @ c445713b). Rend/Sunder Armor/Slam/Sinister Strike carry it; Heroic
 /// Strike and Charge do not.
 const ATTR_EX_INITIATES_COMBAT: u32 = 0x200;
+/// `AttributesEx` bits 0x4|0x40 — the two CHANNELED variants, tested as one mask by the tooltip's
+/// cast cell (`0x52ec27`: `test [rec+0x1c],0x44` → "Channeled"; 1074).
+const ATTR_EX_CHANNELED: u32 = 0x44;
 /// `AttributesEx2` bit `0x100000` — vmangos `SPELL_ATTR_EX2_INITIATE_COMBAT_POST_CAST` ("Client
 /// will send CMSG_ATTACK_SWING after SMSG_SPELL_GO"). The §5-verified send-tail predicate
 /// EXCLUDES it (`[ebp-2] = 0x6e5200 && Ex2-bit20 CLEAR`): a bit20 spell defers its attack-start
@@ -623,7 +647,7 @@ pub fn load_spell_catalog(chain: &mut Chain) -> Result<SpellCatalog> {
                 attributes_ex3: u32_at(r, COL_ATTRIBUTES_EX3).unwrap_or(0),
                 passive: attributes & ATTR_PASSIVE != 0,
                 cast_ui: u32_at(r, COL_CAST_UI).unwrap_or(0),
-                effect_1: u32_at(r, COL_EFFECT_1).unwrap_or(0),
+                effects: [0, 1, 2].map(|i| u32_at(r, COL_EFFECT_1 + i).unwrap_or(0)),
                 spell_level: u32_at(r, COL_SPELL_LEVEL).unwrap_or(0),
                 // Scan the three effects for OPEN_LOCK and take that effect's LockType (its
                 // EffectMiscValue) together with the value inputs the lock resolver compares
@@ -652,6 +676,8 @@ pub fn load_spell_catalog(chain: &mut Chain) -> Result<SpellCatalog> {
                 power_type: u32_at(r, COL_POWER_TYPE).unwrap_or(0),
                 mana_cost: u32_at(r, COL_MANA_COST).unwrap_or(0),
                 mana_cost_pct: u32_at(r, COL_MANA_COST_PCT).unwrap_or(0),
+                mana_cost_per_level: u32_at(r, COL_MANA_COST_PER_LEVEL).unwrap_or(0),
+                mana_per_second: u32_at(r, COL_MANA_PER_SECOND).unwrap_or(0),
                 range_index: u32_at(r, COL_RANGE_INDEX).unwrap_or(0),
                 targets: u32_at(r, COL_TARGETS).unwrap_or(0),
                 implicit_target_a1: u32_at(r, COL_IMPLICIT_TARGET_A1).unwrap_or(0),

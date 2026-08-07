@@ -436,6 +436,28 @@ pub fn pet_cancel_aura(pet_guid: u64, spell_id: u32) -> Vec<u8> {
     body
 }
 
+/// Body of `CMSG_PET_SPELL_AUTOCAST` (opcode 755): `u64 petGuid`, `u32 spellId`, `u8 state` —
+/// **thirteen** bytes, and the trailing field is a byte (decision 1032).
+///
+/// Both ends agree independently. The client builds it at `0x4bcd5f`–`0x4bcdb2`: `push 0x2f3`, the
+/// guid pair through the u64 writer `0x418370`, the spell id through the u32 writer `0x418190`,
+/// then `(word >> 30) & 0xFFFFFF01` through **`0x418070`**, the *byte* writer — which is also why
+/// that mask ends in `01`. vmangos reads `guid, spellId, state` in that order with `state` a
+/// `uint8` (`PetSpellAutocast::ReadFromWorldPacket`, `Server/Packets/Pet.cpp:44-49`).
+///
+/// **This is the pet SPELLBOOK's autocast verb, not the pet bar's.** The bar's right click sends
+/// [`pet_set_action`], whose body names a slot *position*; the book has no positions, so this one
+/// names the spell. The server's handler is correspondingly different — it re-derives which slots
+/// to update itself (`HandlePetSpellAutocastOpcode`, `PetHandler.cpp:451-478`), gating on
+/// `pet->HasSpell(spellId) && Spells::IsAutocastable(spellId)`. No reply packet.
+pub fn pet_spell_autocast(pet_guid: u64, spell_id: u32, enabled: bool) -> Vec<u8> {
+    let mut body = Vec::with_capacity(13);
+    body.extend_from_slice(&pet_guid.to_le_bytes());
+    body.extend_from_slice(&spell_id.to_le_bytes());
+    body.push(u8::from(enabled));
+    body
+}
+
 /// Body of `CMSG_PET_SET_ACTION` (opcode 372): `u64 petGuid` then one or two
 /// `(u32 position, u32 packedData)` pairs. The server distinguishes the forms **by body size
 /// alone** — 24 bytes ⇒ two entries, anything else ⇒ one (`PetSetAction::ReadFromWorldPacket`,
@@ -459,6 +481,32 @@ pub fn pet_set_action(pet_guid: u64, entries: &[(u32, u32)]) -> Vec<u8> {
         body.extend_from_slice(&position.to_le_bytes());
         body.extend_from_slice(&packed.to_le_bytes());
     }
+    body
+}
+
+/// Body of `CMSG_PET_ABANDON` (VERIFIED vmangos `PetAbandon::ReadFromWorldPacket`,
+/// `Server/Packets/Pet.cpp:16-19`; opcode 374): the lone `u64` pet guid.
+///
+/// **The menu's Abandon and its Dismiss are this same message** — see [`super::opcode`]'s note.
+/// Nothing in the body says which the player picked, and nothing needs to: the server forks on the
+/// pet's own type, deleting a hunter pet and unsummoning anything else. The client's fork is purely
+/// about which *word* the menu shows.
+pub fn pet_abandon(pet_guid: u64) -> Vec<u8> {
+    pet_guid.to_le_bytes().to_vec()
+}
+
+/// Body of `CMSG_PET_RENAME` (VERIFIED vmangos `PetRename::ReadFromWorldPacket`,
+/// `Server/Packets/Pet.cpp:21-25`; opcode 375): `u64 petGuid` then the name as a **C string**.
+///
+/// The name is not length-prefixed and not padded — vmangos's `>> std::string` reads to the first
+/// NUL. The 12-character cap is the popup's (`RENAME_PET`'s `maxLetters = 12`), not the wire's; the
+/// server re-checks with `ObjectMgr::CheckPetName` and refuses with `SMSG_PET_NAME_INVALID`
+/// rather than truncating.
+pub fn pet_rename(pet_guid: u64, name: &str) -> Vec<u8> {
+    let mut body = Vec::with_capacity(9 + name.len());
+    body.extend_from_slice(&pet_guid.to_le_bytes());
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
     body
 }
 
@@ -649,6 +697,22 @@ mod tests {
         // form is 16 bytes and the two-entry form is exactly 24.
         assert_eq!(pet_set_action(0x2A, &[(3, packed)]).len(), 16);
         assert_eq!(pet_set_action(0x2A, &[(3, packed), (4, 0)]).len(), 24);
+
+        // CMSG_PET_ABANDON: the lone guid — the same shape as stop-attack, a different verb.
+        assert_eq!(pet_abandon(0x2A), 0x2Au64.to_le_bytes());
+
+        // CMSG_PET_RENAME: guid then a NUL-TERMINATED name. The terminator is the whole framing —
+        // there is no length prefix and no padding, so dropping it would leave the server reading
+        // the name off the end of the body.
+        assert_eq!(
+            pet_rename(0x2A, "Bruce"),
+            [&0x2Au64.to_le_bytes()[..], b"Bruce\0"].concat()
+        );
+        assert_eq!(
+            pet_rename(0x2A, "").len(),
+            9,
+            "an empty name is still framed"
+        );
     }
 
     /// The autocast flip touches **bit 30 and nothing else** — the client's own in-place edit, and

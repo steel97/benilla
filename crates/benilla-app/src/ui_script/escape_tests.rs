@@ -69,6 +69,7 @@ fn escape_closes_bag_and_panel_releases_loot_and_clears_cursor() {
     // Open the bag and the loot window; drain the open kits (not under test here).
     s.run("BenillaBagToggle_OnClick()").unwrap();
     s.set_loot(Some(LootState {
+        fishing: false,
         rows: vec![LootRow {
             item_id: 0,
             name: Some("Wool Cloth".into()),
@@ -76,6 +77,7 @@ fn escape_closes_bag_and_panel_releases_loot_and_clears_cursor() {
             quantity: 1,
             quality: Some(1),
             is_coin: false,
+            link: None,
         }],
     }));
     s.fire_event("LOOT_OPENED", vec![]);

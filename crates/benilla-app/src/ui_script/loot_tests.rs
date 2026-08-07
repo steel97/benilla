@@ -1,6 +1,6 @@
 use benilla_ui::script::{
-    ExtractedQuad, LootRow, LootState, MerchantItem, MerchantState, QuadContent, SoundRequest,
-    UiScript,
+    DressUpIntent, ExtractedQuad, LootRow, LootState, MerchantItem, MerchantState, QuadContent,
+    SoundRequest, UiScript,
 };
 
 /// Load one shipped `assets/ui/<file>` into `s` (the panel tests' loader, duplicated here so this
@@ -63,6 +63,7 @@ fn text_color(quads: &[ExtractedQuad], t: &str) -> Option<[f32; 4]> {
 
 fn coin_and_two_items() -> LootState {
     LootState {
+        fishing: false,
         rows: vec![
             LootRow {
                 item_id: 0,
@@ -71,6 +72,7 @@ fn coin_and_two_items() -> LootState {
                 quantity: 1,
                 quality: Some(1),
                 is_coin: true,
+                link: None,
             },
             LootRow {
                 item_id: 0,
@@ -79,6 +81,7 @@ fn coin_and_two_items() -> LootState {
                 quantity: 3,
                 quality: Some(2), // uncommon → green text
                 is_coin: false,
+                link: None,
             },
             LootRow {
                 item_id: 0,
@@ -87,6 +90,7 @@ fn coin_and_two_items() -> LootState {
                 quantity: 1,
                 quality: Some(1), // common → white text
                 is_coin: false,
+                link: None,
             },
         ],
     }
@@ -216,6 +220,7 @@ fn shipped_loot_frame_drives_end_to_end() {
 
     // LOOT_UPDATE with the coin row gone (looted) repaints to two rows, keeping the window open.
     s.set_loot(Some(LootState {
+        fishing: false,
         rows: coin_and_two_items().rows[1..].to_vec(),
     }));
     s.fire_event("LOOT_UPDATE", vec![]);
@@ -269,7 +274,10 @@ fn loot_empty_roll_plays_the_empty_open_kit() {
     assert!(s.take_sounds().is_empty(), "loot close is silent (C-side)");
 
     // Re-open with an EMPTY roll: OnShow's numItems==0 fork queues exactly LOOTWINDOWOPENEMPTY.
-    s.set_loot(Some(LootState { rows: vec![] }));
+    s.set_loot(Some(LootState {
+        fishing: false,
+        rows: vec![],
+    }));
     s.fire_event("LOOT_OPENED", vec![]);
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
     assert_eq!(
@@ -277,6 +285,58 @@ fn loot_empty_roll_plays_the_empty_open_kit() {
         vec![SoundRequest::KitName("LOOTWINDOWOPENEMPTY".into())],
         "an empty loot roll plays the empty-open kit"
     );
+}
+
+/// The fishing fork (LootFrame.lua LootFrame_OnShow l.137-140; decision 1086): a fishing loot open
+/// plays "FISHING REEL IN" (SoundEntries "Fishing Reel in", kit 3407 — the name lookup is
+/// case-insensitive on both sides) and swaps the portrait ring's skull for the FishingLoot-Icon;
+/// the next ordinary open resets the skull (the ref re-stamps TargetDead at every show, l.133).
+#[test]
+fn fishing_loot_open_plays_the_reel_and_swaps_the_portrait() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_xml(&s, "Fonts.xml"); // ITEM_QUALITY_COLORS (LootFrame's palette), app load order
+    load_xml(&s, "UiPanels.xml");
+    load_xml(&s, "LootFrame.xml");
+    let has_icon = |quads: &[ExtractedQuad], needle: &str| {
+        quads.iter().any(|q| {
+            matches!(&q.content, QuadContent::Texture { path: Some(p), .. } if p.contains(needle))
+        })
+    };
+
+    let mut fished = coin_and_two_items();
+    fished.fishing = true;
+    s.set_loot(Some(fished));
+    s.fire_event("LOOT_OPENED", vec![]);
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+    assert_eq!(
+        s.take_sounds(),
+        vec![SoundRequest::KitName("FISHING REEL IN".into())],
+        "a fishing loot open plays the reel-in kit"
+    );
+    let quads = s.extract();
+    assert!(
+        has_icon(&quads, "FishingLoot-Icon"),
+        "the portrait ring shows the fishing icon"
+    );
+    assert!(
+        !has_icon(&quads, "TargetDead"),
+        "…instead of the dead-target skull"
+    );
+
+    // Close, then an ordinary corpse loot: silent again, and the skull is back.
+    s.fire_event("LOOT_CLOSED", vec![]);
+    let _ = s.take_sounds();
+    s.set_loot(Some(coin_and_two_items()));
+    s.fire_event("LOOT_OPENED", vec![]);
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+    assert!(
+        s.take_sounds().is_empty(),
+        "a non-fishing loot open is silent (its open kit is C-side)"
+    );
+    let quads = s.extract();
+    assert!(has_icon(&quads, "TargetDead"), "the skull is restored");
+    assert!(!has_icon(&quads, "FishingLoot-Icon"));
 }
 
 /// Paging (LootFrame.lua l.70-73,105-118): 5 items ⇒ 3 rows + a Down pager on page 1, 2 rows + an Up
@@ -297,9 +357,13 @@ fn shipped_loot_frame_pages_five_items() {
             quantity: 1,
             quality: Some(1),
             is_coin: false,
+            link: None,
         })
         .collect();
-    s.set_loot(Some(LootState { rows }));
+    s.set_loot(Some(LootState {
+        fishing: false,
+        rows,
+    }));
     s.fire_event("LOOT_OPENED", vec![]);
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 
@@ -366,6 +430,7 @@ fn shipped_loot_pushed_to_center_by_merchant() {
             num_available: -1,
             item_id: 159,
             stats: None,
+            link: None,
         }],
         ..Default::default()
     }));
@@ -454,4 +519,140 @@ fn the_loot_window_draws_over_the_party_frames() {
         (party_art >> STRATUM_SHIFT) < (loot_panel >> STRATUM_SHIFT),
         "they must differ by STRATUM, not by luck within one"
     );
+}
+
+/// The row click's modifier fork (ref `LootFrameItem_OnClick`, LootFrame.lua l.147-154): CTRL
+/// previews the row's item in the dressing room (decision 1060), SHIFT posts its link into an open
+/// chat edit box (decision 1059) — and **neither loots**.
+///
+/// That last clause is the whole point of the test, and it is ours to get right rather than the
+/// reference's: in the real client the loot itself is the C `LootButton` widget's click behaviour
+/// (l.94's `button:SetSlot(slot)`), so its Lua arms fall through harmlessly; ours owns the
+/// `LootSlot` call, so the arms had to grow a `return` the reference does not have. The unmodified
+/// click still loots — the regression that would otherwise ship silently.
+#[test]
+fn ctrl_and_shift_on_a_loot_row_preview_and_post_without_looting() {
+    const WOOL_LINK: &str = "|cffffffff|Hitem:2589:0:0:0|h[Wool Cloth]|h|r";
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    for file in [
+        "Fonts.xml",
+        "UiPanels.xml",
+        "UIParent.xml", // BenillaChatEdit_InsertLink, the shared shift-insert helper
+        "LootFrame.xml",
+        "DressUpFrame.xml",
+        "ChatFrame.xml",
+    ] {
+        load_xml(&s, file);
+    }
+
+    // A coin row + one resolved item: the item's link is fed exactly as `ui_loot.rs` builds it.
+    s.set_loot(Some(LootState {
+        fishing: false,
+        rows: vec![
+            LootRow {
+                item_id: 0,
+                name: Some("1g 23s 45c".into()),
+                texture: Some("Interface\\Icons\\INV_Misc_Coin_01".into()),
+                quantity: 1,
+                quality: Some(1),
+                is_coin: true,
+                link: None, // synthesized row, no item behind it
+            },
+            LootRow {
+                item_id: 2589,
+                name: Some("Wool Cloth".into()),
+                texture: Some("Interface\\Icons\\INV_Fabric_Wool_01".into()),
+                quantity: 3,
+                quality: Some(1),
+                is_coin: false,
+                link: Some(WOOL_LINK.into()),
+            },
+        ],
+    }));
+    s.fire_event("LOOT_OPENED", vec![]);
+    s.resolve();
+    let quads = s.extract();
+    let (x, y) = icon_center(&quads, "INV_Fabric_Wool_01");
+    let (coin_x, coin_y) = icon_center(&quads, "INV_Misc_Coin_01");
+
+    // The control first, while nothing else has been opened: a plain click still loots row 2.
+    s.mouse_button(x, y, "LeftButton", true);
+    s.mouse_button(x, y, "LeftButton", false);
+    assert_eq!(
+        s.take_loot_picks(),
+        vec![2],
+        "an unmodified click still loots the row"
+    );
+
+    // SHIFT with the chat edit box open → the link, and no loot.
+    assert!(s.focus_editbox("ChatFrameEditBox"));
+    s.set_modifiers(true, false, false);
+    s.mouse_button(x, y, "LeftButton", true);
+    s.mouse_button(x, y, "LeftButton", false);
+    s.set_modifiers(false, false, false);
+    assert_eq!(
+        s.eval::<String>("return ChatFrameEditBox:GetText()")
+            .unwrap(),
+        WOOL_LINK,
+        "the row's full escaped link landed in the chat box"
+    );
+    assert!(
+        s.take_loot_picks().is_empty(),
+        "a shift-click must not also loot the row"
+    );
+
+    // The COIN row has no link at all, and a modified click on it must be inert rather than an
+    // error: our `EditBox:Insert` binding is typed `String` and raises on a nil, so the handler
+    // guards it (the reference's C Insert tolerates the nil its own callers hand it).
+    s.set_modifiers(true, false, false);
+    s.mouse_button(coin_x, coin_y, "LeftButton", true);
+    s.mouse_button(coin_x, coin_y, "LeftButton", false);
+    s.set_modifiers(false, false, false);
+    assert!(
+        s.errors().is_empty(),
+        "shift-clicking the linkless coin row must not raise: {:?}",
+        s.errors()
+    );
+    assert_eq!(
+        s.eval::<String>("return ChatFrameEditBox:GetText()")
+            .unwrap(),
+        WOOL_LINK,
+        "and it must not disturb what is already typed"
+    );
+    assert!(
+        s.take_loot_picks().is_empty(),
+        "a shift-click on the coin row must not loot the money either"
+    );
+
+    // ALT → nothing at all, and in particular NOT a loot (decision 1067). No FrameXML file binds
+    // alt on a loot row; the suppression is the C `CLootButton::OnClick`'s own third gate
+    // (`0x41f8f0(2)` @ `0x4c1841`, VERIFIED at the bytes), which our Lua-side take has to
+    // reproduce. This is the arm nothing else in the suite would catch: before 1067, alt looted.
+    s.set_modifiers(false, false, true);
+    s.mouse_button(x, y, "LeftButton", true);
+    s.mouse_button(x, y, "LeftButton", false);
+    s.set_modifiers(false, false, false);
+    assert!(
+        s.take_loot_picks().is_empty(),
+        "an alt-click must not loot the row (the C gate's third modifier)"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+
+    // CTRL → the dressing room wearing it, still no loot. Last, because opening the room takes the
+    // left UIPanel slot and moves the loot window (pushable 2 vs 7).
+    s.set_modifiers(false, true, false);
+    s.mouse_button(x, y, "LeftButton", true);
+    s.mouse_button(x, y, "LeftButton", false);
+    s.set_modifiers(false, false, false);
+    assert_eq!(
+        s.take_dressup_intents(),
+        vec![DressUpIntent::Dress, DressUpIntent::TryOn(2589)],
+        "re-dress first, then try the looted item on"
+    );
+    assert!(
+        s.take_loot_picks().is_empty(),
+        "a ctrl-click must not also loot the row"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }

@@ -540,6 +540,75 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // The rest-state trio (decisions 1082/1087) — player-level globals over the app's rest feed
+    // ([`UiScript::set_rest_state`]), the MainMenuBar exhaustion tick's and the player frame's
+    // whole wire. Byte-VERIFIED, wow-re `system/ui/scratch/rested-xp-bindings.md` (a §5 pair +
+    // orchestrator arbitration): the surface is Exhaustion.dbc DATA, not client constants — the
+    // rows live in the model ([`UiScript::set_exhaustion_rows`]; shipped-table fallback).
+    //
+    // GetRestState() → (stateID, stateName, multiplier) — `0x48d350`: the raw `PLAYER_BYTES_2`
+    // byte 3 indexes Exhaustion.dbc DIRECTLY (the `[0xc0dd78]` ID→row array) and the triple is
+    // `(row.ID, row.name[locale], row.factor)`: 1 → (1, "Rested", 2.0), 2 → (2, "Normal", 1.0),
+    // and FrameXML's dead 3..5 branches map to the real beta rows (XXXTired 1.0/0.5,
+    // XXXExhausted 0.25). Every failure — byte 0 (pre-feed), byte past the table, no row —
+    // returns (nil, nil, nil), the binary's own fail path. The multiplier is what
+    // `EXHAUST_TOOLTIP1` renders ×100 ("200% of normal experience").
+    g.set(
+        "GetRestState",
+        lua.create_function(|lua, ()| {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            Ok(match model.exhaustion.get(&model.rest_state) {
+                Some((name, factor)) => (
+                    Value::Number(f64::from(model.rest_state)),
+                    Value::String(lua.create_string(name)?),
+                    Value::Number(*factor),
+                ),
+                None => (Value::Nil, Value::Nil, Value::Nil),
+            })
+        })?,
+    )?;
+    // GetXPExhaustion() → the rested span in BAR-XP units — `0x48d3f0`: the u32 pool × the f32
+    // factor of **Exhaustion.dbc row ID 1, hard-coded** (`[[0xc0dd78]+4]`, whatever the current
+    // state) — 2.0 in the shipped data, which is the whole "rested XP is double" law: the server
+    // drains the pool 1:1 against BASE kill XP while granting +100% (vmangos `GetXPRestBonus`),
+    // and the client scales by exactly this row's factor. **nil is decided by the rest-state
+    // byte, never by the pool** (`0x48d43b dec/jne`): byte ≠ 1 → nil whatever the pool holds
+    // (vmangos's 0 < bonus ≤ 10 hysteresis window sends byte 2 with a nonzero pool — nil there),
+    // and a rested byte with pool 0 → the NUMBER 0. The tick parks at `currXP + this`
+    // (`ExhaustionTick_Update`).
+    g.set(
+        "GetXPExhaustion",
+        lua.create_function(|lua, ()| {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            Ok(if model.rest_state != 1 {
+                Value::Nil
+            } else {
+                let factor = model.exhaustion.get(&1).map_or(2.0, |(_, f)| *f);
+                Value::Number(f64::from(model.rest_pool) * factor)
+            })
+        })?,
+    )?;
+    // IsResting() → 1/nil: inside a rest area (inn/city) right now — `0x516ea0`, byte-VERIFIED:
+    // PLAYER_FLAGS `shr 5; test 1` = bit 0x20, pushed as the NUMBER 1.0 or nil (the Lua-vanilla
+    // predicate shape, not a boolean). The player frame's flashing zzz reads exactly this.
+    g.set(
+        "IsResting",
+        lua.create_function(|lua, ()| {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            Ok(if model.resting {
+                Value::Integer(1)
+            } else {
+                Value::Nil
+            })
+        })?,
+    )?;
+    // GetTimeToWellRested() → nil, always — `0x48d4b0`, byte-VERIFIED: the whole binding is 11
+    // bytes, `pushnil; return 1`. FrameXML's EXHAUST_TOOLTIP4 countdown branch is dead in 5875.
+    g.set(
+        "GetTimeToWellRested",
+        lua.create_function(|_, ()| Ok(Value::Nil))?,
+    )?;
+
     // TargetUnit(unit) — select a unit by token (the reference's `TargetUnit` Lua shim → SetSelection;
     // the caller here is `PlayerFrame_OnClick`'s left-click branch → `TargetUnit("player")`, and the
     // TARGETSELF binding). Queues the raw token; the app resolves it to a streamed entity and commits
@@ -554,6 +623,44 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             }
             Ok(())
         })?,
+    )?;
+
+    // DropItemOnUnit(unit) — drop the cursor's held item onto a unit (`0x48d960`). Two legs in the
+    // reference: the PET leg feeds the pet, the PLAYER leg opens a trade. Queues the raw token and
+    // nothing else — every gate reads state this VM does not hold, so the app owns all of them
+    // (`ui_action::targeting::drop_item_on_unit`).
+    //
+    // This binding **existed in our shipped `PetFrame_OnClick` before it existed here**: the
+    // handler transcribed the reference's three legs faithfully, and the middle one called a nil
+    // global, so the whole handler errored out the moment you clicked your pet holding anything.
+    // That is B208's "dropping food onto the pet doesn't feed" — the reported bug was a missing
+    // registration, not a missing mechanism.
+    g.set(
+        "DropItemOnUnit",
+        lua.create_function(|lua, token: Option<String>| {
+            if let Some(token) = token {
+                let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+                model.drop_item_on_unit.push(token);
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // SpellTargetUnit(unit) — bind a unit to the spell awaiting its click. The other leg of
+    // `PetFrame_OnClick`, tested BEFORE `CursorHasItem()` (ref `PetFrame.lua:114-129`), and dead
+    // in our VM for the same reason `DropItemOnUnit` was.
+    //
+    // It is registered as an accepted **no-op**, deliberately, and that is faithful for every word
+    // benilla can currently arm: the targeting cursor models the location / item / gameobject
+    // seams (0792/0923/0939), and a *unit* cannot satisfy any of them — the reference's
+    // `BindTarget 0x6e5b40` would reject it at the same three mask tests our seams ask. The word
+    // that would make this do something is the residual unit-word machine that `cast_target`'s
+    // header names as still deferred (a unit-target spell never enters targeting mode here at all;
+    // it resolves to `CastWireTarget::Unit` or refuses). So: present, silent, and honest — what it
+    // must NOT be is absent, which is what took the handler down with it.
+    g.set(
+        "SpellTargetUnit",
+        lua.create_function(|_, _token: Option<String>| Ok(()))?,
     )?;
 
     // ClearTarget() — drop the current selection (the reference API returns 1 when it cleared,

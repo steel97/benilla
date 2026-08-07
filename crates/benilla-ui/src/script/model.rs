@@ -155,6 +155,13 @@ pub(crate) struct Model {
     /// (`ToggleGameMenu`'s order: the clear runs only when nothing earlier ate the press).
     /// Drained by [`super::UiScript::take_target_clear`]; the app commits the deselect ([`unit`]).
     pub(crate) target_clear: bool,
+    /// Unit tokens `DropItemOnUnit` queued since the app's last
+    /// [`UiScript::take_drop_item_on_unit`] drain — the cursor's held item being dropped onto a
+    /// unit (`0x48d960`). The binding queues the token only; **every gate is the app's**, because
+    /// all of them read state the VM does not hold (the pet's owner fields, the learned Feed-Pet
+    /// spell, the held item's guid). A token the app refuses is silent and keeps the payload,
+    /// which is the reference's own behaviour ([`super::cursor`]).
+    pub(crate) drop_item_on_unit: Vec<String>,
 
     /// The party/raid roster snapshot the app pushes (`GroupState`'s merged view, decision 0434
     /// §2) — `GetNumPartyMembers`/`GetPartyLeaderIndex`/`GetLootMethod`/… read it ([`party`]).
@@ -241,6 +248,11 @@ pub(crate) struct Model {
     /// `GetSpellTabInfo`/`GetSpellName`/… bindings read ([`spellbook`]). Durable player state like
     /// `actions` above, never `Option` — "no known spells yet" is simply empty vectors.
     pub(crate) spellbook: spellbook::SpellBookState,
+    /// The **pet's** book (decision 1032) — a second flat slot list, no tabs, with its own
+    /// add-gate and its own class token ([`spellbook::PetBookState`]). Held apart from
+    /// [`Self::spellbook`] because the reference holds two arrays too (`0xb700f0` / `0xb6f098`)
+    /// and every `bookType`-taking binding is a fork between them, never a filter over one.
+    pub(crate) pet_book: spellbook::PetBookState,
     /// The player's **macros** (decision 0983) — the one game-state table this crate owns
     /// outright, because 1.12 macros have no server side at all ([`macros`]'s module docs). The
     /// app seeds it from `benilla/macros/…` and reads it back to persist.
@@ -258,6 +270,12 @@ pub(crate) struct Model {
     /// Spell ids `CastSpell` queued since the app's last [`super::UiScript::take_spell_casts`]
     /// drain.
     pub(crate) spell_casts: Vec<u32>,
+    /// Pet spell ids `CastSpell(id, "pet")` queued — a separate list because the wire verb is a
+    /// separate opcode (`CMSG_PET_ACTION` with a synthesized type-1 word, `0x4b34ce`).
+    pub(crate) pet_spell_casts: Vec<u32>,
+    /// Pet spell ids `ToggleSpellAutocast` queued — `CMSG_PET_SPELL_AUTOCAST 0x2F3`, which names a
+    /// spell rather than the pet bar's slot ([`Self::pet_autocast_toggles`] is the bar's).
+    pub(crate) pet_spell_autocasts: Vec<u32>,
     /// Whether the app's own cast lifecycle holds something `SpellStopCasting()` can stop — a
     /// running auto-repeat or an in-flight cast; a channel is NOT stoppable there (wow-re
     /// `esc-stopcasting.md`; pushed each frame by the app's cast feed,
@@ -274,6 +292,14 @@ pub(crate) struct Model {
     /// `SpellStopTargeting()`, whose 1/nil return the ESC chain's rung (`UIParent.lua:1490`)
     /// falls through on, exactly like [`Self::casting`]'s.
     pub(crate) spell_targeting: bool,
+    /// Whether the standing targeting word could bind a UNIT — what `SpellCanTargetUnit` answers
+    /// (`0x6e6d00` → `0x6e6460`'s unit leg). Pushed by the app beside `spell_targeting`.
+    ///
+    /// Always `false` today, and *derived* rather than hardcoded so it stops being false the moment
+    /// that stops being true: benilla's targeting cursor models the location / item / gameobject
+    /// words (0792/0923/0939), and no unit satisfies any of them — a unit-target spell never enters
+    /// targeting mode at all, it resolves to `CastWireTarget::Unit` or refuses.
+    pub(crate) spell_can_target_unit: bool,
     /// Set when `SpellStopTargeting()` fired while [`Self::spell_targeting`] — the ESC-chain
     /// targeting cancel, drained by [`super::UiScript::take_stop_targeting`] ([`spellbook`]).
     pub(crate) spell_stop_targeting: bool,
@@ -312,6 +338,15 @@ pub(crate) struct Model {
     /// two-pair form **by body size**, so a relocation and its write must travel together and must
     /// not be flattened into a stream of singles.
     pub(crate) pet_set_actions: Vec<Vec<(u32, u32)>>,
+    /// `PetAbandon()` and `PetDismiss()` calls queued — two counts, not one, even though both menu
+    /// rows end at the same opcode (decision 1066). They are two *bindings*, with two Lua names and
+    /// two menu rows the reference shows to different classes, so the seam keeps them apart and
+    /// lets the app decide each one's wire; folding them together here would bake a wire fact into
+    /// an engine that is supposed to hold none.
+    pub(crate) pet_abandons: u32,
+    pub(crate) pet_dismisses: u32,
+    /// Names `PetRename(name)` queued, in order — the `PETRENAMECONFIRM` popup's payload.
+    pub(crate) pet_renames: Vec<String>,
 
     /// The per-bag container snapshot (keyed by live-API bag id, 0 = backpack) the app pushes,
     /// and the `UseContainerItem` intents it drains — the container seam ([`container`]).
@@ -381,6 +416,17 @@ pub(crate) struct Model {
     /// [`merchant`]) — the single "displayed mode" the real client keeps at `0xbe2c2c`, restored to
     /// the base (world-classifier) mode by `ResetCursor`. `None` = no override (show the base mode).
     pub(crate) ui_cursor: Option<container::UiCursorMode>,
+    /// Set by every FrameXML cursor call — `Show*SellCursor` / `ShowInspectCursor` / `SetCursor` /
+    /// `ResetCursor` — and drained by the app each frame ([`UiScript::take_cursor_write`]).
+    ///
+    /// **The cursor mode is a WRITE, not a level** (decision 1061), and that distinction is the
+    /// whole of B208's regression. The reference keeps one sticky global (`0xbe2c2c`): the world
+    /// classifier writes it while the pointer is over the world, FrameXML writes it from a hover
+    /// handler, and in between **nothing** writes it — so the last value simply stands. Reading
+    /// `ui_cursor` as a level made "no override" mean "show the base", which turned every UI
+    /// element with no cursor handler at all (a spellbook button, a panel) into a forced Point and
+    /// killed the armed cast cursor the moment the mouse left the world.
+    pub(crate) ui_cursor_dirty: bool,
     /// `(bag, slot)` sources queued by `AutoEquipCursorItem` (decision 0208 phase 1b, `cursor`'s
     /// `doll` submodule) — drained by the app into `CMSG_AUTOEQUIP_ITEM`.
     pub(crate) container_autoequips: Vec<(i64, u32)>,
@@ -653,11 +699,41 @@ pub(crate) struct Model {
     pub(crate) combo_points: u8,
     pub(crate) combo_target: u64,
 
+    /// The player's rest snapshot, pushed together each frame any part moves
+    /// ([`UiScript::set_rest_state`]) — player-globals like `money`. `rest_state` is the raw
+    /// `PLAYER_BYTES_2` byte 3 (1 = rested, 2 = normal — the server writes it with hysteresis
+    /// off the pool). **Defaults to 2, not 0**: every live 1.12 descriptor carries 2 from
+    /// character creation on, and the tick's faithful FrameXML compares `GetRestState() >= 3`
+    /// unguarded — a pre-feed 0 would render the binary's nil-triple fail path into an event
+    /// handler the real client can only ever run with the byte present. Byte 0 stays reachable
+    /// by explicit push, and the fail path stays faithful there. `rest_pool` is the raw
+    /// `PLAYER_REST_STATE_EXPERIENCE` value in **base kill-XP units**, `resting` the
+    /// `PLAYER_FLAGS_RESTING (0x20)` bit (inside an inn/city). `GetRestState`/`GetXPExhaustion`/
+    /// `IsResting` read these; the pool's display scaling is `exhaustion` row 1's factor,
+    /// applied in the `GetXPExhaustion` binding, where the real client applies it (decisions
+    /// 1082/1087).
+    pub(crate) rest_state: u8,
+    pub(crate) rest_pool: u32,
+    pub(crate) resting: bool,
+    /// Exhaustion.dbc as the rest bindings consume it — rest-state byte → (localized name,
+    /// factor), the table `GetRestState` indexes directly and whose row 1 scales
+    /// `GetXPExhaustion` (wow-re rested-xp-bindings.md; decision 1087). Seeded with the shipped
+    /// 5875 enUS rows so the engine tests and a failed DBC read behave like the shipped client
+    /// (the GlobalStrings-fallback posture); the app overwrites it with the install's real —
+    /// localized — rows at startup ([`UiScript::set_exhaustion_rows`]).
+    pub(crate) exhaustion: HashMap<u8, (String, f64)>,
+
     /// The paper doll's combat-stats snapshot (`None` until the app's feed lands), the
     /// equipment/ammo slot views, and the model pane's persistent bake yaw — the character-window
-    /// seam ([`char_stats`], decision 0208 §3). All player-only data: the backing descriptor
-    /// fields are PRIVATE/OWNER_ONLY.
-    pub(crate) player_combat_stats: Option<char_stats::PlayerCombatStats>,
+    /// seam ([`char_stats`], decision 0208 §3).
+    pub(crate) player_combat_stats: Option<char_stats::UnitCombatStats>,
+    /// The **pet's** combat-stats snapshot (decision 1057) — the same shape under the `"pet"`
+    /// token, because the reference's own pet sheet calls the very same `UnitStat`/`UnitResistance`/
+    /// `PaperDollFrame_Set*(unit, prefix)` family with `unit = "pet"` (ref
+    /// `PetPaperDollFrame.lua:73-81`). A second slot rather than a token map: exactly two units
+    /// ever have one, they are fed by two different systems on two different clocks, and every
+    /// binding's route is a fork between them (the [`Self::pet_book`] precedent).
+    pub(crate) pet_combat_stats: Option<char_stats::UnitCombatStats>,
     pub(crate) inventory_slots: char_stats::InventorySlots,
     /// The 12 alert-region statuses (`GetInventoryAlertStatus`, DurabilityFrame's armor-guy
     /// feed) in the client's own `0x806eb8` table order (11 equipment regions + the low-ammo
@@ -680,6 +756,15 @@ pub(crate) struct Model {
     pub(crate) inspect_clear: bool,
     /// The inspect model pane's bake yaw, the twin of [`Self::paperdoll_yaw`].
     pub(crate) inspect_yaw: f32,
+    /// The **pet** paper doll's model-pane bake yaw (decision 1057) — a third scalar for the same
+    /// reason the inspect pane got a second: character tab 1 and tab 2 are two panes that can sit
+    /// at two different facings, and the ref carries a `rotation` per `<PlayerModel>`.
+    pub(crate) pet_paperdoll_yaw: f32,
+    /// The dressing room's queued intents (decision 1060) — `BenillaDressUpModel_Dress/TryOn/Close`,
+    /// drained by the app in order (see [`super::dressup`] on why order matters).
+    pub(crate) dressup_intents: Vec<super::dressup::DressUpIntent>,
+    /// The dressing-room pane's bake yaw, the fourth of those scalars.
+    pub(crate) dressup_yaw: f32,
     /// Unit token → squared distance from the player, for every popup token the app resolved to a
     /// live inspectable player this frame — the input to both verified range predicates
     /// (`CanInspect`, `CheckInteractDistance`). Absent token = in range (see
@@ -768,6 +853,7 @@ impl Model {
             cancel_aura_requests: Vec::new(),
             tracking: None,
             target_requests: Vec::new(),
+            drop_item_on_unit: Vec::new(),
             target_clear: false,
             party: party::PartyState::default(),
             party_requests: Vec::new(),
@@ -790,14 +876,18 @@ impl Model {
             action_sets: Vec::new(),
             ui_errors: Vec::new(),
             spellbook: spellbook::SpellBookState::default(),
+            pet_book: spellbook::PetBookState::default(),
             macros: macros::MacroState::default(),
             macros_dirty: false,
             macros_generation: 0,
             macro_icons: Vec::new(),
             spell_casts: Vec::new(),
+            pet_spell_casts: Vec::new(),
+            pet_spell_autocasts: Vec::new(),
             casting: false,
             spell_stop: false,
             spell_targeting: false,
+            spell_can_target_unit: false,
             spell_stop_targeting: false,
             talents: super::talent::TalentUiState::default(),
             talent_learns: Vec::new(),
@@ -808,6 +898,9 @@ impl Model {
             pet_autocast_toggles: Vec::new(),
             pet_stop_attacks: 0,
             pet_set_actions: Vec::new(),
+            pet_abandons: 0,
+            pet_dismisses: 0,
+            pet_renames: Vec::new(),
             containers: HashMap::new(),
             container_uses: Vec::new(),
             container_cooldowns: HashMap::new(),
@@ -823,6 +916,7 @@ impl Model {
             enchant_confirms: Vec::new(),
             container_destroys: Vec::new(),
             ui_cursor: None,
+            ui_cursor_dirty: false,
             container_autoequips: Vec::new(),
             drag_registered: HashMap::new(),
             drag: None,
@@ -923,7 +1017,20 @@ impl Model {
             player_next_level_xp: 0,
             combo_points: 0,
             combo_target: 0,
+            rest_state: 2,
+            rest_pool: 0,
+            resting: false,
+            exhaustion: [
+                (1, ("Rested".to_string(), 2.0)),
+                (2, ("Normal".to_string(), 1.0)),
+                (3, ("XXXTired".to_string(), 1.0)),
+                (4, ("XXXTired".to_string(), 0.5)),
+                (5, ("XXXExhausted".to_string(), 0.25)),
+            ]
+            .into_iter()
+            .collect(),
             player_combat_stats: None,
+            pet_combat_stats: None,
             inventory_slots: Default::default(),
             inventory_alerts: [0; 12],
             paperdoll_yaw: 0.0,
@@ -932,6 +1039,9 @@ impl Model {
             inspect_notifies: Vec::new(),
             inspect_clear: false,
             inspect_yaw: 0.0,
+            pet_paperdoll_yaw: 0.0,
+            dressup_intents: Vec::new(),
+            dressup_yaw: 0.0,
             inspect_reach: HashMap::new(),
             chat_input: Vec::new(),
             skills: skills::SkillsState::default(),

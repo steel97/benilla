@@ -276,6 +276,32 @@ impl super::UiScript {
         model.player_next_level_xp = next_level_xp;
     }
 
+    /// Push the player's rest snapshot — the `PLAYER_BYTES_2` byte 3 rest state, the
+    /// `PLAYER_REST_STATE_EXPERIENCE` pool (raw wire value, base kill-XP units) and the
+    /// `PLAYER_FLAGS_RESTING` bit — taken together so the `GetRestState`/`GetXPExhaustion`/
+    /// `IsResting` trio can never read a half-updated rest picture. Player-level fields, same
+    /// shape as [`Self::set_money`]; the app calls this each frame any of the three moves
+    /// (decision 1082).
+    pub fn set_rest_state(&mut self, state: u8, pool: u32, resting: bool) {
+        let mut model = self.model_mut();
+        model.rest_state = state;
+        model.rest_pool = pool;
+        model.resting = resting;
+    }
+
+    /// Push Exhaustion.dbc — `(rest-state byte, localized name, factor)` rows for the
+    /// `GetRestState`/`GetXPExhaustion` bindings (they read the table exactly as `0x48d350` /
+    /// `0x48d3f0` read the client's own copy; decision 1087). Called once at startup off the
+    /// patch chain; an empty push is ignored so a failed DBC read keeps the shipped-table
+    /// fallback the model seeds.
+    pub fn set_exhaustion_rows(&mut self, rows: Vec<(u8, String, f64)>) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut model = self.model_mut();
+        model.exhaustion = rows.into_iter().map(|(id, n, f)| (id, (n, f))).collect();
+    }
+
     /// Push the player's banked combo points (`PLAYER_FIELD_BYTES` byte 1) and the unit they sit
     /// on (`PLAYER_FIELD_COMBO_TARGET`) — the pair `Player::SetComboPoints` writes together, taken
     /// together so they can never be read half-updated. Player-level PRIVATE fields, same shape as
@@ -300,6 +326,12 @@ impl super::UiScript {
     /// call — the ESC chain's last leg; the app commits the deselect (SetSelection guid 0).
     pub fn take_target_clear(&mut self) -> bool {
         std::mem::take(&mut self.model_mut().target_clear)
+    }
+
+    /// Drain the unit tokens `DropItemOnUnit` queued since the last call — the app runs every gate
+    /// and, on the pet leg, casts the learned Feed Pet spell at the held item (`0x48d960`).
+    pub fn take_drop_item_on_unit(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.model_mut().drop_item_on_unit)
     }
 }
 

@@ -450,3 +450,127 @@ fn region_alpha_is_its_own_and_multiplies_the_owner_frames() {
         "a hidden region emits no quad"
     );
 }
+
+/// **The texture-colour composition law** (wow-re `system/ui/scratch/texture-color-composition.md`,
+/// VERIFIED): a region's own solid colour is a real *texel* (`SetTexture(r,g,b,a)` generates an 8×8
+/// block at `+0xcc`), its vertex colour is a *separate* slot (`+0xb8`), and the draw
+/// **multiplies** them per channel, alpha included — it does not replace.
+///
+/// This is the reference `SkillFrame` row trough, verbatim: declared `<Color 1,1,1,0.2>`, then
+/// `SetVertexColor(0, 0, 0.75, 0.5)`'d. It draws at alpha `0.2 × 0.5 = 0.1`. benilla stored ONE
+/// colour slot until this test, which made the second call replace the first and drew it at 0.5.
+#[test]
+fn a_solid_colour_texel_multiplies_with_the_vertex_colour() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        local f = CreateFrame("Frame", "Owner")
+        f:SetPoint("BOTTOMLEFT", 0, 0)
+        f:SetWidth(100) f:SetHeight(50)
+        trough = f:CreateTexture("Trough", "BACKGROUND")
+        trough:SetTexture(1, 1, 1, 0.2)
+    "#,
+    )
+    .unwrap();
+    s.resolve();
+
+    let solid = |s: &UiScript| {
+        s.extract()
+            .iter()
+            .find_map(|q| match &q.content {
+                QuadContent::Texture {
+                    path: None, color, ..
+                } => Some(*color),
+                _ => None,
+            })
+            .expect("solid-colour quad")
+    };
+    assert_eq!(
+        solid(&s),
+        Some([1.0, 1.0, 1.0, 0.2]),
+        "untinted, the texel draws as declared"
+    );
+
+    s.run("trough:SetVertexColor(0, 0, 0.75, 0.5)").unwrap();
+    assert_eq!(
+        solid(&s),
+        Some([0.0, 0.0, 0.75, 0.1]),
+        "texel x vertex, alpha included: 0.2 x 0.5 = 0.1, NOT 0.5"
+    );
+    // The API readback is the vertex slot itself, not the product — the two are distinct storage.
+    assert_eq!(
+        s.eval::<(f32, f32, f32, f32)>("return trough:GetVertexColor()")
+            .unwrap(),
+        (0.0, 0.0, 0.75, 0.5)
+    );
+
+    // Art and a solid colour share the `+0xcc` slot: setting a path releases the generated texel,
+    // and what is left is the tint alone for the renderer to modulate the sample by.
+    s.run(r#"trough:SetTexture("Interface\\Bar.blp")"#).unwrap();
+    let tinted = s
+        .extract()
+        .iter()
+        .find_map(|q| match &q.content {
+            QuadContent::Texture {
+                path: Some(p),
+                color,
+                ..
+            } if p.contains("Bar") => Some(*color),
+            _ => None,
+        })
+        .expect("art quad");
+    assert_eq!(
+        tinted,
+        Some([0.0, 0.0, 0.75, 0.5]),
+        "the vertex colour outlives the texel it was multiplying"
+    );
+}
+
+/// The draw gate is the TEXTURE slot, never the colour (`texture-color-composition.md` §4,
+/// VERIFIED): `0x7706e0` tests `+0xcc` and emits NOTHING when it is empty, whatever the vertex
+/// colour holds. Since the tint deliberately survives `SetTexture(nil)` ("a tint outlives the art
+/// it was tinting"), a cleared region used to leak its tint out of extract as a solid plate — an
+/// occupied action button going empty on a character switch drew its surviving 1/1/1 usable-tint
+/// as a solid WHITE square (decision 1108; the 2026-07-10 grey wells were the same class).
+#[test]
+fn a_vertex_colour_without_a_texture_draws_nothing() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        local f = CreateFrame("Frame", "Owner")
+        f:SetPoint("BOTTOMLEFT", 0, 0)
+        f:SetWidth(100) f:SetHeight(50)
+        icon = f:CreateTexture("Icon", "ARTWORK")
+        icon:SetTexture("Interface\\Icons\\Spell_Nature_Sleep")
+        icon:SetVertexColor(1, 1, 1)
+    "#,
+    )
+    .unwrap();
+    s.resolve();
+    let drawn = |s: &UiScript| {
+        s.extract()
+            .iter()
+            .filter(|q| {
+                matches!(&q.content, QuadContent::Texture { path, color, .. }
+                    if path.is_some() || color.is_some())
+            })
+            .count()
+    };
+    assert_eq!(drawn(&s), 1, "tinted art draws");
+
+    // The slot empties: the art clears, the tint stays (distinct storage) — and nothing draws.
+    s.run("icon:SetTexture(nil)").unwrap();
+    assert_eq!(
+        s.eval::<(f32, f32, f32, f32)>("return icon:GetVertexColor()")
+            .unwrap(),
+        (1.0, 1.0, 1.0, 1.0),
+        "the tint survives the clear"
+    );
+    assert_eq!(
+        drawn(&s),
+        0,
+        "no texture at +0xcc -> emit NOTHING, never a solid plate of the surviving tint"
+    );
+}

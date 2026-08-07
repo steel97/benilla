@@ -51,6 +51,7 @@ mod death;
 mod editbox;
 pub(crate) use editbox::adopt_text_region;
 mod cvars;
+mod dressup;
 mod duel;
 mod event;
 mod extract;
@@ -108,16 +109,17 @@ pub use aura::{AuraState, TrackingState};
 pub use backdrop::{pieces, Backdrop, BackdropPiece, Insets};
 pub use bank::BankState;
 pub use char_stats::{
-    weapon_subclass_skill, InvSlotView, InventorySlots, PlayerCombatStats, INVENTORY_SLOT_COUNT,
-    SKILL_UNARMED,
+    weapon_subclass_skill, InvSlotView, InventorySlots, UnitCombatStats, INVENTORY_SLOT_COUNT,
+    SKILL_DEFENSE, SKILL_UNARMED,
 };
 pub use container::{ContainerMove, ContainerSlot, ContainerState, EnchantView, UiCursorMode};
-pub use craft::{CraftReagent, CraftRecipe, CraftState};
+pub use craft::{CraftReagent, CraftRecipe, CraftState, CraftTooltip};
 pub use cursor::{
     CursorAction, CursorItem, CursorMacro, CursorPayload, CursorPetAction, CursorSpell,
     EnchantConfirm, WorldPick, EQUIPMENT_BAG,
 };
 pub use death::{DeathAction, DeathUiState};
+pub use dressup::DressUpIntent;
 pub use duel::DuelRequest;
 pub use follow::FollowRequest;
 pub use gossip::{GossipMenu, GossipOptionView, GossipQuestRow};
@@ -139,7 +141,9 @@ pub use shapeshift::ShapeshiftFormView;
 pub use skills::{SkillEntry, SkillsState};
 pub use social::{FriendInfo, SocialRequest, SocialState, WhoInfo};
 pub use sound::SoundRequest;
-pub use spellbook::{resolve_spell_by_name, SpellBookState, SpellSlotView, SpellTabView};
+pub use spellbook::{
+    resolve_spell_by_name, PetBookState, SpellBookState, SpellSlotView, SpellTabView,
+};
 pub use talent::{TalentPrereqView, TalentTabView, TalentUiState, TalentView};
 pub use taxi::{TaxiNodeType, TaxiUiNode, TaxiUiState};
 pub use tooltip_spell::SpellTooltipView;
@@ -147,7 +151,7 @@ pub use trade::{TradeSideState, TradeSlotItem, TradeState, TRADE_SLOTS};
 pub use tradeskill::{TradeSkillDifficulty, TradeSkillReagent, TradeSkillRecipe, TradeSkillState};
 pub use trainer::{
     TrainerAbilityReq, TrainerGroup, TrainerService, TrainerServiceCategory, TrainerSkillReq,
-    TrainerState,
+    TrainerState, TrainerTooltip,
 };
 pub use types::{
     EditAction, EditBoxTextUi, EditOutcome, EditUnit, ExtractedQuad, FontObject, FontShadow,
@@ -294,6 +298,7 @@ impl UiScript {
         taxi::install(&lua)?;
         trade::install(&lua)?;
         inspect::install(&lua)?;
+        dressup::install(&lua)?;
         tradeskill::install(&lua)?;
         craft::install(&lua)?;
         skills::install(&lua)?;

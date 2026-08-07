@@ -150,6 +150,9 @@ pub(super) struct ZoneAudio {
     zone_music: u32,
     /// The playing music stream (a zone track, an intro, or a server-pushed event track).
     music: Option<StreamingSoundHandle<kira::sound::FromFileError>>,
+    /// Starvation watch over the music slot (decision 1109) — a streamed track whose decode
+    /// thread is outrun zero-fills the mix, which no other meter sees.
+    music_watch: mixer::StreamWatch,
     /// The SoundEntries kit on the music slot (0 = never started one) — the "what is playing" a
     /// repeat `SMSG_PLAY_MUSIC` is compared against ([`slot_holds`]).
     music_kit: u32,
@@ -186,6 +189,7 @@ impl Default for ZoneAudio {
         Self {
             zone_music: 0,
             music: None,
+            music_watch: mixer::StreamWatch::new("zone music"),
             music_kit: 0,
             music_kit_vol: 1.0,
             next_track_at: None,
@@ -422,16 +426,24 @@ fn zone_audio(
     }
 
     // ---- per-frame volumes (sliders are live) ----
+    // Both feeds `glide` rather than snap (decision 1026): these are the two loudest, longest-lived
+    // channels in the mix, so a stepped gain on either is the most audible click there is.
     // Music holds full kit × category volume every frame — its only transition fade is the
     // outgoing 4.0 s fade-stop (on the backend), and the incoming starts at full (faithful).
     if let Some(h) = &mut zone.music {
         h.set_volume(
             mixer::amp_to_db(config.category_amp(SoundCategory::Music) * zone.music_kit_vol),
-            mixer::snap(),
+            mixer::glide(),
         );
     }
+    // The starvation watch (1109) over the playing track. A track fading out on a dropped handle
+    // isn't watched — under the load bursts that starve a decoder, the *playing* slot's watch is
+    // the indicator either way (every stream decoder shares the same scheduling class).
+    if let Some(h) = &zone.music {
+        zone.music_watch.feed(h, f64::from(time.delta_secs()));
+    }
     // Ambience runs the incoming leg of its 5.0 s crossfade as a per-frame fade-in envelope (the
-    // per-frame snap would otherwise stomp the ramp to full); it clears itself at full.
+    // per-frame feed would otherwise stomp a handle-level ramp to full); it clears itself at full.
     let ambience_gain = fade_in_gain(&mut zone.ambience_fade_in, now);
     if let Some(h) = &mut zone.ambience {
         h.set_volume(
@@ -440,7 +452,7 @@ fn zone_audio(
                     * zone.ambience_kit_vol
                     * ambience_gain,
             ),
-            mixer::snap(),
+            mixer::glide(),
         );
     }
 }
@@ -678,6 +690,9 @@ fn leave_world(mut zone: NonSendMut<ZoneAudio>) {
     if let Some(mut h) = zone.music.take() {
         h.stop(mixer::fade(WORLD_TEARDOWN_FADE_MS));
     }
+    // The next login's first track starts at position 0, far behind this one's baseline — a
+    // stale watch would read that as a freeze (1109).
+    zone.music_watch.reset();
     if let Some(mut h) = zone.ambience.take() {
         h.stop(mixer::fade(WORLD_TEARDOWN_FADE_MS));
     }

@@ -4,9 +4,11 @@
 //!
 //! The net bridge fills [`TrainerOpen`] from the wire (`SMSG_TRAINER_LIST` → the trainer's services +
 //! greeting, reached through the gossip trainer option). Each frame [`feed_trainer`] resolves each
-//! wire [`TrainerSpell`] to a Lua-facing [`TrainerService`] — name/subtext/icon from the spell
-//! catalog (`Spell.dbc`, loaded whole at startup, so no ask-once query like the item rows need), the
-//! skill-requirement name from the skill-line catalog, the green/red/gray state straight off the wire
+//! wire [`TrainerSpell`] to a Lua-facing [`TrainerService`] — name/subtext from the spell catalog
+//! (`Spell.dbc`, loaded whole at startup), the **icon** from its own byte-verified law
+//! ([`service_icon`], which at a *tradeskill* trainer fronts the taught recipe's created item and so
+//! does need the ask-once item-template query the item rows use), the skill-requirement name from
+//! the skill-line catalog, the green/red/gray state straight off the wire
 //! `state` byte — pushes the snapshot ([`UiScript::set_trainer`]), and fires `TRAINER_SHOW` on open /
 //! `TRAINER_UPDATE` on a content change / `TRAINER_CLOSED` on clear. [`drain_trainer`] pulls the Lua
 //! intents back out: the Train button's `BuyTrainerService` → `CMSG_TRAINER_BUY_SPELL` for the open
@@ -23,7 +25,7 @@
 use std::collections::HashSet;
 
 use benilla_formats::{SkillLineCatalog, SpellCatalog};
-use benilla_protocol::messages::{trainer_spell_state, TrainerSpell};
+use benilla_protocol::messages::TrainerSpell;
 use bevy::prelude::*;
 
 use benilla_ui::script::{
@@ -31,6 +33,8 @@ use benilla_ui::script::{
     TrainerState, UiScript,
 };
 
+use crate::entities::ItemDisplays;
+use crate::items::Items;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, NetCommands};
 use crate::ui_action::{PlayerActions, Spells};
@@ -129,28 +133,22 @@ fn train_error_text(code: u32) -> String {
     .to_string()
 }
 
-/// The green/red/gray colour a wire `state` byte maps to (decision 0237): GRAY → known, GREEN →
-/// learnable, everything else (RED + any unexpected value) → gated.
-fn category(state: u8) -> TrainerServiceCategory {
-    match state {
-        trainer_spell_state::GRAY => TrainerServiceCategory::Used,
-        trainer_spell_state::GREEN => TrainerServiceCategory::Available,
-        _ => TrainerServiceCategory::Unavailable,
-    }
-}
-
 /// Resolve one wire [`TrainerSpell`] into the Lua-facing [`TrainerService`]: name/subtext/icon from
 /// the spell catalog (`None` only before `Spell.dbc` has loaded — the row shows a placeholder), the
 /// skill-req name from the skill-line catalog (falling back to `Skill <id>` if it hasn't loaded),
 /// the ability-req names + rank from the same spell catalog, the state/cost/gates straight off the
 /// wire. `known` is the player's known-spell set ([`PlayerActions::spells`]) — each prerequisite
 /// ability is coloured by whether the player already knows that specific spell (see below).
+#[allow(clippy::too_many_arguments)] // the resolver's full catalog set
 fn resolve_service(
     wire: &TrainerSpell,
     trainer_type: u32,
     spells: &SpellCatalog,
     skill_lines: Option<&SkillLineCatalog>,
     known: &HashSet<u32>,
+    icons: Option<&ItemDisplays>,
+    items: &mut Items,
+    commands: &NetCommands,
 ) -> TrainerService {
     // The trainer offers a LEARN wrapper (decision 0247); the ability it teaches — with the skill
     // line the tree groups by, and the real display name/icon — is the taught spell. Resolve it once
@@ -229,7 +227,10 @@ fn resolve_service(
         spell_id: wire.spell,
         name: display.map(|d| d.name.clone()),
         subtext: display.and_then(|d| d.rank.clone()),
-        texture: display.and_then(|d| d.icon.clone()),
+        // The NAME/subtext hop through the taught spell stays (decisions 0247/0252 — the wrapper is
+        // not in SkillLineAbility, so grouping and display MUST hop). The ICON does not: it is its
+        // own byte-verified law over the WIRE spell ([`service_icon`]).
+        texture: service_icon(wire.spell, trainer_type, spells, icons, items, commands),
         // The detail pane's description body, left empty by design. The real
         // `GetTrainerServiceDescription` returns the spell's *tooltip* — `Spell.dbc`'s Description
         // with its `$s1`/`$o1`/`$d`/`$a1` tokens substituted from the spell's effect base points,
@@ -246,16 +247,21 @@ fn resolve_service(
         is_trade_skill: trainer_type == TRAINER_TYPE_TRADESKILL,
         skill_line,
         skill_line_name,
+        tooltip: service_tooltip(wire.spell, spells),
     }
 }
 
 /// Build the Lua-facing snapshot from [`TrainerOpen`] + the spell/skill catalogs — `None` when no
 /// trainer is open.
+#[allow(clippy::too_many_arguments)] // the resolver's full catalog set
 fn snapshot(
     open: &TrainerOpen,
     spells: &SpellCatalog,
     skill_lines: Option<&SkillLineCatalog>,
     known: &HashSet<u32>,
+    icons: Option<&ItemDisplays>,
+    items: &mut Items,
+    commands: &NetCommands,
 ) -> Option<TrainerState> {
     open.trainer?;
     Some(TrainerState {
@@ -264,7 +270,18 @@ fn snapshot(
         services: open
             .services
             .iter()
-            .map(|w| resolve_service(w, open.trainer_type, spells, skill_lines, known))
+            .map(|w| {
+                resolve_service(
+                    w,
+                    open.trainer_type,
+                    spells,
+                    skill_lines,
+                    known,
+                    icons,
+                    items,
+                    commands,
+                )
+            })
             .collect(),
         // The engine synthesizes the skill-line tree in `set_trainer` — the app pushes only the flat
         // services (each carrying its resolved skill line above).
@@ -283,6 +300,10 @@ fn feed_trainer(
     actions: Res<PlayerActions>,
     spells: Option<Res<Spells>>,
     skill_lines: Option<Res<SkillLines>>,
+    // A tradeskill trainer's rows front the CREATED ITEM's icon, so the feed needs the ask-once
+    // template cache + `ItemDisplayInfo.dbc` — the tradeskill window's own pair ([`service_icon`]).
+    icons: Option<Res<ItemDisplays>>,
+    mut items: ResMut<Items>,
     mut errors: ResMut<TrainerErrors>,
     commands: Res<NetCommands>,
     mut names: ResMut<NameCache>,
@@ -316,6 +337,9 @@ fn feed_trainer(
         &spells.catalog,
         Some(&skill_lines.catalog),
         &actions.spells,
+        icons.as_deref(),
+        &mut items,
+        &commands,
     );
     // The trainer's name resolves through the NameCache (a creature-name query, ask-once — the
     // real client's `UnitName("npc")`). `None`/empty while in flight; the title shows the static
@@ -397,218 +421,8 @@ fn drain_trainer(
     }
 }
 
+mod law;
+use law::{category, service_icon, service_tooltip};
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    /// An empty spell catalog (`Spell.dbc` not resolved) — the resolver's name/icon lookups miss.
-    fn empty_catalog() -> SpellCatalog {
-        SpellCatalog::from_displays(HashMap::new())
-    }
-
-    fn wire(spell: u32, state: u8, cost: u32, req_level: u8, req_skill: u32) -> TrainerSpell {
-        TrainerSpell {
-            spell,
-            state,
-            cost,
-            can_learn_primary_prof: false,
-            is_primary_prof_first_rank: false,
-            req_level,
-            req_skill,
-            req_skill_value: if req_skill != 0 { 100 } else { 0 },
-            req_spells: [0, 0, 0],
-        }
-    }
-
-    /// The learn-spell hop end-to-end on real 5875 data (decision 0247): a warrior trainer sends the
-    /// LEARN wrapper 1605 ("learn Heroic Strike"), which is not in SkillLineAbility — resolve_service
-    /// must hop through the taught spell (78) to group it under Arms (26) and show its name, while the
-    /// BUY id stays the wrapper (1605) the server expects. This is the exact failure that emptied the
-    /// tree. Skips without client data.
-    #[test]
-    fn resolve_hops_the_learn_wrapper_to_the_taught_ability() {
-        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return;
-        }
-        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
-        let spells = benilla_formats::load_spell_catalog(&mut chain).expect("load Spell");
-        let skills =
-            benilla_formats::load_skill_line_catalog(&mut chain).expect("load skill lines");
-
-        let svc = resolve_service(
-            &wire(1605, trainer_spell_state::GREEN, 10, 1, 0),
-            0,
-            &spells,
-            Some(&skills),
-            &HashSet::new(),
-        );
-        assert_eq!(svc.spell_id, 1605, "the buy id stays the wire wrapper");
-        assert_eq!(
-            svc.skill_line, 26,
-            "grouped under the taught ability's Arms line"
-        );
-        assert_eq!(svc.skill_line_name, "Arms");
-        assert_eq!(
-            svc.name.as_deref(),
-            Some("Heroic Strike"),
-            "display resolves through the taught spell"
-        );
-    }
-
-    #[test]
-    fn category_maps_the_wire_state_byte() {
-        assert_eq!(
-            category(trainer_spell_state::GREEN),
-            TrainerServiceCategory::Available
-        );
-        assert_eq!(
-            category(trainer_spell_state::RED),
-            TrainerServiceCategory::Unavailable
-        );
-        assert_eq!(
-            category(trainer_spell_state::GRAY),
-            TrainerServiceCategory::Used
-        );
-        // An unexpected value is treated as gated (safe default), never "learnable".
-        assert_eq!(category(99), TrainerServiceCategory::Unavailable);
-    }
-
-    #[test]
-    fn resolve_reads_cost_state_and_gates_with_no_catalog() {
-        // Empty catalog (Spell.dbc not resolved): name/subtext/icon nil, the wire fields still land,
-        // and the skill-req name falls back rather than dropping the gate.
-        let spells = empty_catalog();
-        let mut w = wire(2018, trainer_spell_state::RED, 1000, 20, 164);
-        w.req_spells = [78, 0, 0];
-        // Empty known set: the player knows nothing → the ability gate reads unmet on its own terms.
-        let svc = resolve_service(&w, TRAINER_TYPE_TRADESKILL, &spells, None, &HashSet::new());
-        assert_eq!(svc.spell_id, 2018);
-        assert!(svc.name.is_none(), "no catalog → name in flight");
-        assert_eq!(svc.cost, 1000);
-        assert_eq!(svc.category, TrainerServiceCategory::Unavailable);
-        assert_eq!(svc.level_req, 20);
-        // Unavailable service → the SKILL gate reads unmet (coarse, from the category — no per-gate
-        // wire bit); the ABILITY gate reads unmet because the empty known set doesn't contain spell 78
-        // (per-gate, not from the category). No catalog → the ability name falls back to "Spell 78".
-        assert_eq!(
-            svc.skill_req,
-            Some(TrainerSkillReq {
-                name: "Skill 164".to_string(),
-                rank: 100,
-                met: false,
-            })
-        );
-        assert_eq!(
-            svc.ability_reqs,
-            vec![TrainerAbilityReq {
-                name: "Spell 78".to_string(),
-                met: false,
-            }]
-        );
-        assert!(svc.is_trade_skill, "trainer_type 2 → tradeskill");
-        assert!(svc.prof_first_rank == w.is_primary_prof_first_rank);
-        // No skill-line catalog → skill_line 0 (the engine drops it from the tree) and an empty name.
-        assert_eq!(svc.skill_line, 0);
-        assert_eq!(svc.skill_line_name, "");
-        // No skill gate when req_skill is 0.
-        let plain = resolve_service(
-            &wire(78, trainer_spell_state::GREEN, 50, 5, 0),
-            0,
-            &spells,
-            None,
-            &HashSet::new(),
-        );
-        assert_eq!(plain.skill_req, None);
-        assert!(plain.ability_reqs.is_empty());
-        assert!(!plain.is_trade_skill);
-    }
-
-    /// A prerequisite ability's met/unmet is per-gate — whether the player KNOWS that spell — and is
-    /// decoupled from the service's overall category (wow-re `system/ui/scratch/trainer-requirement.md`).
-    /// The director's exact case: an UNAVAILABLE spell (gated by level) whose already-learned prev-rank
-    /// prerequisite must still read met (white), not red. Deterministic (no client data needed).
-    #[test]
-    fn ability_req_met_tracks_known_spells_not_the_service_category() {
-        let spells = empty_catalog();
-        let mut w = wire(845, trainer_spell_state::RED, 100, 20, 0); // unavailable (gated by level)
-        w.req_spells = [78, 0, 0]; // requires Heroic Strike (78)
-
-        // Player doesn't know 78 → the prerequisite is unmet (red).
-        let unknown = resolve_service(&w, 0, &spells, None, &HashSet::new());
-        assert_eq!(unknown.category, TrainerServiceCategory::Unavailable);
-        assert!(!unknown.ability_reqs[0].met, "prereq unknown → unmet");
-
-        // Player knows 78 → the prerequisite is met (white) EVEN THOUGH the service stays unavailable.
-        let known: HashSet<u32> = [78].into_iter().collect();
-        let learned = resolve_service(&w, 0, &spells, None, &known);
-        assert_eq!(learned.category, TrainerServiceCategory::Unavailable);
-        assert!(
-            learned.ability_reqs[0].met,
-            "prereq known → met, decoupled from the unavailable service"
-        );
-    }
-
-    /// The prerequisite name carries its rank the way the client does — `"Name (Rank)"` — resolved on
-    /// real 5875 data: Heroic Strike (78) is Rank 1, so a service requiring it shows "Heroic Strike
-    /// (Rank 1)", met iff the player knows 78. Skips without client data.
-    #[test]
-    fn ability_req_shows_the_required_rank_on_real_data() {
-        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return;
-        }
-        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
-        let spells = benilla_formats::load_spell_catalog(&mut chain).expect("load Spell");
-
-        let mut w = wire(846, trainer_spell_state::RED, 100, 20, 0);
-        w.req_spells = [78, 0, 0]; // Heroic Strike Rank 1
-
-        let known: HashSet<u32> = [78].into_iter().collect();
-        let svc = resolve_service(&w, 0, &spells, None, &known);
-        assert_eq!(
-            svc.ability_reqs,
-            vec![TrainerAbilityReq {
-                name: "Heroic Strike (Rank 1)".to_string(),
-                met: true,
-            }],
-            "the prereq shows its rank and reads met because the player knows it"
-        );
-        // Not known → same name, but unmet (red).
-        let svc = resolve_service(&w, 0, &spells, None, &HashSet::new());
-        assert!(!svc.ability_reqs[0].met);
-        assert_eq!(svc.ability_reqs[0].name, "Heroic Strike (Rank 1)");
-    }
-
-    #[test]
-    fn snapshot_is_none_when_closed_and_lists_services_when_open() {
-        let spells = empty_catalog();
-        let mut open = TrainerOpen::default();
-        assert!(snapshot(&open, &spells, None, &HashSet::new()).is_none());
-
-        open.open(
-            0x42,
-            0,
-            vec![
-                wire(78, trainer_spell_state::GREEN, 100, 10, 0),
-                wire(79, trainer_spell_state::GRAY, 200, 0, 0),
-            ],
-            "Learn from me.".into(),
-        );
-        let state = snapshot(&open, &spells, None, &HashSet::new()).expect("open → Some");
-        assert_eq!(state.greeting, "Learn from me.");
-        assert_eq!(state.services.len(), 2);
-        assert_eq!(
-            state.services[0].category,
-            TrainerServiceCategory::Available
-        );
-        assert_eq!(state.services[1].category, TrainerServiceCategory::Used);
-
-        open.clear();
-        assert!(snapshot(&open, &spells, None, &HashSet::new()).is_none());
-        assert_eq!(open.trainer, None);
-    }
-}
+mod tests;

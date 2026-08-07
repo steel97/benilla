@@ -6,7 +6,15 @@ use super::*;
 
 impl ObjectFields {
     /// `OBJECT_FIELD_ENTRY` (3) — the object's template entry (an item object's item id, a
-    /// GameObject's template). The one field that names WHAT a streamed object is.
+    /// GameObject's template, a creature's `creature_template` row). The one field that names WHAT
+    /// a streamed object is.
+    ///
+    /// **For a PET this is the only route to its template**, and that is load-bearing: a
+    /// `HIGHGUID_PET` guid carries a *pet number* in the slot a creature's entry occupies
+    /// ([`crate::guid::pet_number`]), so [`crate::guid::entry`] refuses it — but vmangos still
+    /// writes the real `cinfo->entry` here (`Creature::InitEntry`, `Creature.cpp:376`,
+    /// `SetEntry(entry) // normal entry always`). Decision 1062's creature-family lookup goes
+    /// through this field for exactly that reason.
     pub fn object_entry(&self) -> Option<u32> {
         self.get_u32(3)
     }
@@ -341,9 +349,25 @@ impl ObjectFields {
         self.get_u32(FIELD_PLAYER_BYTES)
     }
     /// `PLAYER_BYTES_2` — byte 0 = facialHair, byte 1 = unk, byte 2 = bankBagSlots (see
-    /// [`Self::player_bank_bag_slots_purchased`]), byte 3 = restState (unread here).
+    /// [`Self::player_bank_bag_slots_purchased`]), byte 3 = restState (see
+    /// [`Self::player_rest_state`]).
     pub fn player_bytes_2(&self) -> Option<u32> {
         self.get_u32(FIELD_PLAYER_BYTES_2)
+    }
+    /// `PLAYER_BYTES_2` **byte 3** — the rest state the client's `GetRestState()` maps to its
+    /// (id, name, multiplier) triple: `1` = rested, `2` = normal (vmangos `REST_STATE_*`,
+    /// `Player.h:673`). The server writes it with hysteresis off the rest pool — rested when the
+    /// pool exceeds 10, normal when it falls to ≤1 (`SetRestBonus`) — so the byte, not the pool,
+    /// is the state authority. `None` when never sent; a fresh descriptor reads absent as normal.
+    pub fn player_rest_state(&self) -> Option<u8> {
+        self.player_bytes_2().map(|b| (b >> 24) as u8)
+    }
+    /// `PLAYER_REST_STATE_EXPERIENCE` (field 1175) — the rested-XP pool, in **base kill-XP
+    /// units**: the server drains it 1:1 against a kill's base XP while granting +100%
+    /// (vmangos `GetXPRestBonus`), so the doubled-XP span the exhaustion tick marks is 2× this
+    /// value. `None` before the field streams (PRIVATE — self only).
+    pub fn player_rest_state_experience(&self) -> Option<u32> {
+        self.get_u32(FIELD_PLAYER_REST_STATE_EXPERIENCE)
     }
     /// `PLAYER_BYTES_3` **byte 1** — the inebriation byte (0..255) drunkenness renders from. The
     /// server packs `gender | (drunk & 0xFFFE)` into the field's low u16 and decays it 256 per
@@ -366,6 +390,13 @@ impl ObjectFields {
     /// UnitIsDead/UnitIsGhost/UnitIsDeadOrGhost trio).
     pub fn player_is_ghost(&self) -> bool {
         self.player_flags() & 0x10 != 0
+    }
+    /// Whether the player is inside a rest area (inn/city) — `PLAYER_FLAGS_RESTING (0x20)`
+    /// (vmangos `Player.h:320`), set/cleared by the area-trigger/zone rest checks
+    /// (`SetRestType`). The real client's `IsResting()` and the player frame's flashing zzz
+    /// state icon read exactly this bit.
+    pub fn player_is_resting(&self) -> bool {
+        self.player_flags() & 0x20 != 0
     }
     /// `PLAYER_DUEL_ARBITER` (field 188, GUID) — the duel-flag GameObject of the duel this player
     /// is in, `0` when they are in none. Set on both duellists by `Spell::EffectDuel`, cleared by
@@ -469,6 +500,17 @@ impl ObjectFields {
     /// success, only this descriptor delta (`PLAYERBANKBAGSLOTS_CHANGED` on the reference client).
     pub fn player_bank_bag_slots_purchased(&self) -> Option<u8> {
         self.player_bytes_2().map(|b| ((b >> 16) & 0xff) as u8)
+    }
+    /// `OBJECT_FIELD_CREATED_BY` (the GameObject block's creator guid, fields 6-7 in 1.12): the
+    /// summoning player of a spell-spawned object — the fishing bobber's owner. `None` when absent
+    /// or zero (a world-spawned GO has no creator). The reference's ONE reader on the interaction
+    /// path is the faction resolver `0x5f7fd0`, which prefers the creator's reaction over
+    /// `GAMEOBJECT_FACTION` — the bobber's ownership *gate* is NOT this field but the player's own
+    /// `UNIT_FIELD_CHANNEL_OBJECT` (wow-re `fishing-bobber-interaction.md` §2, the byte-proven
+    /// negative: `0x5f6710` never reads CREATED_BY).
+    pub fn gameobject_created_by(&self) -> Option<u64> {
+        self.get_guid(FIELD_GAMEOBJECT_CREATED_BY)
+            .filter(|&g| g != 0)
     }
     /// `GAMEOBJECT_DISPLAYID`.
     pub fn gameobject_displayid(&self) -> Option<i32> {

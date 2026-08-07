@@ -20,28 +20,27 @@
 use bevy::prelude::*;
 
 use benilla_formats::{
-    SPELL_EFFECT_CREATE_ITEM, SPELL_EFFECT_ENCHANT_ITEM, SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY,
+    SPELL_ATTR_IS_TRADESKILL, SPELL_EFFECT_CREATE_ITEM, SPELL_EFFECT_ENCHANT_ITEM,
+    SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY, SPELL_EFFECT_LEARN_SPELL,
 };
 use benilla_protocol::messages::PLAYER_SKILL_SLOTS;
-use benilla_ui::script::{CraftReagent, CraftRecipe, CraftState, UiScript};
+use benilla_ui::script::{CraftReagent, CraftRecipe, CraftState, CraftTooltip, UiScript};
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
 use crate::net::{NetCommands, ObjectStore, SelfPlayer};
 use crate::ui_action::{cast_target, CastCommit, CastLadder, PlayerActions, Spells};
-use crate::ui_items::count_of;
+use crate::ui_items::{count_of, item_icon};
 use crate::ui_script::UiInput;
 use crate::ui_spellbook::SkillLines;
 use crate::ui_tradeskill::SpellFocus;
 use crate::ui_unit::UnitFeed;
 
-/// `SPELL_ATTR_IS_TRADESKILL` — the item-recipe marker (0227's add-gate bit). Craft recipes
-/// (enchants, the rod crafts) do NOT carry it — they carry **`castUI != 0`** instead (pinned on
-/// the live 5875 data this cycle: 7418/7421 castUI=3, attributes bare 0x10000; exactly the
-/// spellbook add-gate's third exclusion leg). INTERIM admission pending a wow-re detail pass:
-/// a known spell joins the craft list when its SLA line matches AND (`castUI != 0` OR the
-/// tradeskill bit) and it is not an opener.
-const ATTR_IS_TRADESKILL: u32 = 0x20;
+// NOTE on the admission filter below: Craft recipes (enchants, the rod crafts) do NOT carry
+// `SPELL_ATTR_IS_TRADESKILL` — they carry **`castUI != 0`** instead (pinned on the live 5875 data:
+// 7418/7421 castUI=3, attributes bare 0x10000; exactly the spellbook add-gate's third exclusion
+// leg). INTERIM admission pending a wow-re detail pass: a known spell joins the craft list when its
+// SLA line matches AND (`castUI != 0` OR the tradeskill bit) and it is not an opener.
 
 /// The open Craft window: the skill line whose recipes it lists (`None` = closed). Routed here
 /// by the opener's `EffectMiscValue[0] != 0` (byte-VERIFIED — wow-re `tradeskill` TU-A); a Beast
@@ -82,6 +81,51 @@ fn skill_rank(store: &ObjectStore, skill_id: u32) -> (u32, u32, i32) {
         }
     }
     (0, 0, 0)
+}
+
+/// **Law D** — the Craft window's row icon, transcribing `GetCraftIcon 0x4f7160` (byte-VERIFIED;
+/// wow-re `ui/scratch/spell-icon-substitution-law.md` §2, folded back by decision 1107): **always**
+/// this recipe's own `SpellIconID`, straight off `Spell.dbc`.
+///
+/// The one-liner is the point, and it is not an oversight to be "improved". The Craft window and
+/// the TradeSkill window are two translation units of the *same* node, and their icon laws are
+/// exact opposites: `+0x19c` (`EffectItemType[0]`) is never read anywhere in `[0x4f7160,
+/// 0x4f7204]` — no item lookup, no `"%s%s%s"` path composition, no async callback. So a rod-making
+/// `CREATE_ITEM` recipe fronts the *spell's* icon here while the byte-identical recipe in the
+/// TradeSkill window fronts the *rod's* ([`crate::ui_tradeskill`]'s Law C). Substituting the
+/// product here — which this used to do — is wrong on this surface with no diff to catch it.
+fn craft_icon(d: &benilla_formats::SpellDisplay) -> Option<String> {
+    d.icon.clone()
+}
+
+/// The Craft window's **tooltip law** — `SetCraftSpell 0x533e90`, byte-verified in wow-re
+/// (`ui/scratch/trainer-service-tooltip-law.md` §4.1). Like the trainer's, the binding is a
+/// selector into the two shared builders and emits no line of its own; unlike the trainer's, it
+/// reads the **recipe's own** effect columns:
+///
+/// ```text
+/// for i in 0..3:
+///     if Effect[i] == 36 LEARN_SPELL:  return Spell(EffectTriggerSpell[i])   # NOT validated
+///     if Effect[i] == 24 CREATE_ITEM:  return Item(EffectItemType[i])
+/// return Spell(recipe spell id)                                             # every enchant
+/// ```
+///
+/// Three differences from [`crate::ui_trainer::service_tooltip`] that a shared implementation would
+/// erase: this tests the recipe's own `Effect[i]` where the trainer tests the *taught* spell's
+/// `Attributes & 0x20`; it never tests `57 LEARN_PET_SPELL` and so never sets `altCaster`; and it
+/// hops `EffectTriggerSpell[i]` **without** checking that it resolves, where the trainer's scan
+/// falls through to the next slot on an unresolvable trigger. Same shape, different law — the
+/// icon side's lesson (decision 1107) applies to the content side too.
+fn craft_tooltip(spell_id: u32, d: &benilla_formats::SpellDisplay) -> CraftTooltip {
+    for i in 0..3 {
+        if d.effects[i] == SPELL_EFFECT_LEARN_SPELL {
+            return CraftTooltip::Spell(d.effect_trigger_spell[i]);
+        }
+        if d.effects[i] == SPELL_EFFECT_CREATE_ITEM {
+            return CraftTooltip::Item(d.effect_item_type[i]);
+        }
+    }
+    CraftTooltip::Spell(spell_id)
 }
 
 /// Build the craft snapshot — `None` when the window is closed or the catalogs haven't loaded.
@@ -125,8 +169,8 @@ fn feed_craft(
             .iter()
             .filter(|&&s| {
                 spells.catalog.get(s).is_some_and(|d| {
-                    (d.cast_ui != 0 || d.attributes & ATTR_IS_TRADESKILL != 0)
-                        && d.effect_1 != benilla_formats::SPELL_EFFECT_TRADE_SKILL
+                    (d.cast_ui != 0 || d.attributes & SPELL_ATTR_IS_TRADESKILL != 0)
+                        && d.effects[0] != benilla_formats::SPELL_EFFECT_TRADE_SKILL
                 }) && skill_lines.catalog.spell_to_line(s) == Some(line)
             })
             .filter_map(|&s| {
@@ -136,13 +180,13 @@ fn feed_craft(
                 let mut num_available = u32::MAX;
                 for &(entry, need) in d.reagents.iter().filter(|&&(e, n)| e != 0 && n != 0) {
                     let have = count_of(&store.0, &items, entry);
+                    // A reagent is an ITEM row, so it terminates in the one genuinely shared chain
+                    // (wow-re §5): ItemTemplate → ItemDisplayInfo → icon. Unlike the *recipe* icon
+                    // above, there is nothing per-binding about this one.
                     let (name, icon) = match items.template(entry, 0, &commands) {
                         Some(t) => (
                             Some(t.name.clone()),
-                            icons
-                                .as_deref()
-                                .and_then(|i| i.catalog.get(t.display_info_id))
-                                .and_then(|di| di.icon.clone()),
+                            item_icon(icons.as_deref(), t.display_info_id),
                         ),
                         None => (None, None),
                     };
@@ -174,25 +218,10 @@ fn feed_craft(
                     }
                 }
                 let needs_item_target = matches!(
-                    d.effect_1,
+                    d.effects[0],
                     SPELL_EFFECT_ENCHANT_ITEM | SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY
                 );
-                // A rod-making recipe (CREATE_ITEM) fronts the product's icon like a tradeskill
-                // row; an enchant fronts its spell icon.
-                let icon = (d.effect_1 == SPELL_EFFECT_CREATE_ITEM && d.effect_item_type[0] != 0)
-                    .then(|| {
-                        items
-                            .template(d.effect_item_type[0], 0, &commands)
-                            .map(|t| t.display_info_id)
-                            .and_then(|di| {
-                                icons
-                                    .as_deref()
-                                    .and_then(|i| i.catalog.get(di))
-                                    .and_then(|x| x.icon.clone())
-                            })
-                    })
-                    .flatten()
-                    .or_else(|| d.icon.clone());
+                let icon = craft_icon(d);
                 Some(CraftRecipe {
                     spell_id: s,
                     name: d.name.clone(),
@@ -211,6 +240,7 @@ fn feed_craft(
                     needs_item_target,
                     reagents,
                     tools,
+                    tooltip: craft_tooltip(s, d),
                 })
             })
             .collect();
@@ -283,5 +313,65 @@ fn drain_craft(
     if script.take_craft_close() {
         debug!("ui_craft: client-side close (no packet)");
         open.line = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use benilla_formats::SpellDisplay;
+
+    /// Law D never looks at an item. The regression this pins is the *sibling* one: a rod-making
+    /// `CREATE_ITEM` recipe — the exact case our old code substituted the product for — still
+    /// fronts the spell's own icon here, because `EffectItemType[0]` is never read anywhere in
+    /// `GetCraftIcon`'s extent. Craft and TradeSkill disagree on purpose.
+    #[test]
+    fn law_d_is_always_the_spells_own_icon_even_for_a_rod_recipe() {
+        let rod = SpellDisplay {
+            name: "Runed Copper Rod".into(),
+            icon: Some("SPELL".into()),
+            effects: [SPELL_EFFECT_CREATE_ITEM, 0, 0],
+            effect_item_type: [6218, 0, 0],
+            ..Default::default()
+        };
+        assert_eq!(craft_icon(&rod), Some("SPELL".into()));
+    }
+
+    /// A recipe with no `SpellIconID` row resolved is nil — the binding's `lua_pushnil` return.
+    /// There is no item arm to fall through to.
+    #[test]
+    fn law_d_is_nil_when_the_spell_carries_no_icon() {
+        let d = SpellDisplay {
+            effect_item_type: [6218, 0, 0],
+            ..Default::default()
+        };
+        assert_eq!(craft_icon(&d), None);
+    }
+    /// Law D's content twin. Three arms, and the point of each is that it differs from the
+    /// TRAINER's law on the same shape: this reads the recipe's OWN effect columns.
+    #[test]
+    fn craft_tooltip_reads_the_recipes_own_effects() {
+        // An enchant — no matching slot — describes the recipe spell itself.
+        let enchant = SpellDisplay {
+            effects: [SPELL_EFFECT_ENCHANT_ITEM, 0, 0],
+            ..Default::default()
+        };
+        assert_eq!(craft_tooltip(7420, &enchant), CraftTooltip::Spell(7420));
+
+        // A rod craft — CREATE_ITEM in slot 0 — describes the ITEM, off the SAME slot.
+        let rod = SpellDisplay {
+            effects: [SPELL_EFFECT_CREATE_ITEM, 0, 0],
+            effect_item_type: [6218, 0, 0],
+            ..Default::default()
+        };
+        assert_eq!(craft_tooltip(7421, &rod), CraftTooltip::Item(6218));
+
+        // A LEARN_SPELL slot hops — and, unlike the trainer's law, does NOT check that the trigger
+        // resolves. There is no catalog argument here at all, which is the difference made
+        // structural: a trigger id this client has never heard of is still what gets described.
+        let mut teacher = SpellDisplay::default();
+        teacher.effects[1] = SPELL_EFFECT_LEARN_SPELL;
+        teacher.effect_trigger_spell[1] = 999_999;
+        assert_eq!(craft_tooltip(5149, &teacher), CraftTooltip::Spell(999_999));
     }
 }

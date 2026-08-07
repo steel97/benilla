@@ -46,13 +46,19 @@ use crate::schedule::WorldStage;
 
 mod by_name;
 mod click;
-mod cursor_mode;
+// `pub(crate)` for the hover inspector's interact-gate line (`interact/inspect.rs`): the overlay
+// states the very predicate the cursor runs ([`cursor_mode::go_highlightable`]) rather than a
+// re-derivation of it, so the readout can never drift from the behaviour it is reporting on.
+pub(crate) mod cursor_mode;
 mod flash;
 mod highlight;
 mod hover;
 pub(crate) mod lock;
+mod relations;
 mod reticle;
-mod ring;
+// `pub(crate)` for the same reason as `cursor_mode`: the faction catalog is one of
+// [`cursor_mode::go_highlightable`]'s three inputs, so the inspector needs it to run the real gate.
+pub(crate) mod ring;
 mod scan;
 
 pub(crate) use cursor_mode::{CursorKind, WorldCursor, GO_TYPE_GENERIC, SERVICE_RANGE_SQ};
@@ -62,8 +68,11 @@ pub(crate) use lock::GO_FLAG_LOCKED;
 // nameplate colour gate (`crate::nameplates`), the flash's only two consumers (byte-verified).
 pub(crate) use flash::CombatFlash;
 // The action layer's "attack pressed with no target" request — the nearest-enemy auto-acquire
-// (`scan`) answers it with the same core TAB uses.
-pub(crate) use scan::{can_attack, AttackNearestRequest};
+// (`scan`) answers it with the same core TAB uses. `attack_order_target` + `EnemyScan` are that
+// same core called *synchronously*, by the pet bar's ATTACK arm: the pet's order has to leave in
+// the frame it was pressed carrying the acquired guid, so it cannot go round through a request.
+pub(crate) use relations::{can_assist, can_attack};
+pub(crate) use scan::{attack_order_target, AttackNearestRequest, EnemyScan};
 // The chat layer's by-name selection asks (`/target`, `/assist` — decision 0886), answered by the
 // shared resolver the reference parameterises per caller.
 pub(crate) use by_name::{AssistRequest, TargetByNameRequest};
@@ -240,7 +249,14 @@ impl Plugin for TargetPlugin {
                     crate::ui_action::targeting::commit_object_cast_on_click,
                     click::act_on_right_click,
                     click::clear_target_requests,
-                    click::target_unit_requests,
+                    // The two unit-token drains, grouped as one element (the outer chain is at
+                    // Bevy's 20-tuple limit): `TargetUnit`'s selection commit, and
+                    // `DropItemOnUnit`'s pet-leg feed (decision 1055). Independent of each other —
+                    // one writes `Selection`, the other sends a cast — so they need no order.
+                    (
+                        click::target_unit_requests,
+                        crate::ui_action::drop_item::drop_item_on_unit,
+                    ),
                     // The chat layer's by-name asks (decision 0886), beside the UI's token asks:
                     // both are non-mouse selection writers committing through `scan::commit`.
                     // The chat layer's by-name asks, grouped as one chained element (the outer

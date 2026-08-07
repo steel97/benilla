@@ -58,8 +58,10 @@ pub(super) fn drive_script(
     world_assets: Option<ResMut<WorldAssets>>,
     mut images: ResMut<Assets<Image>>,
     mut font_atlas: Option<ResMut<UiFontAtlas>>,
-    // The token -> off-screen-baked-face bridge a `SetPortraitTexture`-bound region samples.
-    portraits: Res<crate::portrait::PortraitImages>,
+    // Both directions of the booth seam: the token -> off-screen-baked-face bridge a
+    // `SetPortraitTexture`-bound region samples, and the pane geometry this pass publishes back
+    // for the booths' projection aspect + render gate (decision 1069).
+    mut booths: crate::portrait::BoothBridge,
     // Gates the held-cursor icon quad (decision 0216 §5): CAPTURE-ONLY, the same presence check
     // every other capture-only system uses (`ui_script::capture_ui_active`'s sibling pattern).
     capture: Option<Res<crate::capture::CaptureMode>>,
@@ -324,7 +326,7 @@ pub(super) fn drive_script(
     let settled = capture.is_none()
         && prev.dims == Some(dims)
         && text_ui == prev.text_ui
-        && portraits.0 == prev.portraits
+        && booths.images.0 == prev.portraits
         && extracted == prev.extracted;
     if settled {
         drop(extract_span);
@@ -358,8 +360,13 @@ pub(super) fn drive_script(
     }
     prev.dims = Some(dims);
     prev.text_ui = text_ui.clone();
-    prev.portraits = portraits.0.clone();
+    prev.portraits = booths.images.0.clone();
     prev.extracted = extracted.clone();
+    // This frame's booth panes, refilled by the loop below (decision 1069). Cleared only HERE, on
+    // the un-skipped path: a settled frame draws exactly what the last one did, so the map it left
+    // is still this frame's truth — clearing it above the gate would make every quiet frame put the
+    // body panes' cameras to sleep and freeze their animation.
+    booths.panes.0.clear();
     for eq in extracted {
         let Some(r) = eq.rect else { continue };
         // WoW UI space is y-up from the bottom-left in 768-virtual units; the quad pass is
@@ -419,7 +426,20 @@ pub(super) fn drive_script(
                 // booth yet) draws nothing rather than the run-splitter's white default.
                 if let Some(token) = &portrait_unit {
                     use crate::portrait::PortraitSource;
-                    let handle = match portraits.0.get(token) {
+                    // A **square** binding is a booth pane (`BenillaSetBoothTexture`, decision
+                    // 0208 §5), not a round unit portrait: publish the rect's aspect so the booth
+                    // can bake at the shape it will be stretched into, and know it is on screen at
+                    // all (decision 1069). Recorded before the readiness `continue` below — a pane
+                    // whose bake hasn't landed yet is still a pane being drawn. The region's rect
+                    // is the whole answer because no pane crops its bake; a pane that grew
+                    // `<TexCoords>` would have to fold that UV window in here too.
+                    if !circular && rect.height() > 0.0 {
+                        booths
+                            .panes
+                            .0
+                            .insert(token.clone(), rect.width() / rect.height());
+                    }
+                    let handle = match booths.images.0.get(token) {
                         Some(PortraitSource::Live(h)) => Some(h.clone()),
                         Some(PortraitSource::File(p)) => assets
                             .as_mut()
@@ -463,15 +483,36 @@ pub(super) fn drive_script(
                 }
                 // A portrait region samples the circular-masked variant so the square icon/model
                 // doesn't poke past the frame ring's thin band (SetPortraitToTexture, decision 0084).
-                let handle = path.as_deref().and_then(|p| {
-                    assets.as_mut().and_then(|a| {
-                        if circular {
+                //
+                // A path the archives don't have draws **nothing** — never a white slab. This arm
+                // used to fall through to `color.unwrap_or(WHITE)` with a `None` texture, which
+                // `ui_pass` renders as the shared 1×1 white image tinted white: an opaque white
+                // rectangle at the region's rect, which is how B221's macro icons reached the
+                // director's screen. wow-re settles what the reference does: `TextureCreate` does
+                // build an 8×8 placeholder, but `CSimpleTexture::SetTexture` (`0x770200`) checks the
+                // status severity and at ≥2 releases it and returns **without touching the widget's
+                // texture** — the widget keeps what it had, and Lua gets `nil`. Nothing goes white.
+                // We can't keep the *previous* art (a path is re-resolved per frame at extract, not
+                // latched at `SetTexture`), so the faithful-enough result is an empty cell; what
+                // matters is that it is never a phantom quad. The `Backdrop` and live-portrait arms
+                // already guard exactly this way.
+                //
+                // `assets` missing ENTIRELY is a data-less run (the headless UI tests), not a bad
+                // path — those keep the old behaviour rather than blanking every textured quad.
+                let handle = match (path.as_deref(), assets.as_mut()) {
+                    (Some(p), Some(a)) => {
+                        let resolved = if circular {
                             a.portrait_texture(p, &mut images)
                         } else {
                             a.sprite_texture(p, &mut images)
+                        };
+                        if resolved.is_none() {
+                            continue;
                         }
-                    })
-                });
+                        resolved
+                    }
+                    _ => None,
+                };
                 // A pathless Texture region is a solid color; a textured one tints by it.
                 let mut color = color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
                 color[3] *= eq.alpha;
@@ -799,6 +840,7 @@ mod clip_plumb_tests {
         app.init_resource::<UiQuads>();
         app.init_resource::<Assets<Image>>();
         app.init_resource::<PortraitImages>();
+        app.init_resource::<crate::portrait::BoothPanes>();
         app.init_resource::<crate::minimap::MinimapWidget>();
         app.init_resource::<crate::hover_log::UiFrameCost>();
         app.init_resource::<Time>();
@@ -882,6 +924,7 @@ mod clip_plumb_tests {
         app.init_resource::<UiQuads>();
         app.init_resource::<Assets<Image>>();
         app.init_resource::<PortraitImages>();
+        app.init_resource::<crate::portrait::BoothPanes>();
         app.init_resource::<crate::minimap::MinimapWidget>();
         app.init_resource::<crate::hover_log::UiFrameCost>();
         app.init_resource::<Time>();
@@ -938,6 +981,7 @@ mod extract_gate_tests {
         app.init_resource::<UiQuads>();
         app.init_resource::<Assets<Image>>();
         app.init_resource::<PortraitImages>();
+        app.init_resource::<crate::portrait::BoothPanes>();
         app.init_resource::<crate::minimap::MinimapWidget>();
         app.init_resource::<crate::hover_log::UiFrameCost>();
         app.init_resource::<Time>();

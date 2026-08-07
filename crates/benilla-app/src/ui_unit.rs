@@ -97,6 +97,15 @@ struct UnitFeedState {
     /// The last `(PLAYER_XP, PLAYER_NEXT_LEVEL_XP)` pair pushed, for the `PLAYER_XP_UPDATE` trigger —
     /// the XP bar's feed is a player-global (like coinage), not a per-unit-token field.
     last_xp: Option<(u32, u32)>,
+    /// The last `(restState, restPool, PLAYER_FLAGS)` triple pushed, for the `UPDATE_EXHAUSTION`
+    /// and `PLAYER_UPDATE_RESTING` triggers — player-globals like the XP pair (decisions
+    /// 1082/1087). The whole flags dword, not just the resting bit: the client's `0x5ee990`
+    /// fires `PLAYER_UPDATE_RESTING` on any PLAYER_FLAGS delta. Pushed as one snapshot so
+    /// `GetRestState`/`GetXPExhaustion`/`IsResting` never read it half-updated.
+    last_rest: Option<(u8, u32, u32)>,
+    /// Our avatar's last-seen `UNIT_FIELD_LEVEL`, for the `PLAYER_LEVEL_UP` trigger (decision
+    /// 1094). `None` until first seen — the first sighting is the login descriptor, not a ding.
+    last_level: Option<u32>,
     /// The last `(count, banked-target guid)` pair pushed, for the `PLAYER_COMBO_POINTS` trigger —
     /// player-globals (`PLAYER_FIELD_BYTES` byte 1 + `PLAYER_FIELD_COMBO_TARGET`), not per-unit-
     /// token fields. Diffed as a pair because the server writes them as one (decision 0875).
@@ -139,7 +148,37 @@ impl Plugin for UiUnitPlugin {
                 .in_set(UnitFeed)
                 .before(UiInput),
         )
-        .add_systems(Update, drain_pvp_toggles.after(UiInput));
+        .add_systems(Update, drain_pvp_toggles.after(UiInput))
+        .add_systems(PostStartup, load_exhaustion_rows);
+    }
+}
+
+/// Seed the VM's Exhaustion.dbc table once at startup — the rest bindings' data
+/// ([`benilla_ui::script::UiScript::set_exhaustion_rows`]; the ui_macro icon-catalog shape).
+/// A failed load keeps the model's shipped-table fallback, so the rest surface still behaves
+/// like the shipped enUS client rather than going dark.
+fn load_exhaustion_rows(
+    script: Option<NonSendMut<UiScript>>,
+    assets: Option<Res<crate::assets::WorldAssets>>,
+) {
+    let (Some(mut script), Some(assets)) = (script, assets) else {
+        return;
+    };
+    let loaded = {
+        use crate::assets::LockRecover;
+        let mut chain = assets.chain.lock_recover();
+        benilla_formats::load_exhaustion(&mut chain)
+    };
+    match loaded {
+        Ok(rows) => {
+            info!("ui_unit: {} Exhaustion.dbc rest states", rows.len());
+            script.set_exhaustion_rows(
+                rows.into_iter()
+                    .map(|r| (r.id as u8, r.name, f64::from(r.factor)))
+                    .collect(),
+            );
+        }
+        Err(e) => error!("ui_unit: Exhaustion.dbc failed — shipped-table fallback holds: {e:#}"),
     }
 }
 
@@ -334,13 +373,24 @@ pub(crate) fn snapshot(store: &ObjectStore, name: Option<String>, reaction: u8) 
     UnitState {
         exists: true,
         name,
-        health: store.0.unit_health().unwrap_or(0),
+        // The UI-facing health/power getters, not the raw fields (decision 1022): a unit carrying
+        // `UNIT_DYNFLAG_DEAD` — a feigning hunter — answers 0 to `UnitHealth 0x5174d0` and
+        // `UnitMana 0x517670`, while the *max* getters stay ungated, so its bars read 0/max (empty)
+        // for itself and for everyone watching. The zeroes ride the ordinary per-field diff in
+        // [`fire_transitions`], which fires `UNIT_HEALTH` + the power event on the flag's edge —
+        // exactly the pair the reference's `UNIT_DYNAMIC_FLAGS` watcher fires there
+        // (`0x6004c5`/`0x6004f0`, event `0x10` and `0x11 + powerType`). The power pair also carries
+        // the raw→display divide the same two getters do (decision 1034) — rage rides the wire ×10
+        // and pet happiness ×1000, so these are the numbers the reference shows, not the wire's.
+        health: store.0.unit_shown_health().unwrap_or(0),
         max_health: store.0.unit_max_health().unwrap_or(0),
         level: store.0.unit_level().unwrap_or(0),
         power_type,
-        power: store.0.unit_power(power_type).unwrap_or(0),
-        max_power: store.0.unit_max_power(power_type).unwrap_or(0),
-        dead: store.0.unit_is_dead(),
+        power: store.0.unit_shown_power(power_type).unwrap_or(0),
+        max_power: store.0.unit_shown_max_power(power_type).unwrap_or(0),
+        // `UnitIsDead 0x517ac0` — health ≤ 0 **or** the dead-looking flag, so a feigning unit is
+        // dead to the API, to the target frame's DEAD text and to the greyed portrait alike.
+        dead: store.0.unit_reads_dead(),
         // The released-ghost predicate (decision 0308 §1): PLAYER_FLAGS bit 0x10 — a ghost's
         // health is 1, so `dead` above is false for it. Zero/absent on creatures.
         ghost: store.0.player_is_ghost(),
@@ -444,6 +494,10 @@ fn drain_pvp_toggles(script: Option<NonSendMut<UiScript>>, commands: Res<NetComm
 /// the icon draws: the preference clears instantly, the flag lingers for the server's timer.
 const PLAYER_FLAGS_PVP_DESIRED: u32 = 0x200;
 
+/// `PLAYER_FLAGS_RESTING` — inside a rest area now (vmangos `Player.h:320`); the bit
+/// `IsResting 0x516ea0` tests (`shr 5; test 1` — wow-re rested-xp-bindings.md §3).
+const PLAYER_FLAGS_RESTING: u32 = 0x20;
+
 /// The PvP-preference announcement rule (decision 0652): `(toast, verbose)` on a real change of the
 /// bit, `None` otherwise.
 ///
@@ -467,6 +521,27 @@ fn pvp_announcement(was: Option<bool>, now: bool) -> Option<(&'static str, &'sta
             "You will be unflagged for PvP combat after five minutes of non-PvP action in friendly territory.",
         )
     })
+}
+
+/// The rest-state chat line (decision 1098; wow-re rested-xp-bindings.md §§6-10, byte-verified
+/// §5): the rest-state BYTE watcher `0x5de4e0` messages only on a real old≠new transition (the
+/// dispatcher's `rep cmpsb` mirror diff at `0x4655bb`), through the hard-coded 3×2 pair table
+/// `0x80af50` — state 1 → `ERR_EXHAUSTION_RESTED`, state 2 → `ERR_EXHAUSTION_NORMAL`, state 0 →
+/// the table's deliberate no-message sentinel (id 0x1d1), states ≥ 3 gated off before the table
+/// (`cmp esi,3; jae`), so the beta tiers never speak even though their strings ship. The line is
+/// a plain yellow SYSTEM chat message (`CHAT_MSG_SYSTEM`) — never UIErrorsFrame, no sound.
+/// enUS literals like every app-side chat line (`level_up_lines`' shape); the keys above are the
+/// GlobalStrings homes. Entering rested also arms a one-shot tutorial popup (id 0x19) — the
+/// tutorial system isn't built, a named cut.
+fn rest_state_message(prev: u8, new: u8) -> Option<&'static str> {
+    if prev == new {
+        return None;
+    }
+    match new {
+        1 => Some("You feel rested."),
+        2 => Some("You feel normal."),
+        _ => None,
+    }
 }
 
 /// A unit's PvP faction group — `UnitFactionGroup`'s pair, as the icon law reads it (decision
@@ -646,10 +721,113 @@ fn feed_units(
     script.set_unit("player", player.clone());
     script.set_unit("target", target.clone());
 
-    // Initial pull: fire PLAYER_ENTERING_WORLD once so frames do their first paint on their own.
-    if !feed.entered_world {
-        script.fire_event("PLAYER_ENTERING_WORLD", vec![]);
-        feed.entered_world = true;
+    // The XP bar's feed: push our own avatar's PLAYER_XP / PLAYER_NEXT_LEVEL_XP (both PRIVATE, only
+    // ever streamed for self) and fire PLAYER_XP_UPDATE when either changes — the coinage feed's
+    // shape. Absent fields read 0 (a fresh descriptor's zero default; the bar shows empty until XP
+    // streams in). BEFORE the PLAYER_ENTERING_WORLD fire below, so the first paint reads real
+    // values (1087 — the tick's handler divides by UnitXPMax).
+    if let Some((store, _)) = self_q.iter().next() {
+        let xp = store.0.player_xp().unwrap_or(0);
+        let next = store.0.player_next_level_xp().unwrap_or(0);
+        if feed.last_xp != Some((xp, next)) {
+            feed.last_xp = Some((xp, next));
+            script.set_player_xp(xp, next);
+            script.fire_event("PLAYER_XP_UPDATE", vec![]);
+        }
+    }
+
+    // The rest feed (decisions 1082/1087): the `PLAYER_BYTES_2` rest-state byte, the
+    // `PLAYER_REST_STATE_EXPERIENCE` pool and PLAYER_FLAGS, pushed as one snapshot. Two watches,
+    // the byte-verified grain (wow-re rested-xp-bindings.md §5): `UPDATE_EXHAUSTION` on a
+    // state-or-pool change (the client installs a watcher on each — `0x5de4e0` on the byte,
+    // `0x5de4b0` on the pool field), `PLAYER_UPDATE_RESTING` on **any PLAYER_FLAGS delta**
+    // (`0x5ee990` fires it beside PLAYER_FLAGS_CHANGED without testing which bit moved — the
+    // resting bit is just its loudest consumer). Runs before the PLAYER_ENTERING_WORLD fire
+    // below, like the XP push: in the real client the descriptor always lands before that
+    // event, so the first paint reads real state — the model's byte-2 default (its doc) is the
+    // backstop, this ordering is the guarantee itself.
+    if let Some((store, _)) = self_q.iter().next() {
+        let rest = (
+            store.0.player_rest_state().unwrap_or(0),
+            store.0.player_rest_state_experience().unwrap_or(0),
+            store.0.player_flags(),
+        );
+        if feed.last_rest != Some(rest) {
+            let prev = feed.last_rest;
+            feed.last_rest = Some(rest);
+            script.set_rest_state(rest.0, rest.1, rest.2 & PLAYER_FLAGS_RESTING != 0);
+            if prev.map(|p| (p.0, p.1)) != Some((rest.0, rest.1)) {
+                script.fire_event("UPDATE_EXHAUSTION", vec![]);
+            }
+            // "You feel rested." / "You feel normal." (decision 1098): the BYTE watcher alone
+            // messages, and only on a real transition — `prev` None is the login descriptor,
+            // which the real client's fresh-CREATE path never runs through the notify pass
+            // (byte-verified: login is structurally silent). The pool watcher never messages.
+            if let Some(p) = prev {
+                if let Some(text) = rest_state_message(p.0, rest.0) {
+                    chat.push_event(ChatEvent::text_only(
+                        ChatEventKind::System,
+                        text.to_string(),
+                    ));
+                }
+            }
+            if prev.map(|p| p.2) != Some(rest.2) {
+                script.fire_event("PLAYER_UPDATE_RESTING", vec![]);
+            }
+        }
+    }
+
+    // The ding feed: `PLAYER_LEVEL_UP` (arg1 = the new level) when our avatar's
+    // `UNIT_FIELD_LEVEL` CHANGES — the event the exhaustion tick (1082) and the max-level rail
+    // (1094) register; it was a dead registration until 1094. Any change, not only a rise:
+    // vmangos `GiveLevel` runs for demotions too (a GM `.character level` down) and sends
+    // `SMSG_LEVELUP_INFO` unconditionally, so the real client hears every change — 1094's
+    // rise-only guard left the rail latched shown after a 60→1 demote (the 1106 live repro).
+    // Trigger PROVISIONAL (0578's pattern): fired off the descriptor diff, which lands in the
+    // same update batch as the ding's XP fields, so consumers read a coherent picture. The
+    // real client plausibly fires it from its `SMSG_LEVELUP_INFO` handler instead, with the
+    // packet's gain tuple as arg2+ — unpinned, and no 1.12 FrameXML consumer reads past arg1
+    // (`ReputationWatchBar_Update` takes arg1; the tick's handler takes none), so the extra
+    // args wait for a consumer.
+    if let Some((store, _)) = self_q.iter().next() {
+        if let Some(level) = store.0.unit_level() {
+            let prev = feed.last_level.replace(level);
+            if prev.is_some_and(|p| level != p) {
+                script.fire_event("PLAYER_LEVEL_UP", vec![ScriptValue::Int(i64::from(level))]);
+            }
+        }
+    }
+
+    // Initial pull: fire PLAYER_ENTERING_WORLD once PER WORLD ENTRY so frames do their first
+    // paint on their own — gated on our avatar's descriptor EXISTING. 1087 stated the real
+    // client's guarantee (the player object lands before this event) and moved the XP/rest
+    // pushes above the fire, but the fire itself still went out on frame 1, seconds before
+    // login: every one-shot first-paint read empty state, and only consumers with their own
+    // diff events recovered. The 1094 live probe caught the one that couldn't — a level-60
+    // login read UnitLevel()=0 at the fire and kept the XP strip. With the gate the guarantee
+    // is structural for every consumer.
+    //
+    // The absent arm is the world-EXIT edge (logout / char switch — the self entity despawns
+    // with the streamed world): the real client fires this event on *every* world entry (it
+    // tears the whole UI down between them; the once-per-process frame tree is our documented
+    // interim, `IngameUiLoaded`), so re-arm the fire and forget the player-global diff
+    // memories. Forgetting them makes every next-login first sighting re-seed SILENTLY — the
+    // byte-verified fresh-CREATE notify silence (1098 §4), now holding per entry: without it a
+    // 60→1 char switch latched the max-level rail shown over a level-1 body (1106's live
+    // repro), and a normal→rested char switch would misfire "You feel rested." at login.
+    if self_pair.is_some() {
+        if !feed.entered_world {
+            script.fire_event("PLAYER_ENTERING_WORLD", vec![]);
+            feed.entered_world = true;
+        }
+    } else if feed.entered_world {
+        feed.entered_world = false;
+        feed.last_xp = None;
+        feed.last_rest = None;
+        feed.last_level = None;
+        feed.last_combo = None;
+        feed.in_combat = None;
+        feed.pvp_desired = None;
     }
 
     for (token, snap) in [("player", &player), ("target", &target)] {
@@ -714,20 +892,6 @@ fn feed_units(
             ));
         }
         feed.pvp_desired = Some(desired);
-    }
-
-    // The XP bar's feed: push our own avatar's PLAYER_XP / PLAYER_NEXT_LEVEL_XP (both PRIVATE, only
-    // ever streamed for self) and fire PLAYER_XP_UPDATE when either changes — the coinage feed's
-    // shape. Absent fields read 0 (a fresh descriptor's zero default; the bar shows empty until XP
-    // streams in).
-    if let Some((store, _)) = self_q.iter().next() {
-        let xp = store.0.player_xp().unwrap_or(0);
-        let next = store.0.player_next_level_xp().unwrap_or(0);
-        if feed.last_xp != Some((xp, next)) {
-            feed.last_xp = Some((xp, next));
-            script.set_player_xp(xp, next);
-            script.fire_event("PLAYER_XP_UPDATE", vec![]);
-        }
     }
 
     // The combo-point feed: `PLAYER_FIELD_BYTES` byte 1 and the `PLAYER_FIELD_COMBO_TARGET` GUID
@@ -806,6 +970,72 @@ mod tests {
         );
     }
 
+    /// **A feigning hunter's frame reads as a corpse's** (decision 1022) — the symptom the whole
+    /// change exists for: the wire says nothing but `UNIT_DYNFLAG_DEAD`, and the snapshot has to
+    /// turn that into empty bars against a real maximum plus `UnitIsDead`. Asserted through
+    /// `snapshot` rather than the field getters (which have their own byte-law test) because what
+    /// can regress here is the *wiring* — a future edit reaching for `unit_health` again.
+    #[test]
+    fn a_feigning_unit_snapshots_empty_bars_over_a_real_maximum() {
+        use benilla_protocol::messages::ObjectFields;
+
+        /// `UNIT_FIELD_HEALTH` / `MAXHEALTH` / `POWER1` / `MAXPOWER1` / `DYNAMIC_FLAGS`.
+        const HEALTH: u16 = 22;
+        const POWER1: u16 = 23;
+        const MAXHEALTH: u16 = 28;
+        const MAXPOWER1: u16 = 29;
+        const DYNFLAGS: u16 = 143;
+
+        let vitals = [
+            (HEALTH, 1200),
+            (MAXHEALTH, 1500),
+            (POWER1, 300),
+            (MAXPOWER1, 900),
+        ];
+        let alive = snapshot(
+            &ObjectStore(ObjectFields::from_pairs(&vitals)),
+            Some("Hunter".into()),
+            0,
+        );
+        assert_eq!((alive.health, alive.max_health), (1200, 1500));
+        assert_eq!((alive.power, alive.max_power), (300, 900));
+        assert!(!alive.dead);
+
+        let feigning = snapshot(
+            &ObjectStore(ObjectFields::from_pairs(
+                &[vitals.as_slice(), &[(DYNFLAGS, 0x20)]].concat(),
+            )),
+            Some("Hunter".into()),
+            0,
+        );
+        assert_eq!(
+            (feigning.health, feigning.max_health),
+            (0, 1500),
+            "UnitHealth 0x5174d0 zeroes, UnitHealthMax 0x5175b0 does not — an EMPTY bar, not a gone one"
+        );
+        assert_eq!(
+            (feigning.power, feigning.max_power),
+            (0, 900),
+            "UnitMana 0x517670 zeroes, UnitManaMax 0x5177e0 does not"
+        );
+        assert!(feigning.dead, "UnitIsDead 0x517ac0's dynflag leg");
+        assert!(
+            !feigning.ghost,
+            "feign is not a ghost — PLAYER_FLAGS is clear"
+        );
+
+        // …and the flag moves the two fields [`fire_transitions`] diffs, so the edge announces
+        // itself as `UNIT_HEALTH` + the power event — the very pair the reference's own dynamic-
+        // flags watcher fires there (`0x6004c5`, `0x6004f0`). Nothing else about the unit moved,
+        // which is why routing the flag through the getters is enough: no extra watcher needed.
+        assert_ne!(alive.health, feigning.health);
+        assert_ne!(alive.power, feigning.power);
+        assert_eq!(
+            (alive.max_health, alive.max_power, alive.level),
+            (feigning.max_health, feigning.max_power, feigning.level),
+        );
+    }
+
     /// The rank getter's two gates (`0x605620`, decision 0782) as they reach a snapshot. The pet
     /// gate is the interesting half: a charmed or enslaved elite reports rank 0, so it loses its
     /// dragon border AND its ELITE tooltip word AND (at rank 3) its world-boss skull together.
@@ -827,6 +1057,7 @@ mod tests {
                 name: "Ol' Sooty".into(),
                 subname: None,
                 creature_type: 1,
+                pet_family: 4, // Bear — a real tameable family, so the record is a plausible one
                 rank: 1,
                 type_flags: 0,
                 civilian: false,
@@ -888,5 +1119,37 @@ mod tests {
             verbose.contains("five minutes"),
             "the OFF sentence is what tells the player the flag lingers: {verbose}"
         );
+    }
+
+    /// The rest-state chat law (decision 1098, wow-re §§6-10): a message needs a real byte
+    /// TRANSITION, and only states 1/2 speak — state 0 is the pair table's no-message sentinel,
+    /// the beta tiers (≥3) are gated off before the table, and a re-send of the same byte is
+    /// swallowed by the dispatcher's mirror diff.
+    #[test]
+    fn rest_state_message_speaks_only_on_a_real_transition() {
+        assert_eq!(rest_state_message(2, 1), Some("You feel rested."));
+        assert_eq!(rest_state_message(1, 2), Some("You feel normal."));
+        assert_eq!(
+            rest_state_message(0, 1),
+            Some("You feel rested."),
+            "0→1 IS a transition"
+        );
+        assert_eq!(
+            rest_state_message(1, 1),
+            None,
+            "same byte re-sent — the mirror diff eats it"
+        );
+        assert_eq!(rest_state_message(2, 2), None);
+        assert_eq!(
+            rest_state_message(1, 0),
+            None,
+            "state 0 is the 0x1d1 sentinel: no message"
+        );
+        assert_eq!(
+            rest_state_message(2, 3),
+            None,
+            "beta tiers are gated off (cmp esi,3; jae)"
+        );
+        assert_eq!(rest_state_message(1, 5), None);
     }
 }

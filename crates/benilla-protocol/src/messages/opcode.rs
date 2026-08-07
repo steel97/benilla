@@ -23,6 +23,15 @@ pub const SMSG_GAMEOBJECT_QUERY_RESPONSE: u16 = 0x005F; // 95
 /// VERIFIED vmangos `Opcodes_1_12_1.h`: 93. Answers `CMSG_QUEST_QUERY`; body in
 /// [`super::quest::read_quest_query_response`] ([`super::QuestTemplate`]).
 pub const SMSG_QUEST_QUERY_RESPONSE: u16 = 0x005D; // 93
+
+// The **page-text** query pair (VERIFIED vmangos `Opcodes_1_12_1.h`: 90/91) — the ask-once cache
+// behind every readable BOOK, and a different one from the mail letter's `CMSG_ITEM_TEXT_QUERY`
+// further down: a `PageText.wdb` id names one *page*, chained by `nextPageId`, and it is what a
+// readable item TEMPLATE (`PageText`) and a world book/plaque GameObject (`GAMEOBJECT_TYPE_TEXT`'s
+// `data[0]`) both read from. Bodies in [`super::page_text`]; decision 1105.
+pub const CMSG_PAGE_TEXT_QUERY: u16 = 0x005A; // 90
+pub const SMSG_PAGE_TEXT_QUERY_RESPONSE: u16 = 0x005B; // 91
+
 pub const SMSG_NEW_WORLD: u16 = 0x003E;
 // The far-teleport preamble pair (VERIFIED vmangos `Opcodes_1_12_1.h`: 63/64). TRANSFER_PENDING's
 // optional transport block decides how NEW_WORLD's coordinates read — boat-local when present,
@@ -256,6 +265,29 @@ pub const CMSG_PET_STOP_ATTACK: u16 = 0x02EA; // 746
 /// whose aura to drop.
 pub const CMSG_PET_CANCEL_AURA: u16 = 0x026B; // 619
 
+// The pet right-click menu's two outbound verbs (decision 1066; VERIFIED vmangos
+// `Opcodes_1_12_1.h`: 374/375). Bodies in [`super::pet`].
+/// **Give the pet up permanently** — the right-click menu's Abandon row, and `PetAbandon
+/// 0x4be4c0`'s only packet (wow-re `ui/scratch/pet-action-bar-api.md` §11c, `push 0x176`
+/// @`0x4bd765`). `HandlePetAbandon` deletes a hunter pet (`PET_SAVE_AS_DELETED`) and merely
+/// unsummons anything else (`PET_SAVE_NOT_IN_SLOT`, `PetHandler.cpp:347-374`).
+///
+/// The menu's **Dismiss** row is NOT this opcode, which is worth stating because the two would be
+/// indistinguishable in play: `PetDismiss 0x4be4d0` opens no packet at all and hands the packed
+/// word `0x07000003` to the pet bar's own dispatcher, so it leaves as [`CMSG_PET_ACTION`].
+pub const CMSG_PET_ABANDON: u16 = 0x0176; // 374
+/// Rename the pet — `PetRename 0x4be4e0` → `0x4bd840` (`push 0x177` @`0x4bd8fe`). Gated server-side
+/// on `UNIT_FLAG_PET_RENAME` and **one-shot**: the handler clears that bit on success, so the row
+/// disappears after the first rename (`PetHandler.cpp:302-345`). Nothing client-side clears it —
+/// wow-re's census found no writer of that byte anywhere in `.text`.
+///
+/// A refused name answers with `SMSG_PET_NAME_INVALID` (0x178), which is **not modelled** and does
+/// not need to be: vmangos sends it with an empty body — `SendPetNameInvalid` drops both the reason
+/// code and the name with the comment "not read by vanilla client" (`PetHandler.cpp:542-548`) — and
+/// the shipped 1.12 `FrameXML` has no event and no string for it. It lands in `ServerPacket::Other`
+/// under its own name, which is the whole of what there is to do with it.
+pub const CMSG_PET_RENAME: u16 = 0x0177; // 375
+
 /// VERIFIED vmangos `Opcodes_1_12_1.h`: 94 (decision 0236). Body in
 /// [`super::gameobject::gameobject_query`] — the ask-once GO template lookup, identical shape to
 /// `CMSG_CREATURE_QUERY`.
@@ -274,6 +306,13 @@ pub const CMSG_OPEN_ITEM: u16 = 0x00AC; // 172
 /// GameObject to use (decision 0236). Not interchangeable with `CMSG_LOOT`: the server rejects a
 /// GameObject guid on `CMSG_LOOT`, so a chest opens its loot through this opcode.
 pub const CMSG_GAMEOBJ_USE: u16 = 0x00B1; // 177
+/// A GameObject plays a one-shot **custom** animation (VERIFIED vmangos `Opcodes_1_12_1.h`: 179;
+/// body in [`super::read_gameobject_custom_anim`] — `u64 guid + u32 animId`, from
+/// `GameObject::SendGameObjectCustomAnim`). The client arms GO substate `8 + animId`
+/// (Custom0..3, AnimationData ids 153..156), rejecting `animId >= 4` — wow-re
+/// `gameobject-anim-arm.md` §"one-shot channel" step 8. The load-bearing sender: the fishing
+/// bobber's bite (`animId 0` — the splash; decision 1086).
+pub const SMSG_GAMEOBJECT_CUSTOM_ANIM: u16 = 0x00B3; // 179
 /// VERIFIED vmangos `Opcodes_1_12_1.h:183`: 180 — and the reference writes this literal
 /// (`0x5e2110`, its area-trigger check, builds `0xb4` + the trigger id). Body in
 /// [`super::area_trigger`]: the `AreaTrigger.dbc` id the player just walked into.
@@ -320,6 +359,15 @@ pub const SMSG_CHAT_PLAYER_NOT_FOUND: u16 = 0x02A9; // 681
 /// A cross-faction whisper was refused (VERIFIED vmangos `Opcodes_1_12_1.h`: 537); empty body
 /// (`WorldPackets::Chat::ChatWrongFaction::AppendBodyTo`, `Server/Packets/Chat.cpp:16-18`).
 pub const SMSG_CHAT_WRONG_FACTION: u16 = 0x0219; // 537
+/// The fishing channel ended with nothing on the hook (VERIFIED vmangos `Opcodes_1_12_1.h`: 456;
+/// empty body — `GameObject::Update`'s bobber-expiry arm and `Use(FISHINGNODE)`'s
+/// clicked-too-early arm both send size 0). The red `ERR_FISH_NOT_HOOKED` toast — "No fish are
+/// hooked." (decision 1086).
+pub const SMSG_FISH_NOT_HOOKED: u16 = 0x01C8; // 456
+/// The hooked fish got away — the fishing-skill roll failed on the click (VERIFIED vmangos
+/// `Opcodes_1_12_1.h`: 457; empty body — `GameObject::Use`'s FISHINGNODE failure arm). The red
+/// `ERR_FISH_ESCAPED` toast — "Your fish got away!" (decision 1086).
+pub const SMSG_FISH_ESCAPED: u16 = 0x01C9; // 457
 /// A server notice the real client flashes in the red UIErrorsFrame (VERIFIED vmangos
 /// `Opcodes_1_12_1.h`: 459): one cstring (`WorldSession::SendNotification`,
 /// `Server/WorldSession.cpp:900-915`) — "You do not know that language", trade refusals, and kin.

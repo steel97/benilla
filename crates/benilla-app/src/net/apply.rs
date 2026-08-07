@@ -183,6 +183,9 @@ pub(super) fn apply_net_updates(
             // through the VM's own GlobalStrings by `ui_action::feed_actions`).
             ResMut<crate::ui_pet::PetBar>,
             ResMut<crate::ui_action::UiErrorKeys>,
+            // The ask-once book-page cache (decision 1105) — every readable's text, keyed by
+            // `PageText` id; the reader session repaints off it.
+            ResMut<crate::ui_item_text::PageTexts>,
         ),
     ),
     // One tuple param (the 16-SystemParam ceiling again): the action-bar- + merchant-facing errors
@@ -254,6 +257,9 @@ pub(super) fn apply_net_updates(
             MessageWriter<crate::ui_unit::UnitCombatFeedback>,
             MessageWriter<crate::ui_unit::CombatTextEvent>,
             MessageWriter<crate::creature_anim::SheathRequest>,
+            // The GO one-shot Custom play (`SMSG_GAMEOBJECT_CUSTOM_ANIM` — the bobber's bite
+            // splash, decision 1086), the step-8 sibling of the `GoLidOpen` writer above.
+            MessageWriter<crate::go_anim::GoCustomAnim>,
         ),
     ),
     // The aura feed's duration side-table + the clock to stamp arrivals (decisions 0255/0257): the
@@ -326,6 +332,7 @@ pub(super) fn apply_net_updates(
             mut mirror_timers,
             mut pet_bar,
             mut ui_error_keys,
+            mut page_texts,
         ),
     ) = caches;
     let (
@@ -610,6 +617,7 @@ pub(super) fn apply_net_updates(
                 name,
                 subname,
                 creature_type,
+                pet_family,
                 rank,
                 type_flags,
                 civilian,
@@ -619,6 +627,7 @@ pub(super) fn apply_net_updates(
                 name,
                 subname,
                 creature_type,
+                pet_family,
                 rank,
                 type_flags,
                 civilian,
@@ -634,6 +643,11 @@ pub(super) fn apply_net_updates(
             } => {
                 objects::gameobject_info(entry, type_id, display_id, name, &data, &mut go_templates)
             }
+            SessionEvent::GameObjectCustomAnim { guid, anim_id } => {
+                objects::gameobject_custom_anim(guid, anim_id, &mut audio.15 .3)
+            }
+            SessionEvent::FishNotHooked => loot::fish_verdict(false, &mut ui_error_keys),
+            SessionEvent::FishEscaped => loot::fish_verdict(true, &mut ui_error_keys),
             SessionEvent::PlaySound { sound_id } => world::play_sound(sound_id, &mut audio.0),
             SessionEvent::PlayMusic { music_id } => world::play_music(music_id, &mut audio.0),
             SessionEvent::PlayObjectSound { sound_id, guid } => {
@@ -1038,6 +1052,7 @@ pub(super) fn apply_net_updates(
                     ui_actions.11.as_deref(),
                     &mut items,
                     &net_commands,
+                    &mut pet_bar,
                 ),
                 play_seq.next(),
             ),
@@ -1305,6 +1320,13 @@ pub(super) fn apply_net_updates(
             SessionEvent::MailItemText { text_id, text } => {
                 mail::mail_item_text(text_id, text, &mut mail_open)
             }
+            // The book-page cache (decision 1105) — one page per packet, the whole chain in
+            // answer to the first ask; the reader repaints off it on the next feed.
+            SessionEvent::PageText {
+                page_id,
+                text,
+                next_page_id,
+            } => page_texts.insert(page_id, text, next_page_id),
             SessionEvent::ReceivedMail { seconds } => {
                 mail::received_mail(seconds, &mut mail_pending, &mail_open, &net_commands)
             }

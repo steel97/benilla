@@ -90,7 +90,10 @@ fn real_spell_catalog_reads_ranged_attributes() {
     // the client's own melee-substitution trigger (decision 0231); an ordinary spell doesn't.
     // A column slip on Effect[0] fails here.
     let attack = cat.get(6603).expect("Attack");
-    assert_eq!(attack.effect_1, 78, "6603 Effect[0] == SPELL_EFFECT_ATTACK");
+    assert_eq!(
+        attack.effects[0], 78,
+        "6603 Effect[0] == SPELL_EFFECT_ATTACK"
+    );
     assert!(attack.is_melee_auto_attack());
     assert!(!fireball.is_melee_auto_attack());
     assert!(
@@ -307,20 +310,23 @@ fn real_spell_catalog_pins_the_skin_latch_effects() {
 
     // Skinning (8613) — `0x4b2623: cmp [esi+0xf4], 0x5f`.
     assert_eq!(
-        cat.get(8613).unwrap().effect_1,
+        cat.get(8613).unwrap().effects[0],
         crate::SPELL_EFFECT_SKINNING,
         "Skinning carries SPELL_EFFECT_SKINNING (95 == 0x5f)"
     );
     // Remove Insignia (22027) — the `[0xb700e8]` half, `0x4b2632: cmp [esi+0xf4], 0x74`.
     assert_eq!(
-        cat.get(22027).unwrap().effect_1,
+        cat.get(22027).unwrap().effects[0],
         0x74,
         "Remove Insignia carries SPELL_EFFECT_SKIN_PLAYER_CORPSE (116 == 0x74)"
     );
     // Nothing an ordinary caster starts with does — the latch stays empty for a non-skinner.
-    assert_ne!(cat.get(133).unwrap().effect_1, crate::SPELL_EFFECT_SKINNING);
     assert_ne!(
-        cat.get(6247).unwrap().effect_1,
+        cat.get(133).unwrap().effects[0],
+        crate::SPELL_EFFECT_SKINNING
+    );
+    assert_ne!(
+        cat.get(6247).unwrap().effects[0],
         crate::SPELL_EFFECT_SKINNING
     );
 }
@@ -791,7 +797,7 @@ fn real_crafting_columns_read_created_item_and_focus() {
     ] {
         let d = cat.get(spell).expect("recipe in the catalog");
         assert_eq!(
-            d.effect_1, SPELL_EFFECT_CREATE_ITEM,
+            d.effects[0], SPELL_EFFECT_CREATE_ITEM,
             "spell {spell} creates"
         );
         assert_eq!(d.effect_item_type[0], item, "spell {spell} created item");
@@ -806,7 +812,7 @@ fn real_crafting_columns_read_created_item_and_focus() {
     // The openers carry effect 47 and no product: Tailoring 3908, Enchanting 7411.
     for opener in [3908u32, 7411] {
         let d = cat.get(opener).expect("opener in the catalog");
-        assert_eq!(d.effect_1, SPELL_EFFECT_TRADE_SKILL, "opener {opener}");
+        assert_eq!(d.effects[0], SPELL_EFFECT_TRADE_SKILL, "opener {opener}");
         assert_eq!(
             d.effect_item_type, [0; 3],
             "opener {opener} creates nothing"
@@ -828,14 +834,14 @@ fn the_tooltip_gates_read_effect_and_mask() {
     assert!(attribute_passive.tooltip_omits_cast_line());
     // 6603 "Attack"'s shape: Effect[0] = 78, attributes 0x10 (NOT the passive bit).
     let auto_attack = SpellDisplay {
-        effect_1: 78,
+        effects: [78, 0, 0],
         attributes: 0x10,
         ..Default::default()
     };
     assert!(!auto_attack.passive, "the attribute bit is clear");
     assert!(auto_attack.tooltip_omits_cast_line(), "the Effect[0] leg");
     let trade_skill = SpellDisplay {
-        effect_1: 47,
+        effects: [47, 0, 0],
         ..Default::default()
     };
     assert!(trade_skill.tooltip_omits_cast_line());
@@ -948,7 +954,7 @@ fn real_item_target_family_and_its_gate_columns() {
     // (`0x495d60`'s loop, `495de4`–`496050`); [`SpellDisplay`] carries only slot 0. That is
     // byte-equivalent on shipped data and this is why: across the whole item-target family, not
     // one row puts its enchant effect anywhere but slot 0. Read raw, since the catalog itself
-    // only keeps `effect_1`.
+    // only keeps `effects[0]`.
     let raw = chain.read_file(SPELL).expect("Spell.dbc");
     let set = parse(&raw, spell_schema(), "Spell.dbc").expect("parse Spell.dbc");
     let is_enchant = |e: u32| {
@@ -1011,5 +1017,108 @@ fn gcd_wildcard_and_shape_corners_hold_on_the_real_data() {
     assert_eq!(
         (scroll.start_recovery_category, scroll.start_recovery_ms),
         (133, 0)
+    );
+}
+
+/// The cost columns on the REAL 5875 data (decision 1074, B192): the health power type
+/// (−2 as `0xFFFFFFFE`), Bloodrage's pct-only shape, Health Funnel's `manaPerSecond`, the cast
+/// cell's attr rows, and the verified NEGATIVE that keeps columns 33/35 unparsed. Skips without
+/// client data.
+#[test]
+fn real_spell_catalog_cost_columns() {
+    let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
+    if !data.is_dir() {
+        eprintln!("skipping: vanilla client not present at {}", data.display());
+        return;
+    }
+    let mut chain = crate::open_chain(&data).expect("open chain");
+    let cat = crate::load_spell_catalog(&mut chain).expect("Spell.dbc");
+
+    // Life Tap, EVERY rank: health type and NO cost columns at all — the client's own file,
+    // against the folk memory of a printed health cost (that is 2.x's change; 1.12 carries the
+    // trade in the description text). The cost cell stays EMPTY, which is the reference render.
+    for id in [1454u32, 1455, 1456, 11687, 11688, 11689] {
+        let d = cat.get(id).unwrap();
+        assert_eq!(
+            (
+                d.power_type,
+                d.mana_cost,
+                d.mana_cost_pct,
+                d.mana_per_second
+            ),
+            (0xFFFF_FFFE, 0, 0, 0),
+            "Life Tap {id}"
+        );
+    }
+    // Bloodrage: pct-ONLY health cost — the resolved-cost law's health-pool lane (B192).
+    let bloodrage = cat.get(2687).unwrap();
+    assert_eq!(
+        (
+            bloodrage.power_type,
+            bloodrage.mana_cost,
+            bloodrage.mana_cost_pct
+        ),
+        (0xFFFF_FFFE, 0, 20)
+    );
+    // Health Funnel: flat health + per-second — the `_PER_TIME` composite's live customer — and
+    // channeled, so its cast cell reads "Channeled".
+    let funnel = cat.get(755).unwrap();
+    assert_eq!(
+        (funnel.power_type, funnel.mana_cost, funnel.mana_per_second),
+        (0xFFFF_FFFE, 11, 5)
+    );
+    assert!(funnel.tooltip_channeled());
+    // The cast cell's attr arms at their pinned rows: Heroic Strike (next melee, rage 150 wire =
+    // "15 Rage" displayed), Auto Shot and Throw (the ranged bit ALONE — Throw is not
+    // auto-repeat and still reads "Attack speed"), Mind Flay (channeled mana), Judgement
+    // (pct-only mana — the resolved flat number, never a percentage line).
+    let hs = cat.get(78).unwrap();
+    assert_eq!((hs.power_type, hs.mana_cost), (1, 150));
+    assert!(hs.on_next_swing());
+    assert!(cat.get(75).unwrap().tooltip_on_next_ranged(), "Auto Shot");
+    assert!(cat.get(2764).unwrap().tooltip_on_next_ranged(), "Throw");
+    let mf = cat.get(15407).unwrap();
+    assert!(mf.tooltip_channeled());
+    assert_eq!((mf.power_type, mf.mana_cost), (0, 45));
+    let judgement = cat.get(20271).unwrap();
+    assert_eq!(
+        (
+            judgement.power_type,
+            judgement.mana_cost,
+            judgement.mana_cost_pct
+        ),
+        (0, 0, 6)
+    );
+
+    // The column scan, both verdicts pinned: `manaPerSecondPerLevel` (35) is all-zero across
+    // the whole file — the verified negative that keeps it unparsed — while `manaCostPerlevel`
+    // (33) is real: exactly 72 nonzero rows, all creature-cast spells (Dark Offering's is even
+    // in the health lane), which is why the per-level term is modeled in `power_cost` but
+    // dormant for player tooltips. (1074)
+    let bytes = chain.read_file(super::SPELL).expect("reading Spell.dbc");
+    let rs = super::parse(&bytes, super::spell_schema(), "Spell.dbc").expect("Spell.dbc");
+    let mut per_level_rows = 0u32;
+    for r in rs.records() {
+        let id = super::u32_at(r, 0).unwrap_or(0);
+        if super::u32_at(r, 33).unwrap_or(0) > 0 {
+            per_level_rows += 1;
+        }
+        assert_eq!(
+            super::u32_at(r, 35).unwrap_or(0),
+            0,
+            "manaPerSecondPerLevel on {id}"
+        );
+    }
+    assert_eq!(per_level_rows, 72, "the manaCostPerlevel population");
+    let dark_offering = cat.get(7154).unwrap();
+    assert_eq!(
+        (
+            dark_offering.power_type,
+            dark_offering.mana_cost,
+            dark_offering.mana_cost_per_level,
+            dark_offering.spell_level
+        ),
+        (0xFFFF_FFFE, 180, 9, 24),
+        "Dark Offering: the per-level term's health-lane row"
     );
 }

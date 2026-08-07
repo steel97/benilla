@@ -169,6 +169,14 @@ fn bake_test(
         .unwrap_or((0.0, 0.0));
     let anchors = PortraitAnchors {
         camera: model.portrait_camera,
+        pane_camera: model.pane_camera,
+        bbox_center: model.bounds.map_or(Vec3::ZERO, |b| {
+            benilla_assets::coords::wow_to_bevy([
+                (b.bbox_min[0] + b.bbox_max[0]) * 0.5,
+                (b.bbox_min[1] + b.bbox_max[1]) * 0.5,
+                (b.bbox_min[2] + b.bbox_max[2]) * 0.5,
+            ])
+        }),
         head: head_anchor(&model.skeleton, &model.attachments),
         pivot_height,
         ground_radius,
@@ -231,7 +239,8 @@ fn bake_test(
             [false, false], // the paper-doll still sheaths its weapons — no in-hand grip
             &[],            // eye-glow in the paper doll is the same follow-up (see above)
         );
-        aim(cams, PAPERDOLL_SLOT, &body_frame(&anchors));
+        // The eyeball harness has no live UI publishing a pane, so it bakes square.
+        aim(cams, PAPERDOLL_SLOT, &body_frame(&anchors, 1.0));
         commands
             .entity(booth.root)
             .insert(Transform::from_rotation(Quat::from_rotation_y(

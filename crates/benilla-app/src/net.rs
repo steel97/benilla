@@ -704,6 +704,33 @@ pub(crate) enum ClientCommand {
     /// player twin: no answer packet — the removal arrives as a `UNIT_FIELD_AURA` delta on the
     /// pet, which is also what puts the slot's icon back.
     PetCancelAura { pet_guid: u64, spell_id: u32 },
+    /// Flip one pet **spellbook** entry's autocast (`CMSG_PET_SPELL_AUTOCAST` 0x2F3, decision
+    /// 1032) — `ToggleSpellAutocast`'s send, and **not** the pet bar's autocast verb.
+    ///
+    /// The bar's right click is [`Self::PetSetAction`]: it rewrites a *slot's word*, so its body
+    /// names a position. This one names a **spell id**, because the book has no positions —
+    /// `0x4b4240` looks the id up in `0xb6f098` and hands `0x4bccb0` the id, never an index. Both
+    /// end up flipping the same bit on the same word; only one of them can say which word by slot.
+    /// No reply packet either way.
+    PetSpellAutocast {
+        pet_guid: u64,
+        spell_id: u32,
+        enabled: bool,
+    },
+    /// Give the pet up permanently (`CMSG_PET_ABANDON`, decision 1066) — the right-click menu's
+    /// **Abandon**, and only that row.
+    ///
+    /// **Its Dismiss is not this**, however alike they read: `PetDismiss 0x4be4d0` opens no packet
+    /// and goes down the pet bar's ordinary [`Self::PetAction`] path with the word `0x07000003`
+    /// (wow-re §11c). Both would have worked against vmangos, which is why it is written here.
+    ///
+    /// No reply: the answer is `SMSG_PET_SPELLS` with a zero guid, and the pet object leaving.
+    PetAbandon { pet_guid: u64 },
+    /// Rename the pet (`CMSG_PET_RENAME`, decision 1066) — the `PETRENAMECONFIRM` popup's accept.
+    ///
+    /// The server may refuse the name outright, so nothing is applied locally; success arrives as a
+    /// bumped `UNIT_FIELD_PET_NAME_TIMESTAMP` on the pet, which is what re-asks the name cache.
+    PetRename { pet_guid: u64, name: String },
     /// Start melee auto-attack on `guid` (`CMSG_ATTACKSWING`); echoed as `SMSG_ATTACKSTART`.
     AttackSwing { guid: u64 },
     /// Stop melee auto-attack (`CMSG_ATTACKSTOP`); echoed as `SMSG_ATTACKSTOP`, whose receive path
@@ -834,6 +861,11 @@ pub(crate) enum ClientCommand {
     /// `guid`. Sent ask-once when a GameObject streams in ([`crate::go_templates`]); the answer's
     /// `lockId` decides whether a right-click uses it or casts an OPEN_LOCK spell.
     GameObjectQuery { entry: u32, guid: u64 },
+    /// Ask for one page of a book (`CMSG_PAGE_TEXT_QUERY`, decision 1105): the `PageText` id + the
+    /// asking object's `guid` (an item's or a TEXT GameObject's — the server discards it). Sent
+    /// ask-once by [`crate::ui_item_text::PageTexts`] when a reader opens on a page it hasn't got;
+    /// vmangos answers with the whole forward chain, one `SMSG_PAGE_TEXT_QUERY_RESPONSE` per page.
+    PageTextQuery { page_id: u32, guid: u64 },
     /// Cast an OPEN_LOCK spell at a **GameObject** (`CMSG_CAST_SPELL`, decision 0239): the right-click
     /// on a locked chest / mining vein / herb node. The server runs `EffectOpenLock` → a chest opens
     /// its loot (`SMSG_LOOT_RESPONSE`); the profession/skill gate is the server's.

@@ -709,6 +709,13 @@ fn writer_loop(
                     ClientCommand::PetCancelAura { pet_guid, spell_id } => {
                         w.pet_cancel_aura(pet_guid, spell_id)
                     }
+                    ClientCommand::PetSpellAutocast {
+                        pet_guid,
+                        spell_id,
+                        enabled,
+                    } => w.pet_spell_autocast(pet_guid, spell_id, enabled),
+                    ClientCommand::PetAbandon { pet_guid } => w.pet_abandon(pet_guid),
+                    ClientCommand::PetRename { pet_guid, name } => w.pet_rename(pet_guid, &name),
                     ClientCommand::AttackSwing { guid } => w.attack_swing(guid),
                     ClientCommand::AttackStop => w.attack_stop(),
                     ClientCommand::SetSheathed { state } => w.set_sheathed(state),
@@ -753,6 +760,9 @@ fn writer_loop(
                     ClientCommand::GameObjUse { guid } => w.gameobj_use(guid),
                     ClientCommand::AreaTrigger { trigger_id } => w.area_trigger(trigger_id),
                     ClientCommand::GameObjectQuery { entry, guid } => w.gameobject_query(entry, guid),
+                    ClientCommand::PageTextQuery { page_id, guid } => {
+                        w.page_text_query(page_id, guid)
+                    }
                     ClientCommand::CastSpellGameObject { spell_id, go_guid } => {
                         w.cast_spell_gameobject(spell_id, go_guid)
                     }

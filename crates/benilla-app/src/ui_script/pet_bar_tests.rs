@@ -263,6 +263,59 @@ fn clicks_route_through_the_attack_toggle_fork() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
+/// **A click takes the ring off; the repaint puts it back** — the contract decision 1021's signal
+/// count depends on, pinned here so it cannot quietly rot.
+///
+/// `PetActionButton_OnClick`'s first line is `this:SetChecked(0)` and it runs for every click, so
+/// the ring always comes off. What puts it back is `PET_BAR_UPDATE` — and the repaint that answers
+/// it must re-derive `SetChecked` from `isActive` per slot, **not** diff the views, or a press that
+/// changed no state would have no way home.
+///
+/// The reference signals that repaint from the state writes (`0x4bc940`/`0x4bc960`) and **not**
+/// from a `TogglePetAutocast` it refuses (`0x4bcbf7` — a token is not autocastable, i.e. every
+/// right-click on Follow, Stay or a reaction). So on a right-click the ring genuinely stays off
+/// until something else repaints the bar. That is the reference's own quirk, checked there by the
+/// director; decision 1027 diverged from it and 1030 put it back.
+#[test]
+fn a_click_drops_the_ring_and_the_repaint_restores_it() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_pet_bar(&s);
+    declare_token_strings(&s);
+
+    let checked = |s: &UiScript| {
+        s.eval::<bool>("return BenillaPetActionButton1:GetChecked()")
+            .unwrap()
+    };
+
+    // Button 1 (Attack, lit) spans x[72,102] y[56,86] ⇒ centre (87,71). Both mouse buttons take
+    // the ring off — the CheckButton toggles itself, then `SetChecked(0)` lands it at 0 either way.
+    for button in ["RightButton", "LeftButton"] {
+        s.set_pet_actions(true, true, true, hunter_slots());
+        s.fire_event("PET_BAR_UPDATE", vec![]);
+        s.resolve();
+        assert!(checked(&s), "{button}: the Attack token starts lit");
+
+        s.mouse_button(87.0, 71.0, button, true);
+        s.mouse_button(87.0, 71.0, button, false);
+        assert!(
+            !checked(&s),
+            "{button}: the ref's own SetChecked(0), reproduced"
+        );
+
+        // A repaint carrying the very SAME views restores it — the property the signal count buys.
+        s.fire_event("PET_BAR_UPDATE", vec![]);
+        assert!(
+            checked(&s),
+            "{button}: an unchanged repaint must re-light, not diff to a no-op"
+        );
+    }
+    let _ = s.take_pet_actions();
+    let _ = s.take_pet_stop_attacks();
+    let _ = s.take_pet_autocast_toggles();
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
 /// A DISABLED bar still draws — every icon desaturated, nothing hidden. That pair
 /// (`PetHasActionBar` true, `GetPetActionsUsable` false) is what a feared or mind-controlled pet
 /// looks like, and collapsing it to "hide the bar" would lose the state entirely.
@@ -456,4 +509,78 @@ fn shift_clicking_a_pet_button_picks_it_up_rather_than_casting() {
         s.take_pet_set_actions(),
         vec![vec![(3, CLAW_WORD & 0xFFFF_0000)]]
     );
+}
+
+/// **The keybind pair** (decision 1052) — what a bound `BONUSACTIONBUTTONn` runs. The ref's
+/// binding body calls `BonusActionButtonDown/Up`, one-liners onto `PetActionButtonDown/Up`
+/// (l.218-231), so the whole lane is these two functions: press shows the pushed art, release
+/// fires the slot.
+///
+/// The load-bearing half is what the key path does NOT do: it is a bare `CastPetAction`, with none
+/// of `PetActionButton_OnClick`'s forks. Pinned below on an Attack token fed as already-active — a
+/// left click on that same view calls the attack off (the test above) while the key re-issues it.
+///
+/// **What that fixture is and is not.** `attack_active` is pushed straight onto the view here, and
+/// on a real *pet* bar it can never be true: `ui_pet`'s `possessing` carve (`0x4bd420`) raises the
+/// latch only for a unit you are POSSESSING, so on a hunter's bar the click fork is dead code and
+/// key and click behave identically. The state below is a **possess** bar's — Mind Control, Eye of
+/// Kilrogg — which is the one case where the two paths genuinely diverge, and therefore the only
+/// one worth pinning. Read as "ordinary pets differ from clicks", this test would be lying.
+#[test]
+fn the_keybind_pair_pushes_and_casts_without_the_clicks_forks() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_pet_bar(&s);
+    declare_token_strings(&s);
+    s.set_pet_actions(true, true, true, hunter_slots());
+    s.fire_event("PET_BAR_UPDATE", vec![]);
+    s.resolve();
+
+    let state = |s: &UiScript| {
+        s.eval::<String>("return BenillaPetActionButton1:GetButtonState()")
+            .unwrap()
+    };
+
+    // Down shows the pushed art and fires nothing (the ref's runOnUp shape).
+    s.run("BenillaPetActionButtonDown(1)").unwrap();
+    assert_eq!(state(&s), "PUSHED");
+    assert!(
+        s.take_pet_actions().is_empty(),
+        "the press is visual only — the ref fires on the release"
+    );
+
+    // Up releases the art and casts — slot 1 is Attack and the view says the order is live, so a
+    // LEFT CLICK here would call it off instead (a possess bar's case; see the header). The key
+    // has no such fork.
+    s.run("BenillaPetActionButtonUp(1)").unwrap();
+    assert_eq!(state(&s), "NORMAL");
+    assert_eq!(s.take_pet_actions(), vec![1]);
+    assert_eq!(
+        s.take_pet_stop_attacks(),
+        0,
+        "IsPetAttackActive lives in OnClick, which a key press never reaches"
+    );
+
+    // The state guard is the whole re-entrancy story: an up with nothing pushed does nothing
+    // (a focus-stolen release, a stuck-latch sweep), and a second down does not re-fire.
+    s.run("BenillaPetActionButtonUp(1)").unwrap();
+    assert!(
+        s.take_pet_actions().is_empty(),
+        "an unmatched release fires nothing"
+    );
+    s.run("BenillaPetActionButtonDown(1) BenillaPetActionButtonDown(1)")
+        .unwrap();
+    assert_eq!(state(&s), "PUSHED");
+    s.run("BenillaPetActionButtonUp(1)").unwrap();
+    assert_eq!(s.take_pet_actions(), vec![1], "one press, one cast");
+
+    // An EMPTY slot is inert through the same path (CastPetAction's own guard): slot 2 of the
+    // hunter bar carries no name, and its button is hidden.
+    s.run("BenillaPetActionButtonDown(2) BenillaPetActionButtonUp(2)")
+        .unwrap();
+    assert!(
+        s.take_pet_actions().is_empty(),
+        "an unnamed slot queues nothing"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }

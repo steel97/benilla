@@ -347,6 +347,10 @@ pub enum SessionEvent {
         /// The template's `CreatureType.dbc` id (Beast, Humanoid, Critter, …) — the TAB-target
         /// critter/totem filter's input. `None` on a server miss.
         creature_type: Option<u32>,
+        /// The template's `CreatureFamily.dbc` id (Wolf, Cat, Imp, …) — `UnitCreatureFamily`'s
+        /// word and, through that row's pet-food mask, the diet tooltip (decision 1062). `0` for
+        /// everything that is neither a tameable beast nor a warlock minion, and `0` on a miss.
+        pet_family: u32,
         /// Elite rank 0..4 (the unit tooltip's rank word, decision 0276). `0` on a miss.
         rank: u32,
         /// The template type flags — bit `0x10` hides the tooltip's faction-name line. `0` on a miss.
@@ -370,6 +374,18 @@ pub enum SessionEvent {
         name: String,
         data: [i32; 24],
     },
+    /// A GameObject plays a one-shot **Custom** animation (`SMSG_GAMEOBJECT_CUSTOM_ANIM`):
+    /// the client arms GO substate `8 + anim_id` — AnimationData ids 153..156 (Custom0..3),
+    /// `anim_id >= 4` rejected at the consumer (wow-re `gameobject-anim-arm.md` §step 8).
+    /// The load-bearing sender is the fishing bobber's bite (`anim_id 0`, the splash;
+    /// decision 1086).
+    GameObjectCustomAnim { guid: u64, anim_id: u32 },
+    /// The fishing channel ended with nothing hooked (`SMSG_FISH_NOT_HOOKED`, empty body):
+    /// the red `ERR_FISH_NOT_HOOKED` toast (decision 1086).
+    FishNotHooked,
+    /// The hooked fish got away — the fishing-skill roll failed on the bobber click
+    /// (`SMSG_FISH_ESCAPED`, empty body): the red `ERR_FISH_ESCAPED` toast (decision 1086).
+    FishEscaped,
     /// A server-pushed 2D sound kit (`SMSG_PLAY_SOUND`): BG events, quest/zone scripts.
     PlaySound { sound_id: u32 },
     /// A server-pushed music kit for the music channel (`SMSG_PLAY_MUSIC`).
@@ -999,6 +1015,15 @@ pub enum SessionEvent {
         error: u32,
         equip_error: Option<u32>,
         item: Option<(u32, u32)>,
+    },
+    /// `SMSG_PAGE_TEXT_QUERY_RESPONSE` — one page of a book, answering `CMSG_PAGE_TEXT_QUERY`.
+    /// The ask-once page cache both readables reach: a readable item template's `PageText` and a
+    /// `GAMEOBJECT_TYPE_TEXT` object's `data[0]` (decision 1105). `next_page_id == 0` ends the
+    /// chain; vmangos pushes the whole chain in answer to the first query.
+    PageText {
+        page_id: u32,
+        text: String,
+        next_page_id: u32,
     },
     /// `SMSG_ITEM_TEXT_QUERY_RESPONSE` — a letter's body text, answering `CMSG_ITEM_TEXT_QUERY`
     /// (a mail's nonzero `item_text_id` triggers the ask-once fetch; decision 0544).

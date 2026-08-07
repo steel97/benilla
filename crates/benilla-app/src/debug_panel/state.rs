@@ -11,7 +11,7 @@ use bevy::prelude::*;
 /// (`open: false`), each section its own `Default` (so this derives cleanly).
 #[derive(Resource, Default)]
 pub struct DebugState {
-    /// Panel visible? Hidden by default; toggled with the backtick key.
+    /// Panel visible? Hidden by default; toggled with the dev chord + `D` (decisions 1043, 1048).
     pub open: bool,
     pub models: ModelDebug,
     pub lighting: LightingDebug,
@@ -114,7 +114,9 @@ impl Default for ModelDebug {
         Self {
             kind_visible: [true; 4],
             blend_visible: [true; 5],
-            portal_cull: true,
+            // `WOW_NOPORTALCULL=1` presets the panel's A/B switch off, so a headless capture can
+            // shoot the same viewpoint with and without the cull (the B65 diff loop).
+            portal_cull: std::env::var("WOW_NOPORTALCULL").is_err(),
         }
     }
 }

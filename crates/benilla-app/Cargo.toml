@@ -71,12 +71,32 @@ cosmic-text = "0.16"
 # public-in-crate types). Pinned to the exact version `cosmic-text` 0.16 depends on so there's one
 # `fontdb` in the graph.
 fontdb = "0.23"
+# kira's own backend dependency, named directly so the mixer can hand cpal an explicit device buffer
+# size instead of accepting `BufferSize::Default` (decision 1026). `CpalBackendSettings`' fields ARE
+# cpal types, so this must stay the exact version kira resolves — one cpal in the graph.
+cpal = "0.17"
 kira = { version = "0.12", default-features = false, features = ["cpal", "mp3", "wav", "pcm", "adpcm"] }
+# kira's own decoder, named directly for one trait: the mixer feeds streams through its own
+# `MediaSource` so kira's per-stream decode thread runs OUR code and can promote its QoS (decision
+# 1109 — a bare-spawned decode thread starves under the world-entry burst and zero-fills the mix).
+# No codecs of its own (kira's features enable those); must stay the version kira resolves — one
+# symphonia in the graph, or the trait impl won't line up.
+symphonia = { version = "0.5", default-features = false }
+# The mix tap's audio-thread → writer-thread ring (decision 1112): the tap effect must never
+# block or allocate on the render path. kira's own SPSC ring crate; kept on the version kira
+# resolves so the graph carries one rtrb.
+rtrb = "0.3"
 mint = "0.5"
 # The gossip greeting is a weighted random DRAW per menu-open, not a fixed pick (wow-re
 # `gossip-npctext-law.md` — the reference re-rolls in its gossip handler), so the app needs a uniform
 # source. Pinned to 0.8: the version `benilla-srp` already depends on, so this adds no crate.
 rand = "0.8"
+
+[dev-dependencies]
+# The WMO portal-cull audit's raw-face instruments (`WOW_PIN_COL`): the pin probe compares the
+# filtered walking-collision set against the group file's FULL face list with per-face MOPY flags,
+# which only the raw parser exposes — benilla-formats' gathers are exactly the filtered views.
+benilla-wmo = { path = "../benilla-wmo" }
 
 # Linux/BSD: the Wayland clipboard (decision 0702). We build with bevy's `wayland` feature, so on a
 # Wayland session winit gives us a native Wayland window and `arboard` — X11-only without its

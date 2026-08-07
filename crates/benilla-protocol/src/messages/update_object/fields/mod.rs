@@ -8,6 +8,10 @@ use super::movement::ObjectType;
 // ObjectFields descriptor-field indices (build 5875), shared across object types.
 const FIELD_OBJECT_TYPE: u16 = 2;
 const FIELD_OBJECT_SCALE_X: u16 = 4;
+// `OBJECT_FIELD_CREATED_BY` = OBJECT_END(6) + 0x0..0x1 (vmangos `UpdateFields_1_12_1.h`): the
+// GameObject block's creator guid pair — the summoning player of a spell-spawned object
+// (fishing bobber, ritual portal); zero/absent for a world spawn.
+const FIELD_GAMEOBJECT_CREATED_BY: u16 = 6;
 const FIELD_GAMEOBJECT_DISPLAYID: u16 = 8;
 const FIELD_GAMEOBJECT_FLAGS: u16 = 9;
 // `GAMEOBJECT_ROTATION` = OBJECT_END(6) + 0x4 .. +0x7 (vmangos `UpdateFields_1_12_1.h`): the
@@ -112,6 +116,14 @@ const FIELD_UNIT_MOUNTDISPLAYID: u16 = 133;
 /// client decides a creature has **no** classification (rank forced to 0), so no elite dragon, no
 /// ELITE/BOSS tooltip word and no world-boss skull on an enslaved mob.
 const FIELD_UNIT_PETNUMBER: u16 = 139;
+/// `UNIT_FIELD_PET_NAME_TIMESTAMP` (`OBJECT_END(6) + 0x86` = 140, PUBLIC — vmangos
+/// `UpdateFields_1_12_1.cpp:80`) — the unix second at which this pet's name was last set.
+///
+/// It matters because a pet's name does **not** ride its descriptor: it is answered once by
+/// `CMSG_PET_NAME_QUERY` and cached by pet NUMBER, so a rename would otherwise stay invisible until
+/// relog. The server bumps this on every `SetName` (`Pet.cpp:285`, and `HandlePetRename`'s last
+/// line `PetHandler.cpp:344`), which makes a **change** here the cache's one invalidation signal.
+const FIELD_UNIT_PET_NAME_TIMESTAMP: u16 = 140;
 /// `UNIT_FIELD_PETEXPERIENCE` (idx 141) / `UNIT_FIELD_PETNEXTLEVELEXP` (142) — a hunter pet's XP
 /// bar, the `(currXP, nextXP)` pair `GetPetExperience 0x4be840` returns in that order.
 /// Byte-verified client-side at `[unit+0x110]+0x21c` / `+0x220` (wow-re
@@ -127,6 +139,15 @@ const FIELD_UNIT_DYNAMIC_FLAGS: u16 = 143;
 /// `UNIT_CHANNEL_SPELL` (idx 144, `OBJECT_END(6) + 0x8A`, PUBLIC — VERIFIED vmangos
 /// `UpdateFields_1_12_1.h:89`) — the spell id a unit is channeling (`0` = not channeling).
 const FIELD_UNIT_CHANNEL_SPELL: u16 = 144;
+/// `UNIT_CREATED_BY_SPELL` (idx 146, `OBJECT_END(6) + 0x8C`, PUBLIC — vmangos
+/// `UpdateFields_1_12_1.h`) — the spell that summoned this unit (`0` = not summoned by one). The
+/// **first** of the three gates on the reference's feed-pet path `0x6ea1e0`: a unit with no
+/// creating spell is not a pet you can feed, whatever else it is.
+///
+/// The index is fixed by construction rather than asserted from a header we don't ship: this table
+/// already pins both ends of a contiguous run — `PETEXPERIENCE` 141, `PETNEXTLEVELEXP` 142,
+/// `DYNAMIC_FLAGS` 143, `CHANNEL_SPELL` 144, `MOD_CAST_SPEED` 145, then this, then `NPC_FLAGS` 147.
+const FIELD_UNIT_CREATED_BY_SPELL: u16 = 146;
 const FIELD_UNIT_NPC_FLAGS: u16 = 147;
 /// `UNIT_NPC_EMOTESTATE` (`OBJECT_END + 0x8E`; PUBLIC — VERIFIED vmangos `UpdateFields_1_12_1.h:93`)
 /// — the unit's looping **state emote** as an `Emotes.dbc` id (dance, NPC cooking/working flavor).
@@ -320,11 +341,18 @@ const FIELD_PLAYER_FIELD_COINAGE: u16 = 1176;
 // UNIT_END + 0x210 / 0x211; its stale hex comments read 0x2C6/0x2C7, the same 6-low drift as COINAGE.)
 const FIELD_PLAYER_XP: u16 = 716;
 const FIELD_PLAYER_NEXT_LEVEL_XP: u16 = 717;
+// PLAYER_REST_STATE_EXPERIENCE (INT, PRIVATE — self only): the rested-XP pool, in BASE kill-XP
+// units — the server drains it 1:1 against a kill's base XP while granting +100%
+// (vmangos `Player::GetXPRestBonus`), and caps it at NEXT_LEVEL_XP × 1.5 / 2 (`SetRestBonus`), so
+// the on-screen doubled-XP span is 2× this field (the exhaustion tick's math; decision 1082).
+// Derived by the same server enum arithmetic as COINAGE above: UNIT_END(0xBC = 188) +
+// 0x3DB(987) = 1175 — exactly one below the tested COINAGE anchor (1175 + 1 = 1176 ✓).
+const FIELD_PLAYER_REST_STATE_EXPERIENCE: u16 = 1175;
 // PLAYER_EXPLORED_ZONES_1 (BYTES ×64, PRIVATE — self only): the discovery bitset, 2048 bits
 // indexed by AreaTable's exploreFlag column; the world map's exploration overlays key off it
 // (decision 0203 phase 3). Derived by the same server enum arithmetic as COINAGE/XP above:
 // UNIT_END(0xBC = 188) + 0x39B(923) = 1111. Cross-checked against COINAGE: 0x3DC − 0x39B = 65 =
-// the 64 bitset slots + PLAYER_FIELD_WATCHED_FACTION_INDEX between them (1111 + 64 = 1175, then
+// the 64 bitset slots + PLAYER_REST_STATE_EXPERIENCE between them (1111 + 64 = 1175, then
 // 1176 ✓); the stale hex comment reads 0x451 — the usual 6-low drift.
 // The four avoidance/crit percentages the spell tooltip's chance-to-X line reads (law §3-CHANCE),
 // consecutive and immediately below EXPLORED_ZONES_1: UNIT_END(188) + 0x396..0x399. FLOAT, and the
@@ -443,20 +471,50 @@ pub struct PlayerSkillSlot {
 /// leaves this crate (decision 0061). The ECS mirrors one of these per object and [`Self::merge`]s each
 /// `Values` delta into it; the codec itself stays stateless (decision 0006).
 ///
-/// **Absent-field semantics** hinge on [`Self::created`]: a CREATE block is a *complete* snapshot —
-/// the server masks in only non-zero fields (vmangos `Object::_SetCreateBits`: bit set iff
-/// `value != 0`), and the real client reads it into a zero-initialized descriptor buffer — so on a
-/// create-seeded store an absent field reads `Some(0)`, the truth. A bare `Values` delta carries
-/// only *changed* fields; there an absent field means "not touched", so it reads `None` (and a
-/// merge must not clobber it). Director-caught: an item at durability 0 streams its create with
-/// `MAXDURABILITY` but no `DURABILITY` word, and the sparse `None` sent the tooltip to the
+/// **Absent-field semantics** hinge on [`Self::descriptor_end`]: a CREATE block is a *complete*
+/// snapshot — the server masks in only non-zero fields (vmangos `Object::_SetCreateBits`: bit set
+/// iff `value != 0`), and the real client reads it into a zero-initialized descriptor buffer — so
+/// on a create-seeded store an absent field reads `Some(0)`, the truth. A bare `Values` delta
+/// carries only *changed* fields; there an absent field means "not touched", so it reads `None`
+/// (and a merge must not clobber it). Director-caught: an item at durability 0 streams its create
+/// with `MAXDURABILITY` but no `DURABILITY` word, and the sparse `None` sent the tooltip to the
 /// template's max/max — 100% on fully broken gear.
+///
+/// **…but only within the object's OWN descriptor** (decision 1081). "Absent = 0" is a statement
+/// about the *zero-initialized buffer*, and that buffer is exactly [`descriptor_len`] dwords long
+/// for this object's type. A creature has no PLAYER block at all, so a PLAYER-block index read off
+/// one is not an absent field — it is a question the object cannot answer, and the honest reply is
+/// `None`. Conflating the two made every `player_*` accessor answer a confident `0` for any
+/// created creature, which is how the pet sheet's damage multiplier came out `0` instead of the
+/// unstreamed default `1.0` and the tooltip read `inf - inf` / `nan` (director, 2026-08-07).
 #[derive(Debug, Clone, Default)]
 pub struct ObjectFields {
     fields: BTreeMap<u16, u32>,
-    /// Seeded by a CREATE block (set by the parser via [`Self::into_created`]): every field is
-    /// known — absent = `0`.
-    created: bool,
+    /// How long this object's descriptor is, in dwords — [`descriptor_len`] of the CREATE block's
+    /// own `ObjectType` (set by the parser via [`Self::into_created`]). Every index **below** it is
+    /// known: absent = `0`. `0` marks a bare `Values` delta (or a hand-built fixture), where no
+    /// index is known and absent = `None`.
+    descriptor_end: u16,
+}
+
+/// The length of an object's descriptor buffer, in dwords — the `*_END` of the innermost block its
+/// `ObjectType` names (vmangos `UpdateFields_1_12_1.h`, build 5875, **by enum arithmetic**: the
+/// trailing comments in that header's CONTAINER and PLAYER blocks are stale by a constant and are
+/// not the numbers here).
+///
+/// The type hierarchy is inclusive — a Player's buffer spans OBJECT+UNIT+PLAYER, a Container's
+/// OBJECT+ITEM+CONTAINER — so each entry is the outermost end, not a block size.
+fn descriptor_len(object_type: ObjectType) -> u16 {
+    match object_type {
+        ObjectType::Object => 6,         // OBJECT_END = 0x6
+        ObjectType::Item => 48,          // ITEM_END = OBJECT_END + 0x2A
+        ObjectType::Container => 122,    // CONTAINER_END = ITEM_END + 0x4A
+        ObjectType::Unit => 188,         // UNIT_END = OBJECT_END + 0xB6
+        ObjectType::Player => 1282,      // PLAYER_END = UNIT_END + 0x446
+        ObjectType::GameObject => 26,    // GAMEOBJECT_END = OBJECT_END + 0x14
+        ObjectType::DynamicObject => 16, // DYNAMICOBJECT_END = OBJECT_END + 0xA
+        ObjectType::Corpse => 38,        // CORPSE_END = OBJECT_END + 0x20
+    }
 }
 
 impl ObjectFields {
@@ -476,14 +534,16 @@ impl ObjectFields {
         }
         Ok(Self {
             fields,
-            created: false,
+            descriptor_end: 0,
         })
     }
 
-    /// Mark this set as a CREATE snapshot (see the struct doc's absent-field semantics) — the
-    /// parser calls it on a create block's mask; a `Values` delta never gets it.
-    pub fn into_created(mut self) -> Self {
-        self.created = true;
+    /// Mark this set as a CREATE snapshot of `object_type` (see the struct doc's absent-field
+    /// semantics) — the parser calls it on a create block's mask with the type off the same block's
+    /// header; a `Values` delta never gets it. The type is what bounds "absent = 0" to the
+    /// object's own descriptor.
+    pub fn into_created(mut self, object_type: ObjectType) -> Self {
+        self.descriptor_end = descriptor_len(object_type);
         self
     }
 
@@ -494,7 +554,7 @@ impl ObjectFields {
     pub fn from_pairs(pairs: &[(u16, u32)]) -> Self {
         Self {
             fields: pairs.iter().copied().collect(),
-            created: false,
+            descriptor_end: 0,
         }
     }
 
@@ -554,7 +614,7 @@ impl ObjectFields {
         self.fields
             .get(&index)
             .copied()
-            .or(self.created.then_some(0))
+            .or((index < self.descriptor_end).then_some(0))
     }
     fn get_f32(&self, index: u16) -> Option<f32> {
         self.get_u32(index).map(f32::from_bits)
@@ -592,7 +652,7 @@ impl ObjectFields {
     /// dropped to zero since the last stream (an aura that expired out of view, durability that
     /// broke) — exactly the absent-vs-zero bug the `created` flag exists to kill.
     pub fn merge(&mut self, delta: ObjectFields) {
-        if delta.created {
+        if delta.descriptor_end != 0 {
             *self = delta;
         } else {
             self.fields.extend(delta.fields);

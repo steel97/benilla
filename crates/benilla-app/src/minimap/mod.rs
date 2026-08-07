@@ -269,6 +269,7 @@ fn emit_minimap(
         unit_pos,
         window,
         mut blip_hover,
+        ui_scale,
         group,
         tracked,
         self_store,
@@ -534,8 +535,12 @@ fn emit_minimap(
             wy,
             wz: wow[2],
             cursor,
-            // The same point in UI space (y-up) — the tooltip's cursor seat.
-            cursor_ui: cursor.zip(win).map(|(c, w)| Vec2::new(c.x, w.height() - c.y)),
+            // The same point in UI space (y-up, ÷s through the 0582/0584 seam — the tooltip's
+            // anchor resolves in the VM's 768-virtual units, not window px): the cursor seat.
+            cursor_ui: cursor.zip(win).map(|(c, w)| {
+                let s = crate::ui_script::seam_scale(w.height(), ui_scale.0);
+                Vec2::new(c.x / s, (w.height() - c.y) / s)
+            }),
         }
     });
     let mut hover = blips::MinimapBlipHover::None;
@@ -695,6 +700,32 @@ fn feed_minimap_inside(
     }
 }
 
+/// Push the live game clock into the VM when the game minute ticks — `GetGameTime()`'s backing
+/// globals (the zone-text family's shape). The reference's GameTimeFrame re-reads GetGameTime
+/// every OnUpdate and compares the packed minute against its cached `timeOfDay`, so a
+/// minute-granular push is exactly the API's own resolution (the binding returns no seconds).
+/// Before the first `SMSG_LOGIN_SETTIMESPEED` the globals stay at their 0:00 stdlib seed.
+fn feed_game_time(
+    script: Option<bevy::ecs::system::NonSendMut<benilla_ui::script::UiScript>>,
+    time: Res<crate::net::ServerTime>,
+    mut last: Local<Option<u32>>,
+) {
+    let Some(script) = script else { return };
+    let Some(gt) = time.0 else { return };
+    let minute = gt.minute_of_day();
+    if *last == Some(minute) {
+        return;
+    }
+    *last = Some(minute);
+    let globals = script.lua().globals();
+    let pushed = globals
+        .set("__benilla_game_hour", minute / 60)
+        .and_then(|()| globals.set("__benilla_game_minute", minute % 60));
+    if let Err(e) = pushed {
+        warn!("minimap: game-time globals: {e}");
+    }
+}
+
 /// The app half of the `<Minimap>` widget (decision 0203 phase 1) — see the module doc. The zone
 /// LABEL feed lives with the rest of the zone-text data plane (`crate::area`, decision 0287's
 /// fold-back): the client updates the minimap line and fires `MINIMAP_ZONE_CHANGED` from the same
@@ -715,6 +746,9 @@ impl Plugin for MinimapPlugin {
                     // Before the script tick, so a zoom button pressed this frame routes to the
                     // indoor/outdoor index that matches where the player actually is.
                     feed_minimap_inside.before(crate::ui_script::UiInput),
+                    // Before the script tick, so GameTimeFrame's OnUpdate reads this frame's
+                    // minute, not last frame's.
+                    feed_game_time.before(crate::ui_script::UiInput),
                     // After the world-mouseover drive (UnitFeed): a same-frame world-hover→blip
                     // transition must end with the blip tooltip shown, not the fade.
                     blips::drive_blip_tooltip

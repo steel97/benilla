@@ -24,8 +24,8 @@ fn shipped_action_bar_drives_end_to_end() {
         );
         if file == "ActionBar.xml" {
             assert_eq!(
-                report.frames, 31,
-                "bar + XP StatusBar + art frame + 12 buttons (each with a Cooldown child) + 2 page buttons + the performance meter and its hover button"
+                report.frames, 34,
+                "bar + XP StatusBar (+ its numerals overlay) + exhaustion tick + max-level rail + art frame + 12 buttons (each with a Cooldown child) + 2 page buttons + the performance meter and its hover button"
             );
         }
     }
@@ -825,75 +825,68 @@ fn state_events_leave_empty_wells_untinted() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
-/// The XP bar's hover (ref-MainMenuBar.xml l.136-147): the strip takes the mouse, and the plate is
-/// the ref's two-line `GameTooltip_AddNewbieTip` — "XP Bar" over the wrapped explanation.
-///
-/// `enableMouse` is the load-bearing half and the easy thing to lose: without it the strip is
-/// transparent and the hover silently never fires, which no tooltip assertion alone would catch.
+/// The white-buttons regression (director-reported 2026-08-07, decision 1108): a slot that was
+/// OCCUPIED — UpdateUsable painted its icon's 1/1/1 usable tint — then goes EMPTY (the feed's
+/// character-switch diff: `set_action(None)` + `ACTIONBAR_SLOT_CHANGED`) kept the tint on the
+/// now-artless icon region and drew it as a solid WHITE square. Two laws close it, both asserted
+/// here: the empty arm HIDES the icon (ref ActionButton.lua l.168), and the engine emits nothing
+/// for a texture-less region whatever its surviving tint (`0x7706e0` — the draw gate is `+0xcc`,
+/// never the colour).
 #[test]
-fn the_xp_bar_takes_the_mouse_and_explains_itself() {
+fn an_occupied_slot_going_empty_leaves_no_white_plate() {
+    use benilla_ui::script::ActionState;
+
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
-    for file in [
-        "Fonts.xml",
-        "UIParent.xml",
-        "GameTooltip.xml",
-        "Cooldown.xml",
-        "ActionBar.xml",
-    ] {
-        let text = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("assets/ui")
-                .join(file),
-        )
-        .unwrap();
-        let doc = benilla_ui::framexml::parse(&text).unwrap();
-        let report = benilla_ui::loader::load(&s, &doc, &|_| None);
-        assert!(
-            report.errors.is_empty(),
-            "{file}: loader errors: {:?}",
-            report.errors
-        );
-    }
+    load_action_bar(&s);
+    s.set_action(
+        3,
+        Some(ActionSlot {
+            texture: Some("Interface\\Icons\\Spell_Nature_HealingTouch".into()),
+            kind: 0x00,
+            action: 5185,
+            count: 0,
+        }),
+    );
+    s.set_action_state(
+        3,
+        Some(ActionState {
+            usable: true,
+            ..Default::default()
+        }),
+    );
+    s.fire_event("PLAYER_ENTERING_WORLD", vec![]);
+    // The usable pass paints the occupied icon's 1/1/1 usable tint — the tint that survives.
+    s.fire_event("ACTIONBAR_UPDATE_USABLE", vec![]);
     s.resolve();
-
-    // Mid-height of the strip (the bar's top 13 px), a quarter of the way along — NOT its
-    // horizontal center, where the page arrows straddle the strip's lower edge and rightly take
-    // the mouse ahead of it.
-    let (x, y) = s
-        .eval::<(f64, f64)>(
-            "return BenillaExpBar:GetLeft() + BenillaExpBar:GetWidth() / 4, \
-                    (BenillaExpBar:GetBottom() + BenillaExpBar:GetTop()) / 2",
-        )
-        .unwrap();
-    assert_eq!(
-        s.hit_test_name(x as f32, y as f32).as_deref(),
-        Some("BenillaExpBar"),
-        "the XP strip must be mouse-enabled or the hover never fires"
-    );
-
-    s.run("BenillaExpBar_OnEnter(BenillaExpBar)").unwrap();
-    assert_eq!(
-        s.eval::<String>("return GameTooltipTextLeft1:GetText()")
-            .unwrap(),
-        "XP Bar"
-    );
-    assert_eq!(
-        s.eval::<String>("return GameTooltipTextLeft2:GetText()")
-            .unwrap(),
-        s.eval::<String>("return NEWBIE_TOOLTIP_XPBAR").unwrap(),
-        "line 2 is the ref's NEWBIE_TOOLTIP_XPBAR, verbatim"
-    );
-    assert_eq!(
-        s.eval::<i64>("return GameTooltip.default").unwrap(),
-        1,
-        "the default-corner anchor"
-    );
-
-    s.run("BenillaExpBar_OnLeave()").unwrap();
     assert!(
-        !s.eval::<bool>("return GameTooltip:IsVisible()").unwrap(),
-        "leaving hides the plate"
+        s.extract().iter().any(|q| matches!(&q.content,
+            QuadContent::Texture { path: Some(p), .. } if p.contains("Spell_Nature_HealingTouch"))),
+        "the occupied slot draws its icon"
     );
+
+    // The character switch: the new character's table has nothing in slot 3.
+    s.set_action(3, None);
+    s.set_action_state(3, None);
+    s.fire_event("ACTIONBAR_SLOT_CHANGED", vec![ScriptValue::Int(3)]);
+    s.resolve();
+    for q in s.extract() {
+        match &q.content {
+            QuadContent::Texture { path: Some(p), .. }
+                if p.contains("Spell_Nature_HealingTouch") =>
+            {
+                panic!("the emptied slot still draws the old icon")
+            }
+            QuadContent::Texture {
+                path: None,
+                color: Some(c),
+                ..
+            } if q.rect.is_some_and(|r| r.right - r.left <= 40.0) => {
+                // Well-sized only, as in the sibling test: page-wide solids are legitimate.
+                panic!("the emptied slot draws its surviving tint as a solid plate: {c:?}")
+            }
+            _ => {}
+        }
+    }
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }

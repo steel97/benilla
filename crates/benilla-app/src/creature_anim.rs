@@ -232,6 +232,178 @@ pub(crate) fn cancel_auto_repeat_local(
     let _ = net.0.send(crate::net::ClientCommand::CancelAutoRepeat);
 }
 
+/// The one local **StopAttack** — benilla's `0x5ecac0` (wow-re §5 trio-verified,
+/// `object-layer/scratch/melee-autorepeat-exclusion.md`): player-only, a no-op unless an attack
+/// lock is held, then `CMSG_ATTACKSTOP` (its builder `0x624370` pushes opcode `0x142`) followed by
+/// the tail jump `0x5ecb63 → CancelQueuedCast 0x6e6f30` — which takes the **queued on-next-swing
+/// spell** down with the attack: `0x6e6f30`'s first leg tests the inflight id `[0xceca88]` for
+/// `Attributes & 0x404` and hands it to `CancelCast 0x6e4940(dl=1, reason 0x1c)`, whose casting arm
+/// sends `CMSG_CANCEL_CAST 0x12f` naming it and then pops the slot through `0x6e4ad0`.
+///
+/// This is the un-queue [`crate::ui_cast::QueuedMeleeSpell`] names as its real clear path, and it
+/// is why a Raptor Strike ring goes dark the moment Auto Shot starts (the auto-repeat arm inside
+/// the cast commit calls straight into here, `0x6e5976`, guarded by nothing but "the caster is the
+/// active player").
+///
+/// The lock is our server-echoed [`Engaged`] — the ref's `[+0xc48]`, which it sets *locally* at
+/// attack-start and which **StopAttack does not clear** (only the `SMSG_ATTACKSTOP` echo does,
+/// `0x624e40`), so the Attack button's own ring survives this call in both clients. Two ref fields
+/// are deliberately unmodelled, neither with a benilla reader: `[+0xc50]` ("locally initiated, not
+/// server-confirmed") and `[+0xc54]` ("stop sent, awaiting the echo") — the latter's sole reader
+/// image-wide is `0x5eccda`, inside `Attack 0x5ecb70`, which no benilla cast path enters while
+/// engaged (see [`crate::ui_action::cast_send`]'s tail). The two ratio legs `0x5ecac0` runs before
+/// the stop are `TriggerTutorial(0xa)` / `(0xb)` — the low-health / low-mana popups, not audio and
+/// not part of this seam.
+pub(crate) fn stop_attack_local(
+    engaged: bool,
+    queued_melee: &mut crate::ui_cast::QueuedMeleeSpell,
+    net: &crate::net::NetCommands,
+) {
+    if !engaged {
+        // The ref's `!IsAttacking(0x60ecb0) && [+0xc50] == 0` early-out: nothing running,
+        // nothing sent — and the queued strike, which cannot exist without a swing to fire it,
+        // survives untouched.
+        return;
+    }
+    let _ = net.0.send(crate::net::ClientCommand::AttackStop);
+    if let Some(spell_id) = queued_melee.current() {
+        let _ = net
+            .0
+            .send(crate::net::ClientCommand::CancelCast { spell_id });
+        queued_melee.clear_if(spell_id);
+    }
+}
+
+/// The one local **StartAttack** — benilla's `0x5ecb70`, [`stop_attack_local`]'s twin (wow-re §5
+/// `melee-autorepeat-exclusion.md` §5c–§5f). Two halves, and keeping them apart is the whole point:
+///
+/// - **the send** (`0x5eccfd`) is gated by the already-attacking test at `0x5eccda` — skipped when
+///   the attack lock is held, *unless* a stop is in flight (`[+0xc54]`), which is why
+///   stop → select → re-swing re-points at a new target instead of going quiet;
+/// - **the tail** (`0x5ecd78`–`0x5ecd95`) — melee sheath SNAP then the local auto-repeat cancel
+///   `0x6ea080` — runs either way, because the skip's `jmp` lands *inside* it. That is what makes
+///   "start swinging" and "keep auto-shooting" mutually exclusive.
+///
+/// `stop_in_flight` is a **parameter, not stored state**: the ref's `[+0xc54]` is set by
+/// [`stop_attack_local`] and consumed here, and the only caller that spans both is the target
+/// switch, which does them back to back in one call chain. Decision 1036 removed the persistent
+/// latch for exactly this reason — outside that chain it has no reader.
+///
+/// The caller owes the reference's own two entry conditions, which differ per site and are not
+/// re-derived here: a cast press must not call this at all while engaged (`TryCast`'s `6e51cb`/
+/// `6e51d2` gate), and the Attack button forks to [`stop_attack_local`] instead (`0x6131a0` @
+/// `0x6131d9`). `0x5ecb70`'s own validator legs — the target's alive-or-feign + `CanAttack
+/// 0x606980` walk, and the `[0xb4b3e4]` world gate — stay with the callers that already compute
+/// them (`target::scan`'s `new_attackable`, the drain's `attack_actor_refusal`).
+#[allow(clippy::too_many_arguments)] // the tail writes four sinks; the alternative is a bundle
+pub(crate) fn start_attack_local(
+    entity: Entity,
+    target: u64,
+    engaged: bool,
+    stop_in_flight: bool,
+    auto_repeat: &mut crate::ui_action::AutoRepeatActive,
+    sheath: &mut MessageWriter<SheathRequest>,
+    commands: &mut Commands,
+    net: &crate::net::NetCommands,
+) {
+    if !engaged || stop_in_flight {
+        let _ = net
+            .0
+            .send(crate::net::ClientCommand::AttackSwing { guid: target });
+    }
+    // The tail. The sheath setter is idempotent — the client's own "no-op if already melee" — so
+    // re-running it on a re-point costs nothing and matches `0x5ecd80`'s unconditional call.
+    sheath.write(SheathRequest {
+        entity,
+        state: 1,
+        ceremony: false,
+    });
+    cancel_auto_repeat_local(Some(entity), auto_repeat, commands, net);
+}
+
+/// The **Attack toggle** — benilla's `0x6131a0`, the third of the trio and the one the base Attack
+/// pseudo-spell runs (`TryCast`'s effect-`0x4e` short-circuit at `0x6e4c7a` dispatches straight to
+/// it, ahead of every cast gate). It forks on the attack lock and nothing else: already attacking →
+/// `0x6131d9 call 0x5ecac0` [`stop_attack_local`], otherwise `0x6131ee call 0x5ecb70`
+/// [`start_attack_local`] (wow-re `melee-autorepeat-exclusion.md` §5f).
+///
+/// The fork is the whole content, and it is worth a name because both halves used to be wrong here:
+/// the button never toggled melee OFF, and it cancelled a running auto-repeat on *every* press —
+/// but only the start arm reaches `0x5ecd8c`, so in the reference toggling melee off leaves Auto
+/// Shot running.
+///
+/// `[0xb4b3e4]` — the reference's second condition on the stop arm, a world/session global also
+/// tested at `0x5ecbc0` — is unmodelled; nothing in benilla can be false there while a press is
+/// being drained.
+#[allow(clippy::too_many_arguments)] // the seams' write set, minus the bundle a caller can't hold
+pub(crate) fn toggle_attack_local(
+    entity: Entity,
+    target: u64,
+    engaged: bool,
+    queued_melee: &mut crate::ui_cast::QueuedMeleeSpell,
+    auto_repeat: &mut crate::ui_action::AutoRepeatActive,
+    sheath: &mut MessageWriter<SheathRequest>,
+    commands: &mut Commands,
+    net: &crate::net::NetCommands,
+) {
+    if engaged {
+        stop_attack_local(engaged, queued_melee, net);
+    } else {
+        start_attack_local(
+            entity,
+            target,
+            engaged,
+            false,
+            auto_repeat,
+            sheath,
+            commands,
+            net,
+        );
+    }
+}
+
+/// **The local attack seams' whole write set, as ONE [`SystemParam`]** — so a caller threading
+/// [`stop_attack_local`]/[`start_attack_local`] through a call chain takes one param instead of
+/// six, and so a new sink in either seam lands in every caller at once.
+///
+/// The targeting side needs exactly this: `target::scan`'s `commit` runs the reference's
+/// stop → select → re-swing law (`SetSelection 0x493540`'s own `0x493a08 call 0x5ecac0` and
+/// `0x4938c8 call 0x5ecb70`), so every selection writer that can fire it has to carry both seams'
+/// inputs. [`crate::ui_action::cast_send::CastLadder`] already carries them field by field for the
+/// cast path and calls the free functions directly.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct AttackSeam<'w, 's> {
+    pub(crate) net: Res<'w, crate::net::NetCommands>,
+    pub(crate) queued_melee: ResMut<'w, crate::ui_cast::QueuedMeleeSpell>,
+    pub(crate) auto_repeat: ResMut<'w, crate::ui_action::AutoRepeatActive>,
+    pub(crate) sheath: MessageWriter<'w, SheathRequest>,
+    pub(crate) ecs: Commands<'w, 's>,
+    /// Our own entity — the sheath snap's and the auto-repeat cancel's subject.
+    pub(crate) me: Query<'w, 's, Entity, With<crate::net::SelfPlayer>>,
+}
+
+impl AttackSeam<'_, '_> {
+    /// `0x5ecac0` — see [`stop_attack_local`].
+    pub(crate) fn stop(&mut self, engaged: bool) {
+        stop_attack_local(engaged, &mut self.queued_melee, &self.net);
+    }
+
+    /// `0x5ecb70` — see [`start_attack_local`]. A no-op before our own entity streams in.
+    pub(crate) fn start(&mut self, target: u64, engaged: bool, stop_in_flight: bool) {
+        let Ok(e) = self.me.single() else { return };
+        start_attack_local(
+            e,
+            target,
+            engaged,
+            stop_in_flight,
+            &mut self.auto_repeat,
+            &mut self.sheath,
+            &mut self.ecs,
+            &self.net,
+        );
+    }
+}
+
 /// A unit is mid-cast (`SMSG_SPELL_START` .. `GO`/`FAILED_OTHER`, decision 0099 phase 1) — the
 /// wire-truth state seam. Inserted on `SpellStart` only when it carries a nonzero cast time (an
 /// instant cast's `SpellGo` follows with nothing to interrupt, so it never gets one); removed on
@@ -504,7 +676,9 @@ use driver::{drive_animations, drive_hand_grip};
 /// small concern, separate from the driver ([`driver`]) that advances the clips it scans.
 mod events;
 use events::fire_anim_events;
-pub(crate) use events::{is_footstep, scan_events, AnimSoundEvent};
+pub(crate) use events::{
+    advance_track, footfall_side, is_footstep_sound, scan_events, AnimSoundEvent,
+};
 
 mod impact;
 use impact::route_swing_impacts;

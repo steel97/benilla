@@ -5,11 +5,17 @@
 //!
 //! Three jobs, each frame, before the VM ticks ([`UiInput`]):
 //!
-//! - **[`PlayerCombatStats`]** from the self player's [`ObjectStore`] — the stat/resistance/
-//!   damage/attack-power fields (all OWNER_ONLY, verified streamed in 0208) plus the two resolved
-//!   weapon-skill pairs: the app picks WHICH skill line the equipped main-hand/ranged item uses
-//!   (`weapon_subclass_skill` — vmangos `Item.cpp`'s table; no weapon = unarmed 162) and reads its
-//!   `PLAYER_SKILL_INFO` triplet, so the engine-free binding just serves the pair.
+//! - **[`UnitCombatStats`]** from the self player's [`ObjectStore`] — the stat/resistance/
+//!   damage/attack-power fields (all OWNER_ONLY, verified streamed in 0208) plus the three resolved
+//!   skill pairs: the app picks WHICH skill line the equipped main-hand/ranged item uses
+//!   (`weapon_subclass_skill` — vmangos `Item.cpp`'s table; no weapon = unarmed 162), reads its
+//!   `PLAYER_SKILL_INFO` triplet and the Defense line's ([`SKILL_DEFENSE`]), so the engine-free
+//!   bindings just serve the pairs.
+//!
+//!   The descriptor half is [`unit_combat_stats`], which any unit's store goes through — the pet
+//!   paper doll's feed ([`crate::ui_pet_doll`], decision 1057) is the second caller. What
+//!   [`combat_stats`] adds on top is exactly the player-only half: the four values derived from the
+//!   equipped items, and the skill pairs, neither of which a creature has.
 //! - **`InventorySlots`** from the inv-slot guids → [`Items`] objects → templates → the
 //!   [`ItemDisplays`] icon — index 0 the ammo slot (`PLAYER_AMMO_ID`, its count summed across the
 //!   backpack + the four equipped bags), 1..=19 the equipment slots, 20..=23 the four equipped-bag
@@ -28,15 +34,16 @@
 //! Events, fired on snapshot transitions (grouped by the ref's own registration set,
 //! `PaperDollFrame.lua:14-28` — arg1 `"player"`): `UNIT_STATS`, `UNIT_RESISTANCES`, `UNIT_DAMAGE`,
 //! `UNIT_ATTACK_SPEED`, `UNIT_ATTACK_POWER`, `UNIT_RANGED_ATTACK_POWER`, `UNIT_RANGEDDAMAGE`,
-//! `UNIT_ATTACK` (the weapon-skill pairs), and `UNIT_INVENTORY_CHANGED` on any slot-view change.
-//! A first snapshot counts as a transition of every group (the `ui_unit` rule).
+//! `UNIT_ATTACK` (the weapon-skill pairs) — [`fire_stat_transitions`], shared with the pet feed —
+//! and `UNIT_INVENTORY_CHANGED` on any slot-view change. A first snapshot counts as a transition of
+//! every group (the `ui_unit` rule).
 
 use bevy::prelude::*;
 
 use benilla_protocol::messages::PLAYER_SKILL_SLOTS;
 use benilla_ui::script::{
-    weapon_subclass_skill, InvSlotView, InventorySlots, PlayerCombatStats, ScriptValue, SkillEntry,
-    SkillsState, UiScript, EQUIPMENT_BAG, SKILL_UNARMED,
+    weapon_subclass_skill, InvSlotView, InventorySlots, ScriptValue, SkillEntry, SkillsState,
+    UiScript, UnitCombatStats, EQUIPMENT_BAG, SKILL_DEFENSE, SKILL_UNARMED,
 };
 
 use crate::entities::ItemDisplays;
@@ -67,7 +74,7 @@ fn fixed(v: f32) -> i64 {
 /// snapshots pushed, so events fire on transitions only.
 #[derive(Resource, Default)]
 struct CharFeedState {
-    last_stats: Option<PlayerCombatStats>,
+    last_stats: Option<UnitCombatStats>,
     last_inv: Option<InventorySlots>,
 }
 
@@ -179,15 +186,19 @@ fn watch_skill_ups(
     }
 }
 
-/// The skills-pane feed (decision 0437 phase 4): every known `PLAYER_SKILL_INFO` line resolved to
-/// a flat [`SkillEntry`] — name off `SkillLine.dbc`, group off the line's `categoryId` ×
-/// `SkillLineCategory.dbc` (name + displayOrder) — pushed via `set_skills` on change; the ENGINE
-/// groups/sorts/folds (the trainer-tree pattern). Hidden faithfully: the `Not Displayed` category
-/// (12) and any line without a `SkillLine.dbc` row. Group order and the within-group name sort
-/// are still an INTERIM — but not the 0437 §5 dispatch's: none of its six TUs covered the
-/// Skills-pane's own grouping (that dispatch resolved as decision 0446, adjudicating the
-/// crafting-book windows only). This law is unpinned, awaiting its own dispatch, named as a
-/// follow-up in decision 0530.
+/// The skills-pane feed (decision 0437 phase 4, corrected by 1091): every `PLAYER_SKILL_INFO` line
+/// the real client would LIST, resolved to a flat [`SkillEntry`] — name off `SkillLine.dbc`, group
+/// off the line's `categoryId` × `SkillLineCategory.dbc` (name + displayOrder) — pushed via
+/// `set_skills` on change; the ENGINE groups/sorts/folds.
+///
+/// The inclusion predicate is the client's own list build (`0x4d2cb0`, wow-re
+/// `system/tradeskill/scratch/skillframe-display-list.md`), transcribed in its order: a line needs
+/// a `SkillLine.dbc` row, an admitting `SkillRaceClassInfo` row and a real `SkillLineCategory` row;
+/// `flags & 0x2` drops it outright; and a line held at **rank 0** appears only if its flags admit
+/// it at this player's level. Note what is NOT a filter: the `Not Displayed` category (12). We used
+/// to hide on it, which happened to hide `GENERIC (DND)` for the right-looking reason — the client
+/// drops that line by its `0x2` bit like `Dual Wield` and the racials, and lists a category-12 line
+/// without `0x2` under its own header (decision 1091).
 fn feed_skills(
     script: Option<NonSendMut<UiScript>>,
     self_store: Query<&ObjectStore, With<SelfPlayer>>,
@@ -200,45 +211,22 @@ fn feed_skills(
     let (Ok(store), Some(skill_lines)) = (self_store.single(), skill_lines.as_deref()) else {
         return;
     };
-    // The unlearn-button predicate needs the player's race/class (SkillRaceClassInfo row-match —
-    // the spellbook's own General-collapse inputs, `ui_spellbook::build_book`).
+    // The display predicate reads the player's own race/class (the SkillRaceClassInfo row-match —
+    // the spellbook's own General-collapse inputs, `ui_spellbook::build_book`) and level (the
+    // untrained gate).
     let (race, class) = (
         store.0.unit_race().unwrap_or(0),
         store.0.unit_class().unwrap_or(0),
     );
+    let level = store.0.unit_level().unwrap_or(0);
     let mut entries = Vec::new();
     for i in 0..PLAYER_SKILL_SLOTS {
         let Some(slot) = store.0.player_skill(i) else {
             continue;
         };
-        if slot.skill_id == 0 {
-            continue;
+        if let Some(e) = skills_row(&slot, &skill_lines.catalog, race, class, level) {
+            entries.push(e);
         }
-        let Some(line) = skill_lines.catalog.line(u32::from(slot.skill_id)) else {
-            continue; // no SkillLine row — nothing to name it by, the client shows nothing
-        };
-        if line.category_id == benilla_formats::SKILL_CATEGORY_NOT_DISPLAYED {
-            continue;
-        }
-        let (category_name, category_order) = skill_lines
-            .catalog
-            .category(line.category_id)
-            .map(|(n, o)| (n.to_string(), o))
-            .unwrap_or_else(|| ("Other".to_string(), u32::MAX));
-        entries.push(SkillEntry {
-            skill_id: u32::from(slot.skill_id),
-            name: line.name.clone(),
-            value: u32::from(slot.value),
-            max: u32::from(slot.max),
-            modifier: i32::from(slot.temp_bonus) + i32::from(slot.perm_bonus),
-            category_id: line.category_id,
-            category_name,
-            category_order,
-            description: line.description.clone(),
-            abandonable: skill_lines
-                .catalog
-                .abandonable(u32::from(slot.skill_id), race, class),
-        });
     }
     let fresh = SkillsState { entries };
     if last.as_ref() == Some(&fresh) {
@@ -246,6 +234,55 @@ fn feed_skills(
     }
     script.set_skills(fresh.clone());
     *last = Some(fresh);
+}
+
+/// One `PLAYER_SKILL_INFO` slot as the Skills tab's row — or `None` when the real client's list
+/// build would not list it at all ([`feed_skills`]'s doc for the citations; the order of the tests
+/// is the client's own, `0x4d2cb0`). Pure, so the whole display predicate is testable against real
+/// DBC data and a real character's skill block (`ui_script::skills_frame_tests`).
+pub(crate) fn skills_row(
+    slot: &benilla_protocol::messages::PlayerSkillSlot,
+    catalog: &benilla_formats::SkillLineCatalog,
+    race: u8,
+    class: u8,
+    level: u32,
+) -> Option<SkillEntry> {
+    if slot.skill_id == 0 {
+        return None;
+    }
+    let id = u32::from(slot.skill_id);
+    // No SkillLine row — nothing to name it by, and the client lists nothing.
+    let line = catalog.line(id)?;
+    // No row admitting this race/class → the client drops the line (its `!srci → continue`).
+    let rc = catalog.race_class(id, race, class)?;
+    // A category that must really exist (the client's own null-row test) — and note the category
+    // ITSELF is never a filter: `Not Displayed` (12) is a header like any other.
+    let (category_name, category_order) = catalog.category(line.category_id)?;
+    // The hide bit: `Dual Wield`, the racials, the mount lines, `GENERIC (DND)`.
+    if rc.hidden() {
+        return None;
+    }
+    // An untrained line shows only where the flags admit it at this level.
+    if slot.value == 0 && !rc.displays_untrained(level) {
+        return None;
+    }
+    Some(SkillEntry {
+        skill_id: id,
+        name: line.name.clone(),
+        value: u32::from(slot.value),
+        max: u32::from(slot.max),
+        temp_bonus: i32::from(slot.temp_bonus),
+        perm_bonus: i32::from(slot.perm_bonus),
+        min_level: rc.min_level,
+        cost_index: rc.cost_index,
+        category_id: line.category_id,
+        category_name: category_name.to_string(),
+        category_order,
+        description: line.description.clone(),
+        // The client ANDs the DBC's unlearnable bit with a nonzero skill STEP (`0x4d3953`).
+        abandonable: slot.step != 0 && rc.unlearnable(),
+        mono: rc.mono(),
+    })
 }
 
 /// The abandon drain (the skills pane's unlearn button → the `UNLEARN_SKILL` popup's accept →
@@ -306,13 +343,27 @@ fn skill_pair(store: &ObjectStore, skill_id: u32) -> (u32, i32) {
     (0, 0)
 }
 
-/// Build the combat-stats snapshot from the self player's descriptor (field mappings pinned in
-/// decision 0208; the absent shapes are the descriptor's zero defaults, `percent` 1.0).
-fn combat_stats(
-    store: &ObjectStore,
-    items: &mut Items,
-    commands: &NetCommands,
-) -> PlayerCombatStats {
+/// Build the **descriptor-only** combat-stats snapshot for ANY unit's store (field mappings pinned
+/// in decision 0208; the absent shapes are the descriptor's zero defaults, `percent` 1.0).
+///
+/// Nothing here reads inventory, templates or skill lines — so it is exactly the part a pet can go
+/// through ([`crate::ui_pet_doll`], decision 1057). The `player_*` reads are deliberately left in:
+/// a creature has no PLAYER block, so they read absent and fall to their defaults, which is the
+/// right pet answer (no buff decomposition, `damage_percent` the divide-safe 1.0) rather than a
+/// second unit-only copy of the same twenty lines.
+///
+/// **That premise is load-bearing, and it was false until decision 1081.** A created store used to
+/// answer `Some(0)` for *any* absent index, PLAYER block or not, so on a live pet every default
+/// here was dead code — `damage_percent` came through as `0` and the ref's `damage / percent` made
+/// the pet sheet read `inf - inf` / `nan`. The protocol layer now bounds "absent = 0" to the
+/// object's own descriptor, which is what makes this shared core honest for a creature.
+/// A swing time in ms, with `0` (and absent) read as "no swing time yet" → the vanilla 2000. Never
+/// zero, because it is the reference's `damage / speed` divisor.
+fn base_swing(streamed: Option<u32>) -> u32 {
+    streamed.filter(|&ms| ms != 0).unwrap_or(2000)
+}
+
+pub(crate) fn unit_combat_stats(store: &ObjectStore) -> UnitCombatStats {
     let f = &store.0;
     let round = |v: Option<f32>| v.unwrap_or(0.0).round() as i32;
 
@@ -336,6 +387,49 @@ fn combat_stats(
     let (ap_pos, ap_neg) = f.unit_attack_power_mods();
     let (rap_pos, rap_neg) = f.unit_ranged_attack_power_mods();
 
+    UnitCombatStats {
+        stats,
+        stat_pos,
+        stat_neg,
+        resistances,
+        resistance_pos,
+        resistance_neg,
+        min_damage: f.unit_min_damage().unwrap_or(0.0),
+        max_damage: f.unit_max_damage().unwrap_or(0.0),
+        min_offhand_damage: f.unit_min_offhand_damage().unwrap_or(0.0),
+        max_offhand_damage: f.unit_max_offhand_damage().unwrap_or(0.0),
+        physical_bonus_pos: f.player_mod_damage_done_pos(0).unwrap_or(0),
+        physical_bonus_neg: f.player_mod_damage_done_neg(0).unwrap_or(0),
+        damage_percent: f.player_mod_damage_done_pct(0).unwrap_or(1.0),
+        // 2000 ms is the vanilla base swing when the field hasn't streamed — keeps the ref's
+        // damage/speed division finite on the first frames. **`0` counts as unstreamed**, not as a
+        // swing time: on a created store an absent in-block field reads `Some(0)` (the descriptor's
+        // zero), so a plain `unwrap_or` would never fire and `damage / speed` would go to infinity
+        // (the shape of the bug decision 1081 is about, one field over).
+        main_attack_time_ms: base_swing(f.unit_base_attack_time(0)),
+        offhand_attack_time_ms: base_swing(f.unit_base_attack_time(1)),
+        attack_power: f.unit_attack_power().unwrap_or(0),
+        attack_power_pos: i32::from(ap_pos),
+        attack_power_neg: i32::from(ap_neg),
+        ranged_attack_power: f.unit_ranged_attack_power().unwrap_or(0),
+        ranged_attack_power_pos: i32::from(rap_pos),
+        ranged_attack_power_neg: i32::from(rap_neg),
+        ranged_attack_time_ms: base_swing(f.unit_ranged_attack_time()),
+        ranged_min_damage: f.unit_min_ranged_damage().unwrap_or(0.0),
+        ranged_max_damage: f.unit_max_ranged_damage().unwrap_or(0.0),
+        // The equipment- and skill-derived half is the PLAYER feed's ([`combat_stats`]); a unit
+        // with neither keeps these defaults.
+        has_offhand: false,
+        has_wand: false,
+        main_weapon_skill: (0, 0),
+        ranged_weapon_skill: (0, 0),
+        defense_skill: (0, 0),
+    }
+}
+
+/// The player's snapshot: [`unit_combat_stats`] plus the half only *we* have — the two values that
+/// need the equipped items' templates, and the three `PLAYER_SKILL_INFO` pairs.
+fn combat_stats(store: &ObjectStore, items: &mut Items, commands: &NetCommands) -> UnitCombatStats {
     // The offhand-speed gate is an offhand *weapon* (a shield doesn't swing); the wand check is
     // the ranged item's subclass. Both read the equipped item's template (ask-once in flight →
     // false this frame, refined when it lands).
@@ -352,37 +446,16 @@ fn combat_stats(
         .filter(|t| t.class == ITEM_CLASS_WEAPON)
         .and_then(|t| weapon_subclass_skill(t.subclass));
 
-    PlayerCombatStats {
-        stats,
-        stat_pos,
-        stat_neg,
-        resistances,
-        resistance_pos,
-        resistance_neg,
-        min_damage: f.unit_min_damage().unwrap_or(0.0),
-        max_damage: f.unit_max_damage().unwrap_or(0.0),
-        min_offhand_damage: f.unit_min_offhand_damage().unwrap_or(0.0),
-        max_offhand_damage: f.unit_max_offhand_damage().unwrap_or(0.0),
-        physical_bonus_pos: f.player_mod_damage_done_pos(0).unwrap_or(0),
-        physical_bonus_neg: f.player_mod_damage_done_neg(0).unwrap_or(0),
-        damage_percent: f.player_mod_damage_done_pct(0).unwrap_or(1.0),
-        // 2000 ms is the vanilla base swing when the field hasn't streamed — keeps the ref's
-        // damage/speed division finite on the first frames.
-        main_attack_time_ms: f.unit_base_attack_time(0).unwrap_or(2000),
-        offhand_attack_time_ms: f.unit_base_attack_time(1).unwrap_or(2000),
+    UnitCombatStats {
         has_offhand,
-        attack_power: f.unit_attack_power().unwrap_or(0),
-        attack_power_pos: i32::from(ap_pos),
-        attack_power_neg: i32::from(ap_neg),
-        ranged_attack_power: f.unit_ranged_attack_power().unwrap_or(0),
-        ranged_attack_power_pos: i32::from(rap_pos),
-        ranged_attack_power_neg: i32::from(rap_neg),
-        ranged_attack_time_ms: f.unit_ranged_attack_time().unwrap_or(2000),
-        ranged_min_damage: f.unit_min_ranged_damage().unwrap_or(0.0),
-        ranged_max_damage: f.unit_max_ranged_damage().unwrap_or(0.0),
+        has_wand,
         main_weapon_skill: skill_pair(store, main_skill),
         ranged_weapon_skill: ranged_skill_id.map_or((0, 0), |id| skill_pair(store, id)),
-        has_wand,
+        // `UnitDefense`'s pair. Its repaint wire is `SKILL_LINES_CHANGED` (which the ref's
+        // `PaperDollFrame` registers, l.28, and `watch_skill_ups` already fires), NOT a
+        // `UNIT_DEFENSE` — the character sheet never registers one.
+        defense_skill: skill_pair(store, SKILL_DEFENSE),
+        ..unit_combat_stats(store)
     }
 }
 
@@ -604,6 +677,109 @@ fn inventory_slots(
     inv
 }
 
+/// Fire the paper doll's per-group repaint events for one unit's snapshot transition, `arg1 =
+/// token` — the [`crate::ui_unit::fire_transitions`] shape, for the combat-stats surface.
+///
+/// The groups ARE the ref's own event registrations (`PaperDollFrame.lua:14-28`, which
+/// `PetPaperDollFrame.lua:12-20` repeats verbatim for the pet page), so each event fires exactly
+/// when a value some handler of it reads has moved; `prev == None` (a first snapshot) counts as a
+/// transition of every group, the `ui_unit` rule.
+///
+/// Shared by both feeds rather than transcribed twice (decision 1057): the pet page calls the same
+/// `PaperDollFrame_Set*` helpers off the same events, so two copies of this grouping could only
+/// ever drift into one page repainting on an edge the other misses.
+pub(crate) fn fire_stat_transitions(
+    script: &mut UiScript,
+    token: &str,
+    prev: Option<&UnitCombatStats>,
+    stats: &UnitCombatStats,
+) {
+    let tok = || ScriptValue::Str(token.to_string());
+    let changed = |sel: fn(&UnitCombatStats) -> Vec<i64>| prev.is_none_or(|p| sel(p) != sel(stats));
+    if changed(|s| {
+        let mut v: Vec<i64> = s.stats.iter().map(|&x| i64::from(x)).collect();
+        v.extend(
+            s.stat_pos
+                .iter()
+                .chain(s.stat_neg.iter())
+                .map(|&x| i64::from(x)),
+        );
+        v
+    }) {
+        script.fire_event("UNIT_STATS", vec![tok()]);
+    }
+    if changed(|s| {
+        s.resistances
+            .iter()
+            .chain(s.resistance_pos.iter())
+            .chain(s.resistance_neg.iter())
+            .map(|&x| i64::from(x))
+            .collect()
+    }) {
+        script.fire_event("UNIT_RESISTANCES", vec![tok()]);
+    }
+    if changed(|s| {
+        vec![
+            fixed(s.min_damage),
+            fixed(s.max_damage),
+            fixed(s.min_offhand_damage),
+            fixed(s.max_offhand_damage),
+            i64::from(s.physical_bonus_pos),
+            i64::from(s.physical_bonus_neg),
+            fixed(s.damage_percent),
+        ]
+    }) {
+        script.fire_event("UNIT_DAMAGE", vec![tok()]);
+    }
+    if changed(|s| {
+        vec![
+            i64::from(s.main_attack_time_ms),
+            i64::from(s.offhand_attack_time_ms),
+            i64::from(s.has_offhand),
+        ]
+    }) {
+        script.fire_event("UNIT_ATTACK_SPEED", vec![tok()]);
+    }
+    if changed(|s| {
+        vec![
+            i64::from(s.attack_power),
+            i64::from(s.attack_power_pos),
+            i64::from(s.attack_power_neg),
+        ]
+    }) {
+        script.fire_event("UNIT_ATTACK_POWER", vec![tok()]);
+    }
+    if changed(|s| {
+        vec![
+            i64::from(s.ranged_attack_power),
+            i64::from(s.ranged_attack_power_pos),
+            i64::from(s.ranged_attack_power_neg),
+            i64::from(s.has_wand),
+        ]
+    }) {
+        script.fire_event("UNIT_RANGED_ATTACK_POWER", vec![tok()]);
+    }
+    if changed(|s| {
+        vec![
+            fixed(s.ranged_min_damage),
+            fixed(s.ranged_max_damage),
+            i64::from(s.ranged_attack_time_ms),
+        ]
+    }) {
+        script.fire_event("UNIT_RANGEDDAMAGE", vec![tok()]);
+    }
+    if changed(|s| {
+        vec![
+            i64::from(s.main_weapon_skill.0),
+            i64::from(s.main_weapon_skill.1),
+            i64::from(s.ranged_weapon_skill.0),
+            i64::from(s.ranged_weapon_skill.1),
+        ]
+    }) {
+        script.fire_event("UNIT_ATTACK", vec![tok()]);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn feed_char(
     script: Option<NonSendMut<UiScript>>,
@@ -641,94 +817,7 @@ fn feed_char(
         // paints the OLD values and, being transition-gated, never corrects itself).
         let prev = feed.last_stats.take();
         script.set_player_combat_stats(Some(stats.clone()));
-        let tok = || ScriptValue::Str("player".to_string());
-        // Group the transitions by the ref's own event registrations (PaperDollFrame.lua:14-28);
-        // a first snapshot fires every group whose data is present (the ui_unit rule).
-        let changed = |sel: fn(&PlayerCombatStats) -> Vec<i64>| {
-            prev.as_ref().is_none_or(|p| sel(p) != sel(&stats))
-        };
-        if changed(|s| {
-            let mut v: Vec<i64> = s.stats.iter().map(|&x| i64::from(x)).collect();
-            v.extend(
-                s.stat_pos
-                    .iter()
-                    .chain(s.stat_neg.iter())
-                    .map(|&x| i64::from(x)),
-            );
-            v
-        }) {
-            script.fire_event("UNIT_STATS", vec![tok()]);
-        }
-        if changed(|s| {
-            s.resistances
-                .iter()
-                .chain(s.resistance_pos.iter())
-                .chain(s.resistance_neg.iter())
-                .map(|&x| i64::from(x))
-                .collect()
-        }) {
-            script.fire_event("UNIT_RESISTANCES", vec![tok()]);
-        }
-        if changed(|s| {
-            vec![
-                fixed(s.min_damage),
-                fixed(s.max_damage),
-                fixed(s.min_offhand_damage),
-                fixed(s.max_offhand_damage),
-                i64::from(s.physical_bonus_pos),
-                i64::from(s.physical_bonus_neg),
-                fixed(s.damage_percent),
-            ]
-        }) {
-            script.fire_event("UNIT_DAMAGE", vec![tok()]);
-        }
-        if changed(|s| {
-            vec![
-                i64::from(s.main_attack_time_ms),
-                i64::from(s.offhand_attack_time_ms),
-                i64::from(s.has_offhand),
-            ]
-        }) {
-            script.fire_event("UNIT_ATTACK_SPEED", vec![tok()]);
-        }
-        if changed(|s| {
-            vec![
-                i64::from(s.attack_power),
-                i64::from(s.attack_power_pos),
-                i64::from(s.attack_power_neg),
-            ]
-        }) {
-            script.fire_event("UNIT_ATTACK_POWER", vec![tok()]);
-        }
-        if changed(|s| {
-            vec![
-                i64::from(s.ranged_attack_power),
-                i64::from(s.ranged_attack_power_pos),
-                i64::from(s.ranged_attack_power_neg),
-                i64::from(s.has_wand),
-            ]
-        }) {
-            script.fire_event("UNIT_RANGED_ATTACK_POWER", vec![tok()]);
-        }
-        if changed(|s| {
-            vec![
-                fixed(s.ranged_min_damage),
-                fixed(s.ranged_max_damage),
-                i64::from(s.ranged_attack_time_ms),
-            ]
-        }) {
-            script.fire_event("UNIT_RANGEDDAMAGE", vec![tok()]);
-        }
-        if changed(|s| {
-            vec![
-                i64::from(s.main_weapon_skill.0),
-                i64::from(s.main_weapon_skill.1),
-                i64::from(s.ranged_weapon_skill.0),
-                i64::from(s.ranged_weapon_skill.1),
-            ]
-        }) {
-            script.fire_event("UNIT_ATTACK", vec![tok()]);
-        }
+        fire_stat_transitions(&mut script, "player", prev.as_ref(), &stats);
         feed.last_stats = Some(stats);
     }
 

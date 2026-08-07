@@ -44,6 +44,11 @@ pub struct CreatureQueryInfo {
     pub subname: String,
     /// `CreatureType.dbc` id (Beast/Humanoid/… — the level line's type word + the TAB filter).
     pub creature_type: u32,
+    /// `CreatureFamily.dbc` id (Wolf/Cat/Imp/… — `UnitCreatureFamily`'s row, and through that row's
+    /// pet-food mask, `GetPetFoodTypes`'s diet list; decision 1062). `0` for anything that is not a
+    /// tameable beast or a warlock minion — which is most of the table, and the reason both
+    /// consumers treat a missing row as nil rather than as an error.
+    pub pet_family: u32,
     /// Elite rank: 0 normal, 1 elite, 2 rare-elite, 3 world boss, 4 rare — the unit tooltip's
     /// rank word `{"", Elite, Elite, Boss, ""}` (decision 0276's byte-verified table).
     pub rank: u32,
@@ -226,9 +231,9 @@ pub enum ServerPacket {
     },
     /// `SMSG_CREATURE_QUERY_RESPONSE` — a creature template's display data, answering
     /// `CMSG_CREATURE_QUERY`. We surface what the UI consumes ([`CreatureQueryInfo`]: name,
-    /// subname, `CreatureType.dbc` id, the elite **rank**, the civilian flag); the rest of the
-    /// tail (type flags/family/pet spells/display id/racial leader) is parsed for alignment and
-    /// dropped until a consumer exists. A **miss** (unknown entry) is a lone `u32` of
+    /// subname, `CreatureType.dbc` id, the `CreatureFamily.dbc` id, the elite **rank**, the type
+    /// flags, and the civilian/racial-leader pair); only `unk`, the pet spell-list id and the
+    /// display id are still parsed for alignment and dropped. A **miss** (unknown entry) is a lone `u32` of
     /// `entry | 0x8000_0000` → `None` (VERIFIED vmangos `HandleCreatureQueryOpcode`, both
     /// branches).
     CreatureQueryResponse {
@@ -255,6 +260,32 @@ pub enum ServerPacket {
         entry: u32,
         info: Option<GameObjectQueryInfo>,
     },
+    /// `SMSG_PAGE_TEXT_QUERY_RESPONSE` — one page of a book, answering `CMSG_PAGE_TEXT_QUERY`
+    /// (the ask-once page cache every readable reaches: a readable item template's `PageText` and a
+    /// `GAMEOBJECT_TYPE_TEXT` object's `data[0]`, decision 1105). Pages **chain** —
+    /// `next_page_id == 0` is the last one — and vmangos answers a single query with one of these
+    /// per page of the whole chain.
+    PageTextQueryResponse {
+        page_id: u32,
+        text: String,
+        next_page_id: u32,
+    },
+    /// `SMSG_GAMEOBJECT_CUSTOM_ANIM` — a GameObject plays a one-shot Custom animation. Payload
+    /// VERIFIED vmangos `GameObject::SendGameObjectCustomAnim`: `u64 guid, u32 animId`. The
+    /// client arms GO substate `8 + animId` (AnimationData 153..156, `animId >= 4` rejected) —
+    /// the fishing bobber's bite splash is `animId 0` (decision 1086).
+    GameObjectCustomAnim {
+        guid: u64,
+        anim_id: u32,
+    },
+    /// `SMSG_FISH_NOT_HOOKED` — the fishing channel ended (expiry, or clicked before the splash)
+    /// with nothing hooked. Empty body (VERIFIED vmangos `GameObject::Update`/`Use`); the red
+    /// `ERR_FISH_NOT_HOOKED` toast (decision 1086).
+    FishNotHooked,
+    /// `SMSG_FISH_ESCAPED` — the hooked fish got away (the skill roll failed on the click).
+    /// Empty body (VERIFIED vmangos `GameObject::Use`); the red `ERR_FISH_ESCAPED` toast
+    /// (decision 1086).
+    FishEscaped,
     /// `SMSG_PLAY_SOUND` — a 2D sound-kit id, map/zone-wide (BG events, scripts). Payload
     /// VERIFIED vmangos `Map::PlayDirectSoundToMap`: one `u32 soundId` (SoundEntries).
     PlaySound {
@@ -1089,6 +1120,10 @@ impl ServerPacket {
             ServerPacket::CreatureQueryResponse { .. } => "SMSG_CREATURE_QUERY_RESPONSE".into(),
             ServerPacket::PetNameQueryResponse { .. } => "SMSG_PET_NAME_QUERY_RESPONSE".into(),
             ServerPacket::GameObjectQueryResponse { .. } => "SMSG_GAMEOBJECT_QUERY_RESPONSE".into(),
+            ServerPacket::PageTextQueryResponse { .. } => "SMSG_PAGE_TEXT_QUERY_RESPONSE".into(),
+            ServerPacket::GameObjectCustomAnim { .. } => "SMSG_GAMEOBJECT_CUSTOM_ANIM".into(),
+            ServerPacket::FishNotHooked => "SMSG_FISH_NOT_HOOKED".into(),
+            ServerPacket::FishEscaped => "SMSG_FISH_ESCAPED".into(),
             ServerPacket::PlaySound { .. } => "SMSG_PLAY_SOUND".into(),
             ServerPacket::PlayMusic { .. } => "SMSG_PLAY_MUSIC".into(),
             ServerPacket::PlayObjectSound { .. } => "SMSG_PLAY_OBJECT_SOUND".into(),

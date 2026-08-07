@@ -53,40 +53,10 @@ use bevy::prelude::*;
 use crate::assets::{LockRecover, WorldAssets};
 use crate::creature_anim::{Engaged, SwingMessage};
 use crate::names::NameCache;
-use crate::net::{
-    ClientCommand, Guid, NetCommands, NetEntity, ObjectStore, Reputations, SelfPlayer,
-};
+use crate::net::{ClientCommand, Guid, NetEntity, ObjectStore, Reputations, SelfPlayer};
 
+use super::relations::can_attack;
 use super::{ring_reaction, Factions, Selection};
-
-/// The five `UNIT_FIELD_FLAGS` disqualifiers `CanAttack 0x606980` tests (bit positions
-/// byte-verified; names vmangos-corroborated): NON_ATTACKABLE(1), NOT_ATTACKABLE_1(7),
-/// NON_ATTACKABLE_2(16), TAXI_FLIGHT(20), NOT_SELECTABLE(25).
-pub(super) const FLAG_DISQUALIFIERS: u32 = (1 << 1) | (1 << 7) | (1 << 16) | (1 << 20) | (1 << 25);
-
-/// `CanAttack 0x606980` — the shared attackability predicate (the combat flash's gate and the
-/// scan's filter 3): the flag disqualifiers clear AND an attackable reaction. A unit without a
-/// store passes the flag leg (nothing known to disqualify). The duel/PVP legs are deferred with
-/// duels/PvP.
-///
-/// The reaction leg is **≤ neutral (rank ≤ 3)** — attackable means *not friendly*. First
-/// director-observed (0170), then **byte-confirmed** by the `0x606980` re-pin: the function has
-/// three reaction legs selected by `UNIT_FLAG_PVP_ATTACKABLE` (bit 3) on both parties, and the
-/// player-vs-creature case is Leg B — `UnitReaction(player→target) < 4` (`cmp eax,4; setl`),
-/// single direction, friendly-only blocked. The old "≤ 1 hostile" gloss was Leg A (both parties
-/// UN-flagged: NPC-vs-NPC, bidirectional), never the player's check. Leg C (both flagged: the
-/// PvP/duel/group machinery) is deferred with PvP.
-pub(crate) fn can_attack(
-    store: Option<&ObjectStore>,
-    factions: Option<&Factions>,
-    reputations: &Reputations,
-    self_store: Option<&ObjectStore>,
-) -> bool {
-    if store.is_some_and(|s| s.0.unit_flags() & FLAG_DISQUALIFIERS != 0) {
-        return false;
-    }
-    ring_reaction(factions, reputations, store, self_store) <= 3
-}
 
 // == The Classic-priority dials ==
 // Each names the Classic Era cvar it stands in for. The VALUES are tuned, not pinned — the
@@ -224,9 +194,13 @@ pub(super) fn load_creature_types(mut commands: Commands, world_assets: Option<R
 }
 
 /// Everything the scan core reads, bundled (the TAB and attack-acquire systems share it).
+///
+/// `pub(crate)` rather than `pub(super)` because the **pet bar's** ATTACK arm runs the same
+/// `TargetNearestEnemy()` the player's does ([`attack_order_target`]), and its drain lives in
+/// `ui_pet`.
 #[derive(SystemParam)]
 #[allow(clippy::type_complexity)] // one bundled system param — the app's convention for big query sets
-pub(super) struct EnemyScan<'w, 's> {
+pub(crate) struct EnemyScan<'w, 's> {
     units: Query<
         'w,
         's,
@@ -267,11 +241,10 @@ pub(super) struct EnemyScan<'w, 's> {
 impl EnemyScan<'_, '_> {
     /// The `0x493e40` mode-1 validity filter — liveness + hostility (kept byte-law).
     fn is_valid(&self, store: Option<&ObjectStore>, self_store: Option<&ObjectStore>) -> bool {
-        if store.is_some_and(|s| {
-            s.0.unit_is_dead()
-                || s.0.unit_dynamic_flags() & (1 << 5) != 0
-                || s.0.unit_stand_state() == 7
-        }) {
+        // The liveness leg is the reference's own reads-dead triple `0x605f90` — health, the
+        // `UNIT_DYNFLAG_DEAD` bit (feign death) and stand state 7 — now the shared predicate
+        // rather than a third transcription of it (decision 1022).
+        if store.is_some_and(|s| s.0.unit_reads_dead()) {
             return false;
         }
         can_attack(
@@ -280,6 +253,46 @@ impl EnemyScan<'_, '_> {
             &self.reputations,
             self_store,
         )
+    }
+
+    /// Our own descriptor, for whichever leg needs the reaction's second party outside [`build`].
+    fn self_store(&self) -> Option<&ObjectStore> {
+        self.self_q.single().ok().and_then(|(_, store, _)| store)
+    }
+
+    /// `0x6130a3`'s keep-or-drop test on a guid we are already holding: is the actor hostile to it?
+    ///
+    /// The reference reads `0x6061e0(actor, target) >= 4` — the **reaction alone**, not the full
+    /// `0x606980` CanAttack, which it saves for the final gate at `0x613167`. So this is
+    /// [`ring_reaction`] and nothing else. A guid whose unit is not streamed answers `false`,
+    /// which is the same exit `0x613099` takes when its object lookup misses.
+    ///
+    /// **The actor is the player here, and in the reference it is the caller's** — the pet on the
+    /// pet arm (`0x4bd40d` passes the pet object). The two agree: vmangos gives a pet its owner's
+    /// faction template outright (`Pet.cpp:248`), and the reputation leg is the owner's by
+    /// definition. Reading the pet's own store instead would also fight [`build`], whose entire
+    /// candidate scan is player-relative (screen, distance, "fighting me").
+    fn reaction_hostile(&self, guid: u64) -> bool {
+        let self_store = self.self_store();
+        self.units
+            .iter()
+            .find(|(_, _, g, _, _, _)| g.0 == guid)
+            .is_some_and(|(_, _, _, _, store, _)| {
+                ring_reaction(
+                    self.factions.as_deref(),
+                    &self.reputations,
+                    store,
+                    self_store,
+                ) <= 3
+            })
+    }
+
+    /// The streamed unit behind a guid, as `(entity, store)` — the final gate's input.
+    fn unit_by_guid(&self, guid: u64) -> Option<(Entity, Option<&ObjectStore>)> {
+        self.units
+            .iter()
+            .find(|(_, _, g, _, _, _)| g.0 == guid)
+            .map(|(e, _, _, _, store, _)| (e, store))
     }
 
     /// The full build: walk every known unit, filter (the kept 1.12 legality laws), project
@@ -455,7 +468,7 @@ pub(super) struct CommitOutcome {
 /// the swing and does NOT re-point (the tail's self exception).
 pub(super) fn commit(
     selection: &mut Selection,
-    net: &NetCommands,
+    seam: &mut crate::creature_anim::AttackSeam,
     entity: Entity,
     guid: u64,
     engaged: bool,
@@ -470,12 +483,19 @@ pub(super) fn commit(
     selection.guid = Some(guid);
     let stop_and_repoint = engaged && had_old;
     if stop_and_repoint {
-        let _ = net.0.send(ClientCommand::AttackStop);
+        // `0x493a08 call 0x5ecac0` — the real StopAttack, so the switch also cancels a queued
+        // on-next-swing strike (the seam's `0x6e6f30` tail). Before this routed through the seam
+        // it was a bare `CMSG_ATTACKSTOP` and a queued Heroic Strike survived the switch.
+        seam.stop(engaged);
     }
-    let _ = net.0.send(ClientCommand::SetSelection { guid });
+    let _ = seam.net.0.send(ClientCommand::SetSelection { guid });
     let swung = stop_and_repoint && new_attackable && self_guid != Some(guid);
     if swung {
-        let _ = net.0.send(ClientCommand::AttackSwing { guid });
+        // `0x4938c8 call 0x5ecb70` with a stop in flight (`[+0xc54]`, set by the call above), so
+        // the swing goes out despite the still-set lock. Its tail cancels a running auto-repeat —
+        // wow-re `melee-autorepeat-exclusion.md` §6 REFUTES `nocked-ammo-cancel.md`'s
+        // direct-callers-only census, which had this chain never reaching `0x6ea080`.
+        seam.start(guid, engaged, true);
     }
     CommitOutcome {
         changed: true,
@@ -494,7 +514,7 @@ pub(super) fn tab_target(
     scan: EnemyScan,
     mut history: ResMut<TabHistory>,
     mut selection: ResMut<Selection>,
-    net: Res<NetCommands>,
+    mut seam: crate::creature_anim::AttackSeam,
     engaged: Query<(), (With<Engaged>, With<SelfPlayer>)>,
 ) {
     let reverse = binds.fired(crate::bindings::cmd::TARGET_PREVIOUS_ENEMY);
@@ -562,7 +582,7 @@ pub(super) fn tab_target(
     }
     let out = commit(
         &mut selection,
-        &net,
+        &mut seam,
         entity,
         guid,
         !engaged.is_empty(),
@@ -586,6 +606,138 @@ pub(super) fn tab_target(
     }
 }
 
+/// `0x6130b5` — **`TargetNearestEnemy()` itself**, and the whole of "pressing Attack at nothing
+/// finds something in front of you".
+///
+/// The acquire the validator runs is not a private helper: it is `0x493f60(ecx = 0, edx = 1)`, the
+/// same cycler the four Lua `TargetNearest*` bindings drive (`0x489a80`–`0x489af3` are the same
+/// call with `edx = 1..4` for enemy / friend / party / raid, and `ecx` the *reverse* flag). So
+/// "in front of me" is not a separate rule with its own cone — it is this module's priority scan,
+/// which is why the acquire commits through [`commit`] like any press: `CMSG_SET_SELECTION` goes
+/// out and **your** target really moves, which is what lets the pet's order and your own swing
+/// aim at the same thing.
+///
+/// Returns the committed `(entity, guid)`, or `None` after raising `0x6130d9`'s
+/// `ERR_NO_ATTACK_TARGET`.
+///
+/// Divergence, deliberate and inherited: the reference's cycler keeps a cached, time-expiring
+/// candidate list and a cursor into it, so a *repeated* acquire walks; ours re-scores the live
+/// world every call and always hands back the head. That is decision 0567's trade for the whole
+/// module (history cycling replaces the snapshot cursor), and an acquire is a fresh pick in both.
+fn acquire_nearest_enemy(
+    scan: &EnemyScan,
+    selection: &mut Selection,
+    seam: &mut crate::creature_anim::AttackSeam,
+    errors: &mut crate::ui_action::UiErrorKeys,
+) -> Option<(Entity, u64)> {
+    let cands = scan.build();
+    let Some(c) = cands.first() else {
+        // `0x6130d9` — the acquire ran and came back empty, so the selection re-read at `0x6130c1`
+        // still finds nothing: errorId `0xa0` `ERR_NO_ATTACK_TARGET`.
+        debug!("attack acquire: nothing to attack (ERR_NO_ATTACK_TARGET)");
+        errors
+            .0
+            .push(crate::ui_action::UiError::key("ERR_NO_ATTACK_TARGET"));
+        return None;
+    };
+    // `engaged = false`: the switch law only fires when we were already swinging at the OLD
+    // selection, and every path that reaches here had no selection or a non-hostile one — neither
+    // is a thing you can be engaged with.
+    commit(selection, seam, c.entity, c.guid, false, None, false);
+    Some((c.entity, c.guid))
+}
+
+/// `0x612df0`'s **Phase B** — the attack order's *target* arm, and the reason pressing the pet's
+/// Attack button at nothing still sends the pet at something.
+///
+/// Phase A (the actor's own eligibility — [`crate::ui_action::attack_actor_refusal`]) has already
+/// run by the time this is reached; what is left is choosing **what** to attack. The candidate the
+/// caller passes is `{0,0}` for a bare press, and it gets replaced by the current selection twice
+/// over — once by `CastPetAction` itself for a nil Lua argument (`0x4bd212`), once by the
+/// validator for a `{0,0}` candidate (`0x61306b`) — so the candidate *is* the selection:
+///
+/// ```text
+/// 0x61306b  candidate == 0             -> candidate = the current selection
+/// 0x61309b  0x6061e0(actor, candidate) -> the actor's reaction toward it
+/// 0x6130a3  reaction >= 4              -> candidate = 0   (friendly or neutral is not a target)
+/// 0x613100  else 0x493540(candidate)   ; promote it into the selection (a dedup when it came from there)
+/// 0x6130b5  candidate == 0             -> 0x493f60(0, 1) == TargetNearestEnemy()
+/// 0x6130c1  re-read the selection      ; whatever the acquire committed
+/// 0x6130d9  still nothing              -> ERR_NO_ATTACK_TARGET, EAX = 0, no packet
+/// 0x613167  final gate                 -> ERR_INVALID_ATTACK_TARGET, EAX = 0, no packet
+/// ```
+///
+/// Two things fall out that are worth knowing before looking at it in game. **Pressing Attack
+/// while you hold a friendly target retargets you** — the reaction test drops it and the acquire
+/// runs, so your selection moves to the nearest enemy. And the guid this returns is what goes in
+/// the packet: the validator writes its answer back through the caller's out-param (`0x6130c6`),
+/// and `0x4bd491` reads that slot when it builds `CMSG_PET_ACTION`.
+///
+/// The final gate is transcribed rather than folded into the reaction test above it, because the
+/// reference deliberately keeps them apart: a *dead* selection is `ERR_INVALID_ATTACK_TARGET`, not
+/// a reason to go find something else. `0x613159`'s odd second leg is verbatim — a zero-health
+/// target passes iff `UNIT_DYNAMIC_FLAGS` bit 5 is set.
+pub(crate) fn attack_order_target(
+    scan: &EnemyScan,
+    selection: &mut Selection,
+    seam: &mut crate::creature_anim::AttackSeam,
+    errors: &mut crate::ui_action::UiErrorKeys,
+) -> Option<u64> {
+    // `0x61306b` + `0x6130a3`: the selection is the candidate, and it survives only if the actor is
+    // hostile to it. Otherwise `0x6130b5` acquires.
+    let guid = match keeps_held_target(selection.guid, |g| scan.reaction_hostile(g)) {
+        Some(kept) => kept,
+        None => acquire_nearest_enemy(scan, selection, seam, errors)?.1,
+    };
+    // `0x613167`'s final gate on whatever we ended up with. `0x61312e`'s legs are the ACTOR's and
+    // are Phase A's, already run by the caller; these two are the target's.
+    let store = scan.unit_by_guid(guid).and_then(|(_, s)| s);
+    if !attack_target_valid(
+        store,
+        scan.factions.as_deref(),
+        &scan.reputations,
+        scan.self_store(),
+    ) {
+        debug!("attack order: {guid:#x} fails the final gate (ERR_INVALID_ATTACK_TARGET)");
+        errors
+            .0
+            .push(crate::ui_action::UiError::key("ERR_INVALID_ATTACK_TARGET"));
+        return None;
+    }
+    Some(guid)
+}
+
+/// `0x6130a3`'s fork on its own: keep what you are holding, or fall through to the acquire.
+///
+/// The whole content is that **the reaction alone decides**, and it decides against the *actor*.
+/// A friendly or neutral selection is not "an invalid target" — the reference zeroes the candidate
+/// (`0x6130a8`) and goes looking, which is why pressing pet-Attack while you have a quest giver
+/// selected moves your target to the nearest mob instead of raising an error.
+fn keeps_held_target(selection: Option<u64>, hostile: impl Fn(u64) -> bool) -> Option<u64> {
+    selection.filter(|&g| hostile(g))
+}
+
+/// `0x613152`–`0x613169` — the final gate's two **target** legs, whatever route the guid arrived
+/// by.
+///
+/// - alive, transcribed verbatim including its odd second half: a zero-health target passes iff
+///   `UNIT_DYNAMIC_FLAGS` bit 5 is set (`0x613159 shr edx,5; test dl,1`);
+/// - `CanAttack 0x606980` — the full predicate this time, not the bare reaction the fork above uses.
+///
+/// A target with no streamed descriptor passes both, matching [`can_attack`]'s own missing-data
+/// posture: nothing known to disqualify is not a disqualification.
+fn attack_target_valid(
+    store: Option<&ObjectStore>,
+    factions: Option<&Factions>,
+    reputations: &Reputations,
+    self_store: Option<&ObjectStore>,
+) -> bool {
+    let alive = store.is_none_or(|s| {
+        s.0.unit_health().is_none_or(|h| h > 0) || s.0.unit_dynamic_flags() & (1 << 5) != 0
+    });
+    alive && can_attack(store, factions, reputations, self_store)
+}
+
 /// Request from the action layer: the attack action fired with NO selection — pick the best
 /// candidate and swing at it (`0x612df0` @ `6130b5`).
 #[derive(Message)]
@@ -602,11 +754,9 @@ pub(super) fn acquire_and_attack(
     mut requests: MessageReader<AttackNearestRequest>,
     scan: EnemyScan,
     mut selection: ResMut<Selection>,
-    net: Res<NetCommands>,
-    self_player: Query<Entity, With<SelfPlayer>>,
+    mut seam: crate::creature_anim::AttackSeam,
     self_store: Query<&crate::net::ObjectStore, With<SelfPlayer>>,
     mut ui_error_keys: ResMut<crate::ui_action::UiErrorKeys>,
-    mut sheath: MessageWriter<crate::creature_anim::SheathRequest>,
 ) {
     if requests.read().last().is_none() {
         return;
@@ -631,33 +781,19 @@ pub(super) fn acquire_and_attack(
     ) {
         return;
     }
-    let cands = scan.build();
-    let Some(c) = cands.first() else {
-        // `0x6130d9` — the acquire ran and came back empty, so the selection re-read at `0x6130c1`
-        // still finds nothing: errorId `0xa0` `ERR_NO_ATTACK_TARGET`. Logged only until wow-re
-        // named the key (`pet-command-validators.md` §2); it is a red line, like every other
-        // `ERR_ATTACK_*` in that registry run.
-        debug!("attack acquire: nothing to attack (ERR_NO_ATTACK_TARGET)");
-        ui_error_keys
-            .0
-            .push(crate::ui_action::UiError::key("ERR_NO_ATTACK_TARGET"));
+    // `0x6130b5` and `0x6130d9`, shared with the pet bar's ATTACK arm — see
+    // [`acquire_nearest_enemy`]. The selection is empty (checked above), which is exactly the
+    // `candidate == 0` leg of [`attack_order_target`]; the follow-through below is what differs.
+    let Some((_, guid)) =
+        acquire_nearest_enemy(&scan, &mut selection, &mut seam, &mut ui_error_keys)
+    else {
         return;
     };
-    debug!(
-        "attack acquire: best candidate {:#x} → select + swing",
-        c.guid
-    );
-    // Selection was empty (checked above), so the engaged-switch law can't apply — plain commit.
-    commit(&mut selection, &net, c.entity, c.guid, false, None, false);
-    // The attack start (`0x6131a0` continuation): auto-draw (snap, decision 0080) + the swing.
-    if let Ok(e) = self_player.single() {
-        sheath.write(crate::creature_anim::SheathRequest {
-            entity: e,
-            state: 1,
-            ceremony: false,
-        });
-    }
-    let _ = net.0.send(ClientCommand::AttackSwing { guid: c.guid });
+    debug!("attack acquire: best candidate {guid:#x} → select + swing");
+    // `0x6131a0`'s continuation — StartAttack through the one seam, so the acquire path gets the
+    // auto-draw AND the auto-repeat cancel its hand-rolled copy used to miss. The selection was
+    // empty on entry, so we cannot have been engaged: no stop is in flight.
+    seam.start(guid, false, false);
 }
 
 /// Auto-acquire the attacker (behavior 2): the ATTACKERSTATEUPDATE victim handler's
@@ -668,7 +804,7 @@ pub(super) fn auto_acquire_attacker(
     self_player: Query<Entity, With<SelfPlayer>>,
     guids: Query<&Guid>,
     mut selection: ResMut<Selection>,
-    net: Res<NetCommands>,
+    mut seam: crate::creature_anim::AttackSeam,
 ) {
     for s in swings.read() {
         if selection.target.is_some() {
@@ -688,126 +824,138 @@ pub(super) fn auto_acquire_attacker(
             guid.0
         );
         // Selection is empty here (checked above): no engaged-switch law, selection only.
-        commit(&mut selection, &net, s.attacker, guid.0, false, None, false);
+        commit(
+            &mut selection,
+            &mut seam,
+            s.attacker,
+            guid.0,
+            false,
+            None,
+            false,
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::NetCommands;
 
     /// The `SetSelection` wire law, byte-read from `0x493540` (the director's "TAB while
     /// auto-attacking kills the attack" bug): an engaged SWITCH is **stop → select → re-swing**
     /// — the attack follows the new target — while a plain select sends only the selection, a
     /// self-target stops without re-pointing, and an unattackable new target (Attack `0x5ecb70`'s
     /// validation) switches and stops but never swings.
+    ///
+    /// Driven through a World because `commit` now runs the two real seams
+    /// ([`crate::creature_anim::AttackSeam`]) rather than emitting bare packets — which is what
+    /// the second half of this test pins: the switch's stop un-queues an on-next-swing strike
+    /// (`0x493a08 call 0x5ecac0` → `0x6e6f30`) and its re-swing cancels a running auto-repeat
+    /// (`0x4938c8 call 0x5ecb70` → `0x5ecd8c`). Both were missing while this path hand-rolled
+    /// its own packets.
     #[test]
     fn commit_follows_the_stop_select_reswing_law() {
+        use bevy::ecs::system::RunSystemOnce;
+
         let (tx, rx) = crossbeam_channel::unbounded();
-        let net = NetCommands(tx);
-        let mut selection = Selection::default();
+        let mut world = World::new();
+        world.insert_resource(NetCommands(tx));
+        world.init_resource::<crate::ui_cast::QueuedMeleeSpell>();
+        world.init_resource::<crate::ui_action::AutoRepeatActive>();
+        world.init_resource::<Messages<crate::creature_anim::SheathRequest>>();
+        world.init_resource::<Selection>();
+        world.spawn(SelfPlayer);
+
         let drain = |rx: &crossbeam_channel::Receiver<ClientCommand>| {
             rx.try_iter()
                 .map(|c| match c {
                     ClientCommand::SetSelection { .. } => "select",
                     ClientCommand::AttackStop => "stop",
                     ClientCommand::AttackSwing { .. } => "swing",
+                    ClientCommand::CancelCast { .. } => "cancel-cast",
+                    ClientCommand::CancelAutoRepeat => "cancel-repeat",
                     _ => "other",
                 })
                 .collect::<Vec<_>>()
         };
+        // One `commit` through a one-shot system, returning its outcome.
+        fn go(
+            world: &mut World,
+            guid: u64,
+            engaged: bool,
+            self_guid: Option<u64>,
+            attackable: bool,
+        ) -> CommitOutcome {
+            world
+                .run_system_once(
+                    move |mut selection: ResMut<Selection>,
+                          mut seam: crate::creature_anim::AttackSeam| {
+                        commit(
+                            &mut selection,
+                            &mut seam,
+                            Entity::PLACEHOLDER,
+                            guid,
+                            engaged,
+                            self_guid,
+                            attackable,
+                        )
+                    },
+                )
+                .expect("commit runs as a one-shot system")
+        }
 
         // Not engaged: first select and a switch are selection-only; a same-guid re-commit dedups.
-        assert!(
-            commit(
-                &mut selection,
-                &net,
-                Entity::PLACEHOLDER,
-                0xA,
-                false,
-                Some(1),
-                true
-            )
-            .changed
-        );
-        assert!(
-            commit(
-                &mut selection,
-                &net,
-                Entity::PLACEHOLDER,
-                0xB,
-                false,
-                Some(1),
-                true
-            )
-            .changed
-        );
-        assert!(
-            !commit(
-                &mut selection,
-                &net,
-                Entity::PLACEHOLDER,
-                0xB,
-                false,
-                Some(1),
-                true
-            )
-            .changed
-        );
+        assert!(go(&mut world, 0xA, false, Some(1), true).changed);
+        assert!(go(&mut world, 0xB, false, Some(1), true).changed);
+        assert!(!go(&mut world, 0xB, false, Some(1), true).changed);
         assert_eq!(drain(&rx), ["select", "select"]);
 
         // Engaged switch onto an attackable unit: the byte order stop → select → swing.
-        let out = commit(
-            &mut selection,
-            &net,
-            Entity::PLACEHOLDER,
-            0xC,
-            true,
-            Some(1),
-            true,
-        );
+        let out = go(&mut world, 0xC, true, Some(1), true);
         assert!(out.changed && out.swung);
         assert_eq!(drain(&rx), ["stop", "select", "swing"]);
 
         // Engaged switch onto MYSELF (TargetUnit("player") mid-combat): stop, no re-point.
-        let out = commit(
-            &mut selection,
-            &net,
-            Entity::PLACEHOLDER,
-            0x1,
-            true,
-            Some(1),
-            true,
-        );
+        let out = go(&mut world, 0x1, true, Some(1), true);
         assert!(out.changed && !out.swung);
         assert_eq!(drain(&rx), ["stop", "select"]);
 
         // Engaged switch onto an unattackable unit (vendor/corpse): stop, no swing at it.
-        let out = commit(
-            &mut selection,
-            &net,
-            Entity::PLACEHOLDER,
-            0xD,
-            true,
-            Some(1),
-            false,
-        );
+        let out = go(&mut world, 0xD, true, Some(1), false);
         assert!(out.changed && !out.swung);
         assert_eq!(drain(&rx), ["stop", "select"]);
 
         // Engaged FIRST select (no old target): the [ebp-1] latch is off — selection only.
-        let mut fresh = Selection::default();
-        let out = commit(
-            &mut fresh,
-            &net,
-            Entity::PLACEHOLDER,
-            0xE,
-            true,
-            Some(1),
-            true,
-        );
+        *world.resource_mut::<Selection>() = Selection::default();
+        let out = go(&mut world, 0xE, true, Some(1), true);
         assert!(out.changed && !out.swung);
         assert_eq!(drain(&rx), ["select"]);
+
+        // **The two edges the seam brought.** A queued strike and a running auto-repeat, then an
+        // engaged switch onto an attackable unit: the stop un-queues the strike, the re-swing
+        // kills the repeat.
+        world
+            .resource_mut::<crate::ui_cast::QueuedMeleeSpell>()
+            .arm(78);
+        world.resource_mut::<crate::ui_action::AutoRepeatActive>().0 = Some(75);
+        let out = go(&mut world, 0xF, true, Some(1), true);
+        assert!(out.changed && out.swung);
+        assert_eq!(
+            drain(&rx),
+            ["stop", "cancel-cast", "select", "swing", "cancel-repeat"]
+        );
+        assert_eq!(
+            world
+                .resource::<crate::ui_cast::QueuedMeleeSpell>()
+                .current(),
+            None,
+            "the switch un-queued Heroic Strike"
+        );
+        assert_eq!(
+            world.resource::<crate::ui_action::AutoRepeatActive>().0,
+            None,
+            "and the re-swing killed Auto Shot"
+        );
     }
 
     fn cand(guid: u64, score: f32, on_screen: bool) -> Candidate {
@@ -898,6 +1046,46 @@ mod tests {
         let solo = [cand(0xA, 0.1, true)];
         assert_eq!(pick_forward(&solo, &[0xA], Some(0xA)), Some((0, true)));
         assert_eq!(pick_forward(&[], &[], None), None);
+    }
+
+    /// **Phase B's fork** (`0x6130a3`): a hostile selection is kept, everything else acquires.
+    ///
+    /// The case that reads wrong until you have read the binary is the *friendly* one — it is not
+    /// an error, it is a reason to go find a real target. That is what makes "press Attack with no
+    /// target and the pet goes for what is in front of you" the same code path as "press Attack
+    /// while talking to a vendor and your target jumps to the wolf behind him".
+    #[test]
+    fn phase_b_keeps_only_a_hostile_selection() {
+        let hostile = |g: u64| g == 0xBAD;
+        assert_eq!(keeps_held_target(Some(0xBAD), hostile), Some(0xBAD));
+        assert_eq!(keeps_held_target(Some(0x600D), hostile), None, "friendly");
+        assert_eq!(keeps_held_target(None, hostile), None, "no selection");
+    }
+
+    /// The final gate's target legs (`0x613152`–`0x613169`), including the transcribed oddity: a
+    /// zero-health target is invalid **unless** dynamic-flag bit 5 is set.
+    #[test]
+    fn the_attack_orders_final_gate_reads_health_then_can_attack() {
+        use benilla_protocol::ObjectFields;
+        const HEALTH: u16 = 22;
+        const DYNFLAGS: u16 = 143;
+        const FLAGS: u16 = 46;
+        let reps = Reputations::default();
+        let unit = |pairs: &[(u16, u32)]| ObjectStore(ObjectFields::from_pairs(pairs));
+        let valid = |s: &ObjectStore| attack_target_valid(Some(s), None, &reps, None);
+
+        assert!(valid(&unit(&[(HEALTH, 120)])), "a live mob");
+        assert!(!valid(&unit(&[(HEALTH, 0)])), "a corpse");
+        assert!(
+            valid(&unit(&[(HEALTH, 0), (DYNFLAGS, 1 << 5)])),
+            "0x613159's second leg, verbatim"
+        );
+        assert!(
+            !valid(&unit(&[(HEALTH, 120), (FLAGS, 1 << 25)])),
+            "NOT_SELECTABLE is one of CanAttack's disqualifiers"
+        );
+        // No descriptor is no disqualification — `can_attack`'s own posture, unchanged.
+        assert!(attack_target_valid(None, None, &reps, None));
     }
 
     /// The history: pruning honors the window, a re-visit moves to most-recent.

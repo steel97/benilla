@@ -37,6 +37,7 @@ mod movement;
 pub mod opcode;
 mod opcode_names;
 mod packet;
+mod page_text;
 mod parse;
 mod pet;
 mod pose;
@@ -128,14 +129,16 @@ pub use mirror_timer::{
 pub use movement::{JumpInfo, MoveMode, MovementInfo, SpeedKind, TransportPose};
 pub use opcode_names::opcode_name;
 pub use packet::{CreatureQueryInfo, MonsterMoveFacing, ServerPacket};
+pub use page_text::page_text_query;
 pub use parse::parse_server;
 pub use pet::{
-    pet_action, pet_cancel_aura, pet_set_action, pet_stop_attack, PetActionEntry, PetMode,
-    PetSpellCooldown, PetSpells, PET_ACTION_SLOTS, PET_ACT_COMMAND, PET_ACT_DISABLED,
-    PET_ACT_ENABLED, PET_ACT_PASSIVE, PET_ACT_REACTION, PET_AUTOCAST_ALLOWED, PET_AUTOCAST_ON,
-    PET_COMMAND_ATTACK, PET_COMMAND_DISMISS, PET_COMMAND_FOLLOW, PET_COMMAND_STAY,
-    PET_COOLDOWN_PERMANENT, PET_REACT_AGGRESSIVE, PET_REACT_DEFENSIVE, PET_REACT_PASSIVE,
-    PET_STATE_BAR_DISABLED, PET_TYPE_SPELL_FIRST, PET_TYPE_SPELL_LAST, PET_UNUSABLE_UNIT_FLAGS,
+    pet_abandon, pet_action, pet_cancel_aura, pet_rename, pet_set_action, pet_spell_autocast,
+    pet_stop_attack, PetActionEntry, PetMode, PetSpellCooldown, PetSpells, PET_ACTION_SLOTS,
+    PET_ACT_COMMAND, PET_ACT_DISABLED, PET_ACT_ENABLED, PET_ACT_PASSIVE, PET_ACT_REACTION,
+    PET_AUTOCAST_ALLOWED, PET_AUTOCAST_ON, PET_COMMAND_ATTACK, PET_COMMAND_DISMISS,
+    PET_COMMAND_FOLLOW, PET_COMMAND_STAY, PET_COOLDOWN_PERMANENT, PET_REACT_AGGRESSIVE,
+    PET_REACT_DEFENSIVE, PET_REACT_PASSIVE, PET_STATE_BAR_DISABLED, PET_TYPE_SPELL_FIRST,
+    PET_TYPE_SPELL_LAST, PET_UNUSABLE_UNIT_FLAGS,
 };
 pub use pose::{set_sheathed, stand_state_change};
 pub use progression::{learn_talent, ExplorationXp, LevelUpInfo, XpGain};
@@ -195,6 +198,32 @@ pub const LOGOUT_SUCCESS: u32 = 0x0;
 /// `Universal` (0) is server-reserved — vmangos rejects it from clients for ordinary chat.
 pub const LANGUAGE_COMMON: u32 = 0x7;
 pub const LANGUAGE_ORCISH: u32 = 0x1;
+
+/// `LANG_ADDON` (VERIFIED vmangos `SharedDefines.h:270`) — **not a tongue**. 1.12.1 has no addon
+/// opcode: `SendAddonMessage` rides the ordinary chat lanes and this sentinel in the `language`
+/// field is the *only* thing that marks the line as addon-to-addon data rather than speech
+/// (decision 1029). The real client routes it to the `CHAT_MSG_ADDON` event; it never reaches the
+/// chat frame.
+///
+/// The server treats it as its own class throughout: exempt from the `KnowsLanguage` gate, from
+/// flood control, and from message sanitizing (`SanitizeChatMessage` returns early,
+/// `Handlers/ChatHandler.cpp:49`); gated instead by the `AddonChannel` config
+/// (`ChatHandler.cpp:165`); and restricted by `WorldSession::IsLanguageAllowedForChatType`
+/// (`ChatHandler.cpp:84`) to the group/guild/channel lanes — PARTY, RAID, RAID_LEADER,
+/// RAID_WARNING, GUILD, OFFICER, BATTLEGROUND, BATTLEGROUND_LEADER, CHANNEL. Never
+/// SAY/YELL/EMOTE/WHISPER, which is why addon traffic can never reach a chat bubble or a
+/// `/r` target. It is also the one language the server never rewrites: the whole
+/// GM/two-side/`SPELL_AURA_MOD_LANGUAGE` normalisation block lives in that check's `else`
+/// (`ChatHandler.cpp:176-218`), so on the party lane a line's language is either a tongue (often
+/// normalised to `Universal`) or exactly this.
+///
+/// **The client's own send set is narrower than the server's permission list.** VERIFIED in
+/// `WoW.exe` (5875) — wow-re `system/ui/scratch/addon-chat-law.md`: `SendAddonMessage`
+/// (`0x49f920`) hard-whitelists **four** types at `0x49fa3f`-`0x49fa4e` — PARTY, RAID, GUILD,
+/// BATTLEGROUND — and the receive side's `distribution` argument uses the same four (remap table
+/// `0x49aff4`), reporting every other type as the literal `"UNKNOWN"`. So a real client accepts
+/// addon traffic on lanes it will never itself send on.
+pub const LANGUAGE_ADDON: u32 = 0xFFFF_FFFF;
 
 /// The language a character speaks by default — its faction tongue. Every send must carry a
 /// language the character *knows*: vmangos drops the whole message (including a `.command`

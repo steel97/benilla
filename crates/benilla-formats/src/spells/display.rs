@@ -56,9 +56,14 @@ pub struct SpellDisplay {
     /// three exclusions ([`Self::in_spellbook`]). Nonzero keeps the spell out of the book; reads
     /// 0 for every ordinary player spell.
     pub cast_ui: u32,
-    /// `Effect[0]` (column 61, module docs) — the first effect type. Only
-    /// [`Self::is_melee_auto_attack`] consumes it (`== SPELL_EFFECT_ATTACK`).
-    pub effect_1: u32,
+    /// `Effect[3]` (column 61 == [`COL_EFFECT_1`], module docs) — each effect's type. Slot 0 is what
+    /// almost every consumer wants (the auto-attack gate [`Self::is_melee_auto_attack`], the
+    /// tradeskill/enchant/duel classifications); the trainer's icon law is the one caller that scans
+    /// all three, hunting a learn-wrapper effect in any slot (wow-re
+    /// `system/ui/scratch/spell-icon-substitution-law.md` §1, `0x4d8fed`'s three-slot loop). Carried
+    /// as the `[T; 3]` array every other per-effect column already uses — it was a lone `effect_1`
+    /// until that scan needed the siblings.
+    pub effects: [u32; 3],
     /// This spell's `SPELL_EFFECT_OPEN_LOCK` effect, or `None` if it opens no lock. The GameObject
     /// interact-cast (decisions 0239/0752) matches it against a lock slot across the player's known
     /// spells: "Opening" for keyless chests, "Mining"/"Herb Gathering"/"Pick Lock" for skill locks.
@@ -102,13 +107,25 @@ pub struct SpellDisplay {
     pub start_recovery_category: u32,
     /// `StartRecoveryTime` ms (column 158) — the GCD duration (1500 for ordinary spells; 0 = no GCD).
     pub start_recovery_ms: u32,
-    /// `powerType` (column 31) — 0 mana, 1 rage, 3 energy (vmangos `Powers`).
+    /// `powerType` (column 31) — 0 mana, 1 rage, 3 energy (vmangos `Powers`); **health is the
+    /// signed −2 stored as `0xFFFFFFFE`** (Life Tap, Bloodrage, Health Funnel), which is why every
+    /// consumer treats "negative or ≥ 5" as the health lane (the ref's own fallback fork, 1074).
     pub power_type: u32,
     /// `manaCost` (column 32) — the flat cast cost in `power_type`'s unit.
     pub mana_cost: u32,
     /// `ManaCostPercentage` (column 156) — percent of base mana added to the flat cost (Judgement
     /// and kin); 0 for most spells.
     pub mana_cost_pct: u32,
+    /// `manaCostPerlevel` (column 33) — the per-level cost term (`0x6e31b0`'s
+    /// `(level − spellLevel) · perLevel`; 1074). 72 nonzero rows in the 5875 file, every one a
+    /// creature-cast spell (Dark Offering's health lane among them) — dormant for player
+    /// tooltips, modeled because the law and the data both carry it.
+    pub mana_cost_per_level: u32,
+    /// `manaPerSecond` (column 34) — the per-second maintenance component; the tooltip cost
+    /// cell's `_PER_TIME` composite ("11 Health, plus 5 per sec" — Health Funnel; 1074). The
+    /// sibling `manaPerSecondPerLevel` (35) is all-zero across the whole 5875 file
+    /// ([`catalog_tests`]'s column scan — a verified negative) and stays unparsed.
+    pub mana_per_second: u32,
     /// `rangeIndex` (column 36) — the `SpellRange.dbc` row ([`SpellRangeCatalog`]).
     pub range_index: u32,
     /// `Targets` (column 13, [`COL_TARGETS`]) — the `TARGET_FLAG_*` seed mask of the cast-arm's
@@ -247,7 +264,7 @@ impl Default for SpellDisplay {
             attributes_ex3: 0,
             passive: false,
             cast_ui: 0,
-            effect_1: 0,
+            effects: [0, 0, 0],
             open_lock: None,
             spell_level: 0,
             dispel: 0,
@@ -263,6 +280,8 @@ impl Default for SpellDisplay {
             power_type: 0,
             mana_cost: 0,
             mana_cost_pct: 0,
+            mana_cost_per_level: 0,
+            mana_per_second: 0,
             range_index: 0,
             targets: 0,
             implicit_target_a1: 0,
@@ -411,7 +430,25 @@ impl SpellDisplay {
     /// are hidden. Passive-but-shown spells exist (a passive is NOT itself a book gate); only the
     /// three bits above hide a spell.
     pub fn in_spellbook(&self) -> bool {
-        self.attributes & (ATTR_DO_NOT_DISPLAY | ATTR_IS_TRADESKILL) == 0 && self.cast_ui == 0
+        self.attributes & (ATTR_DO_NOT_DISPLAY | SPELL_ATTR_IS_TRADESKILL) == 0 && self.cast_ui == 0
+    }
+
+    /// Whether this spell appears in the **pet's** book — a *different* add-gate from
+    /// [`Self::in_spellbook`]'s, and deliberately narrower (decision 1032). `0x4b2f90`, the pet
+    /// book's whole append routine, tests the record's existence and then exactly one bit:
+    ///
+    /// ```text
+    /// 0x4b2fa8  mov dl, byte ptr [rec + 0x18]     ; Attributes, byte 0
+    /// 0x4b2fab  test dl, dl
+    /// 0x4b2fad  js  <drop>                        ; the SIGN of the byte = 0x80 = DO_NOT_DISPLAY
+    /// 0x4b2fb4  [0xb6f098 + 4*count++] = spellId
+    /// ```
+    ///
+    /// No `IS_TRADESKILL` leg and no `castUI` leg — the player book's other two gates simply are
+    /// not there. Reusing `in_spellbook` here would be a guess that happens to agree on every
+    /// vmangos pet list today and would diverge the moment one didn't.
+    pub fn in_pet_book(&self) -> bool {
+        self.attributes & ATTR_DO_NOT_DISPLAY == 0
     }
 
     /// The **melee auto-attack** — `Effect[0] == SPELL_EFFECT_ATTACK (78)`, the client's own
@@ -420,7 +457,7 @@ impl SpellDisplay {
     /// carrying it is 6603 "Attack" (its `SpellIconID` → the `Temp` placeholder the client never
     /// shows, substituting the main-hand weapon icon instead).
     pub fn is_melee_auto_attack(&self) -> bool {
-        self.effect_1 == SPELL_EFFECT_ATTACK
+        self.effects[0] == SPELL_EFFECT_ATTACK
     }
 
     /// The spell **tooltip's** passive gate (wow-re `tooltip-content-law.md` §3.4): the
@@ -437,7 +474,7 @@ impl SpellDisplay {
     pub fn tooltip_omits_cast_line(&self) -> bool {
         self.passive
             || matches!(
-                self.effect_1,
+                self.effects[0],
                 SPELL_EFFECT_TRADE_SKILL | SPELL_EFFECT_ATTACK
             )
     }
@@ -448,7 +485,7 @@ impl SpellDisplay {
     /// show a pie AND their presses can never be cooldown-refused.
     pub fn cooldown_query_excluded(&self) -> bool {
         matches!(
-            self.effect_1,
+            self.effects[0],
             SPELL_EFFECT_TRADE_SKILL | SPELL_EFFECT_ATTACK
         )
     }
@@ -489,6 +526,21 @@ impl SpellDisplay {
     /// test exactly these bits.
     pub fn on_next_swing(&self) -> bool {
         self.attributes & ATTR_ON_NEXT_SWING != 0
+    }
+
+    /// The tooltip cast cell's "Attack speed" arm — `Attributes & 0x2` ALONE (the byte test at
+    /// `0x52ec1c`: `test al,0x2`; 1074), NOT [`Self::ranged_attack`]'s or-pair: Throw carries
+    /// only `0x2` and still reads "Attack speed" in its cell.
+    pub fn tooltip_on_next_ranged(&self) -> bool {
+        self.attributes & ATTR_RANGED != 0
+    }
+
+    /// The tooltip cast cell's "Channeled" arm — `AttributesEx & 0x44` (`SPELL_ATTR_EX_CHANNELED`
+    /// both variants), the byte test at `0x52ec27` (`test [rec+0x1c],0x44`; wow-re
+    /// `tooltip-content-law.md` §3.4, folded as 1074). Distinct from
+    /// [`Self::channel_interrupt_flags`], which is the *running* channel's break mask.
+    pub fn tooltip_channeled(&self) -> bool {
+        self.attributes_ex & ATTR_EX_CHANNELED != 0
     }
 
     /// Whether *casting* this spell turns on the melee auto-attack **at the send** —

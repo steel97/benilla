@@ -1197,3 +1197,251 @@ fn the_party_art_paints_over_the_bars() {
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
+
+/// **What a feigning hunter looks like on the frames** (decision 1022) — the end of the chain the
+/// snapshot starts: `UNIT_DYNFLAG_DEAD` zeroes `UnitHealth`/`UnitMana` while the maxima stay real
+/// (`UnitHealth 0x5174d0` gates, `UnitHealthMax 0x5175b0` does not), so both bars run **empty over
+/// a full-size track** rather than collapsing to a 0/0 nothing, and the target frame's DEAD text
+/// lights on the same `UnitHealth(unit) <= 0` test a corpse trips.
+#[test]
+fn a_feigning_target_paints_empty_bars_and_the_dead_text() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_unit_frames(&s);
+
+    let hunter = |health: u32, power: u32, dead: bool| {
+        Some(UnitState {
+            exists: true,
+            name: Some("Nazriel".into()),
+            health,
+            max_health: 1500,
+            level: 60,
+            power_type: 0,
+            power,
+            max_power: 900,
+            dead,
+            reaction: 2, // hostile — the frame we would be watching him through
+            ..UnitState::default()
+        })
+    };
+
+    s.set_unit("target", hunter(1200, 300, false));
+    s.fire_event("PLAYER_TARGET_CHANGED", vec![]);
+    let alive: bool = s
+        .eval(
+            r#"
+            local hb, pb = BenillaTargetFrameHealthBar, BenillaTargetFramePowerBar
+            return hb:GetValue() == 1200 and pb:GetValue() == 300
+               and BenillaTargetFrameTextureFrameDeadText:GetText() == ""
+        "#,
+        )
+        .unwrap();
+    assert!(alive, "the control: a live hunter reads live");
+
+    // He feigns. Only the flag moved on the wire — the snapshot turns it into these three.
+    s.set_unit("target", hunter(0, 0, true));
+    s.fire_event("UNIT_HEALTH", vec![ScriptValue::Str("target".into())]);
+    let (hp, hmax, mana, mmax): (f64, f64, f64, f64) = (
+        s.eval("return BenillaTargetFrameHealthBar:GetValue()")
+            .unwrap(),
+        s.eval("local _, m = BenillaTargetFrameHealthBar:GetMinMaxValues() return m")
+            .unwrap(),
+        s.eval("return BenillaTargetFramePowerBar:GetValue()")
+            .unwrap(),
+        s.eval("local _, m = BenillaTargetFramePowerBar:GetMinMaxValues() return m")
+            .unwrap(),
+    );
+    assert_eq!((hp, hmax), (0.0, 1500.0), "empty health bar, real track");
+    assert_eq!((mana, mmax), (0.0, 900.0), "empty mana bar, real track");
+    assert!(
+        s.eval::<bool>("return BenillaTargetFramePowerBar:IsVisible()")
+            .unwrap(),
+        "the mana bar empties, it does not disappear — UnitManaMax 0x5177e0 is ungated"
+    );
+    assert_eq!(
+        s.eval::<String>("return BenillaTargetFrameTextureFrameDeadText:GetText()")
+            .unwrap(),
+        "DEAD",
+        "TargetFrame_CheckDead's UnitHealth(unit) <= 0 test, tripped by the flag"
+    );
+    assert!(
+        s.eval::<bool>(r#"return UnitIsDead("target")"#).unwrap(),
+        "UnitIsDead 0x517ac0's dynflag leg reaches the API too"
+    );
+
+    // He stands back up: the flag clears, and nothing about the body needed restoring.
+    s.set_unit("target", hunter(1200, 300, false));
+    s.fire_event("UNIT_HEALTH", vec![ScriptValue::Str("target".into())]);
+    let up: bool = s
+        .eval(
+            r#"
+            return BenillaTargetFrameHealthBar:GetValue() == 1200
+               and BenillaTargetFramePowerBar:GetValue() == 300
+               and BenillaTargetFrameTextureFrameDeadText:GetText() == ""
+               and not UnitIsDead("target")
+        "#,
+        )
+        .unwrap();
+    assert!(up, "the feign ends and the frame reads live again");
+}
+
+/// The resting status flash (decision 1082, ref `PlayerFrame_UpdateStatus` + `_OnUpdate`): while
+/// resting the player frame wears the gold status ring, the zzz state icon and its glow, all
+/// pulsing on a 0.5 s alpha wave; auto-attack (PLAYER_ENTER_COMBAT) swaps them for the red
+/// ring/swords/disc — resting still wins when both hold — and leaving both states clears the lot.
+#[test]
+fn the_player_frame_flashes_zzz_while_resting() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_unit_frames(&s);
+    s.set_unit(
+        "player",
+        Some(UnitState {
+            exists: true,
+            name: Some("Prober".into()),
+            health: 100,
+            max_health: 100,
+            level: 12,
+            power_type: 0,
+            power: 80,
+            max_power: 80,
+            dead: false,
+            reaction: 0,
+            ..UnitState::default()
+        }),
+    );
+
+    // Into the inn: the resting flag lands and PLAYER_UPDATE_RESTING repaints.
+    s.set_rest_state(1, 500, true);
+    s.fire_event("PLAYER_UPDATE_RESTING", vec![]);
+    let resting: bool = s
+        .eval(
+            r#"
+            local tf = "BenillaPlayerFrameTextureFrame"
+            return getglobal(tf .. "StatusTexture"):IsShown()
+               and getglobal(tf .. "RestIcon"):IsShown()
+               and not getglobal(tf .. "AttackIcon"):IsShown()
+               and BenillaPlayerFrameStatusGlow:IsShown()
+               and BenillaPlayerFrameStatusGlowRestGlow:IsShown()
+               and not BenillaPlayerFrameStatusGlowAttackGlow:IsShown()
+               and not getglobal(tf .. "AttackBackground"):IsShown()
+        "#,
+        )
+        .unwrap();
+    assert!(
+        resting,
+        "resting shows the gold ring + zzz + glow, nothing red"
+    );
+
+    // The pulse: two OnUpdate ticks move the ring's alpha (the 0.5 s triangle wave).
+    let a0: f64 = s
+        .eval("return BenillaPlayerFrameTextureFrameStatusTexture:GetAlpha()")
+        .unwrap();
+    s.run("BenillaPlayerFrame_OnUpdate(BenillaPlayerFrame, 0.25)")
+        .unwrap();
+    let a1: f64 = s
+        .eval("return BenillaPlayerFrameTextureFrameStatusTexture:GetAlpha()")
+        .unwrap();
+    assert!(
+        (a0 - a1).abs() > 0.1,
+        "the flash moves the status alpha ({a0} → {a1})"
+    );
+
+    // Swinging while resting: resting still wins (the ref's branch order).
+    s.fire_event("PLAYER_ENTER_COMBAT", vec![]);
+    assert!(
+        s.eval::<bool>("return BenillaPlayerFrameTextureFrameRestIcon:IsShown()")
+            .unwrap(),
+        "resting outranks auto-attack"
+    );
+
+    // Out of the inn mid-swing: the red attack set takes over.
+    s.set_rest_state(2, 0, false);
+    s.fire_event("PLAYER_UPDATE_RESTING", vec![]);
+    let attacking: bool = s
+        .eval(
+            r#"
+            local tf = "BenillaPlayerFrameTextureFrame"
+            return getglobal(tf .. "StatusTexture"):IsShown()
+               and getglobal(tf .. "AttackIcon"):IsShown()
+               and not getglobal(tf .. "RestIcon"):IsShown()
+               and BenillaPlayerFrameStatusGlowAttackGlow:IsShown()
+               and getglobal(tf .. "AttackBackground"):IsShown()
+        "#,
+        )
+        .unwrap();
+    assert!(attacking, "auto-attack shows the red ring + swords + disc");
+
+    // Swords down: everything clears.
+    s.fire_event("PLAYER_LEAVE_COMBAT", vec![]);
+    let clear: bool = s
+        .eval(
+            r#"
+            local tf = "BenillaPlayerFrameTextureFrame"
+            return not getglobal(tf .. "StatusTexture"):IsShown()
+               and not getglobal(tf .. "RestIcon"):IsShown()
+               and not getglobal(tf .. "AttackIcon"):IsShown()
+               and not BenillaPlayerFrameStatusGlow:IsShown()
+               and not getglobal(tf .. "AttackBackground"):IsShown()
+        "#,
+        )
+        .unwrap();
+    assert!(clear, "neither state → no status dressing at all");
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The zzz badge paints OVER the level number (decision 1093): the ref keeps the number in the
+/// texture frame's BACKGROUND layer and the state icons up in OVERLAY, so the opaque badge covers
+/// it while resting. The layer split is the only mechanism that CAN hide it — a fontstring never
+/// ducks under a texture of its own layer (0884's bucket-wide quads-then-text law) — which is
+/// exactly how 1082's transcription slipped: it put the number in OVERLAY beside the icons, and
+/// the number rode on the badge (director report, 2026-08-07).
+#[test]
+fn the_rest_badge_covers_the_level_number() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_unit_frames(&s);
+    s.set_unit(
+        "player",
+        Some(UnitState {
+            exists: true,
+            name: Some("Prober".into()),
+            health: 100,
+            max_health: 100,
+            level: 12,
+            power_type: 0,
+            power: 80,
+            max_power: 80,
+            dead: false,
+            reaction: 0,
+            ..UnitState::default()
+        }),
+    );
+    s.fire_event("PLAYER_ENTERING_WORLD", vec![]);
+    s.set_rest_state(1, 500, true);
+    s.fire_event("PLAYER_UPDATE_RESTING", vec![]);
+    s.resolve();
+    let quads = s.extract();
+
+    // Every UI-StateIcon quad (the badge AND its ADD glow — the glow rides a later frame and
+    // sits higher still): even the LOWEST must clear the number.
+    let badge = quads
+        .iter()
+        .filter(|q| {
+            matches!(&q.content, QuadContent::Texture { path: Some(p), .. }
+                    if p.ends_with("UI-StateIcon"))
+        })
+        .map(|q| q.z)
+        .min()
+        .expect("the zzz badge");
+    let level = quads
+        .iter()
+        .find(|q| matches!(&q.content, QuadContent::Text { text: Some(t), .. } if t == "12"))
+        .expect("the level text");
+    assert!(
+        badge > level.z,
+        "the badge must cover the level number (badge z={badge:#x}, level z={:#x})",
+        level.z
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
