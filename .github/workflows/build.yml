@@ -10,10 +10,10 @@ on:
       - ios-test
 
 jobs:
-  desktop-mac:
-    name: desktop-mac
-    runs-on: macos-latest
-    environment: desktop-mac
+  desktop:
+    name: desktop-build
+    runs-on: ubuntu-latest
+    environment: desktop
     strategy:
       matrix:
         include:
@@ -23,76 +23,12 @@ jobs:
           - target: x86_64-apple-darwin
             artifact: benilla-macx86
             binary: benilla
-
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.97.1
-      - name: Install dependencies
-        run: |
-          rustup target add ${{ matrix.target }}
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p benilla
-
-      - name: Rename and move artifact
-        run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} ./${{ matrix.artifact }}
-          if [ "${{ matrix.binary }}" = "benilla.exe" ]; then
-            mv ./${{ matrix.artifact }} ./${{ matrix.artifact }}.exe
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}${{ matrix.binary == 'benilla.exe' && '.exe' || '' }}
-
-  desktop-win:
-    name: desktop-win
-    runs-on: windows-latest
-    environment: desktop-win
-    strategy:
-      matrix:
-        include:
           - target: x86_64-pc-windows-msvc
             artifact: benilla-win64
             binary: benilla.exe
           - target: aarch64-pc-windows-msvc
             artifact: benilla-winarm
             binary: benilla.exe
-
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.97.1
-      - name: Install dependencies
-        run: |
-          rustup target add ${{ matrix.target }}
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p benilla
-
-      - name: Rename and move artifact
-        run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} ./${{ matrix.artifact }}
-          if [ "${{ matrix.binary }}" = "benilla.exe" ]; then
-            mv ./${{ matrix.artifact }} ./${{ matrix.artifact }}.exe
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}${{ matrix.binary == 'benilla.exe' && '.exe' || '' }}
-
-  desktop-linux:
-    name: desktop-linux
-    runs-on: ubuntu-latest
-    environment: desktop-linux
-    strategy:
-      matrix:
-        include:
           - target: x86_64-unknown-linux-gnu
             artifact: benilla-linux64
             binary: benilla
@@ -105,11 +41,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
-      - name: Install dependencies
-        run: |
-          rustup target add ${{ matrix.target }}
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p benilla
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build with cross
+        run: cross build --release --target ${{ matrix.target }} -p benilla
 
       - name: Rename and move artifact
         run: |
@@ -177,7 +115,7 @@ jobs:
     name: release
     runs-on: ubuntu-latest
     environment: linux
-    needs: [desktop-mac, desktop-linux, desktop-win, ios]
+    needs: [desktop, ios]
     steps:
       - uses: actions/checkout@v6
 
