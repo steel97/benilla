@@ -12,7 +12,7 @@ on:
 jobs:
   desktop:
     name: desktop
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     environment: desktop
     strategy:
       matrix:
