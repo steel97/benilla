@@ -86,10 +86,10 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}${{ matrix.binary == 'benilla.exe' && '.exe' || '' }}
 
-  desktop:
-    name: desktop-mac
+  desktop-linux:
+    name: desktop-linux
     runs-on: ubuntu-latest
-    environment: desktop
+    environment: desktop-linux
     strategy:
       matrix:
         include:
@@ -177,7 +177,7 @@ jobs:
     name: release
     runs-on: ubuntu-latest
     environment: linux
-    needs: [desktop, ios]
+    needs: [desktop-mac, desktop-linux, desktop-win, ios]
     steps:
       - uses: actions/checkout@v6
 
