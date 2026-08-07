@@ -14,10 +14,8 @@ jobs:
     name: ios
     runs-on: macos-latest
     environment: ios
-    env:
-      build_package_name: benilla_ios
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
@@ -49,13 +47,45 @@ jobs:
           mkdir Payload
           mkdir Payload/benilla.app
           cp -R benilla.xcarchive/Products/Applications/benilla.app/ Payload/benilla.app/
-          zip -r ../app-release.ipa Payload
+          zip -r ../benilla.ipa Payload
       - name: Cleanup
         run: |
           cd mobile
           rm -fr benilla.xcarchive
           rm -fr Payload
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.build_package_name }}
-          path: app-release.ipa
+          name: benilla-ios
+          path: |
+            benilla.ipa
+
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    environment: linux
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set short git commit SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: assets
+        run: |
+          cd crates/benilla-app
+          zip -r ../../assets.zip assets
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: benilla-ios
+          path: "./benilla-ios"
+      - run: |
+          mv './benilla-ios/benilla.ipa' './benilla.ipa'
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.vars.outputs.sha_short }}
+          files: |
+            benilla.ipa
+            assets.zip
