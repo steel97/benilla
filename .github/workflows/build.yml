@@ -50,7 +50,7 @@ jobs:
       - name: Install dependencies
         run: |
           rustup target add ${{ matrix.target }}
-      - name: Install ARM64 ALSA development libraries
+      - name: Install linux dependencies
         if: matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           sudo apt install libasound2-dev
@@ -59,6 +59,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} -p benilla
 
       - name: Rename and move artifact
+        shell: bash
         run: |
           cp target/${{ matrix.target }}/release/${{ matrix.binary }} ./${{ matrix.artifact }}
           if [ "${{ matrix.binary }}" = "benilla.exe" ]; then
