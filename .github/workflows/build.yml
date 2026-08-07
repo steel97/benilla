@@ -11,8 +11,8 @@ on:
 
 jobs:
   desktop:
-    name: desktop-build
-    runs-on: ubuntu-latest
+    name: desktop
+    runs-on: ${{ matrix.runner }}
     environment: desktop
     strategy:
       matrix:
@@ -20,34 +20,38 @@ jobs:
           - target: aarch64-apple-darwin
             artifact: benilla-macarm
             binary: benilla
+            runner: macos-latest
           - target: x86_64-apple-darwin
             artifact: benilla-macx86
             binary: benilla
+            runner: macos-26-intel
           - target: x86_64-pc-windows-msvc
             artifact: benilla-win64
             binary: benilla.exe
+            runner: windows-latest
           - target: aarch64-pc-windows-msvc
             artifact: benilla-winarm
             binary: benilla.exe
+            runner: windows-11-arm
           - target: x86_64-unknown-linux-gnu
             artifact: benilla-linux64
             binary: benilla
+            runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             artifact: benilla-linuxarm
             binary: benilla
+            runner: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
-          targets: ${{ matrix.target }}
-
-      - name: Install cross
-        run: cargo install cross --locked
-
-      - name: Build with cross
-        run: cross build --release --target ${{ matrix.target }} -p benilla
+      - name: Install dependencies
+        run: |
+          rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p benilla
 
       - name: Rename and move artifact
         run: |
