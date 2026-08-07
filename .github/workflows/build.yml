@@ -10,6 +10,56 @@ on:
       - ios-test
 
 jobs:
+  desktop:
+    name: desktop
+    runs-on: macos-latest
+    environment: desktop
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            artifact: benilla-macarm
+            binary: benilla
+          - target: x86_64-apple-darwin
+            artifact: benilla-macx86
+            binary: benilla
+          - target: x86_64-pc-windows-msvc
+            artifact: benilla-win64
+            binary: benilla.exe
+          - target: aarch64-pc-windows-msvc
+            artifact: benilla-winarm
+            binary: benilla.exe
+          - target: x86_64-unknown-linux-gnu
+            artifact: benilla-linux64
+            binary: benilla
+          - target: aarch64-unknown-linux-gnu
+            artifact: benilla-linuxarm
+            binary: benilla
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Install dependencies
+        run: |
+          rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename and move artifact
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} ./${{ matrix.artifact }}
+          if [ "${{ matrix.binary }}" = "benilla.exe" ]; then
+            mv ./${{ matrix.artifact }} ./${{ matrix.artifact }}.exe
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}${{ matrix.binary == 'benilla.exe' && '.exe' || '' }}
+
   ios:
     name: ios
     runs-on: macos-latest
@@ -63,7 +113,7 @@ jobs:
     name: release
     runs-on: ubuntu-latest
     environment: linux
-    needs: [ios]
+    needs: [desktop, ios]
     steps:
       - uses: actions/checkout@v6
 
@@ -79,14 +129,81 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           name: benilla-ios
-          path: "./benilla-ios"
-      - run: |
-          mv './benilla-ios/benilla.ipa' './benilla.ipa'
+          path: "./"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: benilla-macarm
+          path: "./"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: benilla-macx86
+          path: "./"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: benilla-win64
+          path: "./"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: benilla-winarm
+          path: "./"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: benilla-linux64
+          path: "./"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: benilla-linuxarm
+          path: "./"
+
+      - name: Create launch scripts
+        run: |
+          # Define platforms
+          platforms=(
+            "macarm:benilla-macarm:sh"
+            "macx86:benilla-macx86:sh"
+            "linux64:benilla-linux64:sh"
+            "linuxarm:benilla-linuxarm:sh"
+            "win64:benilla-win64.exe:bat"
+            "winarm:benilla-winarm.exe:bat"
+          )
+
+          for platform in "${platforms[@]}"; do
+            IFS=':' read -r name binary ext <<< "$platform"
+            
+            if [ "$ext" = "sh" ]; then
+              echo "#!/bin/bash
+          WOW_HOST=127.0.0.1:3724 WOW_BUILTIN=./ ./$binary" > "start_$name.sh"
+              chmod +x "start_$name.sh"
+            else
+              echo "@echo off
+          set WOW_HOST=127.0.0.1:3724
+          set WOW_BUILTIN=./
+          $binary" > "start_$name.bat"
+            fi
+          done
 
       - name: Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.vars.outputs.sha_short }}
           files: |
-            benilla.ipa
             assets.zip
+            benilla.ipa
+            benilla-macarm
+            benilla-macx86
+            benilla-win64
+            benilla-winarm
+            benilla-linux64
+            benilla-linuxarm            
+            start_macarm.sh
+            start_macx86.sh
+            start_linuxarm.sh
+            start_linux64.sh
+            start_win64.bat
+            start_winarm.bat
