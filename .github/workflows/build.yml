@@ -63,6 +63,7 @@ jobs:
     name: release
     runs-on: ubuntu-latest
     environment: linux
+    needs: [ios]
     steps:
       - uses: actions/checkout@v6
 
