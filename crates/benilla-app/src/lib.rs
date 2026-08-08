@@ -268,6 +268,7 @@ pub fn run(build: BuildId) -> AppExit {
     };
 
     let assets_path = path.join("assets");
+    println!("assets path: {}", assets_path.to_str().unwrap());
     // `WOW_CAPTURE=list` just prints the harness scenario names (the source of truth `scripts/visual.sh`
     // reads) and exits before any window/asset setup.
     // `WOW_HOVER_LOG_REPORT=<csv>` re-reads a recorded run and prints its report, then exits —
@@ -324,6 +325,18 @@ pub fn run(build: BuildId) -> AppExit {
     if let Err(e) = benilla_assets::register_mpq_source(&mut app, &data_dir) {
         eprintln!("benilla-assets: mpq:// source unavailable ({e:#})");
     }
+
+    #[cfg(target_os = "android")]
+    {
+        use bevy::asset::io::{file::FileAssetReader, AssetSourceBuilder, AssetSourceId};
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || Box::new(FileAssetReader::new(assets_path.clone()))),
+        );
+    }
+
+    #[cfg(target_os = "android")]
+    let assets_path = std::path::PathBuf::from("");
 
     app.add_plugins(
         DefaultPlugins

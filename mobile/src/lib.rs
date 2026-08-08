@@ -16,6 +16,8 @@ pub mod joystick;
 
 #[bevy_main]
 pub fn main() {
+    println!("running benilla mobile!");
+
     prepare_fs();
 
     unsafe {

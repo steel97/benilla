@@ -4,3 +4,7 @@ benilla/app/src/main/jniLibs
 benilla/app/.cxx
 benilla/app/build
 benilla/.gradle
+benilla/.idea
+benilla/build
+benilla/local.properties
+sign.bat

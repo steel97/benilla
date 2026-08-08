@@ -15,6 +15,9 @@ pub fn prepare_fs() {
         prepare_fs_ios();
     }
 
+    let path_base = transform_path("");
+    let _r = fs::create_dir_all(&path_base);
+
     let path = transform_path("Data");
     println!("path {}", path.to_str().unwrap());
 
@@ -170,7 +173,7 @@ pub fn get_android_media_path() -> PathBuf {
 
 #[cfg(target_os = "android")]
 pub fn transform_path_android(relative_path: &str) -> PathBuf {
-    get_android_media_path().join("WoW/").join(relative_path)
+    get_android_media_path().join(relative_path)
 }
 
 pub fn transform_path(relative_path: &str) -> PathBuf {
