@@ -137,9 +137,7 @@ jobs:
           java-version: "25"
       - uses: android-actions/setup-android@v4
         with:
-          packages: |
-            ndk;26.1.10909125
-            cmdline-tools;11.0
+          packages: "ndk;26.1.10909125 cmdline-tools;11.0"
       - name: Symlink cmdline-tools version to latest
         run: |
           mkdir -p $ANDROID_HOME/cmdline-tools/latest
