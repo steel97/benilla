@@ -209,8 +209,8 @@ jobs:
             benilla.ipa
             benilla-macarm
             benilla-macx86
-            benilla-win64
-            benilla-winarm
+            benilla-win64.exe
+            benilla-winarm.exe
             benilla-linux64
             benilla-linuxarm            
             start_macarm.sh
