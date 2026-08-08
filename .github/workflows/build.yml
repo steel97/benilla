@@ -121,11 +121,52 @@ jobs:
           path: |
             benilla.ipa
 
+  android:
+    name: android
+    runs-on: ubuntu-latest
+    environment: android
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-linux-android
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "25"
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: |
+            ndk;26.1.10909125
+            cmdline-tools;11.0
+      - name: Symlink cmdline-tools version to latest
+        run: |
+          mkdir -p $ANDROID_HOME/cmdline-tools/latest
+          ln -sf $ANDROID_HOME/cmdline-tools/11.0/* $ANDROID_HOME/cmdline-tools/latest/
+      - name: Install dependencies
+        run: |
+          cargo install cargo-ndk
+      - name: Build executable
+        run: |
+          cd mobile
+          cargo ndk -t arm64-v8a -P 26 -o benilla/app/src/main/jniLibs build --release
+          cd benilla
+          ./gradlew build
+      - name: Sign app
+        run: |
+          cd mobile/benilla/app/build/outputs/apk/release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: benilla-android
+          path: |
+            benilla.apk
+
   release:
     name: release
     runs-on: ubuntu-latest
     environment: linux
-    needs: [desktop, ios]
+    needs: [desktop, ios, android]
     steps:
       - uses: actions/checkout@v6
 
@@ -141,6 +182,11 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           name: benilla-ios
+          path: "./"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: benilla-android
           path: "./"
 
       - uses: actions/download-artifact@v7
@@ -207,6 +253,7 @@ jobs:
           files: |
             assets.zip
             benilla.ipa
+            benilla.apk
             benilla-macarm
             benilla-macx86
             benilla-win64.exe
