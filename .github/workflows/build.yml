@@ -133,7 +133,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: "zulu"
-          java-version: "25"
+          java-version: "24"
       - uses: android-actions/setup-android@v4
         with:
           packages: "ndk;26.1.10909125 cmdline-tools;11.0"
