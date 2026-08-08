@@ -130,7 +130,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
-          targets: aarch64-linux-android
       - uses: actions/setup-java@v4
         with:
           distribution: "zulu"
@@ -141,6 +140,7 @@ jobs:
       - name: Install dependencies
         run: |
           cargo install cargo-ndk
+          rustup target add aarch64-linux-android
       - name: Build executable
         run: |
           cd mobile
