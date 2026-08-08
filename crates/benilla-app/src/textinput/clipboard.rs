@@ -53,6 +53,7 @@ trait Pasteboard {
     fn name(&self) -> &'static str;
 }
 
+#[cfg(not(target_os = "android"))]
 impl Pasteboard for arboard::Clipboard {
     fn read_text(&mut self) -> Result<Option<String>, String> {
         // `ContentNotAvailable` is arboard's "empty, or holds no format we asked for" — the normal
@@ -83,7 +84,10 @@ impl Pasteboard for arboard::Clipboard {
 
 /// The Wayland half: the standard `wl_data_device` through our own `wl_display`. Gated to the
 /// platforms `smithay-clipboard` is a dependency on (see `Cargo.toml`) — Linux and the BSDs.
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
 mod wl {
     use super::Pasteboard;
 
@@ -117,7 +121,10 @@ mod wl {
 /// Taken from bevy's own [`RawHandleWrapper`] rather than `WAYLAND_DISPLAY`: `smithay-clipboard`
 /// needs *our* connection (it works off the seat holding our keyboard focus), and the env var only
 /// says a Wayland session exists, not that winit chose it.
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
 pub(crate) fn wayland_display(handle: Option<&RawHandleWrapper>) -> Option<*mut c_void> {
     match handle?.get_display_handle() {
         raw_window_handle::RawDisplayHandle::Wayland(wl) => Some(wl.display.as_ptr()),
@@ -127,7 +134,10 @@ pub(crate) fn wayland_display(handle: Option<&RawHandleWrapper>) -> Option<*mut 
 
 /// Off the Wayland-capable platforms there is no `wl_display` to find, so the backend is always
 /// [`arboard`].
-#[cfg(not(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))))]
+#[cfg(not(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+)))]
 pub(crate) fn wayland_display(_handle: Option<&RawHandleWrapper>) -> Option<*mut c_void> {
     None
 }
@@ -138,13 +148,19 @@ pub(crate) fn wayland_display(_handle: Option<&RawHandleWrapper>) -> Option<*mut
 /// `display` must be a live `wl_display` that outlives the returned backend. It comes from bevy's
 /// [`RawHandleWrapper`], which holds an `Arc` on the window keeping the connection alive, and the
 /// backend lives in a resource dropped during app teardown.
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
 fn open_wayland(display: *mut c_void) -> Box<dyn Pasteboard> {
     // SAFETY: see the doc comment — `display` is winit's own live `wl_display`.
     Box::new(unsafe { smithay_clipboard::Clipboard::new(display) })
 }
 
-#[cfg(not(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))))]
+#[cfg(not(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+)))]
 fn open_wayland(_display: *mut c_void) -> Box<dyn Pasteboard> {
     unreachable!("wayland_display() only yields Some on Wayland-capable platforms")
 }
@@ -187,16 +203,20 @@ impl HostClipboard {
             return;
         }
         self.opened = true;
-        self.backend = match wl_display {
-            Some(display) => Some(open_wayland(display)),
-            None => match arboard::Clipboard::new() {
-                Ok(clipboard) => Some(Box::new(clipboard)),
-                Err(e) => {
-                    warn!("clipboard: unavailable — {e}{}", session_note());
-                    None
-                }
-            },
-        };
+
+        #[cfg(not(target_os = "android"))]
+        {
+            self.backend = match wl_display {
+                Some(display) => Some(open_wayland(display)),
+                None => match arboard::Clipboard::new() {
+                    Ok(clipboard) => Some(Box::new(clipboard)),
+                    Err(e) => {
+                        warn!("clipboard: unavailable — {e}{}", session_note());
+                        None
+                    }
+                },
+            };
+        }
         if let Some(backend) = &self.backend {
             info!("clipboard: {}{}", backend.name(), session_note());
         }

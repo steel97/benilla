@@ -4,7 +4,7 @@ use benilla_app::BuildId;
 use bevy::prelude::bevy_main;
 
 use crate::{
-    fs::{prepare_fs, transform_path, transform_path_pkg},
+    fs::{prepare_fs, transform_path},
     helpers::postprocess_env,
     hooks::register_hooks,
 };

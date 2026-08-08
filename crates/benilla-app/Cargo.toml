@@ -16,13 +16,15 @@ tracy = ["bevy/trace_tracy"]
 # else recorded). Aggregate it with `scripts/tracesum.py`.
 trace_chrome = ["bevy/trace_chrome"]
 
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = "3"
+
 [dependencies]
 anyhow.workspace = true
 # OS clipboard access for the UI EditBox copy/cut/paste chords (chat input). Already in the tree via
 # bevy_egui; pinned to the same 3.x so there's one copy. Read on the main thread (the UI key feed is
 # a NonSend system) — required for the macOS NSPasteboard path. Covers macOS, Windows, and Linux/BSD
 # under X11; the Wayland backend is `smithay-clipboard` below (decision 0702).
-arboard = "3"
 benilla-ui = { path = "../benilla-ui" }
 bevy.workspace = true
 bevy_egui = "0.39"

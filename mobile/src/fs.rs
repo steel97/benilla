@@ -1,3 +1,9 @@
+#[cfg(target_os = "android")]
+use bevy::android::ANDROID_APP;
+#[cfg(target_os = "android")]
+use jni::objects::{JObject, JString, JValue};
+#[cfg(target_os = "android")]
+use jni::{Env, JavaVM, errors::Result, jni_sig, jni_str};
 use serde_json;
 use serde_json::{Value, json};
 use std::fs;
@@ -7,20 +13,32 @@ pub fn prepare_fs() {
     #[cfg(target_os = "ios")]
     {
         prepare_fs_ios();
-        let path = transform_path_ios("Data");
-        println!("path {}", path.to_str().unwrap());
+    }
 
-        match list_files_in_documents(transform_path_ios("")) {
-            Ok(files) => {
-                println!("Contents list");
-                for file in files {
-                    println!("- {}", file);
-                }
-            }
-            Err(e) => println!("Failed to read directory: {}", e),
-        }
+    let path = transform_path("Data");
+    println!("path {}", path.to_str().unwrap());
 
-        read_config();
+    let files = list_files_in_documents(transform_path(""));
+    println!("Contents list");
+    for file in files {
+        println!("- {}", file);
+    }
+
+    write_initial_data();
+    read_config();
+}
+
+pub fn write_initial_data() {
+    let file_path = transform_path("config.json");
+    if !file_path.exists() {
+        let default_config = json!({
+            "host": "127.0.0.1:3724",
+            "user": "changeme",
+            "pass": "changeme"
+        });
+
+        let json_string = serde_json::to_string_pretty(&default_config).unwrap();
+        fs::write(&file_path, json_string).unwrap();
     }
 }
 
@@ -67,7 +85,7 @@ pub fn prepare_fs_ios() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(doc_url) = urls.firstObject() {
             if let Some(path_nsstring) = doc_url.path() {
                 let path_string = path_nsstring.to_string();
-                let mut file_path = std::path::PathBuf::from(path_string.clone());
+                let mut file_path = std::path::PathBuf::from(path_string);
                 file_path.push("Readme.txt");
                 if !file_path.exists() {
                     fs::write(
@@ -75,32 +93,17 @@ pub fn prepare_fs_ios() -> Result<(), Box<dyn std::error::Error>> {
                         "Put your Data directory here, change config.json, play :)",
                     )?;
                 }
-
-                let mut file_path = std::path::PathBuf::from(path_string);
-                file_path.push("config.json");
-                if !file_path.exists() {
-                    let default_config = json!({
-                        "host": "127.0.0.1:3724",
-                        "user": "changeme",
-                        "pass": "changeme"
-                    });
-
-                    let json_string = serde_json::to_string_pretty(&default_config).unwrap();
-                    fs::write(&file_path, json_string)?;
-                }
             }
         }
     }
     Ok(())
 }
 
-pub fn list_files_in_documents(
-    target_path: PathBuf,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+pub fn list_files_in_documents(target_path: PathBuf) -> Vec<String> {
     let mut file_list = Vec::new();
 
-    for entry in fs::read_dir(target_path)? {
-        let entry = entry?;
+    for entry in fs::read_dir(target_path).unwrap() {
+        let entry = entry.unwrap();
         let path = entry.path();
 
         if let Some(file_name) = path.file_name() {
@@ -110,12 +113,72 @@ pub fn list_files_in_documents(
         }
     }
 
-    Ok(file_list)
+    file_list
+}
+
+#[cfg(target_os = "android")]
+pub fn get_android_media_path() -> PathBuf {
+    let android_app = ANDROID_APP
+        .get()
+        .expect("ANDROID_APP is not set. Did you forget to use the #[bevy_main] macro?");
+
+    let vm = unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr() as *mut _) };
+
+    let path_buf_result: Result<PathBuf> = vm.attach_current_thread(|env| {
+        let activity = unsafe { JObject::from_raw(env, android_app.activity_as_ptr() as *mut _) };
+        let directory_documents = env
+            .new_string("Documents")
+            .expect("Failed to create Java string");
+
+        let files_dir = env
+            .call_method(
+                &activity,
+                jni_str!("getExternalFilesDir"),
+                jni_sig!("(Ljava/lang/String;)Ljava/io/File;"),
+                &[JValue::from(&directory_documents)],
+            )
+            .expect("Failed to call getExternalFilesDir")
+            .l()
+            .expect("getExternalFilesDir returned null");
+
+        let path_object = env
+            .call_method(
+                &files_dir,
+                jni_str!("getAbsolutePath"),
+                jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+            .expect("Failed to call getAbsolutePath")
+            .l()
+            .expect("getAbsolutePath returned null");
+
+        let path_jstring: JString =
+            JString::cast_local(env, path_object).expect("Failed to cast path object to JString");
+
+        let java_path: String = env
+            .get_string(&path_jstring)
+            .expect("Failed to get Java string")
+            .into();
+
+        let android_media_path = java_path.replace("Android/data", "Android/media");
+        Ok(PathBuf::from(android_media_path))
+    });
+
+    let android_media_path: PathBuf = path_buf_result.unwrap();
+    android_media_path
+}
+
+#[cfg(target_os = "android")]
+pub fn transform_path_android(relative_path: &str) -> PathBuf {
+    get_android_media_path().join("WoW/").join(relative_path)
 }
 
 pub fn transform_path(relative_path: &str) -> PathBuf {
     #[cfg(target_os = "ios")]
     return transform_path_ios(relative_path);
+
+    #[cfg(target_os = "android")]
+    return transform_path_android(relative_path);
 
     transform_path_pkg(relative_path)
 }

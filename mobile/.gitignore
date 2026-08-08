@@ -1,2 +1,6 @@
 benilla.xcarchive
 Payload
+benilla/app/src/main/jniLibs
+benilla/app/.cxx
+benilla/app/build
+benilla/.gradle
