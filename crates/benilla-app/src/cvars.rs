@@ -2,8 +2,9 @@
 //! (decision 0954). The engine holds the table and the Lua API ([`benilla_ui::script`]'s
 //! `GetCVar`/`SetCVar`); this module is everything host-side:
 //!
-//! - **The registered set** ([`REGISTERED`]): only vars backed by a real engine knob (the
-//!   honest-tree rule). Defaults are the code's own truths — the sound quartet is the client's
+//! - **The registered set** ([`REGISTERED`]): only vars something actually reads — a host knob,
+//!   or (since 1140) a live Lua consumer, which is the same rule seen from the UI side and the
+//!   only refinement the honest-tree law has needed. Defaults are the code's own truths — the sound quartet is the client's
 //!   verified CVar registration defaults (wow-re `benilla-pins.md` B10, quoted in
 //!   [`crate::sound::SoundConfig`]), `uiScale`/`farclip` are benilla's shipped defaults —
 //!   and a test welds each string to the constant it mirrors so they cannot drift.
@@ -27,15 +28,18 @@ use std::time::Instant;
 
 use bevy::prelude::*;
 
+use crate::chat_bubble::BubbleConfig;
 use crate::clutter::ClutterConfig;
+use crate::minimap::MinimapZoom;
 use crate::nameplates::NameConfig;
-use crate::player::camera::LookConfig;
+use crate::player::camera::{LookConfig, ZoomLimit, MOUSE_SPEED_RANGE};
 use crate::sound::SoundConfig;
 use crate::target::ClickConfig;
 use crate::ui_loot::LootConfig;
 use crate::ui_script::UiScaleCvar;
 use crate::view::{ViewDistance, FARCLIP_RANGE};
 use benilla_ui::script::UiScript;
+use benilla_ui::widget::MINIMAP_ZOOM_LEVELS;
 
 /// The host-backed CVars: `(registered name, default)`. Grows one row per knob a settings page
 /// actually wires — never ahead of the knob (see the module doc).
@@ -72,6 +76,34 @@ pub(crate) const REGISTERED: &[(&str, &str)] = &[
     // the clutter-density knob — 0 is the client's bare frillDensity baseline (×1 = 16 visits),
     // each step +1×; the "2" default IS ClutterConfig's shipped ×3 (the reference's High).
     ("WorldDetail", "2"),
+    // Mouse Sensitivity (1140): 1.12's own `mousespeed` slider (UIOptionsFrameSliders, 0.5..1.5
+    // step 0.05), a MULTIPLIER over the camera's own per-pixel rate — which was a frozen constant
+    // until this row. Default "1" is the shipped feel exactly, welded to LookConfig::default().
+    ("mousespeed", "1"),
+    // Max Camera Distance (1140): 1.12's `cameraDistanceMaxFactor` (its MAX_FOLLOW_DIST slider,
+    // 1..2 step 0.1) over `cameraDistanceMax`'s 15 yd base. Registered "2" — the factor fully
+    // raised — because that IS benilla's shipped 30 yd ceiling, a knowing divergence from the
+    // reference's registrar "1" that camera.rs has carried in prose since it was written.
+    ("cameraDistanceMaxFactor", "2"),
+    // Status Text (1140): 1.12's `statusBarText`, the "always show value / max on a status bar"
+    // switch. **No host knob** — its consumer is Lua (TextStatusBar.xml, decision 1082, which was
+    // written waiting for this key and reads it on every repaint). Default "0": the reference's
+    // out-of-box look is hover-only numerals. That default is BEHAVIOUR-derived, not byte-read —
+    // 1.12's registrar value for this var is not pinned in wow-re yet.
+    ("statusBarText", "0"),
+    // The two chat-bubble switches (1139): 1.12's own registrar CVars over the bubble gate,
+    // which held them as `const bool` from 0598 until this window had a page for them.
+    // `ChatBubbles` is the reference's registered "1"; `ChatBubblesParty` is ON where the binary
+    // registers "0" — the director's `/p` ask, mirrored from BubbleConfig::default().
+    ("ChatBubbles", "1"),
+    ("ChatBubblesParty", "1"),
+    // The minimap's two zoom indices (1131). Byte-verified 1.12 CVars, both registered `"3"`
+    // (wow-re, at the `RegisterCVar 0x63db90` argument slot). No options row drives these — the
+    // +/- buttons on the minimap do, through `Minimap:SetZoom`, exactly as in the reference, where
+    // `set_zoom` writes the live index and `CVar::Set`s the CVar in one breath. The knob is
+    // [`crate::minimap::MinimapZoom`], the widget's live index is seeded from it at UI load.
+    ("minimapZoom", "3"),
+    ("minimapInsideZoom", "3"),
 ];
 
 /// `config.toml`'s shape: a `[cvars]` table of `Name = "value"` strings (CVars are strings in
@@ -124,6 +156,9 @@ struct Knobs<'a> {
     loot: &'a mut LootConfig,
     names: &'a mut NameConfig,
     clutter: &'a mut ClutterConfig,
+    minimap: &'a mut MinimapZoom,
+    bubbles: &'a mut BubbleConfig,
+    zoom: &'a mut ZoomLimit,
 }
 
 /// Apply one CVar to its knob resource (parse + the knob's own clamp). `false` = not a knob this
@@ -146,16 +181,38 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
         "farclip" => knobs.view.farclip = v.clamp(*FARCLIP_RANGE.start(), *FARCLIP_RANGE.end()),
         "deselectonclick" => knobs.click.deselect_on_click = v != 0.0,
         "mouseinvertpitch" => knobs.look.invert_pitch = v != 0.0,
+        "cameradistancemaxfactor" => knobs.zoom.set_factor(v),
+        // The 1.12 slider's own range; an off-grid hand-edit rides between stops, like the others.
+        "mousespeed" => {
+            knobs.look.sensitivity = v.clamp(*MOUSE_SPEED_RANGE.start(), *MOUSE_SPEED_RANGE.end());
+        }
         "autolootdefault" => knobs.loot.auto_loot = v != 0.0,
         "unitnameplayer" => knobs.names.player = v != 0.0,
         "unitnamenpc" => knobs.names.npc = v != 0.0,
         "unitnameown" => knobs.names.own = v != 0.0,
+        // A CVar with no HOST knob, because its consumer is Lua (1140). Known — so the caller
+        // dirties the config and the value persists — with nothing to apply on this side.
+        "statusbartext" => {}
+        // The two bubble switches (1139) — flags, like every other pair here.
+        "chatbubbles" => knobs.bubbles.all = v != 0.0,
+        "chatbubblesparty" => knobs.bubbles.party = v != 0.0,
         // The panel's 0/1/2 lands as the density multiplier ×1/×2/×3; the clamp is the 1.12
         // slider's own range (an off-grid hand-edit rides between stops, like every slider).
         "worlddetail" => knobs.clutter.density = v.clamp(0.0, 2.0) + 1.0,
+        // The two zoom indices (1131) clamp exactly like the client's `set_zoom` (`0x6daa10`:
+        // clamp at 5) — the widget clamps again on the way in, so a hand-edited level lands
+        // in range whichever path it takes.
+        "minimapzoom" => knobs.minimap.outdoor = zoom_index(v),
+        "minimapinsidezoom" => knobs.minimap.inside = zoom_index(v),
         _ => return false,
     }
     true
+}
+
+/// A stored minimap zoom level → a valid index: truncate to int and clamp into
+/// `[0, MINIMAP_ZOOM_LEVELS)`, the client's own `set_zoom` clamp.
+fn zoom_index(v: f32) -> u8 {
+    v.clamp(0.0, f32::from(MINIMAP_ZOOM_LEVELS - 1)) as u8
 }
 
 /// Startup: read `benilla/config.toml` (absent file = all defaults, not an error) and apply it
@@ -173,6 +230,9 @@ fn load_config(
     mut loot: ResMut<LootConfig>,
     mut names: ResMut<NameConfig>,
     mut clutter: ResMut<ClutterConfig>,
+    mut minimap: ResMut<MinimapZoom>,
+    mut bubbles: ResMut<BubbleConfig>,
+    mut zoom: ResMut<ZoomLimit>,
 ) {
     let mut knobs = Knobs {
         sound: &mut sound,
@@ -183,6 +243,9 @@ fn load_config(
         loot: &mut loot,
         names: &mut names,
         clutter: &mut clutter,
+        minimap: &mut minimap,
+        bubbles: &mut bubbles,
+        zoom: &mut zoom,
     };
     if std::env::var_os("WOW_UI_SCALE").is_some() {
         persist.env_overridden.insert("uiscale".into());
@@ -251,6 +314,9 @@ fn sync_cvars(
     mut loot: ResMut<LootConfig>,
     mut names: ResMut<NameConfig>,
     mut clutter: ResMut<ClutterConfig>,
+    mut minimap: ResMut<MinimapZoom>,
+    mut bubbles: ResMut<BubbleConfig>,
+    mut zoom: ResMut<ZoomLimit>,
 ) {
     let Some(mut script) = script else {
         return;
@@ -258,7 +324,7 @@ fn sync_cvars(
     if !persist.registered {
         script.register_cvars(REGISTERED.iter().copied());
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 16] = [
+        let session: [(&str, String); 22] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -270,6 +336,8 @@ fn sync_cvars(
             ("farclip", view.farclip.to_string()),
             ("deselectOnClick", flag(click.deselect_on_click)),
             ("mouseInvertPitch", flag(look.invert_pitch)),
+            ("mousespeed", look.sensitivity.to_string()),
+            ("cameraDistanceMaxFactor", zoom.factor().to_string()),
             ("autoLootDefault", flag(loot.auto_loot)),
             ("UnitNamePlayer", flag(names.player)),
             ("UnitNameNPC", flag(names.npc)),
@@ -278,6 +346,10 @@ fn sync_cvars(
             // multiplier seeds off-grid honestly — the dropdown shows the raw number, checks
             // nothing (the 0959 out-of-range posture, dropdown-flavored).
             ("WorldDetail", (clutter.density - 1.0).to_string()),
+            ("ChatBubbles", flag(bubbles.all)),
+            ("ChatBubblesParty", flag(bubbles.party)),
+            ("minimapZoom", minimap.outdoor.to_string()),
+            ("minimapInsideZoom", minimap.inside.to_string()),
         ];
         for (name, value) in session {
             script.set_cvar_host(name, &value);
@@ -300,6 +372,9 @@ fn sync_cvars(
         loot: &mut loot,
         names: &mut names,
         clutter: &mut clutter,
+        minimap: &mut minimap,
+        bubbles: &mut bubbles,
+        zoom: &mut zoom,
     };
     for (name, value) in changes {
         if apply_to_knobs(&name, &value, &mut knobs) {
@@ -415,6 +490,8 @@ mod tests {
             d["mouseInvertPitch"] != 0.0,
             LookConfig::default().invert_pitch
         );
+        assert_eq!(d["mousespeed"], LookConfig::default().sensitivity);
+        assert_eq!(d["cameraDistanceMaxFactor"], ZoomLimit::default().factor());
         assert_eq!(d["autoLootDefault"] != 0.0, LootConfig::default().auto_loot);
         // The name trio (0992) welds to NameConfig's defaults the same way.
         let names = NameConfig::default();
@@ -424,6 +501,17 @@ mod tests {
         // ClutterConfig::default() reads $WOW_CLUTTER_DENSITY; the registered default mirrors
         // the env-less ×3 literal (clutter.rs: "Default ×3 = High") on the panel's 0..2 scale.
         assert_eq!(d["WorldDetail"], 2.0);
+        // The bubble pair (1139) welds to BubbleConfig's defaults — including the "1" that
+        // deliberately disagrees with the binary's registered `ChatBubblesParty` "0" (0598).
+        let bubbles = BubbleConfig::default();
+        assert_eq!(d["ChatBubbles"] != 0.0, bubbles.all);
+        assert_eq!(d["ChatBubblesParty"] != 0.0, bubbles.party);
+        // The minimap pair (1131) welds to the widget's own `MINIMAP_DEFAULT_ZOOM`, which is the
+        // byte-verified registration default `"3"` — one truth, mirrored in three places.
+        let zoom = MinimapZoom::default();
+        assert_eq!(d["minimapZoom"], f32::from(zoom.outdoor));
+        assert_eq!(d["minimapInsideZoom"], f32::from(zoom.inside));
+        assert_eq!(zoom.outdoor, benilla_ui::widget::MINIMAP_DEFAULT_ZOOM);
     }
 
     #[test]
@@ -442,6 +530,9 @@ mod tests {
             alpha_ref: 0.5,
             fade_far: 70.0,
         };
+        let mut minimap = MinimapZoom::default();
+        let mut bubbles = BubbleConfig::default();
+        let mut zoom = ZoomLimit::default();
         let mut knobs = Knobs {
             sound: &mut sound,
             scale: &mut scale,
@@ -451,6 +542,9 @@ mod tests {
             loot: &mut loot,
             names: &mut names,
             clutter: &mut clutter,
+            minimap: &mut minimap,
+            bubbles: &mut bubbles,
+            zoom: &mut zoom,
         };
         assert!(apply_to_knobs("MusicVolume", "0.7", &mut knobs));
         assert_eq!(knobs.sound.music, 0.7);
@@ -469,6 +563,16 @@ mod tests {
         assert!(!knobs.click.deselect_on_click);
         assert!(apply_to_knobs("MouseInvertPitch", "1", &mut knobs));
         assert!(knobs.look.invert_pitch);
+        // The sensitivity multiplier clamps to the 1.12 slider's range at the knob.
+        assert!(apply_to_knobs("mousespeed", "1.4", &mut knobs));
+        assert_eq!(knobs.look.sensitivity, 1.4);
+        assert!(apply_to_knobs("mousespeed", "9", &mut knobs));
+        assert_eq!(knobs.look.sensitivity, 1.5);
+        // The max-orbit factor lands as YARDS on the knob (base 15 x factor), clamped to 1..2.
+        assert!(apply_to_knobs("cameraDistanceMaxFactor", "1", &mut knobs));
+        assert_eq!(knobs.zoom.max, 15.0);
+        assert!(apply_to_knobs("cameradistancemaxfactor", "5", &mut knobs));
+        assert_eq!(knobs.zoom.max, 30.0);
         assert!(apply_to_knobs("autoLootDefault", "1", &mut knobs));
         assert!(knobs.loot.auto_loot);
         // The name trio lands on its gates (0992).
@@ -476,11 +580,24 @@ mod tests {
         assert!(!knobs.names.npc);
         assert!(apply_to_knobs("unitnameown", "1", &mut knobs));
         assert!(knobs.names.own);
+        // The bubble pair lands on the spawn gate's own knob (1139).
+        assert!(apply_to_knobs("ChatBubbles", "0", &mut knobs));
+        assert!(!knobs.bubbles.all);
+        assert!(apply_to_knobs("chatbubblesparty", "0", &mut knobs));
+        assert!(!knobs.bubbles.party);
         // WorldDetail: panel 0/1/2 → density ×1/×2/×3, clamped to the 1.12 slider's range.
         assert!(apply_to_knobs("WorldDetail", "0", &mut knobs));
         assert_eq!(knobs.clutter.density, 1.0);
         assert!(apply_to_knobs("worlddetail", "7", &mut knobs));
         assert_eq!(knobs.clutter.density, 3.0);
+        // The zoom pair (1131): each index lands on its own field, clamped like `set_zoom`.
+        assert!(apply_to_knobs("minimapZoom", "5", &mut knobs));
+        assert_eq!(knobs.minimap.outdoor, 5);
+        assert_eq!(knobs.minimap.inside, 3, "the two indices are independent");
+        assert!(apply_to_knobs("minimapinsidezoom", "9", &mut knobs));
+        assert_eq!(knobs.minimap.inside, MINIMAP_ZOOM_LEVELS - 1);
+        assert!(apply_to_knobs("minimapZoom", "-2", &mut knobs));
+        assert_eq!(knobs.minimap.outdoor, 0);
         // A bad value is consumed (known key) and the resource keeps its truth.
         assert!(apply_to_knobs("uiScale", "banana", &mut knobs));
         assert_eq!(knobs.scale.0, 0.9);
@@ -542,6 +659,9 @@ mod tests {
             .init_resource::<LootConfig>()
             .init_resource::<NameConfig>()
             .init_resource::<ClutterConfig>()
+            .init_resource::<MinimapZoom>()
+            .init_resource::<BubbleConfig>()
+            .init_resource::<ZoomLimit>()
             .add_plugins(CvarPlugin);
         app.insert_non_send_resource(UiScript::new().unwrap());
 
@@ -572,6 +692,90 @@ mod tests {
         assert!(!text.contains("MasterVolume"), "defaults stay out:\n{text}");
         let back: LocalConfig = toml::from_str(&text).unwrap();
         assert_eq!(back.cvars.len(), 1, "a diff, not a dump: {text}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The minimap's zoom rides the same loop, driven from the **engine** rather than a Lua
+    /// `SetCVar` (decision 1131): the `+`/`-` buttons call `Minimap:SetZoom`, which writes the live
+    /// index and its CVar together — and that has to reach the knob and the file exactly like a
+    /// settings row's write does, or the level is forgotten at the next launch.
+    #[test]
+    fn a_minimap_setzoom_reaches_the_knob_and_the_file() {
+        use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
+        let _l = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("benilla-mmzoom-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let _c = EnvGuard::unset("WOW_CAPTURE");
+        let _u = EnvGuard::unset("WOW_UI_SCALE");
+        let _f = EnvGuard::unset("WOW_FARCLIP");
+        let _d = EnvGuard::unset("WOW_CLUTTER_DENSITY");
+        let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
+        // The previous session left the outdoor map zoomed right in.
+        crate::local_state::write_atomic(
+            &tmp.join("config.toml"),
+            "[cvars]\nminimapZoom = \"5\"\n",
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        app.add_plugins(bevy::MinimalPlugins)
+            .insert_resource(SoundConfig::default())
+            .insert_resource(UiScaleCvar(DEFAULT_UI_SCALE))
+            .insert_resource(ViewDistance { farclip: 777.0 })
+            .init_resource::<LookConfig>()
+            .init_resource::<ClickConfig>()
+            .init_resource::<LootConfig>()
+            .init_resource::<NameConfig>()
+            .init_resource::<ClutterConfig>()
+            .init_resource::<MinimapZoom>()
+            .init_resource::<BubbleConfig>()
+            .init_resource::<ZoomLimit>()
+            .add_plugins(CvarPlugin);
+        app.insert_non_send_resource(UiScript::new().unwrap());
+        app.update();
+
+        // Startup restored the knob, and the VM's table answers with it — which is what the UI-load
+        // seam hands to `set_minimap_zoom` when the widget is born.
+        assert_eq!(app.world().resource::<MinimapZoom>().outdoor, 5);
+        assert_eq!(app.world().resource::<MinimapZoom>().inside, 3);
+        let seed = {
+            let z = app.world().resource::<MinimapZoom>();
+            (z.outdoor, z.inside)
+        };
+        {
+            let mut script = app.world_mut().non_send_resource_mut::<UiScript>();
+            assert_eq!(script.cvar("minimapZoom").as_deref(), Some("5"));
+            // The UI-load seam's own order: the widget is born (at its `MinimapState` default),
+            // THEN the persisted level is pushed into it. Seeding a widget that does not exist yet
+            // is a no-op — which is exactly why that call sits after `load_ingame_ui`.
+            script.run(r#"m = CreateFrame("Minimap", "Mini")"#).unwrap();
+            script.set_minimap_zoom(seed.0, seed.1);
+            assert_eq!(script.eval::<u8>("return m:GetZoom()").unwrap(), 5);
+            // The player zooms out two notches with the minimap's own buttons.
+            script.run("m:SetZoom(m:GetZoom() - 2)").unwrap();
+        }
+        app.update();
+        assert_eq!(app.world().resource::<MinimapZoom>().outdoor, 3);
+
+        app.world_mut().write_message(AppExit::Success);
+        app.update();
+        let text = std::fs::read_to_string(tmp.join("config.toml")).unwrap();
+        assert!(
+            !text.contains("minimapZoom"),
+            "back at the registered default 3, so it leaves the diff entirely:\n{text}"
+        );
+
+        // …and one more notch out is a real diff again.
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run("m:SetZoom(1)")
+            .unwrap();
+        app.update();
+        app.world_mut().write_message(AppExit::Success);
+        app.update();
+        let text = std::fs::read_to_string(tmp.join("config.toml")).unwrap();
+        assert!(text.contains("minimapZoom = \"1\""), "{text}");
+        assert_eq!(app.world().resource::<MinimapZoom>().outdoor, 1);
         std::fs::remove_dir_all(&tmp).ok();
     }
 

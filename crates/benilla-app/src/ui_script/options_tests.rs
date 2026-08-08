@@ -158,21 +158,18 @@ fn clicking_a_row_moves_the_selection_and_the_page_title() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
-/// The red Close hides the window on the igMainMenuClose kit, the corner X does not EXIST
-/// (0989's directed cut), and a page WITHOUT rows keeps Defaults disabled (Controls has rows
-/// since 0961, so the rowless check moved to Interface).
+/// The red Close hides the window on the igMainMenuClose kit, and the corner X does not EXIST
+/// (0989's directed cut).
+///
+/// This test used to ride a rowless page here to watch Defaults stay disabled, and the stand-in
+/// kept moving as the arc filled pages in — Controls until 0961, Interface until 1136, Social
+/// until 1139. **There is no rowless category left**, which is the milestone rather than a gap;
+/// the guard itself is pinned by `the_defaults_button_is_armed_by_rows_not_by_a_category` below.
 #[test]
-fn the_close_button_hides_the_window_and_defaults_is_disabled() {
+fn the_close_button_hides_the_window() {
     let mut s = harness();
 
     s.run("ShowUIPanel(OptionsFrame)").unwrap();
-    s.run("OptionsFrameCategoryListRowInterface:Click()")
-        .unwrap();
-    assert!(
-        !s.eval::<bool>("return OptionsFrameContainerDefaults:IsEnabled()")
-            .unwrap(),
-        "Defaults is dead on a page with no rows"
-    );
     let _ = s.take_sounds();
     s.run("OptionsFrameCloseButton:Click()").unwrap();
     assert!(!s.eval::<bool>("return OptionsFrame:IsVisible()").unwrap());
@@ -542,6 +539,82 @@ fn audio_harness() -> UiScript {
     s
 }
 
+/// The Combat page's harness (decision 1134): the **real** `CombatText.xml` loaded ahead of the
+/// window, in the manifest's own order (it is file 59, OptionsFrame.xml file 281), so the rows
+/// capture the same file-scope defaults and the same `applyFunc` they capture in the client —
+/// nothing about the family is restated here. `UIParent.xml` comes first because CombatText's
+/// strings anchor to it.
+fn combat_harness() -> UiScript {
+    let mut s = audio_harness();
+    s.set_screen_size(1024.0, 768.0);
+    load_definers(&s, &["UIParent.xml", "CombatText.xml"]);
+    harness_on(s)
+}
+
+/// The files a saved-variable page's DEFINERS live in, loaded ahead of the window (see
+/// `combat_harness`). Every page over the second store needs this: a row captures its default from
+/// the global's own file-scope assignment at OnLoad, so that file has to have run first — which is
+/// exactly the ordering the real manifest guarantees.
+fn load_definers(s: &UiScript, files: &[&str]) {
+    for file in files {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/ui")
+                .join(file),
+        )
+        .unwrap();
+        let doc = benilla_ui::framexml::parse(&text).unwrap();
+        let report = benilla_ui::loader::load(s, &doc, &|_| None);
+        assert!(
+            report.errors.is_empty(),
+            "{file}: loader errors: {:?}",
+            report.errors
+        );
+    }
+}
+
+/// The Interface page's harness (decision 1136), the same posture as `combat_harness` above: the
+/// **real** definers ahead of the window, in the manifest's own order, so each row captures the
+/// same file-scope value it captures in the client. `SHOW_NEWBIE_TIPS` rides in on `GameTooltip.xml`
+/// which `harness_on` already loads; the two quest globals need their own windows —
+/// `MerchantFrame.xml` for the coin helpers both quest files reuse and `ScrollTemplates.xml` for
+/// the kit `QuestFrame.xml` inherits from (the same chain `quest_tests`/`questlog_tests` load).
+/// `SHOW_BUFF_DURATIONS` arrives with the bar it re-anchors (1139), behind the two files
+/// `buff_tests` loads ahead of it — `Cooldown.xml` (every button's child) and `ActionBar.xml`
+/// (`BENILLA_FALLBACK_ICON`), themselves behind `UIParent.xml`. `TextStatusBar.xml` rides in
+/// ahead of them for the Status Bar Text row's consumer — the XP bar's numerals (1140).
+fn interface_harness() -> UiScript {
+    let mut s = audio_harness();
+    s.set_screen_size(1024.0, 768.0);
+    load_definers(
+        &s,
+        &[
+            "Fonts.xml",
+            "UiPanels.xml",
+            "UIParent.xml",
+            "TextStatusBar.xml",
+            "Cooldown.xml",
+            "ActionBar.xml",
+            "ScrollTemplates.xml",
+            "BuffFrame.xml",
+            "MerchantFrame.xml",
+            "QuestFrame.xml",
+            "QuestLogFrame.xml",
+        ],
+    );
+    harness_on(s)
+}
+
+/// The Action Bars page's harness (decision 1136): `ActionBar.xml` declares `LOCK_ACTIONBAR`, and
+/// it needs `UIParent.xml` (the managed bottom stack it seats into) and `Cooldown.xml`
+/// (`CooldownFrame_SetTimer`, every button's child) ahead of it — the manifest's own order.
+fn actionbars_harness() -> UiScript {
+    let mut s = audio_harness();
+    s.set_screen_size(1024.0, 768.0);
+    load_definers(&s, &["UIParent.xml", "Cooldown.xml", "ActionBar.xml"]);
+    harness_on(s)
+}
+
 /// Selecting Audio shows the page body, arms Defaults, and every row reads the CVar table:
 /// sliders take the stored value with the era rounded-percent readout, checkboxes take the flag.
 /// Leaving the page hides it and puts Defaults back to sleep.
@@ -579,14 +652,14 @@ fn the_audio_page_reads_the_cvar_table_on_select() {
         .eval::<bool>("return OptionsFrameContainerBodyAudioRowEnableAllCheck:GetChecked()")
         .unwrap());
 
-    // Off to a ROWLESS page: body hidden, Defaults disabled again.
-    s.run("OptionsFrameCategoryListRowInterface:Click()")
-        .unwrap();
+    // Off to another page: the Audio body goes away with the selection (the swap is what the
+    // page loop does, and it is the reason a stale row can never be read from the wrong page).
+    s.run("OptionsFrameCategoryListRowSocial:Click()").unwrap();
     assert!(!s
         .eval::<bool>("return OptionsFrameContainerBodyAudio:IsVisible()")
         .unwrap());
-    assert!(!s
-        .eval::<bool>("return OptionsFrameContainerDefaults:IsEnabled()")
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerBodySocial:IsVisible()")
         .unwrap());
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
@@ -1578,7 +1651,10 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 14, "every row but one carries a live 1.12 key");
+    // 19 CVar rows (Social's two bubble switches are 1139's; Status Bar Text, Mouse Sensitivity
+    // and Max Camera Distance 1140's) + the Combat page's 14 saved-variable rows (1134) + the Interface
+    // page's 4 (3 from 1136, Buff Durations 1139) and the Action Bars page's 1 (1136).
+    assert_eq!(checked, 38, "every row but one carries a live 1.12 key");
     assert_eq!(
         untipped,
         vec!["ControlsRowAutoLoot".to_string()],
@@ -1618,7 +1694,16 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
     s.run("ShowUIPanel(OptionsFrame)").unwrap();
 
     let mut raised = 0;
-    for page in ["Controls", "Audio", "Graphics", "Nameplates"] {
+    for page in [
+        "Controls",
+        "Audio",
+        "Graphics",
+        "Nameplates",
+        "Combat",
+        "Interface",
+        "ActionBars",
+        "Social",
+    ] {
         s.run(&format!("OptionsFrameCategoryListRow{page}:Click()"))
             .unwrap();
         let rows: String = s
@@ -1658,5 +1743,824 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
             s.errors()
         );
     }
-    assert_eq!(raised, 14, "14 of the 15 rows have a 1.12 description");
+    // 19 of the 20 CVar rows (Social's two are 1139's; Status Bar Text, Mouse Sensitivity and
+    // Max Camera Distance 1140's), plus the Combat page's 14 saved-variable rows (1134), the Interface page's 4
+    // (1136, + Buff Durations 1139) and Action Bars' 1 (1136).
+    assert_eq!(raised, 38, "every row but Auto Loot has a 1.12 description");
+}
+
+/// The **Combat page** (decision 1134) — the first rows in this window whose store is a
+/// saved-variable GLOBAL rather than a CVar, and so the first thing that can change any of the
+/// stock globals 1128 ported. The page is 1.12's AdvancedOptionsCombatText box: it reads the
+/// globals on select, a click writes the global (and *nothing* reaches the CVar table), and each
+/// write runs the family's `applyFunc` — `CombatText_UpdateDisplayedMessages`, whose visible
+/// effect is the per-type `show` flag and the scroll function.
+#[test]
+fn the_combat_page_writes_saved_variable_globals_and_applies_them() {
+    let mut s = combat_harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowCombat:Click()").unwrap();
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerBodyCombat:IsVisible()")
+        .unwrap());
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerDefaults:IsEnabled()")
+        .unwrap());
+
+    // Read: each box shows its global, at CombatText.xml's own file-scope value.
+    for (row, checked) in [
+        ("RowCombatText", true),
+        ("RowAuras", true),
+        ("RowAuraFade", false),
+        ("RowDodgeParryMiss", false),
+    ] {
+        assert_eq!(
+            s.eval::<bool>(&format!(
+                "return OptionsFrameContainerBodyCombat{row}Check:GetChecked() and true or false"
+            ))
+            .unwrap(),
+            checked,
+            "{row} reads its global"
+        );
+    }
+    // The dropdown capsule reads COMBAT_TEXT_FLOAT_MODE = "1" as its named stop.
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyCombatRowFloatModeDropdownText:GetText()"
+        )
+        .unwrap(),
+        "Scroll Up"
+    );
+
+    // Write: the global moves, the CVar table is untouched, and the applyFunc lands.
+    let _ = s.take_cvar_changes();
+    s.run("OptionsFrameContainerBodyCombatRowDodgeParryMissCheck:Click()")
+        .unwrap();
+    assert_eq!(
+        s.eval::<String>("return COMBAT_TEXT_SHOW_DODGE_PARRY_MISS")
+            .unwrap(),
+        "1"
+    );
+    assert!(
+        s.take_cvar_changes().is_empty(),
+        "a uvar row must not touch the CVar table"
+    );
+    assert_eq!(
+        s.eval::<i64>("return COMBAT_TEXT_TYPE_INFO[\"MISS\"].show or 0")
+            .unwrap(),
+        1,
+        "applyFunc ran: the message type is live now"
+    );
+
+    // The dropdown writes its global and applies too (the scroll function follows the mode).
+    s.run(
+        "OptionsFrameContainerBodyCombatRowFloatModeDropdownButton:Click() \
+         DropDownList1Button2:Click()",
+    )
+    .unwrap();
+    assert_eq!(
+        s.eval::<String>("return COMBAT_TEXT_FLOAT_MODE").unwrap(),
+        "2"
+    );
+    assert!(
+        s.eval::<bool>("return COMBAT_TEXT_SCROLL_FUNCTION == CombatText_StandardScroll")
+            .unwrap(),
+        "mode 2 keeps the standard scroll with a downward step (CombatText.xml's own arm)"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The master's dependency rule, 1.12's verbatim: `SHOW_COMBAT_TEXT` off greys **every** other
+/// row on the page including the dropdown, and back on wakes them — except Combo Points, which
+/// carries the reference's second gate and stays greyed for anyone who is not a rogue or druid.
+#[test]
+fn the_combat_master_greys_the_family_and_combo_points_is_class_gated() {
+    let mut s = combat_harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowCombat:Click()").unwrap();
+
+    let enabled = |s: &mut UiScript, row: &str, control: &str| -> bool {
+        s.eval::<bool>(&format!(
+            "return OptionsFrameContainerBodyCombat{row}{control}:IsEnabled() and true or false"
+        ))
+        .unwrap()
+    };
+    // No player class in this VM, so Combo Points is greyed from the start while its siblings
+    // are live — the two gates are independent.
+    assert!(enabled(&mut s, "RowAuras", "Check"));
+    assert!(!enabled(&mut s, "RowComboPoints", "Check"));
+    assert!(enabled(&mut s, "RowFloatMode", "DropdownButton"));
+
+    s.run("OptionsFrameContainerBodyCombatRowCombatTextCheck:Click()")
+        .unwrap();
+    assert_eq!(s.eval::<String>("return SHOW_COMBAT_TEXT").unwrap(), "0");
+    assert!(
+        !enabled(&mut s, "RowAuras", "Check"),
+        "the master off greys every sub-toggle"
+    );
+    assert!(
+        !enabled(&mut s, "RowFloatMode", "DropdownButton"),
+        "…and the scroll dropdown, so its list cannot even open"
+    );
+    assert!(
+        enabled(&mut s, "RowCombatText", "Check"),
+        "the master itself stays live — it is the way back"
+    );
+
+    s.run("OptionsFrameContainerBodyCombatRowCombatTextCheck:Click()")
+        .unwrap();
+    assert!(enabled(&mut s, "RowAuras", "Check"));
+    assert!(enabled(&mut s, "RowFloatMode", "DropdownButton"));
+    assert!(
+        !enabled(&mut s, "RowComboPoints", "Check"),
+        "the class gate outlives the master's return"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// Defaults on a saved-variable page restores each global to **the value its own XML assigned at
+/// file scope** — captured at the row's OnLoad, which the load order guarantees runs before the
+/// saved chunk (1128). The panel restates no defaults of its own, so it cannot drift from
+/// CombatText.xml the way the reference's hand-copied `default` field can.
+#[test]
+fn defaults_resets_the_combat_page_to_the_shipped_assignments() {
+    let s = combat_harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowCombat:Click()").unwrap();
+    // Move three of them off their shipped values, in both directions and both flavors.
+    s.run(
+        "OptionsFrameContainerBodyCombatRowAurasCheck:Click() \
+         OptionsFrameContainerBodyCombatRowReputationCheck:Click() \
+         OptionsFrameContainerBodyCombatRowFloatModeDropdownButton:Click() \
+         DropDownList1Button3:Click()",
+    )
+    .unwrap();
+    assert_eq!(
+        s.eval::<String>("return COMBAT_TEXT_SHOW_AURAS").unwrap(),
+        "0"
+    );
+    assert_eq!(
+        s.eval::<String>("return COMBAT_TEXT_SHOW_REPUTATION")
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        s.eval::<String>("return COMBAT_TEXT_FLOAT_MODE").unwrap(),
+        "3"
+    );
+
+    s.run("OptionsFrameContainerDefaults:Click()").unwrap();
+    assert_eq!(
+        s.eval::<String>("return COMBAT_TEXT_SHOW_AURAS").unwrap(),
+        "1"
+    );
+    assert_eq!(
+        s.eval::<String>("return COMBAT_TEXT_SHOW_REPUTATION")
+            .unwrap(),
+        "0"
+    );
+    assert_eq!(
+        s.eval::<String>("return COMBAT_TEXT_FLOAT_MODE").unwrap(),
+        "1"
+    );
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyCombatRowFloatModeDropdownText:GetText()"
+        )
+        .unwrap(),
+        "Scroll Up",
+        "the capsule follows the reset"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The point of the whole page: what it writes is **remembered**. A toggle lands in the
+/// saved-variables text (1128's serializer) under its own name, and a fresh VM that executes that
+/// text comes up with the player's choice rather than CombatText.xml's shipped default.
+#[test]
+fn what_the_combat_page_writes_survives_a_restart() {
+    let s = combat_harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowCombat:Click()").unwrap();
+    s.run("OptionsFrameContainerBodyCombatRowHonorGainedCheck:Click()")
+        .unwrap();
+
+    let saved = s.saved_variables_text();
+    assert!(
+        saved.contains("COMBAT_TEXT_SHOW_HONOR_GAINED = \"0\""),
+        "the toggle is in the saved text:\n{saved}"
+    );
+
+    // The restart: a fresh tree at its shipped defaults, then the saved chunk over the top.
+    let fresh = combat_harness();
+    assert_eq!(
+        fresh
+            .eval::<String>("return COMBAT_TEXT_SHOW_HONOR_GAINED")
+            .unwrap(),
+        "1"
+    );
+    fresh.run(&saved).unwrap();
+    assert_eq!(
+        fresh
+            .eval::<String>("return COMBAT_TEXT_SHOW_HONOR_GAINED")
+            .unwrap(),
+        "0",
+        "the saved value wins over the file-scope default"
+    );
+    // And the page paints the restored value the next time it is opened.
+    fresh.run("ShowUIPanel(OptionsFrame)").unwrap();
+    fresh
+        .run("OptionsFrameCategoryListRowCombat:Click()")
+        .unwrap();
+    assert!(!fresh
+        .eval::<bool>(
+            "return OptionsFrameContainerBodyCombatRowHonorGainedCheck:GetChecked() and true or false"
+        )
+        .unwrap());
+    assert!(
+        fresh.errors().is_empty(),
+        "script errors: {:?}",
+        fresh.errors()
+    );
+}
+
+/// The **Action Bars page** (decision 1136) — one row, over the one global on that group whose
+/// store is a uvar at all (the five multibar toggles read a `func`, and our two bottom multibars
+/// are unconditionally on). It is also the page whose setting had to be BUILT first: 1134 §3 listed
+/// `LOCK_ACTIONBAR` as "not defined, and no guard exists".
+///
+/// The end-to-end teeth are the last block: the row's write reaches the shipped bar's own drag
+/// guard in the same VM. `action_bar_tests`/`pet_bar_tests` own the guard's full behaviour
+/// (including the shift-click that deliberately still works); this owns the wire between them.
+#[test]
+fn the_action_bars_page_locks_the_real_bar() {
+    let mut s = actionbars_harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowActionBars:Click()")
+        .unwrap();
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerBodyActionBars:IsVisible()")
+        .unwrap());
+    assert!(
+        !s.eval::<bool>(
+            "return OptionsFrameContainerBodyActionBarsRowLockActionBarCheck:GetChecked() \
+             and true or false"
+        )
+        .unwrap(),
+        "unchecked: ActionBar.xml ships the bar unlocked"
+    );
+
+    let _ = s.take_cvar_changes();
+    s.run("OptionsFrameContainerBodyActionBarsRowLockActionBarCheck:Click()")
+        .unwrap();
+    assert_eq!(s.eval::<String>("return LOCK_ACTIONBAR").unwrap(), "1");
+    assert!(
+        s.take_cvar_changes().is_empty(),
+        "a uvar row must not touch the CVar table"
+    );
+
+    // The real bar, in this same VM, now refuses the drag — the row and the guard are wired.
+    s.set_action(
+        1,
+        Some(benilla_ui::script::ActionSlot {
+            texture: Some("Interface\\Icons\\Spell_A".into()),
+            kind: 0x00,
+            action: 111,
+            count: 0,
+        }),
+    );
+    s.fire_event("PLAYER_ENTERING_WORLD", vec![]);
+    s.resolve();
+    s.run("BenillaActionButton_OnDragStart(BenillaActionButton1)")
+        .unwrap();
+    assert!(
+        s.cursor_payload().is_none(),
+        "the page's write reached the bar's guard"
+    );
+
+    // Defaults walks it back to ActionBar.xml's own assignment, and the bar drags again.
+    s.run("OptionsFrameContainerDefaults:Click()").unwrap();
+    assert_eq!(s.eval::<String>("return LOCK_ACTIONBAR").unwrap(), "0");
+    s.run("BenillaActionButton_OnDragStart(BenillaActionButton1)")
+        .unwrap();
+    assert!(s.cursor_payload().is_some(), "unlocked again");
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The **Interface page** (decision 1136) — the second store's second page, and the three globals
+/// 1134 §3 named as ready: already defined, already consumed, needing only a row. Each box reads
+/// its definer's own file-scope assignment, and a click writes the global and touches nothing else.
+///
+/// None of the three carries an `applyFunc`, and that is the property being asserted at the end:
+/// the consumer reads the global as it acts, so the write alone changes behaviour — here, the
+/// questgiver's instant-text arm, live on the very next show.
+#[test]
+fn the_interface_page_writes_the_three_stock_globals() {
+    let mut s = interface_harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerBodyInterface:IsVisible()")
+        .unwrap());
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerDefaults:IsEnabled()")
+        .unwrap());
+
+    // Read: all three ship on — QuestFrame.xml's "1" (the director's pin), QuestLogFrame.xml's "1"
+    // (the reference's advertised default, as a STRING — see that file on 1.12's own number/string
+    // break), GameTooltip.xml's "1".
+    for row in ["RowInstantQuestText", "RowAutoQuestWatch", "RowNewbieTips"] {
+        assert!(
+            s.eval::<bool>(&format!(
+                "return OptionsFrameContainerBodyInterface{row}Check:GetChecked() and true or false"
+            ))
+            .unwrap(),
+            "{row} reads its global"
+        );
+    }
+
+    // Write: the global moves, and the CVar table is never reached.
+    let _ = s.take_cvar_changes();
+    s.run("OptionsFrameContainerBodyInterfaceRowNewbieTipsCheck:Click()")
+        .unwrap();
+    assert_eq!(s.eval::<String>("return SHOW_NEWBIE_TIPS").unwrap(), "0");
+    s.run("OptionsFrameContainerBodyInterfaceRowAutoQuestWatchCheck:Click()")
+        .unwrap();
+    assert_eq!(s.eval::<String>("return AUTO_QUEST_WATCH").unwrap(), "0");
+    assert!(
+        s.take_cvar_changes().is_empty(),
+        "a uvar row must not touch the CVar table"
+    );
+
+    // No applyFunc, because the write IS the apply: the questgiver's fade arm reads the global as
+    // the panel shows, so turning instant text OFF makes the very next show write on.
+    s.run("OptionsFrameContainerBodyInterfaceRowInstantQuestTextCheck:Click()")
+        .unwrap();
+    assert_eq!(
+        s.eval::<String>("return QUEST_FADING_DISABLE").unwrap(),
+        "0"
+    );
+    assert!(
+        s.eval::<bool>(
+            "return OptionsFrameContainerBodyInterfaceRowInstantQuestText.applyFunc == nil"
+        )
+        .unwrap(),
+        "these three need no apply hook"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// Defaults here restores **our** shipped assignments, which is the visible payoff of capturing the
+/// default at OnLoad instead of restating it (1134 §1): `QUEST_FADING_DISABLE` ships `"1"` by
+/// direction (2026-07-17) where 1.12's own table hand-writes `default = "0"`. The page walks back
+/// to the value QuestFrame.xml actually assigns — there is no second copy to disagree with it.
+#[test]
+fn defaults_on_the_interface_page_restores_our_pin_not_the_references() {
+    let s = interface_harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+    s.run(
+        "OptionsFrameContainerBodyInterfaceRowInstantQuestTextCheck:Click() \
+         OptionsFrameContainerBodyInterfaceRowNewbieTipsCheck:Click()",
+    )
+    .unwrap();
+    assert_eq!(
+        s.eval::<String>("return QUEST_FADING_DISABLE").unwrap(),
+        "0"
+    );
+    assert_eq!(s.eval::<String>("return SHOW_NEWBIE_TIPS").unwrap(), "0");
+
+    s.run("OptionsFrameContainerDefaults:Click()").unwrap();
+    assert_eq!(
+        s.eval::<String>("return QUEST_FADING_DISABLE").unwrap(),
+        "1",
+        "back to OUR default, not the reference's \"0\""
+    );
+    assert_eq!(s.eval::<String>("return SHOW_NEWBIE_TIPS").unwrap(), "1");
+    assert!(s
+        .eval::<bool>(
+            "return OptionsFrameContainerBodyInterfaceRowInstantQuestTextCheck:GetChecked() \
+             and true or false"
+        )
+        .unwrap());
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The point of the page: what it writes is remembered. The toggle lands in the saved-variables
+/// text under the **reference's** global name — `AUTO_QUEST_WATCH`, which is why 1136 renamed our
+/// `BENILLA_AUTO_QUEST_WATCH` onto it — and a fresh tree replaying that text comes up on the
+/// player's choice instead of QuestLogFrame.xml's shipped one.
+#[test]
+fn what_the_interface_page_writes_survives_a_restart() {
+    let s = interface_harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+    s.run("OptionsFrameContainerBodyInterfaceRowAutoQuestWatchCheck:Click()")
+        .unwrap();
+
+    let saved = s.saved_variables_text();
+    assert!(
+        saved.contains("AUTO_QUEST_WATCH = \"0\""),
+        "the toggle is in the saved text under the reference's name:\n{saved}"
+    );
+
+    let fresh = interface_harness();
+    assert_eq!(
+        fresh.eval::<String>("return AUTO_QUEST_WATCH").unwrap(),
+        "1"
+    );
+    fresh.run(&saved).unwrap();
+    assert_eq!(
+        fresh.eval::<String>("return AUTO_QUEST_WATCH").unwrap(),
+        "0",
+        "the saved value wins over the file-scope default"
+    );
+    fresh.run("ShowUIPanel(OptionsFrame)").unwrap();
+    fresh
+        .run("OptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+    assert!(!fresh
+        .eval::<bool>(
+            "return OptionsFrameContainerBodyInterfaceRowAutoQuestWatchCheck:GetChecked() \
+             and true or false"
+        )
+        .unwrap());
+    assert!(
+        fresh.errors().is_empty(),
+        "script errors: {:?}",
+        fresh.errors()
+    );
+}
+
+/// **A saved value that has a SIDE EFFECT has to be applied when the chunk lands.** The whole UI's
+/// XML runs before `benilla/saved-variables.lua` executes over it (1128), so every file-scope
+/// consumer of a global ran against the *shipped* default: `CombatText_OnLoad` armed its six event
+/// registrations from `SHOW_COMBAT_TEXT = "1"`, and nothing re-ran when the saved `"0"` replaced it.
+/// The player's "off" came back on at every restart. 1.12 closes this with a hand-written ladder in
+/// `UIOptionsFrame`'s `VARIABLES_LOADED` arm ("Option specific function calls", UIOptionsFrame.lua
+/// l.204-220); we hold each side effect on its own row already, so the window runs them there.
+#[test]
+fn a_saved_switch_with_a_side_effect_is_applied_when_the_variables_land() {
+    let mut s = combat_harness();
+    // What the saved chunk does, verbatim: assign over the file-scope default, then the event.
+    s.run("SHOW_COMBAT_TEXT = \"0\"").unwrap();
+    s.fire_event("VARIABLES_LOADED", vec![]);
+
+    s.fire_event(
+        "COMBAT_TEXT_UPDATE",
+        vec![
+            benilla_ui::script::ScriptValue::Str("DAMAGE".into()),
+            benilla_ui::script::ScriptValue::Str("17".into()),
+        ],
+    );
+    assert!(
+        s.eval::<bool>("return getn(COMBAT_TEXT_TO_ANIMATE) == 0")
+            .unwrap(),
+        "the saved-off master is armed at load: the registrations were never re-run"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The **Buff Durations** row (decision 1139) — the first setting in this window whose value has a
+/// consequence nothing re-derives on its own, and so the first to carry an `applyFunc`. The timer
+/// text needs no hook (the bar re-decides it every frame), but the ROW PITCH is stated once: with
+/// timers the buff bar's three rows sit 45px apart, without them 35px — the reference's own two
+/// geometries (`BuffButtons_UpdatePositions`). The click has to move it, and so does the saved
+/// value landing at load, which is what the VARIABLES_LOADED walk is for.
+#[test]
+fn the_buff_durations_row_repitches_the_bar_and_the_pitch_survives_a_restart() {
+    let gap = |s: &mut UiScript| -> f64 {
+        s.resolve();
+        s.eval::<f64>("return BuffButton0:GetBottom() - BuffButton8:GetTop()")
+            .unwrap()
+    };
+
+    let mut s = interface_harness();
+    assert_eq!(s.eval::<String>("return SHOW_BUFF_DURATIONS").unwrap(), "1");
+    assert!(
+        (gap(&mut s) - 15.0).abs() < 1e-3,
+        "the shipped default is the durations-SHOWN geometry: {}",
+        gap(&mut s)
+    );
+
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+    assert!(s
+        .eval::<bool>(
+            "return OptionsFrameContainerBodyInterfaceRowBuffDurationsCheck:GetChecked() \
+             and true or false"
+        )
+        .unwrap());
+
+    s.run("OptionsFrameContainerBodyInterfaceRowBuffDurationsCheck:Click()")
+        .unwrap();
+    assert_eq!(s.eval::<String>("return SHOW_BUFF_DURATIONS").unwrap(), "0");
+    assert!(
+        (gap(&mut s) - 5.0).abs() < 1e-3,
+        "the click closed the timer gutter: {}",
+        gap(&mut s)
+    );
+
+    // Restart: the fresh tree comes up on the shipped geometry, the chunk replaces the value, and
+    // VARIABLES_LOADED is what puts the bar where the value says.
+    let saved = s.saved_variables_text();
+    assert!(
+        saved.contains("SHOW_BUFF_DURATIONS = \"0\""),
+        "the switch is in the saved text:\n{saved}"
+    );
+    let mut fresh = interface_harness();
+    fresh.run(&saved).unwrap();
+    assert!(
+        (gap(&mut fresh) - 15.0).abs() < 1e-3,
+        "the chunk moved the variable, not the bar"
+    );
+    fresh.fire_event("VARIABLES_LOADED", vec![]);
+    assert!(
+        (gap(&mut fresh) - 5.0).abs() < 1e-3,
+        "the apply walk re-derives the geometry from the saved value: {}",
+        gap(&mut fresh)
+    );
+    assert!(
+        fresh.errors().is_empty(),
+        "script errors: {:?}",
+        fresh.errors()
+    );
+}
+
+/// **Every category in this window now leads somewhere** (decision 1139). Social was the last one
+/// that opened onto an empty page, and the arc that started at 1134 — rows over the second store —
+/// closes here: Controls, Interface, Action Bars, Combat, Social, Nameplates, Graphics and Audio
+/// all carry rows, and Keybindings runs its own machinery. A category added without a page fails
+/// this, which is the point: the honest tree (0950) is now a property the test holds, not a
+/// promise the reader has to check.
+///
+/// The Defaults guard is keyed on ROWS, not on the category being real, so it is pinned directly
+/// rather than through a stand-in page — there is no longer one to borrow.
+#[test]
+fn the_defaults_button_is_armed_by_rows_not_by_a_category() {
+    let s = harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+
+    let keys: Vec<String> = s
+        .eval::<String>("return table.concat(OPTIONS_CATEGORY_KEYS, \",\")")
+        .unwrap()
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    assert_eq!(keys.len(), 9, "the nine 1.15.9 categories: {keys:?}");
+    for key in &keys {
+        let has_rows = s
+            .eval::<bool>(&format!(
+                "return OPTIONS_PAGE_ROWS[\"{key}\"] ~= nil and \
+                 getn(OPTIONS_PAGE_ROWS[\"{key}\"]) > 0"
+            ))
+            .unwrap();
+        assert!(
+            has_rows || key == "Keybindings",
+            "{key} opens onto nothing — every category leads somewhere since 1139"
+        );
+        s.run(&format!("OptionsFrameCategoryListRow{key}:Click()"))
+            .unwrap();
+        assert!(
+            s.eval::<bool>("return OptionsFrameContainerDefaults:IsEnabled()")
+                .unwrap(),
+            "{key}: Defaults is live on a page that has something to reset"
+        );
+    }
+
+    // And the guard itself: a key with no rows behind it leaves Defaults asleep.
+    s.run("OptionsFrame_SelectCategory(\"NotACategory\")")
+        .unwrap();
+    assert!(
+        !s.eval::<bool>("return OptionsFrameContainerDefaults:IsEnabled()")
+            .unwrap(),
+        "Defaults is dead when the selected page has no rows"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The **Social page** (decision 1139) — the two chat-bubble switches, and the last category in
+/// this window to stop opening onto nothing. Both are CVar rows: `chat_bubble.rs` transcribed the
+/// client's `ChatBubbles`/`ChatBubblesParty` spawn gate faithfully in 0598 and then froze it at a
+/// pair of `const bool`, so this is the action-bar lock's shape again — the knob had to become
+/// real before the row could mean anything. The page reads the registered table on select, a
+/// click queues the flag the host drains onto `BubbleConfig`, and the two are independent (the
+/// client gates party lines on their own CVar, which is why party bubbles survive turning
+/// say/yell bubbles off).
+#[test]
+fn the_social_page_toggles_the_chat_bubble_cvars() {
+    let mut s = audio_harness();
+    s.set_cvar_host("ChatBubblesParty", "0");
+    let mut s = harness_on(s);
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowSocial:Click()").unwrap();
+
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerBodySocial:IsVisible()")
+        .unwrap());
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerDefaults:IsEnabled()")
+        .unwrap());
+    // Read from the table, not from a restated default: bubbles on, party bubbles off.
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerBodySocialRowChatBubblesCheck:GetChecked()")
+        .unwrap());
+    assert!(!s
+        .eval::<bool>("return OptionsFrameContainerBodySocialRowPartyChatBubblesCheck:GetChecked()")
+        .unwrap());
+    let _ = s.take_sounds();
+
+    s.run("OptionsFrameContainerBodySocialRowPartyChatBubblesCheck:Click()")
+        .unwrap();
+    assert_eq!(
+        s.take_cvar_changes(),
+        vec![("ChatBubblesParty".to_string(), "1".to_string())]
+    );
+    assert!(s
+        .take_sounds()
+        .contains(&SoundRequest::KitName("igMainMenuOptionCheckBoxOn".into())));
+
+    // Turning say/yell bubbles off writes only its own switch — party keeps the value above.
+    s.run("OptionsFrameContainerBodySocialRowChatBubblesCheck:Click()")
+        .unwrap();
+    assert_eq!(
+        s.take_cvar_changes(),
+        vec![("ChatBubbles".to_string(), "0".to_string())]
+    );
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerBodySocialRowPartyChatBubblesCheck:GetChecked()")
+        .unwrap());
+
+    // Defaults walks the page back to the registered pair — including the ChatBubblesParty "1"
+    // that deliberately disagrees with the binary's registered "0" (the director's /p ask, 0598).
+    s.run("OptionsFrameContainerDefaults:Click()").unwrap();
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerBodySocialRowChatBubblesCheck:GetChecked()")
+        .unwrap());
+    assert!(s
+        .eval::<bool>("return OptionsFrameContainerBodySocialRowPartyChatBubblesCheck:GetChecked()")
+        .unwrap());
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **Status Bar Text** (decision 1140) — the row that finally reaches `TextStatusBar.xml`. That
+/// file has been transcribed whole since 1082, with a `CVAR_UPDATE` watcher and a `statusBarText`
+/// read on every repaint, and nothing in the client could move the variable: `GetCVar` answered nil
+/// for a key the host never registered, which reads as off. So the numerals were hover-only, with
+/// no way to pin them.
+///
+/// The row is also the only one in this window carrying a `cvarEvent`, and this is what that buys:
+/// the XP bar's numerals appear on the click, not on the next XP tick. The event is 1.12's own —
+/// `SetCVar(cvar, value, index)`'s third argument, handed back as arg1 — which is why the token
+/// here is the uppercase display name and not the CVar's own spelling.
+#[test]
+fn the_status_bar_text_row_pins_the_numerals_the_moment_it_is_clicked() {
+    let mut s = interface_harness();
+    // The bar needs a real span before it decides anything about its numerals (its update bails
+    // on valueMax == 0 and hides the strip instead).
+    s.set_player_xp(1000, 10000);
+    s.run("BenillaExpBar_Update(BenillaExpBar)").unwrap();
+    // Shipped default: off, so the numerals only show while hovered.
+    assert_eq!(
+        s.eval::<String>("return GetCVar(\"statusBarText\")")
+            .unwrap(),
+        "0"
+    );
+    assert!(!s
+        .eval::<bool>("return BenillaExpBarText:IsShown()")
+        .unwrap());
+
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+    assert!(!s
+        .eval::<bool>("return OptionsFrameContainerBodyInterfaceRowStatusTextCheck:GetChecked()")
+        .unwrap());
+
+    s.run("OptionsFrameContainerBodyInterfaceRowStatusTextCheck:Click()")
+        .unwrap();
+    assert_eq!(
+        s.take_cvar_changes(),
+        vec![("statusBarText".to_string(), "1".to_string())]
+    );
+    // No repaint, no XP tick — only the CVAR_UPDATE the third argument queued.
+    s.tick(0.0);
+    assert!(
+        s.eval::<bool>("return BenillaExpBarText:IsShown()")
+            .unwrap(),
+        "the watcher woke on the click, not on the next value change"
+    );
+
+    // And back off again, the same way.
+    s.run("OptionsFrameContainerBodyInterfaceRowStatusTextCheck:Click()")
+        .unwrap();
+    s.tick(0.0);
+    assert!(!s
+        .eval::<bool>("return BenillaExpBarText:IsShown()")
+        .unwrap());
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **Mouse Sensitivity** (decision 1140) — the Controls page's first slider, and the third frozen
+/// constant this arc has unfrozen: the camera's radians-per-pixel rate was a `const` with no way
+/// to reach it. 1.12's own row (`UIOptionsFrameSliders`' MOUSE_SENSITIVITY): 0.5 … 1.5 by 0.05,
+/// a multiplier, so the registered default 1 is the shipped feel and the percent readout reads it
+/// straight. The slider snaps to the reference's step and writes the CVar the host drains onto
+/// `LookConfig::sensitivity`.
+#[test]
+fn the_mouse_sensitivity_slider_snaps_to_the_reference_step() {
+    let mut s = audio_harness();
+    s.set_cvar_host("mousespeed", "1.25");
+    let mut s = harness_on(s);
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowControls:Click()")
+        .unwrap();
+
+    // Read from the table on select, with the era's rounded-percent readout.
+    assert!(s
+        .eval::<bool>(
+            "return math.abs(OptionsFrameContainerBodyControlsRowMouseSpeedControlSlider:GetValue() \
+             - 1.25) < 0.0001"
+        )
+        .unwrap());
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyControlsRowMouseSpeedControlValue:GetText()"
+        )
+        .unwrap(),
+        "125%"
+    );
+
+    // A user move snaps to 0.05 and writes once.
+    s.run("OptionsFrameContainerBodyControlsRowMouseSpeedControlSlider:SetValue(1.42)")
+        .unwrap();
+    assert_eq!(
+        s.take_cvar_changes(),
+        vec![("mousespeed".to_string(), "1.4".to_string())]
+    );
+
+    // Defaults walks it back to the neutral notch — the shipped feel, not the slider's floor.
+    s.run("OptionsFrameContainerDefaults:Click()").unwrap();
+    assert_eq!(
+        s.eval::<String>("return GetCVar(\"mousespeed\")").unwrap(),
+        "1"
+    );
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyControlsRowMouseSpeedControlValue:GetText()"
+        )
+        .unwrap(),
+        "100%"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **Max Camera Distance** (decision 1140) — the fourth frozen constant, and the one with a wrinkle
+/// worth pinning: 1.12 stores a FACTOR over `cameraDistanceMax`'s 15 yd base, so the value that
+/// persists is `1.0 … 2.0` while the thing the player is choosing is a distance. The readout shows
+/// the distance; the CVar carries the factor. Our default is the factor fully raised — the 30 yd
+/// ceiling benilla has always had — where the reference's registrar ships 1.0.
+#[test]
+fn the_max_camera_distance_slider_stores_a_factor_and_reads_out_yards() {
+    let mut s = harness_on(audio_harness());
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowControls:Click()")
+        .unwrap();
+
+    // The shipped ceiling, shown as what it buys.
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyControlsRowMaxCameraDistanceControlValue:GetText()"
+        )
+        .unwrap(),
+        "30 yd"
+    );
+
+    // Down to the reference's own default: the factor is what persists, the yards are the label.
+    s.run("OptionsFrameContainerBodyControlsRowMaxCameraDistanceControlSlider:SetValue(1.0)")
+        .unwrap();
+    assert_eq!(
+        s.take_cvar_changes(),
+        vec![("cameraDistanceMaxFactor".to_string(), "1".to_string())]
+    );
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyControlsRowMaxCameraDistanceControlValue:GetText()"
+        )
+        .unwrap(),
+        "15 yd",
+        "vanilla's own out-of-box ceiling"
+    );
+
+    s.run("OptionsFrameContainerDefaults:Click()").unwrap();
+    assert_eq!(
+        s.eval::<String>("return GetCVar(\"cameraDistanceMaxFactor\")")
+            .unwrap(),
+        "2"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }

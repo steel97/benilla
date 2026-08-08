@@ -32,6 +32,9 @@ use crate::ui_script::PointerOverUi;
 
 mod arc;
 pub(crate) mod camera;
+// The remembered camera pose (decision 1131) — it lives inside `player/` so it can read the rig's
+// own `pub(super)` fields instead of widening them for a module outside.
+mod camera_saved;
 mod drunk;
 mod follow;
 
@@ -51,6 +54,8 @@ mod probe_look;
 mod server_ride;
 mod setup;
 mod state;
+/// The step-up diagnostic probe — the blocked-frame report behind the `stup` trace tag.
+pub(crate) mod step_probe;
 mod swim;
 mod wire_in;
 
@@ -70,9 +75,10 @@ pub(crate) use follow::{FollowRequest, FollowState};
 // what lets this module and the concern modules beside it keep naming them `super::X` unchanged.
 use state::{
     MoveSpeed, PlayerRide, AIR_NUDGE_SPEED, CAPSULE_RADIUS, FALL_FAR_DROP, FALL_FAR_TIME,
-    GROUND_COS, GROUND_PROBE, JUMP_SPEED, LAND_PROBE, MOUSELOOK_PITCH_CLAMP, RUN_BACK_RATIO,
-    SKIN_WIDTH, STATIONARY_CHASE_RATE, STEP_SLOPE_RATIO, STEP_SNAP_SLACK, STEP_UP_HEIGHT,
-    TURN_RATE, TURN_RATE_MOVING, WEDGE_MIN_FALL, WEDGE_STALL_RATIO, WEDGE_STILL_FRAMES,
+    FOOT_CONE_HEIGHT, GROUND_COS, GROUND_PROBE, JUMP_SPEED, LAND_PROBE, MOUSELOOK_PITCH_CLAMP,
+    RUN_BACK_RATIO, SKIN_WIDTH, STATIONARY_CHASE_RATE, STEP_SLOPE_RATIO, STEP_SNAP_SLACK,
+    STEP_UP_ADVANCE, STEP_UP_HEIGHT, TURN_RATE, TURN_RATE_MOVING, WEDGE_MIN_FALL,
+    WEDGE_STALL_RATIO, WEDGE_STILL_FRAMES,
 };
 // `SETTLE_TIMEOUT` is `pub(crate)`: the settle release lives in the terrain streamer (decision
 // 0737 — residency releases the hold, not ground contact), which owns the deadline push while the
@@ -133,7 +139,9 @@ impl Plugin for PlayerPlugin {
             app.insert_resource(cam);
         }
         follow::plugin(app);
+        camera_saved::plugin(app);
         app.init_resource::<camera::LookConfig>();
+        app.init_resource::<camera::ZoomLimit>();
         app.add_systems(Startup, setup::setup_player.after(AssetSet::Open))
             // The world camera renders only when the world can be seen (decision 0540): in world,
             // or under the opaque loading screen (whose covered render is what compiles the
@@ -270,7 +278,14 @@ fn control(
     buttons: Res<ButtonInput<MouseButton>>,
     // Nested into one param to stay within Bevy's 16-element system-param tuple limit. (The
     // scroll wheel left this tuple with 0997: zoom reads the CAMERAZOOM bindings now.)
-    mouse: (Res<AccumulatedMouseMotion>, Res<camera::LookConfig>),
+    // The pointer's motion this frame + the two knobs that scale what it does with it. Bundled
+    // because a Bevy system takes at most 16 parameters and this one is at the ceiling — the
+    // grouping is the existing `mouse` tuple, widened rather than a seventeenth argument.
+    pointer: (
+        Res<AccumulatedMouseMotion>,
+        Res<camera::LookConfig>,
+        Res<camera::ZoomLimit>,
+    ),
     // The net bridge, bundled into one param (16-param limit): the outbound command channel + the
     // inbound teleport/worldport messages `apply_net_updates` wrote earlier this frame
     // (WorldStage::Net), + the sheath-setter queue (the Z toggle's request — decision 0080).
@@ -340,17 +355,20 @@ fn control(
         (With<SelfPlayer>, Without<FlyCam>),
     >,
     window: Single<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
-    // Clean clicks (press+release, no drag) go out here — left for the target picker, right for the
-    // context action (attack) — while *drags* engage the camera looks below instead; the third is
-    // the right button's raw DOWN edge (targeting's cancel, decision 0792). The locals hold
-    // each button's accumulated drag distance while a press is being classified (`None` = no press
-    // pending).
+    // Clicks go out here — left for the target picker, right for the context action (attack) — and
+    // the third is the right button's raw DOWN edge (targeting's cancel, decision 0792). A press
+    // engages its camera look *and* arms a click test; the release settles that test on the
+    // reference's time/travel predicate, so one gesture can orbit and select both (decision 1122).
+    // The locals hold each button's pending [`camera::PressGesture`] (`None` = no press pending).
     mut world_clicks: (
         MessageWriter<WorldClick>,
         MessageWriter<WorldRightClick>,
         MessageWriter<WorldRightPress>,
     ),
-    mut click_test: (Local<Option<f32>>, Local<Option<f32>>),
+    mut click_test: (
+        Local<Option<camera::PressGesture>>,
+        Local<Option<camera::PressGesture>>,
+    ),
     // World context for the mover, bundled into one param (16-param limit): the loaded water
     // surfaces (swim mode + the buoyant float, see [`swim`]), the armed transports (the
     // platform-frame carry/attach — decision 0438 phase 2; `Without`s only disjoint the borrows),
@@ -384,8 +402,9 @@ fn control(
         return;
     };
     let (mut window, mut cursor_opts) = window.into_inner();
-    let mouse_motion = &mouse.0;
-    let invert_pitch = mouse.1.invert_pitch;
+    let mouse_motion = &pointer.0;
+    let look_cfg = *pointer.1;
+    let zoom_max = pointer.2.max;
     let (move_speed, capsule, cam_probe, pointer_over_ui, inspect, ui_capture, click_consumed) = (
         &speed_capsule.0,
         &speed_capsule.1 .0,
@@ -472,7 +491,8 @@ fn control(
         &mut world_clicks.2,
         left_click,
         right_click,
-        invert_pitch,
+        look_cfg,
+        time.elapsed_secs(),
     );
     // A stun freezes the BODY, not the view. The look session has already moved `cam.yaw` (and, on
     // a right-drag, coupled `face_yaw = cam.yaw`); putting the aim back leaves the camera orbiting
@@ -500,7 +520,7 @@ fn control(
     // `CameraZoomIn(1.0)` argument.
     let zoom = binds.amount(crate::bindings::cmd::CAMERA_ZOOM_IN)
         - binds.amount(crate::bindings::cmd::CAMERA_ZOOM_OUT);
-    apply_zoom_scroll(zoom, dt, &mut rig);
+    apply_zoom_scroll(zoom, dt, &mut rig, zoom_max);
 
     // Free-fly is a dev instrument, so it sits on the dev chord, not a bare `F` (decision 1043).
     // A bare `F` is a key the reference lets a player bind — our own store test binds it to JUMP —
@@ -1180,6 +1200,61 @@ fn control(
             }
         }
         let feet = player.pos;
+        // **The ride trace** (`WOW_MOVE_TRACE_TAGS=ride`) — one line per frame while attached, plus
+        // the frame after a detach, because "what happened on the boat" is otherwise unanswerable:
+        // the deck's own motion is in the boat's transform, the rider's in world space, and the
+        // difference between them is the only thing that says whether the carry composed. The
+        // director's report — *stepped off a ledge on a boat and it threw me back across the boat
+        // until I landed* — is a statement about the DECK-relative path, which no other instrument
+        // here records.
+        if crate::dbg_trace::enabled_for("ride") {
+            let boat_pose = player
+                .ride
+                .as_ref()
+                .and_then(|r| transports.get(r.entity).ok())
+                .map(|(t, _)| (t.translation, t.rotation.to_euler(EulerRot::YXZ).0));
+            if let (Some(ride), Some((bpos, byaw))) = (player.ride.as_ref(), boat_pose) {
+                let local = Quat::from_euler(EulerRot::YXZ, byaw, 0.0, 0.0)
+                    .inverse()
+                    .mul_vec3(feet - bpos);
+                crate::dbg_trace::line(
+                    "ride",
+                    &format!(
+                        "on {:#x} deck({:8.2},{:7.2},{:8.2}) yaw{:+.3} | feet({:8.2},{:7.2},{:8.2})                          local({:7.2},{:6.2},{:7.2}) | grounded={} support={} vy={:+6.2}",
+                        ride.guid,
+                        bpos.x,
+                        bpos.y,
+                        bpos.z,
+                        byaw,
+                        feet.x,
+                        feet.y,
+                        feet.z,
+                        local.x,
+                        local.y,
+                        local.z,
+                        grounded as u8,
+                        match ground.and_then(owning_transport) {
+                            Some(_) => "deck",
+                            None if ground.is_some() => "world",
+                            None => "NONE",
+                        },
+                        player.vel_y,
+                    ),
+                );
+            } else if !swimming {
+                // Not riding: only worth a line when something under us *is* a transport, i.e. the
+                // frames where an attach should have happened and did not.
+                if let Some((_, _, guid)) = ground.and_then(owning_transport) {
+                    crate::dbg_trace::line(
+                        "ride",
+                        &format!(
+                            "OFF but standing on {:#x} at ({:8.2},{:7.2},{:8.2}) grounded={}",
+                            guid.0, feet.x, feet.y, feet.z, grounded as u8
+                        ),
+                    );
+                }
+            }
+        }
         if let Some(ride) = player.ride.as_mut() {
             if let Ok((boat, _)) = transports.get(ride.entity) {
                 ride.local_pos = boat.compute_affine().inverse().transform_point3(feet);

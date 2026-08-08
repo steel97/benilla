@@ -308,15 +308,21 @@ pub(crate) const DEV_CHORD: &str = "Ctrl+Shift";
 ///
 /// **Exactly those two modifiers and no others**, both sides of each. The block is what makes this
 /// plane safe to leave ungated below: AltGr+Shift+*key* is `Ctrl`+`Alt`+`Shift`+*key*, and a German
-/// layout typing one of those into chat must not fire an overlay. It is also the same exact-set rule
-/// every binding here obeys — the reference matches a binding by string equality, so `CTRL-SHIFT-P` is
-/// a different entry from `SHIFT-P` and neither answers for the other.
+/// layout typing one of those into chat must not fire an overlay.
+///
+/// **"No letter at all" was half the story, and the missing half cost us a plane's worth of safety**
+/// (decision 1142). The reference does not match bindings by equality alone: an exact miss re-probes
+/// **once** with the leftmost modifier dropped, so `CTRL-SHIFT-`*key* falls through to
+/// `SHIFT-`*key* — never to the bare letter, which is why this plane survived the correction at all,
+/// but far enough that `Ctrl`+`Shift`+`P` would open the pet paper doll (`SHIFT-P`,
+/// `TOGGLECHARACTER3`) under the perf HUD. So the other half of the rule now lives where the law
+/// itself does, in `bindings::BindingDispatch::resolve`: this plane spends the keyboard's
+/// **fallback probe**, and only that — an exact `CTRL-SHIFT-` binding, the reference's two included,
+/// still dispatches normally.
 ///
 /// Deliberately **not** gated on [`crate::ui_script::UiKeyboardCapture`] the way the bare-key toggles
 /// were: a chord can't be mistaken for typed text, so the dev overlays stay reachable with the chat bar
-/// open. The other half of the rule lives at the gameplay key feed (`ui_script::input`): a bare-key
-/// binding doesn't fire while *any* modifier is held, so this chord doesn't also trigger the letter's
-/// game action.
+/// open.
 pub(crate) fn dev_chord(keys: &ButtonInput<KeyCode>, key: KeyCode) -> bool {
     dev_plane(keys) && keys.just_pressed(key)
 }
@@ -667,6 +673,40 @@ fn debug_panel_ui(
                                     ui.label(line);
                                 }
                             }
+                        });
+                    // The step-up probe's last blocked-frame report (`crate::player::step_probe`).
+                    // On the panel *because a capture has to be steerable*: the director walks into
+                    // the kerb that will not climb and watches the `t=` stamp tick and the ladder
+                    // fill in, instead of finding out afterwards that the probe never fired at the
+                    // spot they meant (method §6 — prove the run before reading the result).
+                    egui::CollapsingHeader::new("Step-up")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let (report, at) = crate::player::step_probe::latest();
+                            if report.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "no blocked walk frame yet — walk square into the thing \
+                                         that will not step up",
+                                    )
+                                    .color(OVERLAY_TEXT_DIM),
+                                );
+                                return;
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("last fired t={at:.1}s"))
+                                    .small()
+                                    .color(OVERLAY_TEXT_DIM),
+                            );
+                            egui::ScrollArea::horizontal()
+                                .id_salt("stepup_report")
+                                .show(ui, |ui| {
+                                    for line in report {
+                                        ui.label(
+                                            egui::RichText::new(line).small().monospace(),
+                                        );
+                                    }
+                                });
                         });
                     // Future sections add their own CollapsingHeader here.
                 });
