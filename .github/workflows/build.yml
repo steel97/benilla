@@ -237,11 +237,12 @@ jobs:
             
             if [ "$ext" = "sh" ]; then
               echo "#!/bin/bash
-          WOW_HOST=127.0.0.1:3724 ./$binary" > "start_$name.sh"
+          WOW_HOST=127.0.0.1:3724 BENILLA_HOME=./ ./$binary" > "start_$name.sh"
               chmod +x "start_$name.sh"
             else
               echo "@echo off
           set WOW_HOST=127.0.0.1:3724
+          set BENILLA_HOME=./
           $binary" > "start_$name.bat"
             fi
           done

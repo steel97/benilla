@@ -22,6 +22,7 @@ pub fn main() {
 
     unsafe {
         std::env::set_var("WOW_DATA", transform_path("Data").to_str().unwrap());
+        std::env::set_var("BENILLA_HOME", transform_path("").to_str().unwrap());
     }
 
     postprocess_env();
