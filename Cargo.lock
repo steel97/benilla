@@ -761,6 +761,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "benilla_mobile"
+version = "0.0.0"
+dependencies = [
+ "benilla-app",
+ "bevy",
+ "jni 0.22.4",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "objc2-ui-kit 0.3.2",
+ "serde_json",
+ "variadics_please 2.0.0",
+]
+
+[[package]]
 name = "bevy"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

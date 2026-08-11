@@ -1,5 +1,6 @@
 use benilla_app::register_hook;
 use bevy::{
+    asset::embedded_asset,
     input::{
         ButtonState, InputSystems,
         keyboard::{Key, KeyboardInput, NativeKey},
@@ -29,6 +30,8 @@ pub fn register_hooks() {
         }));*/
 
         // enable sound
+        embedded_asset!(app, "assets/mobile/joystick/Knob.png");
+        embedded_asset!(app, "assets/mobile/joystick/Outline.png");
         app.init_state::<UnmuteSoundState>();
         app.add_systems(PreUpdate, unmute_sound_system.after(InputSystems));
 
@@ -133,8 +136,8 @@ fn init_joystick(mut cmd: bevy::prelude::Commands, asset_server: Res<AssetServer
     create_joystick(
         &mut cmd,
         "UniqueJoystick".to_string(),
-        asset_server.load("mobile/joystick/Knob.png"),
-        asset_server.load("mobile/joystick/Outline.png"),
+        asset_server.load("embedded://benilla_mobile/assets/mobile/joystick/Knob.png"),
+        asset_server.load("embedded://benilla_mobile/assets/mobile/joystick/Outline.png"),
         None,
         None,
         Some(Color::srgba(1.0, 0.27, 0.0, 0.0)),

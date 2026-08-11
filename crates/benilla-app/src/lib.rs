@@ -214,14 +214,6 @@ pub use bevy::app::AppExit;
 /// ([`build_id`]) — passed in as plain data so the sha lives in the shim's fingerprint, not
 /// this crate's, and a commit stops recompiling the app (decision 0993).
 pub fn run(build: BuildId) -> AppExit {
-    let builtin_dir = std::env::var("WOW_BUILTIN");
-    let path = match builtin_dir {
-        Ok(val) => std::path::PathBuf::from(val),
-        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
-    };
-
-    let assets_path = path.join("assets");
-    println!("assets path: {}", assets_path.to_str().unwrap());
     // `WOW_CAPTURE=list` just prints the harness scenario names (the source of truth `scripts/visual.sh`
     // reads) and exits before any window/asset setup.
     // `WOW_HOVER_LOG_REPORT=<csv>` re-reads a recorded run and prints its report, then exits —
@@ -292,18 +284,6 @@ pub fn run(build: BuildId) -> AppExit {
             benilla_formats::candidates()
         ),
     }
-
-    #[cfg(target_os = "android")]
-    {
-        use bevy::asset::io::{file::FileAssetReader, AssetSourceBuilder, AssetSourceId};
-        app.register_asset_source(
-            AssetSourceId::Default,
-            AssetSourceBuilder::new(move || Box::new(FileAssetReader::new(assets_path.clone()))),
-        );
-    }
-
-    #[cfg(target_os = "android")]
-    let assets_path = std::path::PathBuf::from("");
 
     // NOTE: there is deliberately no `game://` asset source here (decision 1175). 1171 gave the
     // game's five UI shaders their own source pointed at this crate's `assets/` — with the path

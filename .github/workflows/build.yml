@@ -180,11 +180,6 @@ jobs:
         id: vars
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-      - name: assets
-        run: |
-          cd crates/benilla-app
-          zip -r ../../assets.zip assets
-
       - uses: actions/download-artifact@v7
         with:
           name: benilla-ios
@@ -242,12 +237,11 @@ jobs:
             
             if [ "$ext" = "sh" ]; then
               echo "#!/bin/bash
-          WOW_HOST=127.0.0.1:3724 WOW_BUILTIN=./ ./$binary" > "start_$name.sh"
+          WOW_HOST=127.0.0.1:3724 ./$binary" > "start_$name.sh"
               chmod +x "start_$name.sh"
             else
               echo "@echo off
           set WOW_HOST=127.0.0.1:3724
-          set WOW_BUILTIN=./
           $binary" > "start_$name.bat"
             fi
           done
@@ -257,7 +251,6 @@ jobs:
         with:
           tag_name: ${{ steps.vars.outputs.sha_short }}
           files: |
-            assets.zip
             benilla.ipa
             benilla.apk
             benilla-macarm
