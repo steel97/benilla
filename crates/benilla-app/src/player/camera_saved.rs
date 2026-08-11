@@ -17,7 +17,7 @@
 //! 1138 corrects it. benilla has no `SaveView`, so nothing is owed here yet.)
 //!
 //! benilla writes the same two keys in the same order to
-//! `benilla/camera/<realm>-<character>.txt` ([`crate::local_state::camera_character_path`]) — a file
+//! `benilla-config/camera/<realm>-<character>.txt` ([`crate::local_state::camera_character_path`]) — a file
 //! that stays readable beside its ancestor.
 //!
 //! **Character-scoped, deliberately.** It is where the reference puts it, and it is what the setting
@@ -44,9 +44,8 @@ use bevy::prelude::*;
 
 use crate::char_select::ClientState;
 
-use super::camera::{
-    CameraControl, FlyCam, WorldCamera, CAM_DIST_MAX, CAM_DIST_MIN, CAM_PITCH_LIMIT,
-};
+use super::camera::{CameraControl, FlyCam, CAM_DIST_MAX, CAM_DIST_MIN, CAM_PITCH_LIMIT};
+use benilla_world::view::WorldCamera;
 
 /// The persisted pose's file keys — the reference's own spellings, in the reference's own order.
 const KEY_DISTANCE: &str = "cameraDistance";

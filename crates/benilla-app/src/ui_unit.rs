@@ -32,7 +32,7 @@ use crate::target::{ring_reaction, Factions, Selection};
 use crate::ui_chat::{ChatEvent, ChatEventKind, ChatLog};
 use crate::ui_script::UiInput;
 
-/// The feed pass — runs **after [`crate::schedule::WorldStage::Net`]** (the feeds snapshot state
+/// The feed pass — runs **after [`benilla_world::schedule::WorldStage::Net`]** (the feeds snapshot state
 /// the net apply writes; unordered, `apply_net_updates` could land BETWEEN two feeds, and a
 /// synchronous event fired by the later one then re-read the earlier one's pre-mutation push —
 /// the spellbook's cooldown pie stayed cold until a manual reopen, reproduced live 2026-07-31)
@@ -131,7 +131,7 @@ impl Plugin for UiUnitPlugin {
     fn build(&self, app: &mut App) {
         app.configure_sets(
             Update,
-            UnitFeed.after(crate::schedule::WorldStage::Net), // the set's own doc: the why
+            UnitFeed.after(benilla_world::schedule::WorldStage::Net), // the set's own doc: the why
         )
         .init_resource::<UnitFeedState>()
         .add_message::<UnitCombatFeedback>()
@@ -149,7 +149,66 @@ impl Plugin for UiUnitPlugin {
                 .before(UiInput),
         )
         .add_systems(Update, drain_pvp_toggles.after(UiInput))
-        .add_systems(PostStartup, load_exhaustion_rows);
+        .add_systems(Update, feed_default_language.in_set(UnitFeed))
+        .add_systems(PostStartup, (load_exhaustion_rows, load_default_languages));
+    }
+}
+
+/// The race → default-chat-language join, loaded once ([`benilla_formats::DefaultLanguages`]).
+/// Absent when the tables would not load — `GetDefaultLanguage()` then answers the reference's own
+/// zero-values shape rather than a made-up word.
+#[derive(Resource)]
+pub(crate) struct DefaultLanguagesRes(pub(crate) benilla_formats::DefaultLanguages);
+
+/// Load `Languages.dbc` × `ChrRaces.dbc` once at startup ([`load_exhaustion_rows`]'s shape).
+fn load_default_languages(
+    mut commands: Commands,
+    assets: Option<Res<benilla_assets::WorldAssets>>,
+) {
+    let Some(assets) = assets else { return };
+    let loaded = {
+        use benilla_assets::LockRecover;
+        let mut chain = assets.chain.lock_recover();
+        benilla_formats::load_default_languages(&mut chain)
+    };
+    match loaded {
+        Ok(langs) => {
+            info!("ui_unit: {} race → default-language rows", langs.len());
+            commands.insert_resource(DefaultLanguagesRes(langs));
+        }
+        // Not fatal: the binding's contract already has an answer for "no table".
+        Err(e) => warn!("ui_unit: default languages unavailable — {e:#}"),
+    }
+}
+
+/// Push `GetDefaultLanguage()`'s one string, on change only.
+///
+/// The reference resolves it per call from the live player object; we resolve it once per race
+/// change, which is the same answer with none of the per-frame churn — a race cannot change
+/// without a new world entry. `None` (no player object, or no table) is the reference's zero-value
+/// state, and that is what the VM stores.
+///
+/// **The locale column is 0.** `[0xc0e080]` is the client's locale slot; only enUS is populated in
+/// the 5875 data, and every other DBC catalog here reads column 0 for the same reason.
+fn feed_default_language(
+    script: Option<NonSendMut<UiScript>>,
+    self_q: Query<&ObjectStore, With<SelfPlayer>>,
+    langs: Option<Res<DefaultLanguagesRes>>,
+    mut pushed: Local<Option<Option<String>>>,
+) {
+    let Some(mut script) = script else {
+        return;
+    };
+    let name = self_q
+        .iter()
+        .next()
+        .and_then(|store| store.0.unit_race())
+        .zip(langs.as_ref())
+        .and_then(|(race, langs)| langs.0.name(u32::from(race), 0))
+        .map(str::to_string);
+    if pushed.as_ref() != Some(&name) {
+        script.set_default_language(name.clone());
+        *pushed = Some(name);
     }
 }
 
@@ -159,13 +218,13 @@ impl Plugin for UiUnitPlugin {
 /// like the shipped enUS client rather than going dark.
 fn load_exhaustion_rows(
     script: Option<NonSendMut<UiScript>>,
-    assets: Option<Res<crate::assets::WorldAssets>>,
+    assets: Option<Res<benilla_assets::WorldAssets>>,
 ) {
     let (Some(mut script), Some(assets)) = (script, assets) else {
         return;
     };
     let loaded = {
-        use crate::assets::LockRecover;
+        use benilla_assets::LockRecover;
         let mut chain = assets.chain.lock_recover();
         benilla_formats::load_exhaustion(&mut chain)
     };
@@ -336,6 +395,32 @@ pub(crate) fn class_names(class: u8) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// A playable race id → `UnitFactionGroup`'s token (`"Alliance"`/`"Horde"`), or `None` for a race
+/// id that is not one of the eight.
+///
+/// **A side derived from the RACE, not from the faction template** — deliberately, and only for
+/// the one window in which the template does not exist yet. [`faction_group`] is the real answer
+/// and reads `UNIT_FIELD_FACTIONTEMPLATE` off the descriptor; during world entry there is no
+/// descriptor, and `UnitFactionGroup("player")` answering nil there is not "no faction", it is a
+/// state a real player character cannot be in. AceDB-2.0 — embedded across a large slice of the
+/// corpus — builds its per-realm key as `realm .. " - " .. faction` at **file scope**, so a nil
+/// side is 24 corpus addons stopping on `attempt to concatenate local 'faction'`
+/// (`addon_harness::seat_a_session`, decision 1195, which seats exactly this in the survey's VM).
+///
+/// Every playable race has a fixed side in 1.12, so this is a lookup rather than a guess — and it
+/// reads the [`crate::char_create::ALLIANCE`] column the create screen already keeps, so the two
+/// cannot drift apart.
+pub(crate) fn race_faction_group(race: u8) -> Option<&'static str> {
+    if !(1..=8).contains(&race) {
+        return None;
+    }
+    Some(if crate::char_create::ALLIANCE.contains(&race) {
+        "Alliance"
+    } else {
+        "Horde"
+    })
+}
+
 /// Resolve a UnitPopup unit token to the **player guid** it names — `"target"` through the
 /// selection iff it really is a player (the target frame's PLAYER menu), a `"partyN"` token through
 /// the roster (the party frame's PARTY menu). `"player"` (yourself) and any unresolved token answer
@@ -410,6 +495,11 @@ pub(crate) fn snapshot(store: &ObjectStore, name: Option<String>, reaction: u8) 
         // UNIT_FIELD_FLAGS (vmangos UnitDefines.h: 0x1000 / 0x04000000, VERIFIED).
         pvp: store.0.unit_flags() & 0x1000 != 0,
         skinnable: store.0.unit_flags() & 0x0400_0000 != 0,
+        // `UnitAffectingCombat 0x517e10` — the SAME `UNIT_FIELD_FLAGS` word, bit 19
+        // (`shr ecx,0x13; test cl,1`). One flag for every token: wow-re's whole-image census of
+        // that idiom found the local-player readers reading this identical bit, so there is no
+        // player-specific combat latch to model beside it.
+        in_combat: store.0.unit_flags() & crate::player::UNIT_FLAG_IN_COMBAT != 0,
         // Free-for-all PvP (decision 0646 §1): `PLAYER_FLAGS` bit 7, the same field the ghost
         // predicate above reads (vmangos `Player.h:322` `PLAYER_FLAGS_FFA_PVP`, cross-read against
         // 0633's byte-level `[+0xe68]+8` bit-7). Zero on creatures, which have no PLAYER_FLAGS —

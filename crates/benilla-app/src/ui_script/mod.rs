@@ -22,29 +22,91 @@ use bevy::prelude::*;
 
 use benilla_ui::script::{ActionSlot, ScriptValue, UiScript, UnitState};
 
-use crate::assets::LockRecover;
-use crate::debug_panel::EguiPointerOver;
-use crate::schedule::WorldStage;
 use crate::ui_unit::UnitFeed;
+use benilla_assets::LockRecover;
+use benilla_world::schedule::WorldStage;
 
+/// The addon folder: discovery, manifests, the enable file, and the load walk. `pub(crate)`
+/// because the AddOns screens read the same folder without a VM (decision 1196).
+pub(crate) mod addons;
+mod content;
 mod extract;
 mod input;
 mod manifest;
 
+/// The reference FrameXML this client EXECUTES off the player's own patch chain instead of
+/// transcribing it — the rule, the list, and the licensing reason are that module's header.
+mod reference_ui;
+
 // The manifest's loaders read as `ui_script::…` at every call site, including the tests' `super::`.
-#[cfg(test)]
+// `load_default_ui` is no longer test-only: the addon harness (1188 phase 6) loads the whole
+// shipped interface under each surveyed addon, because roughly half of what an addon calls is
+// FrameXML's Lua rather than the engine's (decision 1190).
 pub(crate) use manifest::load_default_ui;
 pub(crate) use manifest::{load_font_registry, load_ingame_ui};
 
 /// Is the pointer over *any* UI this frame — the egui dev overlay OR a mouse-enabled player-UI
 /// frame? The single source of truth for "the mouse is talking to the UI, not the world",
 /// combined by [`arbitrate_pointer_over_ui`] from both contributors (dev overlay =
-/// [`crate::debug_panel::EguiPointerOver`]; player UI = [`PlayerUiHover`]). Gameplay reads it so
+/// [`EguiPointerOver`]; player UI = [`PlayerUiHover`]). Gameplay reads it so
 /// a drag doesn't start mouse-look; the inspector reads it so a pick doesn't fire behind an
 /// overlaid frame. Owned HERE, not by the dev plugin (decision 0026): gameplay's read must
 /// survive a build without the dev overlays, so the combiner treats the egui half as optional.
 #[derive(Resource, Default)]
 pub(crate) struct PointerOverUi(pub(crate) bool);
+
+/// The egui dev overlay's half of the pointer arbitration, written each egui pass by the debug
+/// panel's `track_pointer_over_ui`. **Defined here, with the arbiter that reads it** (decision
+/// 1174 finishing 0026): the type has to exist in a build with no dev overlays compiled in, and
+/// the arbiter takes it as `Option<Res<…>>` so its absence simply means "nothing is hovering the
+/// dev UI" — which is the player-faithful answer. The writer lives in `debug_panel`; a dev
+/// module writing an always-present fact is the allowed direction.
+#[derive(Resource, Default)]
+pub(crate) struct EguiPointerOver(pub(crate) bool);
+
+/// Whether mouseover **world picking** is armed — the dev-chord `I` inspector's mode, toggled by
+/// `debug_panel::inspect`.
+///
+/// The second of the two resources 0026 named as needing "a player-safe home", and here for the
+/// same reason as [`EguiPointerOver`]: `player::control` and `target::click` read it every frame
+/// to decide whether a left-click is the inspector's or the game's, and those reads must compile
+/// and behave in a build with no inspector. The [`Default`] — **disarmed** — *is* the player
+/// behaviour, so a player build's readers take the ordinary branch with nothing to switch them.
+#[derive(Resource, Default)]
+pub(crate) struct InspectMode {
+    pub(crate) enabled: bool,
+}
+
+/// One frame's UI-pass phase split, in μs — written by [`extract::drive_script`] under the same
+/// marks the `[ui-cost]` line prints. **Owned by the producer** (decision 1174): the split is a
+/// fact this pass publishes about itself, so it must exist whether or not the recorder that reads
+/// it (`hover_log`) is compiled in. Its consumers are instruments; its writer is not.
+#[derive(Resource, Default, Clone)]
+pub(crate) struct UiFrameCost {
+    /// How many FontStrings the layout asked the font engine to shape this frame, and the first
+    /// few by name — a steady hover that keeps asking is the churn the recorder exists to catch.
+    pub(crate) measured: usize,
+    pub(crate) measured_texts: Vec<String>,
+    pub(crate) tick: u128,
+    pub(crate) resolve: u128,
+    pub(crate) measure: u128,
+    pub(crate) extract: u128,
+    pub(crate) convert: u128,
+    pub(crate) diff: u128,
+    pub(crate) quads: usize,
+    pub(crate) solves: u64,
+    pub(crate) skipped: bool,
+}
+
+/// Does anything want [`UiFrameCost`] filled in this run? Measuring the split costs a clock read
+/// per phase plus the churn strings, so the pass only pays when asked.
+///
+/// `WOW_UI_COST=1` (this module's own `[ui-cost]` line) arms it inline; the hover recorder arms it
+/// by setting this — the direction that keeps the pass free of the instrument's name, and the
+/// reason the flag is a resource rather than an env read here (decision 1174). Default `false` is
+/// the player answer.
+#[derive(Resource, Default)]
+pub(crate) struct UiCostWanted(pub(crate) bool);
 
 /// The frame the cursor is currently over (a mouse-enabled, visible player-UI frame), or `None`.
 /// Written by [`feed_ui_input`], read by the pointer arbiter below so world-pick
@@ -117,6 +179,12 @@ impl Default for UiClock {
 /// mid-chunk on a missing `EditBox:SetTextColor` every single frame and nothing ever said so
 /// (the /w caret bug). A chunk failure is always an app or engine defect; this is the mandatory
 /// form for any run whose `Result` isn't otherwise consumed.
+/// The FrameXML digest of the interface this process loads — see [`content::digest`]. Re-exported
+/// so the corpus harness can stamp every report with the tree it measured.
+pub(crate) fn framexml_digest() -> String {
+    content::digest()
+}
+
 pub(crate) fn run_or_warn(script: &benilla_ui::script::UiScript, chunk: &str) {
     if let Err(e) = script.run(chunk) {
         warn!("ui_script: chunk failed: {e}");
@@ -175,24 +243,39 @@ impl Plugin for UiScriptPlugin {
             // The UI pass publishes its per-frame phase split here every frame the cost meter or
             // the hover recorder is armed; the producer owns the resource so any minimal app that
             // runs `drive_script` (the extract tests) has it.
-            .init_resource::<crate::hover_log::UiFrameCost>()
+            .init_resource::<UiFrameCost>()
+            .init_resource::<UiCostWanted>()
             .init_resource::<PointerOverUi>()
+            .init_resource::<EguiPointerOver>()
+            .init_resource::<InspectMode>()
             .init_resource::<PlayerUiHover>()
             .init_resource::<UiKeyboardCapture>()
             .init_resource::<PlayerUiClickConsumed>()
             .init_resource::<CursorPayloadHeld>()
             .init_resource::<UiClock>()
             .init_resource::<IngameUiLoaded>()
+            .init_resource::<AddOnIdentity>()
             // After `AssetSet::Open` so the patch chain exists at boot: the VM's first load is
             // the real `GlobalStrings.lua` (the reference's own FrameXML order), which the
             // cast-fail display (0427) resolves its messages from.
-            .add_systems(Startup, setup_script.after(crate::assets::AssetSet::Open))
+            .add_systems(Startup, setup_script.after(benilla_assets::AssetSet::Open))
             // The in-game UI materializes on entering the world, not at boot (1051) — the
             // reference's own seam. Only the font registry loads at `Startup`.
             .add_systems(
                 OnEnter(crate::char_select::ClientState::InWorld),
                 load_ingame_ui_on_world_entry,
             )
+            // The whole shutdown tail — events then writes, in the reference's order. See
+            // [`shutdown_ui_state`]; the two edges here are its five roots as far as our session
+            // has them.
+            .add_systems(
+                OnExit(crate::char_select::ClientState::InWorld),
+                shutdown_on_session_end,
+            )
+            .add_systems(Update, shutdown_on_exit)
+            // `GetFramerate()`'s host half (decision 1195), before the VM ticks so an `OnUpdate`
+            // handler reads this frame's number rather than the previous one's.
+            .add_systems(Update, feed_framerate.before(UiInput))
             // `drive_script` resolves layout; `feed_ui_input` hit-tests against those rects, so they
             // chain (also required because both take the single `NonSend` VM). The pair runs before
             // `WorldStage::Input` so the hover result reaches the pointer arbiter in time. The input
@@ -238,7 +321,7 @@ impl Plugin for UiScriptPlugin {
 /// Should this CAPTURE include the player UI (+ the synthetic unit snapshot)? The visual harness's
 /// baselines must stay UI-free (they regression-test the WORLD render), so captures skip the UI
 /// unless `WOW_CAPTURE_UI=1` opts in. Normal runs always load the UI and never take synthetic data.
-fn capture_ui_active(capture: Option<Res<crate::capture::CaptureMode>>) -> bool {
+fn capture_ui_active(capture: Option<Res<crate::run_mode::CaptureMode>>) -> bool {
     capture.is_some() && std::env::var("WOW_CAPTURE_UI").as_deref() == Ok("1")
 }
 
@@ -281,7 +364,7 @@ fn setup_script(world: &mut World) {
 /// Does this run want the player UI at all? Captures stay pristine — their baselines regression-test
 /// the WORLD render — unless `WOW_CAPTURE_UI=1` opts the UI in.
 fn ui_wanted(world: &World) -> bool {
-    !world.contains_resource::<crate::capture::CaptureMode>()
+    !world.contains_resource::<crate::run_mode::CaptureMode>()
         || std::env::var("WOW_CAPTURE_UI").as_deref() == Ok("1")
 }
 
@@ -299,7 +382,7 @@ pub(crate) struct IngameUiLoaded(pub(crate) bool);
 ///
 /// Safe on the state edge only because 1038 moved the initial transition after `PostStartup` — a
 /// capture boots straight into `InWorld`, so before that this would have run ahead of
-/// [`crate::assets::AssetSet::Open`] and loaded against no patch chain.
+/// [`benilla_assets::AssetSet::Open`] and loaded against no patch chain.
 fn load_ingame_ui_on_world_entry(world: &mut World) {
     if world.resource::<IngameUiLoaded>().0 || !ui_wanted(world) {
         return;
@@ -308,7 +391,28 @@ fn load_ingame_ui_on_world_entry(world: &mut World) {
         warn!("ui_script: entering the world with no VM — the in-game UI will not load");
         return;
     };
-    let _ = load_ingame_ui(&script);
+    // The character whose AddOn enable state applies. Resolved before the load because the
+    // enable file gates which addons run at all.
+    let identity = world
+        .get_resource::<crate::char_select::Roster>()
+        .and_then(crate::ui_macro::identity);
+    // The realm name goes in BEFORE the UI loads, because `GetRealmName()` is read at addon file
+    // scope — `MyAddonDB[GetRealmName()] = …` is the corpus idiom, and 24 addons stop on it
+    // (decision 1195). The roster carries the auth realm-list entry this session connected to.
+    let realm = world
+        .get_resource::<crate::char_select::Roster>()
+        .and_then(|r| r.realm.as_ref().map(|r| r.name.clone()))
+        .unwrap_or_default();
+    script.set_realm_name(&realm);
+    // …and so does the PLAYER, for the same reason and with more riding on it — see
+    // [`seat_from_roster`], which is where the why lives.
+    if let Some(seat) = world
+        .get_resource::<crate::char_select::Roster>()
+        .and_then(seat_from_roster)
+    {
+        script.set_unit("player", Some(seat));
+    }
+    let _ = load_ingame_ui(&mut script, identity.as_ref());
     // The Minimap widget was born a moment ago with `MinimapState::default()`; seed its two live
     // zoom indices from the persisted CVars now, before anything reads them — the reference's own
     // minimap reset path copying each CVar object's int into its live index (decision 1131). Once
@@ -320,9 +424,179 @@ fn load_ingame_ui_on_world_entry(world: &mut World) {
     // any consumer reads them — then `VARIABLES_LOADED`. That is the reference's own load order
     // (`AddOn_Load 0x51f240` steps 2 → 4 → 6, decision 1128); reversing it means the defaults
     // always win and nothing can ever be remembered.
-    crate::ui_saved::load_saved_variables(&mut script);
+    finish_ui_load(&mut script);
     world.insert_non_send_resource(script);
+    world.insert_resource(AddOnIdentity(identity));
     world.resource_mut::<IngameUiLoaded>().0 = true;
+}
+
+/// The `"player"` snapshot the UI loads **under**, built from the roster row of the pick in
+/// flight — `None` when there is no pick (a capture, a scenario, a test world).
+///
+/// **The reference's invariant is that addon file scope always sees a real character**:
+/// `AddOn_Load 0x51f240` runs from inside `UI_Init 0x48fbf0`, which is after the world is entered.
+/// benilla's does not. `Connected` flips us `InWorld` a whole server round-trip before the self
+/// descriptor streams in ([`crate::ui_unit`]'s own comment measures that gap in *seconds*), and
+/// `feed_units` — the only writer of the `"player"` token — is gated on that descriptor existing.
+/// So until this existed, every addon's file scope ran in a VM where `UnitName("player")` was
+/// **nil**, which is a state a real session cannot present. It is the same argument, at the same
+/// line, as the `set_realm_name` above it (decision 1195) — and this is the more load-bearing half.
+///
+/// **The failure it fixes is silent, which is why it survived every instrument.** The director
+/// installed Bagnon, opened their bags, and got a window with a title, a gold line and **no bag
+/// slots at all**. `Bagnon_Core/core/Utility.lua:5` opens `local currentPlayer =
+/// UnitName("player")`, and every one of Bagnon's "am I looking at a cached snapshot of some OTHER
+/// character?" predicates is `currentPlayer ~= frame.player`. With `currentPlayer` nil, Bagnon
+/// concluded the live player's own bags belonged to somebody else, took every bag size from
+/// Bagnon_Forever's (empty) offline cache instead of `GetContainerNumSlots`, created zero item
+/// buttons — and raised nothing, so `loaded`, `session` and the UI probe all scored it a pass.
+/// Reproduced both ways in [`bagnon_render_tests`].
+///
+/// **What is filled is what the roster actually knows**: name, race, class, gender and level, all
+/// a round-trip ahead of the descriptor (the same fact [`crate::char_select::Roster::pending_entry`]
+/// already exploits for the streamers). Health and power are deliberately left at zero — those are
+/// the descriptor's to say, they land within the second, and inventing them would be a different
+/// lie from the one being fixed.
+fn seat_from_roster(roster: &crate::char_select::Roster) -> Option<benilla_ui::script::UnitState> {
+    let row = roster.pending_row()?;
+    let race = crate::ui_unit::race_names(row.race);
+    let class = crate::ui_unit::class_names(row.class);
+    Some(benilla_ui::script::UnitState {
+        exists: true,
+        name: Some(row.name.clone()),
+        level: u32::from(row.level),
+        race: race.map(|(n, _)| n.to_string()),
+        race_file: race.map(|(_, f)| f.to_string()),
+        class: class.map(|(n, _)| n.to_string()),
+        class_file: class.map(|(_, f)| f.to_string()),
+        // The wire's 0/1 on `UnitSex`'s 2/3 scale — `ui_unit::snapshot`'s own mapping.
+        sex: match row.gender {
+            0 => 2,
+            1 => 3,
+            _ => 0,
+        },
+        is_player: true,
+        // Nil here is not "no faction", it is a state a player character cannot be in, and
+        // AceDB-2.0 concatenates it at file scope — see [`crate::ui_unit::race_faction_group`].
+        faction_group: crate::ui_unit::race_faction_group(row.race).map(str::to_string),
+        ..Default::default()
+    })
+}
+
+/// `GetFramerate()`'s host half: push a **smoothed** frames-per-second into the VM each frame
+/// (decision 1195).
+///
+/// Smoothed, not `1.0 / delta`, for the reason the reference smooths it too: 71 corpus addons put
+/// this number on a panel, and a raw per-frame reciprocal reads as a flickering three-digit mess
+/// that nobody can take a value off. The pole is a one-second time constant — fast enough that a
+/// real stall is visible within a frame or two, slow enough to read.
+///
+/// `Time<Real>` deliberately, the same choice `drive_script` documents: this is a *frame rate*, and
+/// a virtual clock that clamps its delta would report a rate the machine is not achieving.
+fn feed_framerate(
+    script: Option<NonSendMut<UiScript>>,
+    time: Res<Time<bevy::time::Real>>,
+    mut smoothed: Local<f64>,
+) {
+    let Some(mut script) = script else {
+        return;
+    };
+    let dt = time.delta_secs_f64();
+    if dt <= 0.0 {
+        return; // the first frame, and any paused one — nothing to average in
+    }
+    let instant = 1.0 / dt;
+    // One-pole IIR with a 1 s time constant, frame-rate independent.
+    let alpha = (dt / 1.0).min(1.0);
+    *smoothed = if *smoothed <= 0.0 {
+        instant
+    } else {
+        *smoothed + alpha * (instant - *smoothed)
+    };
+    script.set_framerate(*smoothed);
+}
+
+/// The character the loaded AddOn enable state belongs to, remembered so the shutdown write goes
+/// back to the file it came from — the roster's pick can be gone by then.
+#[derive(Resource, Default)]
+pub(crate) struct AddOnIdentity(pub(crate) Option<(String, String)>);
+
+/// **The UI shutdown, in the reference's own order** — `0x490bd0`, whose ordered tail wow-5875-re
+/// carves as (`system/ui/ui.md`):
+///
+/// > `PLAYER_LEAVING_WORLD` (273) → **`PLAYER_LOGOUT`** (271, `0x490c2a`) → `layout-cache.txt` →
+/// > **the flat saved file** (`0x490c7e`) → **the per-addon files** (`0x490c83`) → `AddOns.txt` →
+/// > destroy the Lua state
+///
+/// **`PLAYER_LOGOUT` fires before any write, and that is the point**: it is an addon's last chance
+/// to mutate a saved global, so a handler that stores "where I left off" runs while the write is
+/// still ahead of it. Firing it after would make the event useless and the bug invisible.
+///
+/// One function, called from every root, because the steps are ordered *against each other* —
+/// three independent Bevy systems on one state edge cannot express that, and until this landed the
+/// flat write and the `AddOns.txt` write were exactly that.
+///
+/// **There is no autosave**, deliberately: the reference has none (decision 1128, and
+/// `ds:0xb4b3f4` has three references image-wide). These are a handful of scalars a player toggles
+/// a few times a session, and every file is written whole from the live globals.
+pub(crate) fn shutdown_ui_state(script: &mut UiScript, identity: Option<&(String, String)>) {
+    script.fire_event("PLAYER_LEAVING_WORLD", vec![]);
+    script.fire_event("PLAYER_LOGOUT", vec![]);
+    crate::ui_saved::save(script);
+    addons::save_addon_variables(script, identity);
+    addons::save_enable_state(script, identity);
+}
+
+/// `OnExit(InWorld)`: a `/logout` back to the glue, or a disconnect — two of the reference's five
+/// roots.
+fn shutdown_on_session_end(script: Option<NonSendMut<UiScript>>, id: Res<AddOnIdentity>) {
+    if let Some(mut script) = script {
+        shutdown_ui_state(&mut script, id.0.as_ref());
+    }
+}
+
+/// `AppExit`: quitting the client — the quit / application-exit roots. Reads the message rather
+/// than a state edge because a quit from in-world never leaves `InWorld`.
+fn shutdown_on_exit(
+    script: Option<NonSendMut<UiScript>>,
+    id: Res<AddOnIdentity>,
+    mut exits: MessageReader<AppExit>,
+) {
+    if exits.read().next().is_none() {
+        return;
+    }
+    if let Some(mut script) = script {
+        shutdown_ui_state(&mut script, id.0.as_ref());
+    }
+}
+
+/// The UI-init sequence's ordered tail, once every file — ours and every addon's — has loaded:
+/// the saved-variables chunk and `VARIABLES_LOADED`, then `PLAYER_LOGIN`.
+///
+/// **The order is the reference's**, byte-verified in wow-5875-re (`system/ui/ui.md`, and the
+/// cascade in `system/ui/scratch/mail-pending-countdown.md`). Inside `UI_Init 0x48fbf0`, in
+/// straight-line address order:
+///
+/// | | |
+/// |---|---|
+/// | `0x4900a3` → `0x51f600` | load every non-LoadOnDemand addon — each fires its own **`ADDON_LOADED`** (429, `0x51f5ad`) |
+/// | `0x4900b2` → `0x4913b0` | read the flat saved file, fire **`VARIABLES_LOADED`** (430) |
+/// | `0x490168` → `0x4908c0` | the world-enter cascade: **`PLAYER_LOGIN`** (`0x49094b`, `0x10e`) then **`PLAYER_ENTERING_WORLD`** (`0x490965`, `0x110`) |
+///
+/// So every non-LoD addon's `ADDON_LOADED` precedes `VARIABLES_LOADED`, which precedes
+/// `PLAYER_LOGIN`. It is one function rather than three inline calls because that sequence is the
+/// mechanism — an addon restores state on `ADDON_LOADED` and expects the saved chunk to have run,
+/// and a window that waits on `PLAYER_LOGIN` expects both — so it is worth being able to assert.
+///
+/// **`PLAYER_LOGIN` is the conditional one; `PLAYER_ENTERING_WORLD` is not.** The cascade fires
+/// the former only when `[0xb4e260]` is set, and only the FrameXML-loader path sets it, clearing
+/// it immediately after — so it means "the UI came up", once, which is exactly the
+/// [`IngameUiLoaded`] latch this sits behind. `PLAYER_ENTERING_WORLD` keeps its own per-entry
+/// latch in [`crate::ui_unit`] and still lands after this, since it waits on the self descriptor
+/// arriving over the wire.
+pub(crate) fn finish_ui_load(script: &mut UiScript) {
+    crate::ui_saved::load_saved_variables(script);
+    script.fire_event("PLAYER_LOGIN", vec![]);
 }
 
 /// Execute the real `Interface\FrameXML\GlobalStrings.lua` off the patch chain into the VM —
@@ -332,7 +606,7 @@ fn load_ingame_ui_on_world_entry(world: &mut World) {
 /// a silently missing GlobalStrings once suppressed every red error line (the 0427 fold's
 /// absent-key face is faithful data suppression — but only when the file actually loaded).
 fn load_global_strings(world: &mut World, script: &UiScript) {
-    let Some(assets) = world.get_resource::<crate::assets::WorldAssets>() else {
+    let Some(assets) = world.get_resource::<benilla_assets::WorldAssets>() else {
         warn!("ui_script: no patch chain — GlobalStrings absent, error lines will be empty");
         return;
     };
@@ -373,7 +647,7 @@ fn load_global_strings(world: &mut World, script: &UiScript) {
 /// Rust: a transcription can be wrong, and a hand-kept alias list is exactly what left 61 real
 /// commands (`/lol`, `/hi`, `/ty`, …) unresolvable before 0881.
 fn load_emote_tokens(world: &mut World, script: &UiScript) {
-    let Some(assets) = world.get_resource::<crate::assets::WorldAssets>() else {
+    let Some(assets) = world.get_resource::<benilla_assets::WorldAssets>() else {
         return; // already WARNed by load_global_strings
     };
     let bytes = {
@@ -634,6 +908,9 @@ mod unit_frame_tests;
 mod unit_popup_tests;
 
 #[cfg(test)]
+mod dropdown_tests;
+
+#[cfg(test)]
 mod action_bar_tests;
 
 #[cfg(test)]
@@ -659,6 +936,30 @@ mod panel_tests;
 
 #[cfg(test)]
 mod merchant_tests;
+
+#[cfg(test)]
+mod money_frame_tests;
+
+#[cfg(test)]
+mod faux_scroll_tests;
+
+/// The reference's shared widget kit (UIPanelTemplates.xml + OptionsFrameTemplates.xml), driven
+/// through `CreateFrame`'s fourth argument the way an addon drives it — decision 1203's queue.
+#[cfg(test)]
+mod panel_template_tests;
+
+/// The reference's BasicControls.xml — TEXT/message/_ERRORMESSAGE and the ScriptErrors dialog,
+/// none of which benilla itself calls: every test enters from Lua the way an addon does.
+#[cfg(test)]
+mod basic_controls_tests;
+
+#[cfg(test)]
+mod color_picker_tests;
+
+/// `UIParent.xml`'s loose addon-facing helpers (`MouseIsOver` and kin) — the panel and ESC halves
+/// of that file live in `panel_tests` / `escape_tests`.
+#[cfg(test)]
+mod uiparent_tests;
 
 #[cfg(test)]
 mod trainer_tests;
@@ -689,8 +990,16 @@ mod tooltip_anchor_tests;
 #[cfg(test)]
 mod tooltip_compare_tests;
 
+/// `GameTooltipTemplate` as an ADDON sees it — the corpus's most-wanted template, driven through
+/// `inherits=` and `CreateFrame` the way the 27 addons that name it do.
+#[cfg(test)]
+mod tooltip_template_tests;
+
 #[cfg(test)]
 mod escape_tests;
+
+#[cfg(test)]
+mod addon_list_tests;
 
 #[cfg(test)]
 mod game_menu_tests;
@@ -718,11 +1027,18 @@ mod duel_tests;
 #[cfg(test)]
 mod enchant_confirm_tests;
 
+/// The shared reference-geometry diff (decision 0675) every transcribed window's test calls.
+#[cfg(test)]
+mod framexml_diff;
+
 #[cfg(test)]
 mod friends_tests;
 
 #[cfg(test)]
 mod quest_tests;
+
+#[cfg(test)]
+mod quest_timer_tests;
 
 #[cfg(test)]
 mod durability_tests;
@@ -765,6 +1081,9 @@ mod errors_tests;
 
 #[cfg(test)]
 mod shipped_xml_tests;
+
+#[cfg(test)]
+mod bagnon_render_tests;
 
 #[cfg(test)]
 mod seam_scale_tests {

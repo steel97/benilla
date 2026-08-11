@@ -19,6 +19,7 @@
 //! durability model), and the ghost state beyond plain death. CanAssist inside 10b is the
 //! reaction-rank stand-in the ring/`can_attack` share, pending the true `0x6066f0` walk.
 
+use crate::ui_items::{count_of, InventoryScope};
 use benilla_formats::{
     SpellDisplay, ATTR_CASTABLE_WHILE_DEAD, ATTR_NOT_IN_COMBAT, ATTR_ONLY_STEALTHED,
     SPELL_EFFECT_TRADE_SKILL,
@@ -31,8 +32,8 @@ use crate::target::{can_attack, ring_reaction, Factions};
 
 use super::Spells;
 
-/// `UNIT_FLAG_IN_COMBAT` (vmangos `UnitDefines.h`, bit 19) — leg 8's caster unit-flag test.
-const UNIT_FLAG_IN_COMBAT: u32 = 0x0008_0000;
+/// Leg 8's caster unit-flag test — the shared bit, declared once ([`crate::player`]).
+use crate::player::UNIT_FLAG_IN_COMBAT;
 
 /// The implicit-target enums leg 10b forks on (`0x6e3f8a`/`0x6e3fa2`): 6 = single enemy →
 /// `CanAttack 0x606980`, 21 = single friend → `CanAssist 0x6066f0`.
@@ -98,12 +99,12 @@ pub(crate) fn spell_usable(
     }
     // Leg 3 (`0x6e4000`): every reagent pair in bag counts; every totem tool present.
     for &(entry, count) in &d.reagents {
-        if entry != 0 && crate::ui_items::count_of(&ctx.store.0, items, entry) < count {
+        if entry != 0 && count_of(&ctx.store.0, items, entry, InventoryScope::CARRIED) < count {
             return (false, false);
         }
     }
     for &totem in &d.totems {
-        if totem != 0 && crate::ui_items::count_of(&ctx.store.0, items, totem) == 0 {
+        if totem != 0 && count_of(&ctx.store.0, items, totem, InventoryScope::CARRIED) == 0 {
             return (false, false);
         }
     }

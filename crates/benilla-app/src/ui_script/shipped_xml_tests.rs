@@ -107,6 +107,14 @@ fn every_shipped_texture_path_resolves_in_the_client_archives() {
     // `file=` on a texture element is an ARCHIVE path; `<Script file=>`/`<Include file=>` name our
     // own source files and are top-level items, not elements, so walking elements can't see them.
     fn walk(el: &Element, file: &str, out: &mut Vec<(String, String, String)>) {
+        // `<Model file=>` names a **model** (`.mdx`), not a texture: it never reaches
+        // `sprite_candidates` and it cannot draw a white quad, because this engine renders no
+        // FrameXML models at all. The one shipped case is the reference's `CooldownFrameTemplate`,
+        // transcribed with its own attributes so an addon's `inherits=` resolves, while the sweep
+        // it drives lives in our native `<Cooldown>` widget instead (decision 0263).
+        if el.tag.eq_ignore_ascii_case("Model") {
+            return;
+        }
         for (key, value) in el.attrs() {
             let archive_path = ["file", "bgfile", "edgefile"]
                 .contains(&key.to_ascii_lowercase().as_str())
@@ -153,19 +161,12 @@ fn every_shipped_texture_path_resolves_in_the_client_archives() {
         );
     }
 
-    let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-    if !data.is_dir() {
-        eprintln!(
-            "skipping the resolve half: no client data at {}",
-            data.display()
-        );
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let chain = benilla_formats::open_chain(&data).expect("open chain");
     let missing: Vec<String> = refs
         .iter()
         .filter(|(_, _, path)| {
-            !crate::assets::sprite_candidates(path)
+            !benilla_assets::sprite_candidates(path)
                 .iter()
                 .any(|c| chain.contains(c))
         })
@@ -195,11 +196,7 @@ fn every_shipped_texture_path_resolves_in_the_client_archives() {
 /// keys would rot into agreeing with itself).
 #[test]
 fn every_shipped_text_attribute_answers_against_the_real_global_strings() {
-    let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = benilla_formats::open_chain(&data).expect("open chain");
     let src = chain
         .read_file("Interface\\FrameXML\\GlobalStrings.lua")
@@ -352,7 +349,7 @@ fn the_boot_phase_materializes_no_frames() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ui/Fonts.xml");
     let text = std::fs::read_to_string(&dir).expect("Fonts.xml");
     let doc = benilla_ui::framexml::parse(&text).expect("parses");
-    let provider = |_: &str| -> Option<String> { None };
+    let provider = |_: &str| -> Option<Vec<u8>> { None };
     let report = benilla_ui::loader::load(&s, &doc, &provider);
     assert_eq!(
         report.frames, 0,
@@ -432,4 +429,77 @@ fn the_shipped_ui_takes_variables_loaded_without_a_script_error() {
         "VARIABLES_LOADED script errors: {:?}",
         s.errors()
     );
+}
+
+/// **Every `<Font name=…>` the shipped manifest declares is a real Lua global** — a `Font` object
+/// answering the FontInstance getters, not a bare style record with no name.
+///
+/// The per-fragment test in `benilla-ui` proves the mechanism on a two-font document; this proves
+/// it over the 54 fonts our real `Fonts.xml` (and the windows after it) actually declare, in
+/// manifest order, which is the only place a name collision with a *frame* of the same name — the
+/// one way publication can silently not happen, since `publish_global` never overwrites — could
+/// show up.
+///
+/// The named spot-checks are the corpus's four most-wanted font objects: `GameFontNormal` (98
+/// addons), `GameTooltipText` (89), `GameFontHighlightSmall` (69), `GameTooltipHeaderText` (the
+/// `Tablet-2.0.lua:289` header-size probe, 268 read sites).
+#[test]
+fn every_shipped_font_object_is_published_as_a_lua_global() {
+    let mut s = benilla_ui::script::UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    let failures = super::load_default_ui(&s);
+    assert!(failures.is_empty(), "loader errors: {failures:?}");
+
+    // Collect the declared names straight out of the shipped XML, so the sweep cannot go stale.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ui");
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("assets/ui").flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "xml") {
+            let text = std::fs::read_to_string(&path).expect("read");
+            for chunk in text.split("<Font ").skip(1) {
+                if let Some(rest) = chunk.split_once("name=\"") {
+                    if let Some((name, _)) = rest.1.split_once('"') {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    assert!(
+        names.len() >= 50,
+        "only {} <Font name=> declarations found — the sweep broke",
+        names.len()
+    );
+
+    let mut unpublished: Vec<&str> = Vec::new();
+    for name in &names {
+        match s.eval::<String>(&format!("return {name}:GetObjectType()")) {
+            Ok(t) if t == "Font" => {}
+            _ => unpublished.push(name),
+        }
+    }
+    assert!(
+        unpublished.is_empty(),
+        "declared <Font name=> that is not a Font global: {unpublished:?}"
+    );
+
+    // The four the corpus wants most actually carry a face and a size, not just a name.
+    for name in [
+        "GameFontNormal",
+        "GameTooltipText",
+        "GameFontHighlightSmall",
+        "GameTooltipHeaderText",
+    ] {
+        let (face, height) = s
+            .eval::<(String, f32)>(&format!("return {name}:GetFont()"))
+            .unwrap_or_else(|e| panic!("{name}:GetFont() — {e}"));
+        assert!(
+            face.to_ascii_uppercase().ends_with(".TTF"),
+            "{name}: {face}"
+        );
+        assert!(height > 0.0, "{name}: height {height}");
+    }
 }

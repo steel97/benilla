@@ -40,7 +40,7 @@ use bevy::window::{PresentMode, PrimaryWindow};
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 
 use crate::debug_panel::{overlay_text, OVERLAY_FILL, OVERLAY_TEXT_DIM};
-use crate::player::WorldCamera;
+use benilla_world::view::WorldCamera;
 
 /// The frame budget: a 60 fps floor. No frame should exceed this.
 pub const FRAME_BUDGET_MS: f32 = 1000.0 / 60.0;
@@ -81,7 +81,6 @@ impl Plugin for PerfPlugin {
         ))
         .init_resource::<FrameStats>()
         .init_resource::<PerfHud>()
-        .init_resource::<StreamActivity>()
         .insert_resource(StreamTrace {
             path: std::env::var("WOW_STREAM_TRACE").unwrap_or_default(),
             frame: 0,
@@ -101,57 +100,6 @@ impl Plugin for PerfPlugin {
         .add_systems(EguiPrimaryContextPass, perf_hud_ui);
         #[cfg(target_os = "macos")]
         stall_sample::plugin(app);
-    }
-}
-
-/// Per-frame terrain-streamer activity, bumped by the `WorldStage::Stream` chain as it works
-/// (a handful of integer adds + three self-timers — maintained unconditionally, zeroed by
-/// [`trace_stream`] every frame). Exists because B181's symptom — a frame spike on every ADT
-/// tile-boundary crossing — is keyed to *what the streamer did that frame*, which no 1 Hz journal
-/// row can attribute: the spike frame needs its own row saying what was dropped, requested and
-/// spawned beside what the frame cost.
-#[derive(Resource, Default)]
-pub(crate) struct StreamActivity {
-    /// Tiles whose owned entities (terrain root + cells, liquid, clutter) were despawned.
-    pub(crate) tiles_dropped: u32,
-    /// Shared placements whose refcount hit zero (their entities despawned with them).
-    pub(crate) placements_dropped: u32,
-    /// Entity handles despawned with those placements (submeshes, colliders, lights, props).
-    pub(crate) placement_entities_dropped: u32,
-    /// New ADT asset requests fired.
-    pub(crate) tiles_requested: u32,
-    /// Loaded tiles spawned (root + collider kicked off + placements registered + liquid + clutter).
-    pub(crate) tiles_spawned: u32,
-    /// MCNK cell meshes built + spawned by the paced furnisher (decision 0832).
-    pub(crate) cells_spawned: u32,
-    /// Model submesh render forms built by the paced model furnisher (decision 0834).
-    pub(crate) model_meshes_built: u32,
-    /// Placements (or WMO props) whose model landed and spawned.
-    pub(crate) placements_spawned: u32,
-    /// Off-thread colliders attached.
-    pub(crate) colliders_attached: u32,
-    /// Self-time of `stream_terrain` / `furnish_tile_cells` / `furnish_model_forms` /
-    /// `spawn_loaded_placements` / `finish_colliders` (ms).
-    pub(crate) stream_ms: f32,
-    pub(crate) furnish_ms: f32,
-    pub(crate) mfurnish_ms: f32,
-    pub(crate) spawn_ms: f32,
-    pub(crate) collider_ms: f32,
-}
-
-impl StreamActivity {
-    /// Did the streamer *do* anything this frame? (The self-timers don't count: the desired-set
-    /// scan runs every frame and would make every row an "event".)
-    fn any_event(&self) -> bool {
-        self.tiles_dropped
-            + self.placements_dropped
-            + self.tiles_requested
-            + self.tiles_spawned
-            + self.cells_spawned
-            + self.model_meshes_built
-            + self.placements_spawned
-            + self.colliders_attached
-            > 0
     }
 }
 
@@ -192,7 +140,7 @@ const STREAM_TRACE_HEADER: &str = "frame,t,delta_ms,cpu_ms,ents,stream_ms,furnis
 #[allow(clippy::too_many_arguments)]
 fn trace_stream(
     mut trace: ResMut<StreamTrace>,
-    mut activity: ResMut<StreamActivity>,
+    mut activity: ResMut<benilla_world::terrain_stream::StreamActivity>,
     time: Res<Time<Real>>,
     entities: Query<()>,
     mut adt_events: MessageReader<bevy::asset::AssetEvent<benilla_assets::AdtTile>>,
@@ -397,7 +345,7 @@ fn toggle_hud(keys: Res<ButtonInput<KeyCode>>, mut hud: ResMut<PerfHud>) {
     // The dev chord + `P`, not a bare `p` — `P` is the reference's TOGGLESPELLBOOK, and a dev
     // doesn't get to squat on a game binding (decision 0585). The chord can't be mistaken for typed
     // text, so unlike the old bare key it needs no chat-bar/EditBox gate.
-    if crate::debug_panel::dev_chord(&keys, KeyCode::KeyP) {
+    if benilla_world::modkeys::dev_chord(&keys, KeyCode::KeyP) {
         hud.visible = !hud.visible;
     }
 }
@@ -680,18 +628,18 @@ struct FpsJournal {
 /// 0793, because nothing but a `MapChange` evicted anything (0729).
 #[derive(bevy::ecs::system::SystemParam)]
 struct JournalResidency<'w> {
-    mats: Res<'w, Assets<crate::terrain::WowModelMaterial>>,
+    mats: Res<'w, Assets<benilla_assets::materials::WowModelMaterial>>,
     meshes: Res<'w, Assets<Mesh>>,
     images: Res<'w, Assets<bevy::image::Image>>,
     m2: Res<'w, Assets<benilla_assets::M2Model>>,
-    uv_reg: Res<'w, crate::doodad_anim::UvAnimMaterials>,
-    tint_reg: Res<'w, crate::doodad_anim::TintAnimMaterials>,
-    art: Res<'w, crate::art_scope::ArtCensus>,
+    uv_reg: Res<'w, benilla_world::doodad_anim::UvAnimMaterials>,
+    tint_reg: Res<'w, benilla_world::doodad_anim::TintAnimMaterials>,
+    art: Res<'w, benilla_world::art_scope::ArtCensus>,
     /// The **view focus** — where art is actually being asked for. Distinct from the row's `x,y,z`,
     /// which is the avatar: through a detached free-fly the body stands still while the camera covers
     /// kilometres, so on that leg the position columns describe nothing that is happening. The
     /// director's first run was exactly that leg, and reading it needed this column.
-    scope: Res<'w, crate::art_scope::ArtScopeState>,
+    scope: Res<'w, benilla_world::art_scope::ArtScopeState>,
 }
 
 fn journal_fps(
@@ -743,7 +691,7 @@ fn journal_fps(
         residency.tint_reg.0.len(),
     );
     // The per-cache breakdown, in `ArtSlot::ALL` order — which IS the header's column order.
-    for slot in crate::art_scope::ArtSlot::ALL {
+    for slot in benilla_world::art_scope::ArtSlot::ALL {
         line.push_str(&format!(",{}", residency.art.live(slot)));
     }
     line.push_str(&format!(",{}", residency.art.dropped_total()));
@@ -787,6 +735,67 @@ pub(crate) fn process_cpu_secs() -> Option<f64> {
         }
     }
     #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Cumulative **machine-wide** CPU ticks as `(busy, total)` — every core, every process, us
+/// included (`host_statistics64(HOST_CPU_LOAD_INFO)`). Diff two samples and `busy/total` is the
+/// fraction of all cores that were doing work between them.
+///
+/// Why the probes need it, when [`process_cpu_secs`] above already promises load-independence:
+/// that promise is **weaker than it reads**, and 1157 caught it. `cpu_ms` is per-frame work rather
+/// than wall time, so it shrugs off the scheduling delay that makes frame time useless under load
+/// — but it is not immune. The same LBRS pin leg, same binary, same day, read **25.93** while two
+/// other slots ran `cargo test --workspace` (load 20-32 on 14 cores) and **18.80-20.12** on a quiet
+/// machine: a ~35 % inflation, far outside the ±0.4 band the campaign reasons in (0736). Cache and
+/// memory-bandwidth contention is work we genuinely do; `getrusage` counts it and cannot tell us
+/// it was someone else's fault.
+///
+/// So the leg has to say how loaded the machine was, and the reader compares. Deliberately a
+/// **stamp, not a gate** (the director's call): no threshold is invented here. Two legs at similar
+/// `sys_busy_pct` are comparable; two legs far apart are not, whatever their `cpu_ms` says. That
+/// is a relative rule, which is the only kind the four calibration points behind 1157 support.
+///
+/// **Do not reach for `uptime` instead.** Load average is a 1-minute *decaying* mean and lags
+/// badly: a leg stamped 99 % here was taken at load 5.55, seconds after a build burst the average
+/// had not caught up with. Cross-checked against an independent out-of-process sampler over the
+/// same window — 44 % vs 44.5 % — so where the two disagree, this is the one that is right.
+///
+/// Non-macOS returns `None`: the probes print the field only where the platform answers.
+///
+/// The `deprecated` allow is `libc::mach_host_self`, whose deprecation note says "use the `mach2`
+/// crate instead". Checked, and it does not apply here: `mach2` 0.5.0 carries `mach_host_self` and
+/// **nothing else this call needs** — no `host_statistics64`, no `host_cpu_load_info`, no
+/// `HOST_CPU_LOAD_INFO`. Taking the advice would split one call across two crates and add a direct
+/// dependency to get the *port* while `libc` still supplies the call it is passed to. Revisit if
+/// `mach2` ever grows the host-statistics surface.
+#[allow(deprecated)]
+pub(crate) fn system_cpu_ticks() -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `host_statistics64` fills at most `count` u32s into the out-param and reads
+        // nothing from it; `host_cpu_load_info` is plain integers, so zeroed is a valid starting
+        // value. `mach_host_self` returns the global host port — no send right to deallocate.
+        unsafe {
+            let mut info: libc::host_cpu_load_info = std::mem::zeroed();
+            let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+            if libc::host_statistics64(
+                libc::mach_host_self(),
+                libc::HOST_CPU_LOAD_INFO,
+                (&raw mut info).cast(),
+                &mut count,
+            ) != libc::KERN_SUCCESS
+            {
+                return None;
+            }
+            let total: u64 = info.cpu_ticks.iter().map(|&x| u64::from(x)).sum();
+            let idle = u64::from(info.cpu_ticks[libc::CPU_STATE_IDLE as usize]);
+            Some((total - idle, total))
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
     {
         None
     }

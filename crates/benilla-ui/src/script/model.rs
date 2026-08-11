@@ -6,8 +6,9 @@ use crate::widget::{FrameHandle, RegionHandle, WidgetArena};
 use super::{
     backdrop, bank, char_stats, container, craft, cursor, death, duel, follow, gossip, inspect,
     item_text, loot, loot_roll, macros, mail, merchant, party, quest, quest_log, session, skills,
-    slider, social, spellbook, taxi, trade, tradeskill, trainer, ActionSlot, AuraState, FontObject,
-    ItemTemplateView, PlayerReqState, RegionData, ScriptValue, SoundRequest, UnitState,
+    slider, social, spellbook, taxi, trade, tradeskill, trainer, weapon_enchant, ActionSlot,
+    AuraState, FontObject, ItemTemplateView, PlayerReqState, RegionData, ScriptValue, SoundRequest,
+    UnitState,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -18,6 +19,31 @@ use super::{
 /// id↔handle bijection, region visuals, and the event/script registrations. Held in `lua.app_data`
 /// (interior-mutable) so callbacks reach it; contains **no** mlua handles (the MAXCSTACK discipline).
 pub(crate) struct Model {
+    /// Every discovered addon, in load order — the AddOn API's registry, filled by the host at
+    /// world entry ([`super::UiScript::register_addons`]). See [`super::addon`].
+    pub(crate) addons: Vec<super::addon::AddOnInfo>,
+    /// The AddOns folder, so `LoadAddOn` can read an addon's files from inside a Lua binding.
+    pub(crate) addons_root: Option<std::path::PathBuf>,
+    /// Where per-addon saved variables live: the account-scoped folder, then this character's.
+    /// Both are directories holding one `<Addon>.lua` per declaring addon.
+    pub(crate) addons_saved_account: Option<std::path::PathBuf>,
+    pub(crate) addons_saved_character: Option<std::path::PathBuf>,
+    /// The FrameXML **template registry**, persisted across [`crate::loader::load`] calls — the
+    /// client's template table is global (`0x6ee500`, rf24), so a file may `inherits=` a template
+    /// an *earlier file* registered (the real MerchantFrame.xml inherits
+    /// CharacterFrameTemplates.xml's tab template). Register-before-use in load order, exactly
+    /// the client's rule; a per-document registry silently dropped every cross-file inherit.
+    ///
+    /// **Here rather than on `UiScript`** so the loader can run from a bare `&Lua`: that is what
+    /// lets `LoadAddOn` load an addon from inside a Lua binding, synchronously, the way the
+    /// reference does (1188 phase 2). `font_objects` below was already here, and these two are
+    /// the same kind of thing — VM-global registries the loader fills.
+    pub(crate) framexml_templates:
+        std::cell::RefCell<std::collections::HashMap<String, crate::framexml::Element>>,
+    /// The FrameXML **font-element registry** (a separate namespace — a font inherits a font,
+    /// never a frame template), persisted for the same cross-file reason.
+    pub(crate) framexml_fonts:
+        std::cell::RefCell<std::collections::HashMap<String, crate::framexml::Element>>,
     /// The frame arena (create/destroy + show/hide/strata/level/scale/alpha propagation).
     pub(crate) arena: WidgetArena,
     /// Per-frame layout input (anchors/size/scale). Every live frame has one (created at
@@ -122,6 +148,29 @@ pub(crate) struct Model {
     /// same-frame press+release test in [`UiScript::mouse_button`]. Keyed by button so a `LeftButton`
     /// press is not cleared by a `RightButton` release.
     pub(crate) mouse_down_on: HashMap<String, FrameHandle>,
+    /// Per **frame**, the [`UiScript::now`] second at which its last single `OnClick` fired — the
+    /// double-click detector's entire state, and the faithful stand-in for the client's per-widget
+    /// timestamp `[CButton+0x334]` (wow-re `ui/scratch/button-doubleclick-law.md`).
+    ///
+    /// Three properties of that field are load-bearing, and are why this is keyed the way it is.
+    /// It lives on the **widget**, so two frames can never pair with each other. It carries **no
+    /// button identity** — the detector is button-agnostic, so a left release followed by a right
+    /// one on a button registered for both completes a double click (with `arg1` = the *second*
+    /// button); what normally confines double-clicks to the left button is `RegisterForClicks`'
+    /// `{"LeftButtonUp"}` default, not the detector. And it is written only when a single click
+    /// actually fires, then **zeroed** when a double completes — which is what makes four rapid
+    /// clicks read `Click · DoubleClick · Click · DoubleClick` rather than one click and three
+    /// doubles. Nothing else clears it: not hide, not disable, not the cursor leaving the frame
+    /// (`[+0x334]` has exactly three writers binary-wide — ctor, the fired-double zero, and the
+    /// fired-single stamp).
+    pub(crate) last_click: HashMap<FrameHandle, f64>,
+
+    /// Frames whose resolved SIZE moved in the last [`UiScript::resolve_layout`], as
+    /// `(frame id, width, height)` — queued there (it holds only a `&mut Model`, so it cannot call
+    /// Lua) and drained by [`super::event::fire_size_changes`] at the next `&Lua` seam, which turns
+    /// each into `OnSizeChanged(self, width, height)`. Same compute-under-borrow / fire-outside
+    /// shape as the pointer path's `OnValueChanged`/`OnDragStart` hand-offs.
+    pub(crate) pending_size_changed: Vec<(u32, f32, f32)>,
 
     /// Script errors collected from `pcall`'d handlers (never panics, never prints — decision 0068).
     pub(crate) errors: Vec<String>,
@@ -151,6 +200,11 @@ pub(crate) struct Model {
     /// The app resolves each token to a streamed entity and commits the selection; a token it can't
     /// resolve is a no-op, as the real client no-ops `TargetUnit` on a nonexistent unit ([`unit`]).
     pub(crate) target_requests: Vec<String>,
+    /// `(name, exactMatch)` pairs `TargetByName` queued since the app's last
+    /// [`UiScript::take_target_by_name_requests`] drain — the by-NAME twin of
+    /// [`Self::target_requests`], which takes unit tokens. The app runs the shared by-name
+    /// resolver (`crate::target::by_name`, decision 0886) and commits the selection ([`unit`]).
+    pub(crate) target_by_name_requests: Vec<(String, bool)>,
     /// Set when `ClearTarget()` fired with a live target — the ESC chain's LAST leg
     /// (`ToggleGameMenu`'s order: the clear runs only when nothing earlier ate the press).
     /// Drained by [`super::UiScript::take_target_clear`]; the app commits the deselect ([`unit`]).
@@ -167,6 +221,10 @@ pub(crate) struct Model {
     /// §2) — `GetNumPartyMembers`/`GetPartyLeaderIndex`/`GetLootMethod`/… read it ([`party`]).
     /// `PartyState::default()` = not in a group (every getter reports the solo-player shape).
     /// Per-member game state rides the `units` map above, under `"party1"`..`"party4"` tokens.
+    /// The channels this session has CONFIRMED joining, in join order — the client-side number
+    /// law `GetChannelName` answers with ([`super::channel`]). Mirrored from `ui_chat`'s
+    /// `ChannelState` by `set_joined_channels`; empty until the server's first YOU_JOINED.
+    pub(crate) joined_channels: Vec<String>,
     pub(crate) party: party::PartyState,
     /// Party/loot intents (`AcceptGroup`/`InviteToParty`/`SetLootMethod`/…) queued since the
     /// app's last [`super::UiScript::take_party_requests`] drain — the outbound seam ([`party`]).
@@ -183,6 +241,15 @@ pub(crate) struct Model {
     /// [`super::UiScript::take_tell_requests`] drain — the app opens its chat edit box prefilled
     /// `/w <name> ` (the unit popup's WHISPER action; [`party`] registers the global).
     pub(crate) tell_requests: Vec<String>,
+    /// Prefill texts `ChatFrame_OpenChat` queued since the app's last
+    /// [`super::UiScript::take_open_chat_requests`] drain — `tell_requests`' sibling, one step
+    /// less resolved: a name there, a whole draft line here ([`chat_window`] registers the global).
+    pub(crate) open_chat_requests: Vec<String>,
+    /// The player's default chat language name, app-resolved from `ChrRaces.BaseLanguage` ×
+    /// `Languages.dbc` ([`super::UiScript::set_default_language`]). `None` = the reference's
+    /// no-player-object state, where `GetDefaultLanguage()` returns **zero Lua values**
+    /// ([`chat_send`]).
+    pub(crate) default_language: Option<String>,
     /// Duel intents (`AcceptDuel`/`CancelDuel`/`StartDuel*`) queued since the app's last
     /// [`super::UiScript::take_duel_requests`] drain — the outbound seam ([`duel`]). There is no
     /// duel *snapshot* beside it: everything the UI reads arrives as event arguments.
@@ -259,7 +326,7 @@ pub(crate) struct Model {
     pub(crate) pet_book: spellbook::PetBookState,
     /// The player's **macros** (decision 0983) — the one game-state table this crate owns
     /// outright, because 1.12 macros have no server side at all ([`macros`]'s module docs). The
-    /// app seeds it from `benilla/macros/…` and reads it back to persist.
+    /// app seeds it from `benilla-config/macros/…` and reads it back to persist.
     pub(crate) macros: macros::MacroState,
     /// A script mutated [`Self::macros`] since the app's last
     /// [`super::UiScript::take_macros_dirty`] drain — the save + `UPDATE_MACROS` trigger.
@@ -448,6 +515,14 @@ pub(crate) struct Model {
     /// `started` once the cursor has moved past the drag-start threshold — `None` between
     /// gestures ([`cursor::DragGesture`], decision 0216 §3).
     pub(crate) drag: Option<cursor::DragGesture>,
+    /// The one in-flight `StartMoving()` — the client's single root-side drag slot (`root+0xcfc`
+    /// and the cursor sample beside it), `None` between moves ([`super::object::FrameMove`]). Held
+    /// beside [`Model::drag`] because that gesture is what normally opens and closes it: the
+    /// canonical addon idiom is `OnDragStart → StartMoving`, `OnDragStop → StopMovingOrSizing`.
+    /// The two remain separate systems, exactly as in the reference — a drag can carry a payload
+    /// with nothing moving, and a move outlives the mouse button (the reference's mouse-up
+    /// auto-stop skips the Lua drag type).
+    pub(crate) moving: Option<super::object::FrameMove>,
     /// The in-flight Slider thumb drag: set when a LeftButton press lands on a Slider's thumb, held
     /// until release / pointer-leave (decision 0250 §5, the engine's C++-equivalent thumb drag —
     /// like a scrollbar dragging in the real client, no Lua involved). `None` between drags
@@ -673,6 +748,15 @@ pub(crate) struct Model {
     /// The watched (tracked) quests, by stable quest id in watch order — the tracker HUD's set
     /// (engine-owned like the selection; pruned by `set_quest_log` when a quest leaves the log).
     pub(crate) quest_log_watched: Vec<u32>,
+    /// The server's wall clock in unix-epoch seconds, pushed by the app each frame it has one
+    /// ([`UiScript::set_server_unix_time`]); `None` before the first `SMSG_QUERY_TIME_RESPONSE`.
+    ///
+    /// Held here rather than folded into the quest-log snapshot because the *engine* owns every
+    /// countdown the Lua reads: a timed quest's deadline is an absolute stamp in this epoch, and
+    /// `GetQuestTimers` subtracts against it **per call**, exactly as the reference's C binding
+    /// does. That is what lets the reference `QuestTimerFrame` tick smoothly from its OnUpdate
+    /// while the log snapshot itself only changes when the log does (decision 1150).
+    pub(crate) server_unix_time: Option<f64>,
     /// The player's purse in copper (`GetMoney`), pushed each frame it changes by the app's
     /// `PLAYER_FIELD_COINAGE` feed ([`UiScript::set_money`]). Plain data — the money display + the
     /// merchant window's coin line read it.
@@ -748,6 +832,11 @@ pub(crate) struct Model {
     /// Inventory-slot ids queued by `UseInventoryItem` (decision 0208 phase 1b, `cursor`'s `doll`
     /// submodule) — drained by the app into `CMSG_USE_ITEM` against the equipped position.
     pub(crate) inventory_uses: Vec<u32>,
+    /// The two weapons' **temporary** enchantments — `[0]` main hand, `[1]` off hand, in the order
+    /// `GetWeaponEnchantInfo` pushes them ([`weapon_enchant`]). A separate slot from
+    /// [`Self::inventory_slots`] on purpose: this one carries a live countdown and is pushed every
+    /// frame, where the slot snapshot is change-gated and fires an event.
+    pub(crate) weapon_enchants: [Option<weapon_enchant::WeaponEnchant>; 2],
 
     /// The inspected unit's equipment view, keyed by unit token ([`inspect`], decision 0631) —
     /// the *second* source behind the unit-keyed `GetInventoryItem*` family. Unlike
@@ -811,6 +900,17 @@ pub(crate) struct Model {
     /// saw (UI space: logical px, y-up — the same frame `resolve` rects live in). Behind Lua's
     /// `GetCursorPosition()`; the reference world map polls it every OnUpdate for hover/click math.
     pub(crate) cursor_pos: (f32, f32),
+    /// The realm this session is on, behind `GetRealmName()` (decision 1195). `""` until the app
+    /// pushes one — the glue screen's own answer, and never `nil`, because the corpus idiom is
+    /// `db[GetRealmName()] = …` at file scope and a nil index errors one call deeper.
+    /// Lines an addon queued with `SendChatMessage`, drained by the app into the wire
+    /// (decision 1199). Deliberately a different queue from the chat box's input: the box's drain
+    /// runs the slash grammar and this one must not.
+    pub(crate) chat_sends: Vec<super::chat_send::ChatSend>,
+    pub(crate) realm_name: String,
+    /// Frames per second, behind `GetFramerate()`. Pushed per tick by the app, which owns the
+    /// clock this crate does not have.
+    pub(crate) framerate: f64,
     /// The modifier-key mirror `(shift, ctrl, alt)` behind `IsShiftKeyDown`/`IsControlKeyDown`/
     /// `IsAltKeyDown` — pushed by the app's input pass ([`UiScript::set_modifiers`]) BEFORE the
     /// frame's mouse events, so a click handler's fork reads the state at click time.
@@ -820,6 +920,12 @@ pub(crate) struct Model {
 impl Model {
     pub(crate) fn new() -> Model {
         Model {
+            addons: Vec::new(),
+            addons_root: None,
+            addons_saved_account: None,
+            addons_saved_character: None,
+            framexml_templates: Default::default(),
+            framexml_fonts: Default::default(),
             arena: WidgetArena::new(),
             layout_inputs: HashMap::new(),
             solver: LayoutSolver::new(),
@@ -847,6 +953,8 @@ impl Model {
             focused_editbox: None,
             mouseover: None,
             mouse_down_on: HashMap::new(),
+            last_click: HashMap::new(),
+            pending_size_changed: Vec::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
             // Classic Era's UIParent virtual space is 1024×768-ish; a sensible default the host can
@@ -857,13 +965,17 @@ impl Model {
             cancel_aura_requests: Vec::new(),
             tracking: None,
             target_requests: Vec::new(),
+            target_by_name_requests: Vec::new(),
             drop_item_on_unit: Vec::new(),
             target_clear: false,
+            joined_channels: Vec::new(),
             party: party::PartyState::default(),
             party_requests: Vec::new(),
             social: social::SocialState::default(),
             social_requests: Vec::new(),
             tell_requests: Vec::new(),
+            open_chat_requests: Vec::new(),
+            default_language: None,
             duel_requests: Vec::new(),
             follow_requests: Vec::new(),
             session_requests: Vec::new(),
@@ -925,6 +1037,7 @@ impl Model {
             container_autoequips: Vec::new(),
             drag_registered: HashMap::new(),
             drag: None,
+            moving: None,
             slider_drag: None,
             gossip: None,
             gossip_selects: Vec::new(),
@@ -1012,9 +1125,13 @@ impl Model {
             spell_tooltip_asks: HashSet::new(),
             quest_log_collapses: Vec::new(),
             quest_log_watched: Vec::new(),
+            server_unix_time: None,
             worldmap: super::worldmap::WorldMapState::default(),
             pending_events: Vec::new(),
             cursor_pos: (0.0, 0.0),
+            chat_sends: Vec::new(),
+            realm_name: String::new(),
+            framerate: 0.0,
             modifiers: (false, false, false),
             money: 0,
             net_latency_ms: 0,
@@ -1040,6 +1157,7 @@ impl Model {
             inventory_alerts: [0; 12],
             paperdoll_yaw: 0.0,
             inventory_uses: Vec::new(),
+            weapon_enchants: [None; 2],
             inspect: None,
             inspect_notifies: Vec::new(),
             inspect_clear: false,

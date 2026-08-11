@@ -50,11 +50,11 @@ use benilla_assets::coords::bevy_to_wow;
 use benilla_formats::AreaTriggerCatalog;
 use bevy::prelude::*;
 
-use crate::assets::{AssetSet, LockRecover, WorldAssets};
 use crate::net::{ClientCommand, NetCommands};
 use crate::player::Player;
-use crate::schedule::WorldStage;
-use crate::world_map::CurrentMap;
+use benilla_assets::{AssetSet, LockRecover, WorldAssets};
+use benilla_world::schedule::WorldStage;
+use benilla_world::world_map::CurrentMap;
 
 /// The `AreaTrigger.dbc` catalog, bucketed by map. Absent when the client data didn't load — the
 /// check then does nothing, like every other data-driven system here.
@@ -165,11 +165,7 @@ mod tests {
     use super::*;
 
     fn real_catalog() -> Option<AreaTriggerCatalog> {
-        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return None;
-        }
+        let data = benilla_formats::wow_data_or_skip!(None);
         let mut chain = benilla_formats::open_chain(&data).expect("open chain");
         Some(benilla_formats::load_area_trigger_catalog(&mut chain).expect("AreaTrigger.dbc"))
     }

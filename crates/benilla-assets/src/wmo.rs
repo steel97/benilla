@@ -169,6 +169,10 @@ pub struct WmoModel {
     /// object and bakes the hit's barycentric MOCV, floor-168/cap-96, on the fixed interior axis
     /// (`0x69e4c0`; wow-re `wmo-lit-selector.md`, trace-decisive on the abbey benches).
     pub group_footprints: Vec<Option<FootprintTris>>,
+    /// Root MOMT `ground_type` per material — the `TerrainType.dbc` id a face's
+    /// `FootprintTris::mopy_material` resolves to. Shared by every group (MOMT lives on the root),
+    /// and the tail of the footstep chain's WMO leg (decision 1161).
+    pub material_ground_type: Vec<u32>,
     /// Per-group AABB of the faces [`Self::group_footprints`] actually references (parallel;
     /// `None` = no footprint faces), computed at load from the triangles themselves — the broad
     /// phase for the footprint down-ray, the same exact-cull argument as
@@ -722,6 +726,7 @@ impl AssetLoader for WmoModelLoader {
             doodad_owner,
             doodad_groups,
             group_footprints,
+            material_ground_type: root.material_ground_types(),
             group_footprint_bounds,
             group_footprint_grids,
             group_light_refs,
@@ -880,11 +885,7 @@ mod doodad_base_tests {
     /// calls, so it fails the moment the lane law regresses (decision 0969).
     #[test]
     fn booty_bays_entrance_arch_is_sky_lit_not_a_black_silhouette() {
-        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return;
-        }
+        let data = benilla_formats::wow_data_or_skip!();
         let stem = "World\\wmo\\Azeroth\\Buildings\\Stranglethorn_BootyBay\\BootyBay";
         let chain = benilla_formats::Chain::open(&data).expect("open vanilla patch chain");
         let bytes = chain

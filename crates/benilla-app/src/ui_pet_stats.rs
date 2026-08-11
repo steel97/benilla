@@ -73,13 +73,13 @@ pub(crate) struct PetFamilyTables {
 /// the codebase's own "push before firing" rule (`crate::ui_unit`), which held *inside* every
 /// feed but not *between* them.
 ///
-/// It cost the Pet tab. `BenillaPetTab_Update` is edge-driven off `UNIT_PET` / `PET_BAR_UPDATE`
+/// It cost the Pet tab. `PetTab_Update` is edge-driven off `UNIT_PET` / `PET_BAR_UPDATE`
 /// and its whole predicate is `HasPetUI()`, which is this snapshot. With the three pet feeds
 /// merely unordered inside [`UnitFeed`], a cold first summon fired both edges while `HasPetUI()`
 /// still answered "no pet"; the push landed after, and since neither edge repeats, the tab stayed
 /// down for the rest of the session. Measured live, frame by frame: both events on frame 440 with
 /// `HasPetUI()=(nil,nil)`, the flip to `(1,nil)` on 441, and the tab still hidden 48 s later —
-/// while calling `BenillaPetTab_Update()` by hand raised it instantly.
+/// while calling `PetTab_Update()` by hand raised it instantly.
 ///
 /// A set rather than a pair of `.before()` calls because the constraint belongs to the *snapshot*,
 /// not to today's two consumers: anything that later fires a pet event inherits it by ordering
@@ -362,11 +362,7 @@ mod tests {
     }
 
     fn chain() -> Option<benilla_formats::Chain> {
-        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return None;
-        }
+        let data = benilla_formats::wow_data_or_skip!(None);
         Some(benilla_formats::open_chain(&data).expect("open chain"))
     }
 
@@ -520,11 +516,7 @@ mod tests {
     /// here is silent — `getglobal` answers nil and the tooltip simply loses a line.
     #[test]
     fn every_happiness_string_resolves_in_the_real_global_strings() {
-        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return;
-        }
+        let data = benilla_formats::wow_data_or_skip!();
         let mut chain = benilla_formats::open_chain(&data).expect("open chain");
         let src = chain
             .read_file("Interface\\FrameXML\\GlobalStrings.lua")
@@ -687,7 +679,7 @@ mod tests {
     /// ordering does. Driven through **one** `app.update()` on a cold pet — the exact live shape,
     /// where `feed_pet_unit` sees the guid appear and fires while `feed_pet_stats` has or has not
     /// yet pushed. A handler that reads `HasPetUI()` at that instant is what the shipped
-    /// `BenillaPetTab_Update` is, minus the frames.
+    /// `PetTab_Update` is, minus the frames.
     #[test]
     fn unit_pet_reaches_lua_with_has_pet_ui_already_true() {
         use crate::char_select::ClientState;

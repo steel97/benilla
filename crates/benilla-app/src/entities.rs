@@ -24,20 +24,15 @@ use benilla_formats::{
 use benilla_protocol::EntityKind;
 use bevy::prelude::*;
 
-use crate::assets::{AssetSet, LockRecover, WorldAssets};
-use crate::lighting::SharedLightBuffer;
-use crate::model_fade::{
-    apply_despawn_fade, apply_render_fade, arm_appear_fade, retire_unit_appear_fade,
-};
-use crate::model_render::MaterialCache;
 use crate::net::NetEntity;
-use crate::schedule::WorldStage;
-use crate::terrain::WowModelMaterial;
+use benilla_assets::{AssetSet, LockRecover, WorldAssets};
+use benilla_world::model_fade::apply_render_fade;
+use benilla_world::schedule::WorldStage;
 
 /// Resolving a display id to its [`DisplayModel`] and building its spawn parts once the model asset
 /// loads (materials, skeleton, collider, camera/selection metrics) — the front half of this subsystem,
 /// kept in its own file as it carries the bulk of the per-display cache/build logic.
-mod display;
+pub(crate) mod display;
 use display::{
     build_parts, empty_display, empty_shell, new_creature_display, new_gameobject_display,
     DisplayModel, EntityPart, ModelHandle,
@@ -98,7 +93,7 @@ use missile::{attach_missile_models, move_missiles, spawn_missiles};
 /// M2s spawned as children of the streamed gameobject, so they ride a moving transport.
 mod wmo_props;
 use wmo_props::{resolve_wmo_gameobject_props, spawn_wmo_gameobject_props};
-mod spell_fx;
+pub(crate) mod spell_fx;
 use spell_fx::{attach_spell_fx, resolve_spell_fx};
 
 /// Dest-anchored spell effects (decision 0797): a DynamicObject's persistent area visuals
@@ -116,7 +111,6 @@ mod chain_beam;
 pub(crate) use chain_beam::ChainHops;
 use chain_beam::{simulate_chain_beams, spawn_chain_beams};
 // The container feed reads the icon column off the same catalog resource (one DBC parse).
-pub(crate) use attach::spawn_joints;
 // The one InventoryType → equipment-slot table (`attach::preview`): the dressing-room feed places a
 // tried-on item by the very same map the preview it feeds dresses by (decision 1060).
 pub(crate) use attach::equip_slot;
@@ -222,6 +216,13 @@ impl Creatures {
         self.catalog.footprint(display_id)
     }
 
+    /// Does this display's model breathe — may it wear the `$BTH` puffs (cold vapour, bubbles)?
+    /// `CreatureModelData.Flags & 0x2` suppresses the family: skeletons, ghosts, elementals,
+    /// golems, slimes, totems. See [`benilla_formats::CreatureCatalog::breathes`].
+    pub(crate) fn breathes(&self, display_id: u32) -> bool {
+        self.catalog.breathes(display_id)
+    }
+
     /// A display's **base render alpha** (`CreatureDisplayInfo.CreatureModelAlpha / 255`) — the
     /// `baseAlpha` factor of the per-unit alpha product the aura CharProc nodes multiply into
     /// (`crate::aura_visual`). `None` for an unknown display.
@@ -310,17 +311,12 @@ struct SkinSections(CharSections);
 #[derive(Resource)]
 pub(crate) struct CharCreate(pub(crate) CharCreateCatalog);
 
-/// The shared material-dedup cache for streamed-entity models (creatures + GameObjects share one look
-/// across instances). Kept as its own resource so the build system can reach it independently.
-#[derive(Resource, Default)]
-struct EntityMaterials(MaterialCache);
-
 /// Per-appearance cache of composited body-skin atlases (decision 0044): each distinct character look
 /// composites + uploads its 256² skin once, and every player sharing that look reuses the handle. A
 /// composite is a fresh `Image` asset per build (unlike an `asset_server.load` path, which dedups by
 /// path), so without this cache every player would re-composite and break material dedup downstream.
 #[derive(Resource, Default)]
-struct SkinComposites(crate::art_scope::SpatialCache<SkinKey, Handle<Image>>);
+struct SkinComposites(benilla_assets::SpatialCache<SkinKey, Handle<Image>>);
 
 /// The appearance fields that determine a composited body skin (decision 0044): race/sex pick the
 /// CharSections rows; skin/face/facialHair/hairStyle/hairColor pick the base + overlay variations;
@@ -351,14 +347,23 @@ pub(crate) struct VisualAttached;
 #[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct EntityVisualsSet;
 
+/// [`update_display_models`]' ordering handle: anything that must **create** a display-cache entry
+/// in time for this frame's build orders before it.
+///
+/// It exists for one caller, the `fxview` fixture's driver — which registers itself against this
+/// from `capture` rather than being listed in the chain above, because a fixture's driver belongs
+/// with its fixture and gameplay may not name the harness (decisions 1173/1174). Same shape as the
+/// `waterfx` fixture's registration against the engine's `WaterFoamSet`.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DisplayBuildSet;
+
 /// Drop every display/material dedup on a cross-map transition (`world_map::MapChange` — see its
 /// doc for why a clear is always safe mid-session). These caches are get-or-insert at every use
 /// site, so a cleared entry rebuilds on the next spawn that wants it; without this, every display
 /// id, material key, and composited skin ever seen stayed resident for the life of the process.
 #[allow(clippy::too_many_arguments)]
 fn evict_display_caches(
-    mut changes: MessageReader<crate::world_map::MapChange>,
-    mut entity_mats: ResMut<EntityMaterials>,
+    mut changes: MessageReader<benilla_world::world_map::MapChange>,
     mut composites: ResMut<SkinComposites>,
     mut fx: ResMut<spell_fx::SpellFx>,
     creatures: Option<ResMut<Creatures>>,
@@ -371,8 +376,7 @@ fn evict_display_caches(
     }
     changes.clear();
     info!(
-        "display caches evicted: {} materials, {} creature / {} go / {} item / {} fx / {} glow models, {} skins",
-        entity_mats.0.len(),
+        "display caches evicted: {} creature / {} go / {} item / {} fx / {} glow models, {} skins",
         creatures.as_ref().map_or(0, |c| c.models.len()),
         gos.as_ref().map_or(0, |g| g.models.len()),
         items.as_ref().map_or(0, |i| i.models.len()),
@@ -380,7 +384,6 @@ fn evict_display_caches(
         glows.as_ref().map_or(0, |g| g.models.len()),
         composites.0.len(),
     );
-    entity_mats.0.clear();
     composites.0.clear();
     fx.models.clear();
     if let Some(mut c) = creatures {
@@ -404,12 +407,74 @@ fn evict_display_caches(
 /// `ItemDisplays`/`SpellFx`) are deliberately *not* swept: they key on ids, not places, and hold M2
 /// assets whose count is bounded by the catalogs rather than by where you have been.
 fn scope_entity_art(
-    mut scope: crate::art_scope::ArtScope,
-    mut mats: ResMut<EntityMaterials>,
+    mut scope: benilla_world::art_scope::ArtScope,
     mut composites: ResMut<SkinComposites>,
 ) {
-    scope.apply(&mut mats.0, crate::art_scope::ArtSlot::EntityMats);
-    scope.apply(&mut composites.0, crate::art_scope::ArtSlot::Skins);
+    scope.apply(&mut composites.0, benilla_world::art_scope::ArtSlot::Skins);
+}
+
+/// **Restate every wire body as a [`WorldUnit`](benilla_world::world_unit::WorldUnit)** — the game's half
+/// of the unit inversion (see that module).
+///
+/// One reconciler rather than a line at each of the dozen sites that spawn a `NetEntity`: a
+/// spawn path that forgets the marker is a body the world cannot see — no ground shade, no room
+/// claim, no foam — and that is exactly the kind of omission nobody notices until a screenshot.
+/// Runs between the wire drain and the rest of the frame, so a unit that arrived this frame is
+/// visible to the world this frame.
+fn publish_world_units(
+    mut commands: Commands,
+    bodies: Query<(
+        Entity,
+        &NetEntity,
+        Option<&collision_height::CollisionHeight>,
+        Option<&benilla_world::world_unit::WorldUnit>,
+    )>,
+    viewers: Query<(
+        Entity,
+        Has<crate::net::SelfPlayer>,
+        Has<benilla_world::world_unit::ViewerUnit>,
+    )>,
+) {
+    for (entity, net, height, current) in &bodies {
+        let want = benilla_world::world_unit::WorldUnit {
+            // The wire kind is answered HERE and never handed over (1177): the engine asks "does
+            // this body displace water", and translating its own vocabulary into that answer is
+            // the game's job. A live body wades; a GameObject, a dynamic-object spell anchor or
+            // anything else standing in a lake makes no ripple.
+            wades: matches!(net.kind, EntityKind::Unit | EntityKind::Player),
+            scale: net.scale,
+            // `unwrap_or_default`, NOT zero: `CollisionHeight`'s Default is the client's own
+            // ctor value, and its doc says why — at 0.0 "every depth line collapses and the unit
+            // swims on dry land". A body whose display has not resolved yet must read as a
+            // default-sized body, which is what the foam site did before this component existed.
+            height: height.copied().unwrap_or_default().0,
+        };
+        // Only write on a real change: the component is change-detected downstream, and a
+        // per-frame rewrite would mark every body dirty for every reader every frame.
+        let same = current.is_some_and(|c| {
+            c.wades == want.wades && c.scale == want.scale && c.height == want.height
+        });
+        if !same {
+            commands.entity(entity).insert(want);
+        }
+    }
+    // The viewer marker is reconciled independently of `NetEntity`: the self entity exists before
+    // its wire record does, and a `/logout` takes the record away first.
+    for (entity, is_self, marked) in &viewers {
+        match (is_self, marked) {
+            (true, false) => {
+                commands
+                    .entity(entity)
+                    .insert(benilla_world::world_unit::ViewerUnit);
+            }
+            (false, true) => {
+                commands
+                    .entity(entity)
+                    .remove::<benilla_world::world_unit::ViewerUnit>();
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The streamed-entity subsystem: builds the shared cube assets + display catalogs at startup, then
@@ -418,248 +483,190 @@ pub(crate) struct EntitiesPlugin;
 
 impl Plugin for EntitiesPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<EntityMaterials>()
-            .init_resource::<SkinComposites>()
-            .init_resource::<spell_fx::SpellFx>()
-            .init_resource::<spell_fx::FxTintAnims>()
-            // The per-caster pending-projectile queues (the client's `unit+0xac` lists).
-            .init_resource::<missile::PendingMissiles>()
-            // The projectile flight-loop edges (`crate::sound::missile` consumes them).
-            .add_message::<MissileSound>()
-            // The cast router's dest one-shot orders (`dest_fx`, decision 0797).
-            .add_message::<dest_fx::GroundBurst>()
-            .add_systems(Startup, setup_entities.after(AssetSet::Open))
-            // The map-scope teardown (`world_map::MapChange`): drop every display/material dedup
-            // so a map's assets actually die with it — the #bugs teleport leak.
-            .add_systems(Update, (evict_display_caches, scope_entity_art))
-            // Every streamed unit's collision height, the frame after `apply_net_updates` spawns it
-            // (that stage's Commands are what create the entity, so this cannot be earlier). Its
-            // consumers all read `Option<&CollisionHeight>` against the ctor default, so a unit's
-            // first frame simply uses that — see `CollisionHeight`.
-            .add_systems(Update, stamp_collision_heights.after(WorldStage::Net))
-            // Resolve/build display models before attaching, so a model is ready the frame attach wants it.
-            // **After `WorldStage::Net`**: `apply_net_updates` spawns the entities (via Commands), so
-            // these must run *after* that stage — with the sync point it forces — or they'd attach an
-            // entity the same frame its display id is still unresolved (`dm == None`) and lock in a cube.
-            // The net stage was previously unordered (`schedule.rs` chained only Input→Stream→Present), so
-            // this held only by luck of Bevy's auto-sort; pinning it makes display resolution deterministic.
-            .add_systems(
-                Update,
+        app.add_systems(
+            Update,
+            publish_world_units
+                .after(benilla_world::schedule::WorldStage::Net)
+                .before(benilla_world::schedule::WorldStage::Input),
+        )
+        .init_resource::<SkinComposites>()
+        .init_resource::<spell_fx::SpellFx>()
+        .init_resource::<spell_fx::FxTintAnims>()
+        // The per-caster pending-projectile queues (the client's `unit+0xac` lists).
+        .init_resource::<missile::PendingMissiles>()
+        // The projectile flight-loop edges (`crate::sound::missile` consumes them).
+        .add_message::<MissileSound>()
+        // The cast router's dest one-shot orders (`dest_fx`, decision 0797).
+        .add_message::<dest_fx::GroundBurst>()
+        .add_systems(Startup, setup_entities.after(AssetSet::Open))
+        // The map-scope teardown (`world_map::MapChange`): drop every display/material dedup
+        // so a map's assets actually die with it — the #bugs teleport leak.
+        .add_systems(Update, (evict_display_caches, scope_entity_art))
+        // Every streamed unit's collision height, the frame after `apply_net_updates` spawns it
+        // (that stage's Commands are what create the entity, so this cannot be earlier). Its
+        // consumers all read `Option<&CollisionHeight>` against the ctor default, so a unit's
+        // first frame simply uses that — see `CollisionHeight`.
+        .add_systems(Update, stamp_collision_heights.after(WorldStage::Net))
+        // Resolve/build display models before attaching, so a model is ready the frame attach wants it.
+        // **After `WorldStage::Net`**: `apply_net_updates` spawns the entities (via Commands), so
+        // these must run *after* that stage — with the sync point it forces — or they'd attach an
+        // entity the same frame its display id is still unresolved (`dm == None`) and lock in a cube.
+        // The net stage was previously unordered (`schedule.rs` chained only Input→Stream→Present), so
+        // this held only by luck of Bevy's auto-sort; pinning it makes display resolution deterministic.
+        .add_systems(
+            Update,
+            (
+                // Equipment resolution first (decisions 0072/0074): it *creates* item
+                // DisplayModel entries, which update_display_models then builds the same frame.
+                resolve_equipment,
+                // Spell-effect resolution likewise creates its path-keyed entries (0099 P3),
+                // as does the missile launcher (P4) — both feed the same SpellFx model cache.
+                resolve_spell_fx,
+                move_missiles,
+                spawn_missiles,
+                // The dest-anchored lane (0797): the dynobj arm + the GO burst + the shard
+                // tick all create cache entries too — before the same-frame build below.
+                // One nested (unordered) element: three independent producers, and the
+                // outer tuple is at `chain()`'s 20-element ceiling.
+                (arm_ground_effects, spawn_ground_bursts, tick_shard_emitters),
+                update_display_models.in_set(DisplayBuildSet),
+                // The char-create preview (decision 0423): assemble the selected look's parts from
+                // the freshly-built display model, for the create booth to bake. After
+                // `update_display_models` (its want-list built the body) — server-less, at char select.
+                build_glue_preview,
+                // The dressing room's preview (decision 1060): the same tuple-driven assembly,
+                // for the item nobody in the world is wearing. Beside the glue one — same
+                // dependency (the display cache built by `update_display_models` above), same
+                // retry-until-ready latch.
+                build_dressup_preview,
+                attach_entity_visuals,
+                // WMO-gameobject doodad props (the ship's sails): resolve the MODD list the
+                // frame after the WMO visual attaches, then spawn each prop as its M2 lands
+                // (parented under the entity — they sail with the boat).
+                resolve_wmo_gameobject_props,
+                spawn_wmo_gameobject_props,
+                attach_held_items,
+                // One nested (unordered) element — the two passes that hang effect models on
+                // a unit: its spell-kit instances, and the glows its held items' `ItemVisuals`
+                // ids name (0805 — after `attach_held_items`, which makes the item roots).
+                // Independent of each other, both before the tint tick below; the outer tuple
+                // is at `chain()`'s 20-element ceiling.
+                (attach_item_glows, attach_spell_fx),
+                // One nested (unordered) element — two independent free-model attach
+                // passes, plus the world-plant tender (0850: sweeps orphaned plants,
+                // re-plants root-aura ones on owner displacement); the outer tuple is at
+                // `chain()`'s 20-element ceiling.
                 (
-                    // Equipment resolution first (decisions 0072/0074): it *creates* item
-                    // DisplayModel entries, which update_display_models then builds the same frame.
-                    resolve_equipment,
-                    // Spell-effect resolution likewise creates its path-keyed entries (0099 P3),
-                    // as does the missile launcher (P4) — both feed the same SpellFx model cache.
-                    resolve_spell_fx,
-                    move_missiles,
-                    spawn_missiles,
-                    // The dest-anchored lane (0797): the dynobj arm + the GO burst + the shard
-                    // tick all create cache entries too — before the same-frame build below.
-                    // One nested (unordered) element: three independent producers, and the
-                    // outer tuple is at `chain()`'s 20-element ceiling.
-                    (arm_ground_effects, spawn_ground_bursts, tick_shard_emitters),
-                    // The fxview capture fixture (inert outside `WOW_CAPTURE=fxview`): creates
-                    // its cache entry before the same-frame build, attaches after it.
-                    spell_fx::drive_fx_view,
-                    update_display_models,
-                    // The char-create preview (decision 0423): assemble the selected look's parts from
-                    // the freshly-built display model, for the create booth to bake. After
-                    // `update_display_models` (its want-list built the body) — server-less, at char select.
-                    build_glue_preview,
-                    // The dressing room's preview (decision 1060): the same tuple-driven assembly,
-                    // for the item nobody in the world is wearing. Beside the glue one — same
-                    // dependency (the display cache built by `update_display_models` above), same
-                    // retry-until-ready latch.
-                    build_dressup_preview,
-                    attach_entity_visuals,
-                    // WMO-gameobject doodad props (the ship's sails): resolve the MODD list the
-                    // frame after the WMO visual attaches, then spawn each prop as its M2 lands
-                    // (parented under the entity — they sail with the boat).
-                    resolve_wmo_gameobject_props,
-                    spawn_wmo_gameobject_props,
-                    attach_held_items,
-                    // One nested (unordered) element — the two passes that hang effect models on
-                    // a unit: its spell-kit instances, and the glows its held items' `ItemVisuals`
-                    // ids name (0805 — after `attach_held_items`, which makes the item roots).
-                    // Independent of each other, both before the tint tick below; the outer tuple
-                    // is at `chain()`'s 20-element ceiling.
-                    (attach_item_glows, attach_spell_fx),
-                    // One nested (unordered) element — two independent free-model attach
-                    // passes, plus the world-plant tender (0850: sweeps orphaned plants,
-                    // re-plants root-aura ones on owner displacement); the outer tuple is at
-                    // `chain()`'s 20-element ceiling.
-                    (
-                        attach_missile_models,
-                        attach_ground_fx_models,
-                        spell_fx::tend_world_plants,
-                    ),
-                    // Tick the live per-instance tint clones AFTER the attach passes registered
-                    // them, so a clone's first drawn frame is already on its own clock.
-                    spell_fx::tick_fx_tint,
-                    // Fire each live instance's crossed event keyframes (decision 0304) — after
-                    // attach so a just-spawned instance's head window [0, cur] fires this frame.
-                    // Beside it (one nested, unordered element — the outer tuple is at `chain()`'s
-                    // 20-element ceiling): the effect-model completion callbacks, which advance an
-                    // instance birth → Hold and arm the reap's Decay. Independent of the event
-                    // scan; both only read a player Bevy already advanced in `PreUpdate`, and both
-                    // want to run after the attach passes so a fresh instance is covered at once.
-                    (spell_fx::fire_fx_anim_events, spell_fx::advance_fx_anim),
-                    // A gear change re-dresses the standing visual in place — a re-composited atlas
-                    // on the same parts, the equipment geosets re-selected, every attachment left
-                    // alone (decision 0835, the reference's own shape).
-                    attach::redress_player_looks,
-                    // A mount transition does the same, and for the same reason (B199): the
-                    // field diff **re-seats** the standing rig — onto the mount's attachment-0
-                    // joint, or back onto its own frame — where it used to tear the whole rider
-                    // down and let attach rebuild it. The reference re-parents the body model
-                    // (`0x712f70`/`0x713020`); it never re-creates it.
-                    reseat_mounts,
-                    // A live display-id / scale change (decision 0695): the display swap is the
-                    // same teardown-and-rebuild; the scale change arms the reference's 2 s ease.
-                    // The rig heal (decision 0863) rides the same nest (Bevy's 20-tuple ceiling):
-                    // a unit denied a palette rig at attach rebuilds — the same teardown — once
-                    // the table has headroom again; never a permanent statue.
-                    (
-                        refresh_live_display,
-                        tick_scale_ease,
-                        live_display::heal_rig_starved,
-                    )
-                        .chain(),
-                )
-                    .chain()
-                    .in_set(EntityVisualsSet)
-                    .after(WorldStage::Net),
-            )
-            // The ground-fx decal placement (`crate::ground_fx`): rides the BillboardPlace set —
-            // post-propagation (the effect rig's joints carry THIS frame's pose) — after the
-            // stream clear, since it pushes its cached projection into this frame's stream.
-            .add_systems(
-                PostUpdate,
-                crate::ground_fx::update_ground_fx_decals
-                    .in_set(crate::billboard::BillboardPlace)
-                    .after(crate::particles::buffer::begin_effect_frame),
-            )
-            // The chain-beam spawner (0955): in the visuals set, so the cast router — which is
-            // `.before(EntityVisualsSet)` — has already emitted this frame's beam plays, and the
-            // net stage's Commands (the hop arrays) have already been applied.
-            .add_systems(
-                Update,
-                spawn_chain_beams
-                    .in_set(EntityVisualsSet)
-                    .after(WorldStage::Net),
-            )
-            // …and its per-frame geometry, beside the ribbon trails and for the same reason: a
-            // beam's endpoints are attachment joints, so it must sample the pose the billboard
-            // palette and the rig finalizer just wrote.
-            //
-            // `.after(begin_effect_frame)` is the load-bearing one, and its omission is what made
-            // the whole beam invisible on first ship (B161): the clear carries an extra
-            // `.after(face_billboards)` the beam sim does not, so without this edge the sim
-            // becomes runnable a step EARLIER and its vertices are wiped before extract — every
-            // frame, silently, with the arithmetic perfect. Every writer into the shared stream
-            // declares this; the tripwire in `commit` now refuses a write that precedes the clear.
-            .add_systems(
-                PostUpdate,
-                simulate_chain_beams
-                    .in_set(crate::billboard::BillboardPlace)
-                    .after(crate::billboard::billboard_joint_palette)
-                    .after(crate::creature_anim::finalize_rig_worlds)
-                    .after(crate::particles::buffer::begin_effect_frame),
-            )
-            // Terrain conform (decisions 0482/0486, the byte law of wow-re `terrain-tilt.md`):
-            // reads each flagged unit's Update-final transform, writes its conform node's
-            // local rotation — before propagation so the composite's globals carry this
-            // frame's stance.
-            .add_systems(
-                PostUpdate,
-                conform::conform_units.before(bevy::transform::TransformSystems::Propagate),
-            )
-            // The unit lane's material-alpha compose: after every steady-state owner of the
-            // render-alpha field (the interior classifier, the visibility authority's own
-            // fade/effect writes), before the self-avatar feather that is allowed to override it.
-            .add_systems(
-                Update,
-                apply_unit_mat_alpha
-                    .after(crate::interior::classify_entity_interior)
-                    .after(crate::debug_panel::ModelVisSet)
-                    .after(apply_render_fade)
-                    .before(crate::player::apply_self_model_fade),
-            )
-            // The aura CharProc layer (`crate::aura_visual`): the state kit's effect on the BODY.
-            // The drain installs/removes this frame's nodes; the author then owns the render alpha
-            // of every part under a translucent unit — after the three steady-state alpha authors
-            // above so its override lands, before the self feather which folds the factor in itself.
-            .add_systems(
-                Update,
+                    attach_missile_models,
+                    attach_ground_fx_models,
+                    spell_fx::tend_world_plants,
+                ),
+                // Tick the live per-instance tint clones AFTER the attach passes registered
+                // them, so a clone's first drawn frame is already on its own clock.
+                spell_fx::tick_fx_tint,
+                // Fire each live instance's crossed event keyframes (decision 0304) — after
+                // attach so a just-spawned instance's head window [0, cur] fires this frame.
+                // Beside it (one nested, unordered element — the outer tuple is at `chain()`'s
+                // 20-element ceiling): the effect-model completion callbacks, which advance an
+                // instance birth → Hold and arm the reap's Decay. Independent of the event
+                // scan; both only read a player Bevy already advanced in `PreUpdate`, and both
+                // want to run after the attach passes so a fresh instance is covered at once.
+                (spell_fx::fire_fx_anim_events, spell_fx::advance_fx_anim),
+                // A gear change re-dresses the standing visual in place — a re-composited atlas
+                // on the same parts, the equipment geosets re-selected, every attachment left
+                // alone (decision 0835, the reference's own shape).
+                attach::redress_player_looks,
+                // A mount transition does the same, and for the same reason (B199): the
+                // field diff **re-seats** the standing rig — onto the mount's attachment-0
+                // joint, or back onto its own frame — where it used to tear the whole rider
+                // down and let attach rebuild it. The reference re-parents the body model
+                // (`0x712f70`/`0x713020`); it never re-creates it.
+                reseat_mounts,
+                // A live display-id / scale change (decision 0695): the display swap is the
+                // same teardown-and-rebuild; the scale change arms the reference's 2 s ease.
+                // The rig heal (decision 0863) rides the same nest (Bevy's 20-tuple ceiling):
+                // a unit denied a palette rig at attach rebuilds — the same teardown — once
+                // the table has headroom again; never a permanent statue.
                 (
-                    // The display's own base alpha first (the reference's DISPLAYID-watcher leg
-                    // of the same recompute, `base-render-alpha.md` §5 — no aura needed), so a
-                    // same-frame aura edge retargets from the already-updated base.
-                    crate::aura_visual::refresh_base_alpha,
-                    crate::aura_visual::drain_aura_procs,
-                    // The tint publish only needs the drain ahead of it (it writes a resource, not
-                    // the alpha channel), so it rides the same chain rather than earning its own.
-                    (
-                        crate::aura_visual::apply_aura_alpha,
-                        crate::aura_visual::apply_aura_tint,
-                    ),
-                )
-                    .chain()
-                    .after(apply_unit_mat_alpha)
-                    .before(crate::player::apply_self_model_fade),
-            )
-            // Arm a queued appear-fade once the world is on-screen, then drive it each frame; the despawn
-            // fade-out re-arms the same `RenderFade` channel on stream-out. All disjoint from the interior
-            // classifier + the doodad fade (they touch different entities / the same channel only while a
-            // fade is pending or live).
-            .add_systems(
-                Update,
-                (
-                    arm_appear_fade,
-                    apply_despawn_fade,
-                    apply_render_fade,
-                    // Retires the unit-root clock (`UnitAppearFade`) once its mirrored ramp completes,
-                    // so a part spawning after the unit has fully appeared reads no marker and spawns
-                    // steady (`entities::attach`/`entities::equipment` join off it).
-                    retire_unit_appear_fade,
+                    refresh_live_display,
+                    tick_scale_ease,
+                    live_display::heal_rig_starved,
                 )
                     .chain(),
             )
-            // The water-plane interleave's MESH half (the sibling of the effect half in
-            // `particles::sim`): every transparent M2 batch classifies against the water plane
-            // and takes its far-side twin, so the surface paints over a submerged model's
-            // sheen/glow layers. Two lanes: entities whose handle the Visibility authority owns
-            // (the `DoodadFade` holders it pins every frame, decision 0025) get a MARKER the
-            // authority composes into its own pick — so classify runs before `ModelVisSet`, and
-            // the pick sees this frame's side; everything else (equipment, spell-fx, fade twins)
-            // is swapped here directly, after the fade resolve whose choice it re-derives from
-            // the current handle. The self feather stays deliberately unordered: it composes the
-            // same marker through `far_resolved`, so the two writers can only disagree on a
-            // frame the marker itself flips — a one-frame stale side on the player's own parts
-            // at the instant the eye crosses the surface, inside the whole-screen atmosphere
-            // swap that crossing already is (the same accepted class as the interior law's
-            // one-frame lag, 0919).
-            .init_resource::<crate::model_render::FarSideTwins>()
-            .add_systems(
-                Update,
-                crate::model_render::classify_water_side
-                    .after(crate::liquid::SubmersionVerdict)
-                    .after(apply_render_fade)
-                    .before(crate::debug_panel::ModelVisSet),
+                .chain()
+                .in_set(EntityVisualsSet)
+                .after(WorldStage::Net),
+        )
+        // The chain-beam spawner (0955): in the visuals set, so the cast router — which is
+        // `.before(EntityVisualsSet)` — has already emitted this frame's beam plays, and the
+        // net stage's Commands (the hop arrays) have already been applied.
+        .add_systems(
+            Update,
+            spawn_chain_beams
+                .in_set(EntityVisualsSet)
+                .after(WorldStage::Net),
+        )
+        // …and its per-frame geometry, beside the ribbon trails and for the same reason: a
+        // beam's endpoints are attachment joints, so it must sample the pose the billboard
+        // palette and the rig finalizer just wrote.
+        //
+        // `.after(begin_effect_frame)` is the load-bearing one, and its omission is what made
+        // the whole beam invisible on first ship (B161): the clear carries an extra
+        // `.after(face_billboards)` the beam sim does not, so without this edge the sim
+        // becomes runnable a step EARLIER and its vertices are wiped before extract — every
+        // frame, silently, with the arithmetic perfect. Every writer into the shared stream
+        // declares this; the tripwire in `commit` now refuses a write that precedes the clear.
+        .add_systems(
+            PostUpdate,
+            simulate_chain_beams
+                .in_set(benilla_world::billboard::BillboardPlace)
+                .after(benilla_world::billboard::billboard_joint_palette)
+                .after(benilla_world::rig_anim::finalize_rig_worlds)
+                .after(benilla_world::particles::buffer::begin_effect_frame),
+        )
+        // Terrain conform (decisions 0482/0486, the byte law of wow-re `terrain-tilt.md`):
+        // reads each flagged unit's Update-final transform, writes its conform node's
+        // local rotation — before propagation so the composite's globals carry this
+        // frame's stance.
+        .add_systems(
+            PostUpdate,
+            conform::conform_units.before(bevy::transform::TransformSystems::Propagate),
+        )
+        // The unit lane's material-alpha compose: after every steady-state owner of the
+        // render-alpha field (the interior classifier, the visibility authority's own
+        // fade/effect writes), before the self-avatar feather that is allowed to override it.
+        .add_systems(
+            Update,
+            apply_unit_mat_alpha
+                .after(benilla_world::interior::classify_entity_interior)
+                .after(benilla_world::model_render::ModelVisSet)
+                .after(apply_render_fade)
+                .before(crate::player::apply_self_model_fade),
+        )
+        // The aura CharProc layer (`crate::aura_visual`): the state kit's effect on the BODY.
+        // The drain installs/removes this frame's nodes; the author then owns the render alpha
+        // of every part under a translucent unit — after the three steady-state alpha authors
+        // above so its override lands, before the self feather which folds the factor in itself.
+        .add_systems(
+            Update,
+            (
+                // The display's own base alpha first (the reference's DISPLAYID-watcher leg
+                // of the same recompute, `base-render-alpha.md` §5 — no aura needed), so a
+                // same-frame aura edge retargets from the already-updated base.
+                crate::aura_visual::refresh_base_alpha,
+                crate::aura_visual::drain_aura_procs,
+                // The tint publish only needs the drain ahead of it (it writes a resource, not
+                // the alpha channel), so it rides the same chain rather than earning its own.
+                (
+                    crate::aura_visual::apply_aura_alpha,
+                    crate::aura_visual::apply_aura_tint,
+                ),
             )
-            // …and publish those same ramps as ONE number per model instance, for the consumers
-            // that are not meshes and so cannot read a `MeshTag`: an emitter's particles and a
-            // ribbon's strip (decision 0827 — the reference's `CM2Model+0x19c`). PostUpdate, so
-            // every Update-side fade writer and the camera controller's self feather have already
-            // run this frame, and before the effect sims that read it.
-            .add_systems(
-                PostUpdate,
-                crate::model_fade::publish_model_alpha.before(crate::billboard::BillboardPlace),
-            )
-            // The depth-prime twins (decision 0831 — the reference's `M2UseZFill`): PostUpdate too,
-            // after the same Update-side tag writers, so a twin arms on its episode's first frame.
-            .add_systems(PostUpdate, crate::zfill::sync_zfill_twins);
+                .chain()
+                .after(apply_unit_mat_alpha)
+                .before(crate::player::apply_self_model_fade),
+        );
     }
 }
 
@@ -856,22 +863,18 @@ fn update_display_models(
     mut spell_fx: Option<ResMut<spell_fx::SpellFx>>,
     mut glows: Option<ResMut<ItemGlows>>,
     model_assets: (Res<Assets<M2Model>>, Res<Assets<WmoModel>>),
-    mut forms: ResMut<crate::model_forms::ModelForms>,
+    mut forms: ResMut<benilla_world::model_forms::ModelForms>,
     asset_server: Res<AssetServer>,
-    mut materials: ResMut<Assets<WowModelMaterial>>,
-    mut entity_mats: ResMut<EntityMaterials>,
-    shared_light: Option<Res<SharedLightBuffer>>,
+    mut mats: benilla_world::model_render::M2BatchMaterials,
     // The glue-preview want (decisions 0423 + 0465): the glue screens' look's body displayId, so
     // its model builds with no wire entity (the screens run pre-world, where no NetEntity carries it).
     glue_preview: Option<Res<crate::portrait::GluePreview>>,
     char_create: Option<Res<CharCreate>>,
 ) {
-    let Some(light) = shared_light else {
+    if !mats.ready() {
         return; // no lighting yet → no materials to build
-    };
+    }
     let (m2s, wmos) = (&model_assets.0, &model_assets.1);
-    let cache = &mut entity_mats.0;
-    let light = &light.0;
 
     // The (kind, display) pairs live in the world this frame — cheap to collect.
     let mut actives: Vec<(EntityKind, u32)> = entities
@@ -909,9 +912,7 @@ fn update_display_models(
                             wmos,
                             &mut forms,
                             &asset_server,
-                            &mut materials,
-                            cache,
-                            light,
+                            &mut mats,
                             false, // gameobject: creatures — no hull collider, no bake variant
                         );
                     }
@@ -933,9 +934,7 @@ fn update_display_models(
                             wmos,
                             &mut forms,
                             &asset_server,
-                            &mut materials,
-                            cache,
-                            light,
+                            &mut mats,
                             true, // gameobject: hull collider + the interior BAKE material variant
                         );
                     }
@@ -956,9 +955,7 @@ fn update_display_models(
                     wmos,
                     &mut forms,
                     &asset_server,
-                    &mut materials,
-                    cache,
-                    light,
+                    &mut mats,
                     false, // gameobject: held items — unit lighting, no collider
                 );
             }
@@ -976,9 +973,7 @@ fn update_display_models(
                     wmos,
                     &mut forms,
                     &asset_server,
-                    &mut materials,
-                    cache,
-                    light,
+                    &mut mats,
                     false, // gameobject: effects — unit lighting, no collider
                 );
             }
@@ -996,9 +991,7 @@ fn update_display_models(
                     wmos,
                     &mut forms,
                     &asset_server,
-                    &mut materials,
-                    cache,
-                    light,
+                    &mut mats,
                     false, // gameobject: effects — unit lighting, no collider
                 );
             }
@@ -1013,7 +1006,7 @@ fn update_display_models(
 /// factor, the dimming half, which only a `MeshTag` write can express.
 ///
 /// A fourth alpha writer is exactly what decision 0066's protocol forbids, so this is not one: it
-/// writes **only** the alpha field, through [`crate::mesh_tag::with_alpha`] (the probe slot,
+/// writes **only** the alpha field, through [`benilla_world::mesh_tag::with_alpha`] (the probe slot,
 /// interior-fog bit, shade byte and highlight bit all ride through), it writes the sampled factor
 /// **verbatim** rather than multiplying into what it finds — so re-running it is idempotent, unlike
 /// a compounding read-modify-write — and it is ordered after the steady-state owner (the interior
@@ -1027,10 +1020,13 @@ fn update_display_models(
 #[allow(clippy::type_complexity)]
 fn apply_unit_mat_alpha(
     mut parts: Query<
-        (&crate::doodad_anim::MatAnim, &mut bevy::mesh::MeshTag),
         (
-            Without<crate::model_fade::RenderFade>,
-            Without<crate::model_fade::PendingAppearFade>,
+            &benilla_world::doodad_anim::MatAnim,
+            &mut bevy::mesh::MeshTag,
+        ),
+        (
+            Without<benilla_world::model_fade::RenderFade>,
+            Without<benilla_world::model_fade::PendingAppearFade>,
         ),
     >,
     mut logged: Local<bool>,
@@ -1043,7 +1039,7 @@ fn apply_unit_mat_alpha(
         if anim.current <= 0.0 {
             culled += 1;
         }
-        let bits = crate::mesh_tag::with_alpha(tag.0, anim.current);
+        let bits = benilla_world::mesh_tag::with_alpha(tag.0, anim.current);
         if tag.0 != bits {
             tag.0 = bits;
         }
@@ -1054,5 +1050,110 @@ fn apply_unit_mat_alpha(
     if !*logged && culled > 0 {
         *logged = true;
         info!("unit material alpha: {culled} batch(es) culled at A <= 0 (the first frame any did)");
+    }
+}
+
+#[cfg(test)]
+mod world_unit_tests {
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+
+    fn net(kind: EntityKind, scale: f32) -> NetEntity {
+        NetEntity {
+            kind,
+            display_id: None,
+            scale,
+        }
+    }
+
+    /// The reconciler is the *only* thing that makes a wire body visible to the world — no
+    /// `WorldUnit` means no ground shade, no WMO room claim, no foam ring, and nothing louder than
+    /// a slightly emptier screenshot to say so. So: a body gets one, the viewer gets its marker,
+    /// and both track the facts they restate.
+    #[test]
+    fn every_wire_body_becomes_a_world_unit_and_the_viewer_is_marked() {
+        let mut app = App::new();
+        let plain = app.world_mut().spawn(net(EntityKind::Unit, 1.25)).id();
+        let chest = app.world_mut().spawn(net(EntityKind::GameObject, 1.0)).id();
+        let me = app
+            .world_mut()
+            .spawn((
+                net(EntityKind::Player, 1.0),
+                crate::net::SelfPlayer,
+                collision_height::CollisionHeight(2.5),
+            ))
+            .id();
+
+        app.world_mut()
+            .run_system_once(publish_world_units)
+            .expect("reconciler runs");
+
+        let w = app.world();
+        let unit = w
+            .get::<benilla_world::world_unit::WorldUnit>(plain)
+            .expect("a wire body is a world unit");
+        assert!(unit.wades, "a creature displaces water");
+        assert_eq!(unit.scale, 1.25);
+        assert_eq!(
+            unit.height,
+            collision_height::CollisionHeight::default().0,
+            "an unresolved height reads as the CLIENT's ctor default, never 0.0 — at zero every \
+             depth line collapses and the body swims on dry land (see the type's own doc)"
+        );
+
+        // The wire→engine translation 1177 moved here: `benilla-world` no longer knows what a
+        // `TYPEID` is, so this is the only place the creature-vs-GameObject question is answered.
+        assert!(
+            !w.get::<benilla_world::world_unit::WorldUnit>(chest)
+                .expect("a GameObject is still a body the world can shade and room-claim")
+                .wades,
+            "…but a chest standing in a lake makes no ripple"
+        );
+
+        let mine = w
+            .get::<benilla_world::world_unit::WorldUnit>(me)
+            .expect("so is the avatar's");
+        assert!(mine.wades, "and so does a player");
+        assert_eq!(mine.height, 2.5, "the collision cylinder travels with it");
+        assert!(
+            w.get::<benilla_world::world_unit::ViewerUnit>(me).is_some(),
+            "and the eye's own body is marked, which is what first-person feathering filters on"
+        );
+        assert!(
+            w.get::<benilla_world::world_unit::ViewerUnit>(plain)
+                .is_none(),
+            "…and nothing else is"
+        );
+    }
+
+    /// The viewer marker is reconciled, not stamped once: a `/logout` takes `SelfPlayer` away and
+    /// the marker has to go with it, or the next character is feathered as someone else's avatar.
+    #[test]
+    fn the_viewer_marker_follows_self_player_off_as_well_as_on() {
+        let mut app = App::new();
+        let me = app
+            .world_mut()
+            .spawn((net(EntityKind::Player, 1.0), crate::net::SelfPlayer))
+            .id();
+        app.world_mut()
+            .run_system_once(publish_world_units)
+            .expect("reconciler runs");
+        assert!(app
+            .world()
+            .get::<benilla_world::world_unit::ViewerUnit>(me)
+            .is_some());
+
+        app.world_mut()
+            .entity_mut(me)
+            .remove::<crate::net::SelfPlayer>();
+        app.world_mut()
+            .run_system_once(publish_world_units)
+            .expect("reconciler runs");
+        assert!(
+            app.world()
+                .get::<benilla_world::world_unit::ViewerUnit>(me)
+                .is_none(),
+            "the marker is reconciled off, not left behind"
+        );
     }
 }

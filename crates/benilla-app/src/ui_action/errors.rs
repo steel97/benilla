@@ -16,6 +16,7 @@
 //! absent key shows nothing (the reference's data-suppression face) and localization rides
 //! for free.
 
+use crate::ui_items::{count_of, InventoryScope};
 use bevy::prelude::*;
 
 use crate::net::ObjectStore;
@@ -214,7 +215,7 @@ pub(super) fn first_missing_totem(
         .iter()
         .copied()
         .filter(|&t| t != 0)
-        .find(|&t| crate::ui_items::count_of(&store.0, items, t) == 0)
+        .find(|&t| count_of(&store.0, items, t, InventoryScope::CARRIED) == 0)
 }
 
 /// The first reagent slot whose owned count falls short — the `0x6e4000` reagent loop's failing
@@ -228,7 +229,7 @@ pub(super) fn first_short_reagent(
         .iter()
         .copied()
         .filter(|&(id, _)| id != 0)
-        .find(|&(id, n)| crate::ui_items::count_of(&store.0, items, id) < n)
+        .find(|&(id, n)| count_of(&store.0, items, id, InventoryScope::CARRIED) < n)
         .map(|(id, _)| id)
 }
 
@@ -282,11 +283,7 @@ mod mount_error_tests {
     /// against a typo'd key silently swallowing the red line. Skips without client data.
     #[test]
     fn every_mount_key_resolves_in_the_real_global_strings() {
-        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return;
-        }
+        let data = benilla_formats::wow_data_or_skip!();
         let mut chain = benilla_formats::open_chain(&data).expect("open chain");
         let src = chain
             .read_file("Interface\\FrameXML\\GlobalStrings.lua")
@@ -358,11 +355,7 @@ mod ui_error_tests {
     /// client data.
     #[test]
     fn every_lock_refusal_key_resolves_in_the_real_global_strings() {
-        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return;
-        }
+        let data = benilla_formats::wow_data_or_skip!();
         let mut chain = benilla_formats::open_chain(&data).expect("open chain");
         let src = chain
             .read_file("Interface\\FrameXML\\GlobalStrings.lua")
@@ -510,11 +503,7 @@ mod attack_actor_tests {
     /// one — a veto that shows nothing is indistinguishable from a click that did nothing.
     #[test]
     fn every_attack_error_key_resolves_in_the_real_global_strings() {
-        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return;
-        }
+        let data = benilla_formats::wow_data_or_skip!();
         let mut chain = benilla_formats::open_chain(&data).expect("open chain");
         let src = chain
             .read_file("Interface\\FrameXML\\GlobalStrings.lua")

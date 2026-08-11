@@ -80,7 +80,15 @@ impl Loader<'_> {
             return;
         }
         let tex = |tag: &str, method: &str, this: &mut Self| {
-            for t in children_named(el, tag) {
+            for raw in children_named(el, tag) {
+                // A state texture may `inherits=` a virtual `<Texture>` — `<NormalTexture
+                // inherits="UIPanelButtonUpTexture"/>` is how the reference's whole shared button
+                // kit carries its art, and it is the ONLY form those templates use. Expanding here
+                // is the same call a `<Layers>` region gets (`expand_region`, which passes a
+                // non-template `inherits=` through untouched), and without it the reads below found
+                // no `file=`, no `<TexCoords>` and no `<Size>`: a button with no art and NO ERROR.
+                let expanded = this.expand_region(raw);
+                let t = &expanded;
                 if let Some(file) = t.attr("file") {
                     this.call(wrapper, method, file.to_string(), dbg);
                 } else if let Some(c) = children_named(t, "Color").next().map(color_of) {
@@ -255,22 +263,40 @@ impl Loader<'_> {
         }
     }
 
-    /// `<ScrollingMessageFrame>` LoadXML extras (msgframe-runtime.md `0x787b20`): `maxLines`
-    /// (int, `> 0` — destructive `SetMaxLines`), `displayDuration`/`fadeDuration` (float, `> 0` →
-    /// SetTimeVisible/SetFadeDuration), and the `fade` bool (→ SetFading). A missing attr keeps the
-    /// ctor default (fading on, 10s/3s, 8 lines). The `<FontString>` child renders through the
-    /// generic `<Layers>` path; its resolved font is what the frame's lines bake and stack at
-    /// (read at extract, `crate::script::UiScript::extract`).
+    /// The two message-frame classes' LoadXML extras — **`0x787b20` and `0x785910`, two separate
+    /// tables** (msgframe-runtime.md's XML-attribute section), which is why the shared attrs are
+    /// applied for either tag and the two divergent ones are gated on the tag that has them:
+    ///
+    /// - both: `displayDuration`/`fadeDuration` (float, applied **iff `> 0`** — the client's own
+    ///   gate) → SetTimeVisible/SetFadeDuration, and the `fade` bool → SetFading.
+    /// - `<ScrollingMessageFrame>` only: `maxLines` (int, `> 0`, destructive `SetMaxLines`).
+    /// - `<MessageFrame>` only: `insertMode` → SetInsertMode. The scrolling class has no such
+    ///   attribute and no such binding.
+    ///
+    /// A missing attr keeps the ctor default (fading on, 10s/3s; 8 lines / insertMode BOTTOM). The
+    /// `<FontString>` child renders through the generic `<Layers>` path; its resolved font **and its
+    /// `justifyH`** are what the frame's lines bake, stack and align at (read at extract,
+    /// `crate::script::UiScript::extract`) — that child is how `UIErrorsFrame.xml` centres its
+    /// toasts and how a chat frame keeps its lines flush left.
     pub(super) fn apply_messageframe(&mut self, el: &Element, wrapper: &Table, dbg: &str) {
-        if !el.tag.eq_ignore_ascii_case("ScrollingMessageFrame") {
+        let scrolling = el.tag.eq_ignore_ascii_case("ScrollingMessageFrame");
+        let plain = el.tag.eq_ignore_ascii_case("MessageFrame");
+        if !scrolling && !plain {
             return;
         }
-        if let Some(n) = el
-            .attr("maxLines")
-            .and_then(|v| v.trim().parse::<i64>().ok())
-        {
-            if n > 0 {
-                self.call(wrapper, "SetMaxLines", n, dbg);
+        if scrolling {
+            if let Some(n) = el
+                .attr("maxLines")
+                .and_then(|v| v.trim().parse::<i64>().ok())
+            {
+                if n > 0 {
+                    self.call(wrapper, "SetMaxLines", n, dbg);
+                }
+            }
+        }
+        if plain {
+            if let Some(mode) = el.attr("insertMode") {
+                self.call(wrapper, "SetInsertMode", mode.trim().to_string(), dbg);
             }
         }
         if let Some(s) = el
@@ -328,7 +354,14 @@ impl Loader<'_> {
             }
         }
         let layer = el.attr("drawLayer").map(str::to_string);
-        for tt in children_named(el, "ThumbTexture") {
+        for raw in children_named(el, "ThumbTexture") {
+            // Same two rules as a Button's state textures, for the same reasons: `inherits=` on a
+            // virtual `<Texture>` is expanded here (see `apply_button`), and a NAMED thumb is
+            // published as a global — `UIPanelScrollBarTemplate`'s own
+            // `ScrollFrame_OnScrollRangeChanged` reaches it with
+            // `getglobal(bar:GetName().."ThumbTexture")`.
+            let expanded = self.expand_region(raw);
+            let tt = &expanded;
             if let Some(file) = tt.attr("file") {
                 self.call(
                     wrapper,
@@ -349,6 +382,13 @@ impl Loader<'_> {
                 self.apply_region_layout(tt, &region, self_name, dbg);
                 if let Some(tc) = tex_coords_of(tt) {
                     self.call_region(&region, "SetTexCoord", tc, dbg);
+                }
+                if let Some(rname) = tt.name().map(|raw| framexml::resolve_name(raw, self_name)) {
+                    if let Err(e) = self.lua().globals().set(rname.clone(), region) {
+                        self.report
+                            .warnings
+                            .push(format!("{dbg}: thumb-texture global '{rname}': {e}"));
+                    }
                 }
             }
         }

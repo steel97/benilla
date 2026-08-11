@@ -3,7 +3,7 @@
 //! modeled per-kind behavior ([`KindState`]) that a `CSimple*` subtype adds over `CSimpleFrame`
 //! (RF-28 tables; decision 0068). Split from the arena so each grows independently.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use super::{FrameHandle, RegionHandle};
 
@@ -27,6 +27,10 @@ pub enum FrameKind {
     Slider,
     ScrollFrame,
     Model,
+    /// `CSimpleMessageFrame` — the non-scrolling message frame (`UIErrorsFrame`'s class, and the
+    /// one `CreateFrame("MessageFrame")` makes). Its behaviour (the display lines, the per-line
+    /// fade, `insertMode`) is modeled in [`KindState::Message`]. Sibling of
+    /// [`FrameKind::ScrollingMessageFrame`], not a base or a subset of it.
     MessageFrame,
     /// `CSimpleMessageScrollFrame` — the scrolling, ring-buffered message frame (the chat window's
     /// class). Its behavior (the line ring, per-line fade, wheel scrollback) is modeled in
@@ -88,6 +92,11 @@ pub enum KindState {
     /// `CSimpleMessageScrollFrame` (ctor `0x787670`; runtime model msgframe-runtime.md): the line
     /// ring, the per-line fade snapshots + phases, and the scrollback cursor.
     ScrollingMessage(ScrollingMessageState),
+    /// `CSimpleMessageFrame` (ctor `0x785640`; same runtime model) — the `UIErrorsFrame` class:
+    /// display lines with no ring and no scrollback, plus `insertMode`. A **sibling** of
+    /// [`KindState::ScrollingMessage`], not a subset of it ([`MessageFrameState`]'s doc has the
+    /// contract table).
+    Message(MessageFrameState),
     /// `CSimpleScrollFrame` (decision 0112 — the ScrollFrame mechanism, the engine's last structural
     /// gap: the quest log's detail pane, chat history, and every long-content window need it): the
     /// scroll child + the vertical scroll offset. The mechanism is spec-faithful (the documented
@@ -99,6 +108,13 @@ pub enum KindState {
     /// spec-faithful to the documented Slider widget contract (same posture as StatusBar's fill /
     /// ScrollFrame's scroll), not byte-pinned. Every scrollbar is one (decision 0250).
     Slider(SliderState),
+    /// `CSimpleColorSelect` (ctor `0x78b220`, factory `0x6eef90`; LoadXML `0x78b3f0`, script-map
+    /// `0x78b4f0`, RF-28): the colour the picker window holds, as the client holds it — **HSV
+    /// floats**, not RGB ([`ColorSelectState`], whose docs carry the byte-verified law). The colour
+    /// *wheel* and *value strip* the real widget draws are engine art with no BLP behind them (their
+    /// `<ColorWheelTexture>`/`<ColorValueTexture>` elements carry no `file=`), so this state is the
+    /// widget's whole modeled behavior here; see [`crate::script::colorselect`].
+    ColorSelect(ColorSelectState),
     /// The `<Minimap>` widget's zoom state (decision 0203). The engine core carries only what the
     /// Lua API reads/writes (`GetZoom`/`SetZoom`/`GetZoomLevels`); the tile/blip render is app-side.
     Minimap(MinimapState),
@@ -107,6 +123,34 @@ pub enum KindState {
     Cooldown(CooldownState),
     /// The GameTooltip widget's line stack + owner/fade state ([`TooltipState`], decision 0274).
     Tooltip(TooltipState),
+}
+
+impl KindState {
+    /// The display lines of **either** message-frame class, or `None` for every other kind.
+    ///
+    /// The two classes are siblings with different stores, different `AddMessage` tails and
+    /// different scrollback (see [`MessageFrameState`]), but the *line record* they display is the
+    /// same [`MessageLine`] — text, quantized colour, fade phases, wrapped row count. This pair of
+    /// accessors is the only place that likeness is spent: the wrapped-row measure round-trip and
+    /// the band emit are one code path for both, while every behaviour that actually differs stays
+    /// on its own state. Matching on the two variants at those sites instead would have been two
+    /// near-copies of the round-trip, which is how the second one silently rots.
+    pub fn message_lines(&self) -> Option<&VecDeque<MessageLine>> {
+        match self {
+            KindState::ScrollingMessage(smf) => Some(&smf.lines),
+            KindState::Message(mf) => Some(&mf.lines),
+            _ => None,
+        }
+    }
+
+    /// [`Self::message_lines`], mutably — the measure round-trip's write-back half.
+    pub fn message_lines_mut(&mut self) -> Option<&mut VecDeque<MessageLine>> {
+        match self {
+            KindState::ScrollingMessage(smf) => Some(&mut smf.lines),
+            KindState::Message(mf) => Some(&mut mf.lines),
+            _ => None,
+        }
+    }
 }
 
 /// A `GameTooltip`'s runtime state (decision 0274). The line *text/color/wrap* is not duplicated
@@ -297,6 +341,34 @@ pub struct ScrollFrameState {
     pub vertical: f32,
 }
 
+/// The face/size/flags one `Button:SetFont(file, height [, flags])` call writes.
+///
+/// **One record, not three, and that is the faithful shape here rather than a shortcut.** The
+/// client's Button embeds three `CSimpleFont` sub-objects — normal `+0x33c`, disabled `+0x434`,
+/// highlight `+0x3b8` — and `SetFont` (`0x780880`) retunes **all three with the same values**
+/// (`GetFont` reads only the normal one). Nothing in the 1.12 Lua surface can set them apart: a
+/// Button has `SetFont` and the `*FontObject` triple, and the latter changes which object each
+/// state *inherits*, never its local face. So three identical copies could only ever diverge by
+/// our own bug (wow-re `system/ui/scratch/widget-api-batch-benilla.md` Q8).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ButtonFont {
+    /// The TTF path (`"Fonts\\FRIZQT__.TTF"`).
+    pub path: String,
+    /// The font height in logical px.
+    pub height: f32,
+    /// The **normalized** OUTLINETYPE token — `""`, `"OUTLINE"` or `"THICKOUTLINE"` — so
+    /// `GetFont`'s third return reads like the FontString/Font-object one rather than echoing
+    /// whatever the addon spelled. Kept as a string, not `script::Outline`, because this module is
+    /// the arena's vocabulary and deliberately names no script type.
+    ///
+    /// **An omitted `flags` argument clears the outline** (this is `""`), which is the reading the
+    /// batch does not pin: it records arg4 as parsed against `{OUTLINE, THICKOUTLINE, MONOCHROME}`
+    /// and says nothing about its absence. A `lua_tostring` on a missing argument yields no flags,
+    /// so "absent means none" is what the shared impl most plausibly does, and it is the reading
+    /// an addon setting a plain face expects.
+    pub flags: String,
+}
+
 /// A Button's state model: which of the state textures draws is a *function of interaction state*
 /// (the client's texture array `+0x4b8` with a current-shown pointer `+0x4c4`), so the regions all
 /// exist in the arena and [`Self::region_visible`] picks at extract time.
@@ -344,6 +416,17 @@ pub struct ButtonState {
     pub highlight_font: Option<String>,
     /// See [`ButtonState::normal_font`] — the disabled state.
     pub disabled_font: Option<String>,
+    /// `Button:SetFont(file, height [, flags])` — the button's own face/size/flags, set on the
+    /// embedded font objects themselves rather than on any font object they inherit. See
+    /// [`ButtonFont`] for why one record covers the client's three.
+    ///
+    /// It lives here, not on the ButtonText's [`crate::script::RegionData`], because the reference
+    /// **never dereferences the label pointer** (`+0x338`) in `SetFont`/`GetFont`: styling a
+    /// `CreateFrame("Button")` with no `<ButtonText>` is a silent no-op there, and writing to a
+    /// label would have meant lazily creating one — observable through `GetFontString()`, which
+    /// must stay nil. `extract` applies it to the label whenever there is one, which also makes a
+    /// later `SetText` (which *does* create the FontString) pick the style up for free.
+    pub font: Option<ButtonFont>,
     /// Per-state label COLOR overrides (`Button:SetTextColor` and the Highlight/Disabled pair):
     /// when the matching state is current, extract repaints the ButtonText with this color over
     /// the state font object's own paint — the dropdown kit's rows lean on all three
@@ -377,6 +460,7 @@ impl Default for ButtonState {
             normal_font: None,
             highlight_font: None,
             disabled_font: None,
+            font: None,
             normal_color: None,
             highlight_color: None,
             disabled_color: None,
@@ -531,5 +615,225 @@ impl SliderState {
             self.value = clamped;
             clamped
         })
+    }
+}
+
+/// A `ColorSelect`'s colour (`CSimpleColorSelect`, ctor `0x78b220`) — **three HSV `f32`s**, hue in
+/// **degrees**, and `-1` for the hue of anything grey.
+///
+/// **This is the corrected model, and the correction is the point.** The obvious store is three RGB
+/// bytes, and it is wrong: wow-re's §5 trio (`system/ui/scratch/colorselect-color-law.md`,
+/// 2026-08-11, dispatched from this repo for exactly this question) reads the members off the ctor —
+/// `+0x328` hue-degrees, `+0x32c` saturation, `+0x330` value, all `f32`, initialised `(0, 0, 1)` =
+/// white — with the packed dword at `+0x334` a *derived cache* for the value-strip gradient, not the
+/// state. Two consequences a byte store cannot express: hue survives a drag that takes saturation to
+/// zero, and `GetColorHSV` really does answer `-1` for a grey (`0x7bbc80` writes the sentinel at
+/// `0x7bbccd`).
+///
+/// **The round trip is not the identity, and that is the client's arithmetic, not ours.** There are
+/// two quantizers and they disagree:
+///
+/// * **A, inbound, round-half-up** — `SetColorRGB` only: `trunc(v·255 + 0.5)` via the CRT `__ftol`
+///   (`0x78ec7d`/`0x78ec91`/`0x78eca9`).
+/// * **B, outbound, floor** — every read path: `(bits_f32(v·255 + 512.0) >> 14) & 0xff`
+///   (`0x7bbec0`), a one-sided `2^-15` window.
+///
+/// Composed over the lossy `f32`-degrees hue trip, wow-re measured **exhaustively over all 256³
+/// reachable triples: 1,636,226 (9.7527 %) come back with exactly one channel exactly `-1`** — never
+/// `+1`, never `±2`, never the minimum channel, greys never. And because `quantize_a(b/255) == b` for
+/// every byte, it **ratchets**: the FrameXML idiom `r,g,b = f:GetColorRGB() … f:SetColorRGB(r,g,b)`
+/// re-applies the same lossy map instead of settling — `(0, 8, 132)` walks to `(0, 0, 132)` in eight
+/// cycles. Every Ace2/Dewdrop colour option is that idiom, once per open-and-accept.
+///
+/// It is transcribed rather than smoothed **because it is what the client computes** and the addons
+/// were written against it (wow-re's own §7: *"not a fidelity defect to correct"*). If it ever has to
+/// go, the surgical change is one line — using quantizer A on the read-back too drives the mismatch
+/// count to exactly 0, measured — and it would be a deliberate, recorded deviation, not a bug fix.
+///
+/// No alpha: `SetColorRGB` reads an optional 5th argument, quantizes it, and *discards* it
+/// (`0x7bbf20` reads three bytes; `0x7bbec0` hard-writes `0xff`). The reference's opacity is a
+/// separate `Slider`. `SetColorHSV`/`GetColorHSV` (`0x78e920`/`0x78ea00`) have zero callers across
+/// the 218-addon corpus, so they wait for a customer (decision 1195) — but the state they would read
+/// and write is now the right shape for them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorSelectState {
+    /// `[hue-degrees, saturation, value]` — the widget's `+0x328`/`+0x32c`/`+0x330`. Hue is `-1.0`
+    /// whenever saturation is 0 (the grey sentinel).
+    pub hsv: [f32; 3],
+}
+
+impl Default for ColorSelectState {
+    /// The ctor's own initial state: H=0, S=0, V=1 — white (`0x78b27e`/`0x78b298`/`0x78b28e`).
+    fn default() -> ColorSelectState {
+        ColorSelectState {
+            hsv: [0.0, 0.0, 1.0],
+        }
+    }
+}
+
+impl ColorSelectState {
+    /// **Quantizer A** — `SetColorRGB`'s inbound leg only (`0x78ec7d`/`0x78ec91`/`0x78eca9`): clamp
+    /// to `[0, 1]`, `·255.0 + 0.5`, then the CRT `__ftol` (`0x40a2b0`) which forces round-to-chop.
+    /// Round-**half-up**. The `255.0`/`0.5` operands are `f32` in `.rdata` and widen exactly, so the
+    /// chain runs in `f64` as the x87 PC_53 registers do.
+    pub fn quantize_a(v: f64) -> u8 {
+        let clamped = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+        // In-range the product is `[0.5, 255.5]`, so the truncation is always a valid byte.
+        (clamped * 255.0 + 0.5) as u8
+    }
+
+    /// **Quantizer B** — `0x7bbec0`'s magic-512 pack, on *every* outbound path (the `OnColorSelect`
+    /// payload `0x78bb42`, `GetColorRGB` `0x78ede6`, the strip tint `0x78bbf6`). `v·255 + 512.0`
+    /// lands in the `[512, 1024)` binade where the `f32` ulp is exactly `2^-14`, so the mantissa
+    /// holds `RN(v·255·2^14)` and `>>14` reads its **floor**. No clamp — out-of-range wraps mod 256,
+    /// which is reachable through `SetColorHSV` (unclamped) but not through `SetColorRGB`.
+    pub fn quantize_b(v: f32) -> u8 {
+        let c = (f64::from(v) * 255.0 + 512.0) as f32;
+        ((c.to_bits() >> 14) & 0xff) as u8
+    }
+
+    /// `0x7bbf20`'s unpack — a colour byte back to `f32`, scaling by the **`f32`** `0x3b808081`
+    /// (≈1/255, rounded *up*: this is why the only round-trip failure mode is a shortfall that
+    /// floors down). Distinct from the `f64` `1/255` the Lua push uses; both appear in one call.
+    fn unpack_byte(b: u8) -> f32 {
+        let k = f32::from_bits(0x3b80_8081);
+        (f64::from(i32::from(b)) * f64::from(k)) as f32
+    }
+
+    /// The Lua-facing normalize (`0x78bb47..0x78bb85` and `0x78edfa`/`0x78ee17`/`0x78ee34`): the
+    /// channel byte times the **`f64`** `1/255` at `0x804578` — a multiply by the reciprocal, never a
+    /// divide (they are not the same double).
+    pub fn normalize(byte: u8) -> f64 {
+        f64::from(byte) * (1.0_f64 / 255.0)
+    }
+
+    /// `0x7bf680` — the index of the largest `|component|`. Compares are strict `>` (`fcom`; equal
+    /// takes the not-greater branch), so a tie resolves to the **later** index.
+    fn dominant_axis(v: &[f32; 3]) -> usize {
+        let (a0, a1, a2) = (v[0].abs(), v[1].abs(), v[2].abs());
+        if a0 > a1 {
+            if a0 > a2 {
+                0
+            } else {
+                2
+            }
+        } else if a1 > a2 {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// `0x7bf700` — the index of the smallest `|component|`, traced from the same flag pattern.
+    fn minor_axis(v: &[f32; 3]) -> usize {
+        let (a0, a1, a2) = (v[0].abs(), v[1].abs(), v[2].abs());
+        if a0 >= a1 {
+            if a2 < a1 {
+                2
+            } else {
+                1
+            }
+        } else if a0 >= a2 {
+            2
+        } else {
+            0
+        }
+    }
+
+    /// `0x7bbc80` — RGB→HSV. `value` is the dominant channel; `saturation = (value − minor)/value`
+    /// (0 when `value == 0`); `hue` is the `-1` sentinel when saturation is 0, else the 60°-sector
+    /// formula on the chroma, wrapped `+360` if negative. Each store rounds to `f32`; the chroma
+    /// divide runs on the un-rounded `f64` register.
+    fn rgb_to_hsv(rgb: &[f32; 3]) -> [f32; 3] {
+        let f = f64::from;
+        let dom = Self::dominant_axis(rgb);
+        let minor = Self::minor_axis(rgb);
+        let value = rgb[dom];
+        let sat = if value == 0.0 {
+            0.0
+        } else {
+            ((f(value) - f(rgb[minor])) / f(value)) as f32
+        };
+        let hue = if sat == 0.0 {
+            -1.0
+        } else {
+            let chroma = f(value) - f(rgb[minor]);
+            let sector = match dom {
+                0 => ((f(rgb[1]) - f(rgb[2])) / chroma) as f32,
+                1 => ((f(rgb[2]) - f(rgb[0])) / chroma + 2.0) as f32,
+                _ => ((f(rgb[0]) - f(rgb[1])) / chroma + 4.0) as f32,
+            };
+            let hue_deg = (f(sector) * 60.0) as f32;
+            if hue_deg < 0.0 {
+                (f(hue_deg) + 360.0) as f32
+            } else {
+                hue_deg
+            }
+        };
+        [hue, sat, value]
+    }
+
+    /// `0x7bbd60` — HSV→RGB. `s == 0` short-circuits to `(v, v, v)` *without reading hue*, which is
+    /// what makes the `-1` sentinel inert on the way out. Otherwise the 6-sector decode, with the
+    /// sector floored by the same magic-512 trick as quantizer B and clamped to `≤ 5`. The
+    /// `f32(1/60) = 0x3c888889` on the way back is the lossy step the whole `-1` drift comes from.
+    fn hsv_to_rgb(hsv: &[f32; 3]) -> [f32; 3] {
+        let f = f64::from;
+        let (h, s, v) = (hsv[0], hsv[1], hsv[2]);
+        if s == 0.0 {
+            return [v, v, v];
+        }
+        let hue = if h == 360.0 { 0.0 } else { h };
+        let inv60 = f32::from_bits(0x3c88_8889);
+        let sector_float = f(hue) * f(inv60); // an un-rounded f64 register
+        let magic = (sector_float + 512.0) as f32;
+        let raw = (magic.to_bits() >> 14) & 0xff;
+        let sector = if raw <= 5 { raw } else { 5 };
+        let frac = (sector_float - f64::from(sector as i32)) as f32;
+        let p = ((1.0 - f(s)) * f(v)) as f32;
+        let q = ((1.0 - f(frac) * f(s)) * f(v)) as f32;
+        let t = ((1.0 - (1.0 - f(frac)) * f(s)) * f(v)) as f32;
+        match sector {
+            0 => [v, t, p],
+            1 => [q, v, p],
+            2 => [p, v, t],
+            3 => [p, q, v],
+            _ if sector == 4 => [t, p, v],
+            _ => [v, p, q],
+        }
+    }
+
+    /// `SetColorRGB`'s whole store, in the binary's order (`0x78eb7e`…`0x78ecfa`): clamp each
+    /// argument to `[0, 1]` as `f32` → quantizer A → back to `f32` through `0x7bbf20`'s `1/255` →
+    /// `0x7bbc80` RGB→HSV → store. Always stores — there is deliberately **no change-gate**, unlike
+    /// [`SliderState::store_value`]: the only conditional between `SetColorRGB`'s entry and its
+    /// handler invoke is `0x78bafd`, which tests whether a handler is *bound*, and none of the three
+    /// writers reads the old HSV before overwriting it. Two sibling widgets in the same band,
+    /// opposite gating.
+    pub fn set_rgb(&mut self, r: f64, g: f64, b: f64) {
+        let bytes = [
+            Self::quantize_a(r),
+            Self::quantize_a(g),
+            Self::quantize_a(b),
+        ];
+        let rgb = [
+            Self::unpack_byte(bytes[0]),
+            Self::unpack_byte(bytes[1]),
+            Self::unpack_byte(bytes[2]),
+        ];
+        self.hsv = Self::rgb_to_hsv(&rgb);
+    }
+
+    /// The read-back both `GetColorRGB` and the `OnColorSelect` payload run — literally the same two
+    /// calls in the same order (`0x78edda`/`0x78ede6` vs `0x78bb36`/`0x78bb42`), which is *why* a
+    /// handler's `arg1..arg3` are bit-identical to a `GetColorRGB()` on the next line: HSV→RGB, then
+    /// quantizer B, then the `f64` `1/255`.
+    pub fn rgb_f64(&self) -> (f64, f64, f64) {
+        let rgb = Self::hsv_to_rgb(&self.hsv);
+        (
+            Self::normalize(Self::quantize_b(rgb[0])),
+            Self::normalize(Self::quantize_b(rgb[1])),
+            Self::normalize(Self::quantize_b(rgb[2])),
+        )
     }
 }

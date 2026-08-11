@@ -660,6 +660,16 @@ pub(super) struct PlayerRide {
 }
 
 impl Player {
+    /// Turn the avatar's **aim** by `radians` — the scripted mouse-turn's one lever
+    /// (`capture::probe_look`, decision 0621). Writing `face_yaw` is deliberately the whole of it:
+    /// from here on this is the identical path a real mouse-turn takes, and it is the same value
+    /// `stream_self_movement` diffs to decide on a `MSG_MOVE_SET_FACING`. A named method rather
+    /// than a `pub(crate)` field for decision 1174's reason — an instrument may reach into
+    /// gameplay, but not by opening gameplay's internals to the whole crate.
+    pub(crate) fn turn_aim(&mut self, radians: f32) {
+        self.face_yaw += radians;
+    }
+
     /// The character's *facing* (Bevy yaw, radians) — the aim, kept in sync with the camera by
     /// right-drag/movement. This is the unit's orientation as sent to the server, distinct from the
     /// rendered body heading (`model_yaw`, which a strafe rotates). The 3D-audio listener panning
@@ -684,6 +694,29 @@ impl Player {
     /// the reference (`& 0xf` translating, `& 0x30` turning; wow-re CWater0Ripple driver `0x5fa760`).
     pub(crate) fn move_flags(&self) -> u32 {
         self.move_flags
+    }
+
+    /// The **commanded planar speed** in yd/s — the reference's `[[player+0x118]+0x84]`, the
+    /// CMovement speed scalar its producer `0x7c4c90` returns:
+    ///
+    /// ```text
+    /// mov  edx,[ecx+0x40]        ; movement flags
+    /// test dl,0xf                ; the four DIRECTION bits
+    /// jne  …                     ; moving → the speed
+    /// fld  dword ptr [0x7ffd74]  ; = 0.0
+    /// ```
+    ///
+    /// So it is **exactly zero with no direction key held** — not a measured velocity that decays,
+    /// and not the weather wind's 149 ms positional average (`0x67c150`): it is live, and tracks a
+    /// speed change on the same frame. The precipitation spawn slab's tilt keys on it through
+    /// `mgr+0x7c` (wow-re `wx-snow-placement-law.md` §9), which is why the distinction earns an
+    /// accessor: an averaged stand-in would leave the slab leaning for 150 ms after a stop, and a
+    /// raw `horiz_vel` would keep it leaning through an entire fall on take-off momentum.
+    pub(crate) fn planar_speed(&self) -> f32 {
+        if self.move_flags & 0xf == 0 {
+            return 0.0;
+        }
+        self.horiz_vel.with_y(0.0).length()
     }
 
     /// The transport we're standing on (its guid), if any — the platform-frame attachment

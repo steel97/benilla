@@ -56,7 +56,11 @@ pub(super) fn seed_ui_fixture(
         ResMut<crate::ui_bank::BankOpen>,
     ),
 ) {
-    let Some(fixture) = ctx.scenario.ui else {
+    // A glue-screen capture has no world scenario, and no glue screen opens a UI fixture.
+    let Some(scenario) = ctx.scenario else {
+        return;
+    };
+    let Some(fixture) = scenario.ui else {
         return;
     };
     if ctx.ui_seeded || !(progress.total > 0 && progress.ready == progress.total) {
@@ -342,10 +346,10 @@ pub(super) fn seed_ui_fixture(
             // frames — the window's OnUpdate polls, flag-guarded, exactly once).
             if let Some(s) = script.as_mut() {
                 if let Err(e) = s.run(
-                    "BenillaBankFrame:SetScript(\"OnUpdate\", function()\n\
-                         if not benillaBankPopoutDone and C_Container.GetContainerNumSlots(5) > 0 then\n\
+                    "BankFrame:SetScript(\"OnUpdate\", function()\n\
+                         if not benillaBankPopoutDone and GetContainerNumSlots(5) > 0 then\n\
                              benillaBankPopoutDone = 1\n\
-                             BenillaBankBagButton_OnClick(getglobal(\"BenillaBankBagButton1\"))\n\
+                             BenillaBankBagButton_OnClick(getglobal(\"BankBagButton1\"))\n\
                          end\n\
                      end)",
                 ) {
@@ -636,7 +640,7 @@ pub(super) fn seed_ui_fixture(
             // Server-less, Player defaults to the origin — off every zone rect, so the blip
             // projects to the (0,0) hide sentinel and the arrow never shows. Park the avatar at
             // the scenario's Northshire spot so the arrow lands on the Elwynn map for real.
-            player.pos = benilla_assets::coords::wow_to_bevy(ctx.scenario.eye);
+            player.pos = benilla_assets::coords::wow_to_bevy(scenario.eye);
             // Alternating explore bits: roughly half of every zone's overlays reveal, so the
             // capture shows fog doing its job (some sub-areas drawn, some parchment).
             script.set_world_map_explored(vec![0x5555_5555; 64]);
@@ -862,7 +866,7 @@ pub(super) fn seed_ui_fixture(
             // Open the window (the C binding's path). The feed pushes on the following frames of
             // the settle window; OnShow + the UNIT_* events repaint exactly as live.
             if let Some(s) = script.as_mut() {
-                if let Err(e) = s.run("ToggleCharacter(\"BenillaPaperDollFrame\")") {
+                if let Err(e) = s.run("ToggleCharacter(\"PaperDollFrame\")") {
                     warn!("capture: ui-char seed failed to open the window: {e}");
                 }
             }
@@ -881,7 +885,7 @@ pub(super) fn seed_ui_fixture(
                 ])),
                 crate::net::SelfPlayer,
                 crate::net::Guid(PLAYER_GUID),
-                Transform::from_translation(wow_to_bevy(ctx.scenario.eye)),
+                Transform::from_translation(wow_to_bevy(scenario.eye)),
             ));
             // The wolf: the live spawn's component set (net/apply.rs) with the descriptor seeded
             // directly, standing at the look point facing the camera, at full health.
@@ -1134,7 +1138,7 @@ pub(super) fn seed_ui_fixture(
             // opaque-gray selection highlight (ctor 0xFF606060) under the glyphs AND the white
             // caret at the selection's end — the whole text-UI overlay stack in one golden.
             // …then pin the hover-revealed chrome: in-game the tab + the black window textures
-            // follow the OS cursor (BenillaFCF_OnUpdate), which a headless capture can't hover —
+            // follow the OS cursor (FCF_OnUpdate), which a headless capture can't hover —
             // replace the OnUpdate with a fixed-reveal one so the golden also locks the window
             // tint (chat-cache COLOR 0 0 0) and the text-sized tab (BenillaFCF_TabResize, which
             // must keep retrying until the label's measure lands).
@@ -1164,7 +1168,7 @@ pub(super) fn seed_ui_fixture(
                 ])),
                 crate::net::SelfPlayer,
                 crate::net::Guid(SELF_GUID),
-                Transform::from_translation(wow_to_bevy(ctx.scenario.eye)),
+                Transform::from_translation(wow_to_bevy(scenario.eye)),
             ));
             // The named unit out in the river (the `vplates` wolf, re-seated): 25 yd along the
             // scenario's own look bearing, so its overhead name lands on the water surface
@@ -1257,7 +1261,7 @@ pub(super) fn seed_ui_fixture(
 }
 
 /// Seed + open the backpack window with a fixed item set — shared by the `Bag` and `Tooltip`
-/// fixtures. The bag is a standalone addon (no `ShowUIPanel` path): drive the `C_Container` snapshot
+/// fixtures. The bag is a standalone addon (no `ShowUIPanel` path): drive the container snapshot
 /// and purse directly, then open and paint. The feed (`crate::ui_items`) leaves bag 0 alone when
 /// there is no `SelfPlayer` (net is disabled in capture), so this manual snapshot is not clobbered.
 fn seed_bag_window(

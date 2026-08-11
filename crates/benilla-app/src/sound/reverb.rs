@@ -5,22 +5,29 @@
 //! `...Underwater`, parent-inherited — the client's caller `0x67e7f0` walks the same fallback,
 //! wow-re `reverb-pipeline.md` A2, VERIFIED) → `SoundProviderPreferences.dbc` (the EAX listener
 //! properties, consumed RAW — no clamps on this path, A1) → [`Mixer::set_reverb`]'s Freeverb
-//! projection, applied **instantly** on change (A2). Submerged ([`Underwater`]) the underwater
+//! projection, applied **instantly** on change (A2). Submerged, the underwater
 //! column wins — pref 11 on 568 areas; dry land uses the dry column (8 dungeon floors in 1.12).
 //!
-//! Only 3D world SFX carry the wet signal — the client's per-channel gate is set exclusively on
-//! 3D-open (channel flag bit 27, A3, VERIFIED); 2D/UI/music/ambience are structurally dry.
-//! `WMOAreaTable` carries the big interior payload (~4 000 group rows, CAVE/AUDITORIUM/ARENA);
-//! it joins this chain when WMO interior containment exists — the preset side is already here.
+//! Which sounds the wet signal reaches is **not** this module's business and is not "every 3D
+//! sound": 3D-open (channel flag bit 27, A3) is necessary but not sufficient — the kit's
+//! `SoundEntries.EAXDef` decides, and `0` means a NULL `SoundSamplePreferences` slot and a
+//! permanently dry channel (decision 1155; the gate lives at [`Mixer::play_3d`]). 2D/UI/music/
+//! ambience are structurally dry on top of that. `WMOAreaTable` carries the big interior payload
+//! (~4 000 group rows, CAVE/AUDITORIUM/ARENA — 3 687 of them CAVE, which is what the Thunderbrew
+//! Distillery's interior groups say).
+//!
+//! **The whole chain is gated on the `SoundReverb` CVar, and benilla defaults it OFF** —
+//! [`SoundConfig::reverb`] carries the why and the confidence (decisions 1153, 1155): the
+//! reference emits the calls but its EAX API has had no hardware to render on since Vista.
+//! Everything below stays built and correct — this module resolves the same preset the binary
+//! would — but nothing reaches the mixer until the CVar says so.
 
 use bevy::prelude::*;
 
 use benilla_formats::SoundProviderCatalog;
 
-use crate::assets::{AssetSet, LockRecover, WorldAssets};
-use crate::liquid::Underwater;
-use crate::schedule::WorldStage;
-use crate::terrain_stream::CurrentArea;
+use benilla_assets::{AssetSet, LockRecover, WorldAssets};
+use benilla_world::schedule::WorldStage;
 
 use super::zone::AreaSounds;
 use super::{SoundConfig, SoundOutput};
@@ -57,8 +64,7 @@ struct AppliedPreset(Option<u32>);
 fn zone_reverb(
     mut applied: ResMut<AppliedPreset>,
     mut out: NonSendMut<SoundOutput>,
-    area: Res<CurrentArea>,
-    underwater: Res<Underwater>,
+    world: benilla_world::world_point::WorldPoint,
     areas: Option<Res<AreaSounds>>,
     providers: Option<Res<SoundProviders>>,
     config: Res<SoundConfig>,
@@ -67,14 +73,20 @@ fn zone_reverb(
     let (Some(areas), Some(providers)) = (areas, providers) else {
         return;
     };
-    let column = usize::from(underwater.0.is_water());
-    let pref = if config.enabled {
+    let column = usize::from(world.submersion().is_water());
+    // `SoundReverb` off ⇒ no preset reaches the backend at all — the client's `0x45a75b` gate,
+    // which returns before the marshal rather than applying a silent one. Off is our default and
+    // the reference's audible truth (decision 1153): its EAX path needs hardware no machine has
+    // had since DirectSound lost hardware mixing in Vista. Flipping the CVar re-applies here,
+    // like the client's callback (`0x4574d0`).
+    let pref = if config.enabled && config.reverb {
         interior
             .0
             .map(|i| i.sound_provider[column])
             .filter(|p| *p != 0)
             .or_else(|| {
-                area.0
+                world
+                    .area()
                     .and_then(|id| areas.0.resolve(id))
                     .map(|a| a.sound_provider[column])
             })

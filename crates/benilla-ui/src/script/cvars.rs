@@ -137,8 +137,31 @@ fn value_to_string(v: &Value) -> Option<String> {
     }
 }
 
-/// Register the `GetCVar`/`SetCVar`/`GetCVarDefault` globals.
+/// Register the `GetCVar`/`SetCVar`/`GetCVarDefault`/`RegisterCVar` globals.
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
+    // `RegisterCVar(name, value)` — declare a CVar the client does not ship (decision 1195).
+    //
+    // This is how an addon gets a persisted setting without a saved-variables file, and it is why
+    // `GetCVar` on an unknown name is a *warning* rather than an error: an addon that calls
+    // `RegisterCVar` at load and `GetCVar` after expects the second to answer. Registering an
+    // existing name is a **no-op, not an overwrite** — the reference will not let an addon reset a
+    // client CVar's live value by re-declaring it, and a re-run of the addon's own load must not
+    // wipe the player's setting either.
+    lua.globals().set(
+        "RegisterCVar",
+        lua.create_function(|lua, (name, value): (String, Option<Value>)| {
+            let value = value.as_ref().and_then(value_to_string).unwrap_or_default();
+            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+            let key = name.to_ascii_lowercase();
+            model.cvars.entry(key).or_insert(CvarSlot {
+                name,
+                value: value.clone(),
+                default: value,
+            });
+            Ok(())
+        })?,
+    )?;
+
     lua.globals().set(
         "GetCVar",
         lua.create_function(|lua, name: String| {
@@ -325,5 +348,38 @@ mod tests {
         s.set_cvar_host("MusicVolume", "0.9");
         s.register_cvars([("MusicVolume", "0.4")]);
         assert_eq!(s.cvar("MusicVolume").as_deref(), Some("0.9"));
+    }
+    /// **`GetCVar("realmName")` answers the session's realm, set by the one seam that owns it.**
+    ///
+    /// It is a real 1.12 CVar (`0x83f2d0`, persisted — the client builds its SavedVariables path
+    /// from it) and it had no value here at all. `Ace/AceState.lua:27` is
+    /// `ace.trim(GetCVar("realmName"))` inside `SetGameState`, which EVERY Ace addon runs at
+    /// PLAYER_ENTERING_WORLD, so nil became `gsub(nil, ...)` and took the whole family down.
+    ///
+    /// Asserted through `set_realm_name` rather than by writing the CVar directly, because that is
+    /// the point: the CVar and `GetRealmName()` are the SAME fact and must not be settable apart.
+    #[test]
+    fn the_realm_name_cvar_and_get_realm_name_are_one_fact() {
+        let mut s = UiScript::new().unwrap();
+        s.register_cvars([("realmName", "")]);
+
+        // Before a session: empty, never nil — `ace.trim` must have a string to gsub.
+        assert_eq!(
+            s.eval::<String>(r#"return GetCVar("realmName")"#).unwrap(),
+            ""
+        );
+
+        s.set_realm_name("Archimonde");
+        assert_eq!(
+            s.eval::<String>(r#"return GetCVar("realmName")"#).unwrap(),
+            "Archimonde",
+            "the realm seam must write the CVar too, or the two facts drift"
+        );
+
+        // Ace's own line, run for real.
+        let trimmed: String = s
+            .eval(r#"return string.gsub(GetCVar("realmName"), "^%s*", "")"#)
+            .unwrap();
+        assert_eq!(trimmed, "Archimonde");
     }
 }

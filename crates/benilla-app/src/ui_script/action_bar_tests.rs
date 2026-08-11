@@ -24,8 +24,9 @@ fn shipped_action_bar_drives_end_to_end() {
         );
         if file == "ActionBar.xml" {
             assert_eq!(
-                report.frames, 34,
-                "bar + XP StatusBar (+ its numerals overlay) + exhaustion tick + max-level rail + art frame + 12 buttons (each with a Cooldown child) + 2 page buttons + the performance meter and its hover button"
+                report.frames, 59,
+                "bar + XP StatusBar (+ its numerals overlay) + exhaustion tick + max-level rail + art frame + 12 buttons (each with a Cooldown child) + 2 page buttons + the performance meter and its hover button, \
+                 + BonusActionBarFrame and its 12 buttons with their Cooldown children (25 — hidden, as the reference's is; decision 1223)"
             );
         }
     }
@@ -94,11 +95,11 @@ fn shipped_action_bar_drives_end_to_end() {
     s.mouse_button(26.0, 22.0, "LeftButton", false);
     assert_eq!(s.take_action_uses(), vec![73]);
 
-    // The keybinding entry (the app's key feed runs `BenillaActionButtonDown/Up(i)` on the two
+    // The keybinding entry (the app's key feed runs `ActionButtonDown/Up(i)` on the two
     // key edges — the ref's ACTIONBUTTONn binding, ActionButton.lua:15-45): UP fires UseAction
     // directly with no checkCursor (a keybind never places, decision 0216 §7) — but ONLY from
     // the PUSHED state a DOWN set, so a stray release with no press is the ref's own no-op.
-    s.run("BenillaActionButtonUp(2)").unwrap();
+    s.run("ActionButtonUp(2)").unwrap();
     assert!(
         s.take_action_uses().is_empty(),
         "an Up without a Down is a no-op (the PUSHED gate)"
@@ -112,14 +113,14 @@ fn shipped_action_bar_drives_end_to_end() {
             })
             .count()
     };
-    s.run("BenillaActionButtonDown(2)").unwrap();
+    s.run("ActionButtonDown(2)").unwrap();
     assert_eq!(depressed(&s), 1, "key DOWN shows the pushed texture");
     assert_eq!(
-        s.eval::<String>("return BenillaActionButton2:GetButtonState()")
+        s.eval::<String>("return ActionButton2:GetButtonState()")
             .unwrap(),
         "PUSHED"
     );
-    s.run("BenillaActionButtonUp(2)").unwrap();
+    s.run("ActionButtonUp(2)").unwrap();
     assert_eq!(s.take_action_uses(), vec![74], "key '2' fires action 74");
     assert_eq!(depressed(&s), 0, "key UP restores the normal state");
 
@@ -212,9 +213,7 @@ fn state_feedback_drives_cooldown_checked_and_usable_through_the_xml() {
         }),
     );
     s.fire_event("ACTIONBAR_UPDATE_STATE", vec![]);
-    assert!(s
-        .eval::<bool>("return BenillaActionButton1:GetChecked()")
-        .unwrap());
+    assert!(s.eval::<bool>("return ActionButton1:GetChecked()").unwrap());
 
     // The OOM blue tint (the transcribed UpdateUsable): usable=false + notEnoughMana=true.
     s.set_action_state(
@@ -442,7 +441,7 @@ fn the_action_bar_lock_stops_the_drag_and_leaves_shift_click_alone() {
     s.resolve();
 
     s.run(r#"LOCK_ACTIONBAR = "1""#).unwrap();
-    s.run("BenillaActionButton_OnDragStart(BenillaActionButton1)")
+    s.run("BenillaActionButton_OnDragStart(ActionButton1)")
         .unwrap();
     assert!(
         s.cursor_payload().is_none(),
@@ -468,7 +467,7 @@ fn the_action_bar_lock_stops_the_drag_and_leaves_shift_click_alone() {
     );
 
     // The receiving end is guarded too: the held action cannot be dropped back by a drag…
-    s.run("BenillaActionButton_OnReceiveDrag(BenillaActionButton1)")
+    s.run("BenillaActionButton_OnReceiveDrag(ActionButton1)")
         .unwrap();
     assert!(
         s.cursor_payload().is_some(),
@@ -476,7 +475,7 @@ fn the_action_bar_lock_stops_the_drag_and_leaves_shift_click_alone() {
     );
     // …and unlocking makes both ends live again.
     s.run(r#"LOCK_ACTIONBAR = "0""#).unwrap();
-    s.run("BenillaActionButton_OnReceiveDrag(BenillaActionButton1)")
+    s.run("BenillaActionButton_OnReceiveDrag(ActionButton1)")
         .unwrap();
     assert!(s.cursor_payload().is_none(), "unlocked, the drop lands");
     assert_eq!(
@@ -614,10 +613,8 @@ fn count_fontstring_follows_is_consumable_action_not_the_bag_count() {
     // Read the fontstrings by name, not by scanning painted text: a single-character count
     // ("0") is indistinguishable from a neighbouring button's static HotKey label by content.
     let count_of = |s: &UiScript, n: u32| {
-        s.eval::<String>(&format!(
-            "return BenillaActionButton{n}Count:GetText() or \"\""
-        ))
-        .unwrap()
+        s.eval::<String>(&format!("return ActionButton{n}Count:GetText() or \"\""))
+            .unwrap()
     };
     assert_eq!(
         count_of(&s, 1),
@@ -670,7 +667,7 @@ fn shipped_bag_frame_drives_end_to_end() {
 
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
-    // The bag toggle now seats on the main action bar (BenillaActionBarArtFrame, ActionBar.xml);
+    // The bag toggle now seats on the main action bar (MainMenuBarArtFrame, ActionBar.xml);
     // load the bar FIRST so the toggle's cross-file relativeTo resolves to the real art frame at
     // SetPoint time. The app loads ActionBar before BagFrame (load_default_ui order); without it the
     // anchor would silently fall back to the screen root (it only lands right here by the 1024-wide
@@ -684,6 +681,19 @@ fn shipped_bag_frame_drives_end_to_end() {
         .unwrap();
         let abdoc = benilla_ui::framexml::parse(&abtext).unwrap();
         benilla_ui::loader::load(&s, &abdoc, &|_| None);
+    }
+    // UiPanels.xml before the bag file: `ToggleBackpack` calls the GLOBAL `CloseAllBags`, which
+    // lives there (homed in the panel glue rather than the bag's own file, deliberately — see its
+    // comment). Production loads both; this test was under-loading relative to it, and started
+    // failing the moment the toggle went through the reference's names instead of a local body.
+    // Loading it is the honest fix: the dependency is real, not an artifact.
+    {
+        let panels = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ui/UiPanels.xml"),
+        )
+        .unwrap();
+        let pdoc = benilla_ui::framexml::parse(&panels).unwrap();
+        let _ = benilla_ui::loader::load(&s, &pdoc, &|_| None);
     }
     let text = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ui/BagFrame.xml"),
@@ -967,4 +977,181 @@ fn an_occupied_slot_going_empty_leaves_no_white_plate() {
         }
     }
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **The bonus action bar exists and stays hidden** — the same posture 1219 gave the vertical
+/// multibars, and the largest single session-start row in the corpus.
+///
+/// `ref-BonusActionBarFrame.xml` l.54 instantiates `BonusActionBarFrame` as a real
+/// `parent="MainMenuBar"` frame carrying `hidden="true"`, with `BonusActionButton1..12` inside.
+/// benilla models the bonus page by re-paging the MAIN bar, so we never show this one — but four
+/// addons died at `CT_BarMod\CT_BarModOptions.lua:154`,
+/// `getglobal("BonusActionButton" .. i):ClearAllPoints()`, which is pure layout and needs only
+/// that the buttons be there.
+///
+/// The last assertion is the one that keeps it honest: declaring a hidden bar must not change what
+/// the visible bar shows.
+#[test]
+fn the_bonus_action_bar_exists_hidden_and_takes_layout_calls() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_action_bar(&s);
+
+    assert!(
+        s.eval::<bool>("return BonusActionBarFrame ~= nil").unwrap(),
+        "5 corpus addons index BonusActionBarFrame by name"
+    );
+    assert!(
+        !s.eval::<bool>("return BonusActionBarFrame:IsShown()")
+            .unwrap(),
+        "it must ship HIDDEN — benilla re-pages the main bar instead of showing this one"
+    );
+
+    for i in [1, 12] {
+        assert!(
+            s.eval::<bool>(&format!("return BonusActionButton{i} ~= nil"))
+                .unwrap(),
+            "BonusActionButton{i} must exist"
+        );
+        // CT_BarModOptions.lua:154's exact pair, on a bar that has never been shown.
+        s.run(&format!("BonusActionButton{i}:ClearAllPoints()"))
+            .unwrap();
+        s.run(&format!(
+            "BonusActionButton{i}:SetPoint(\"TOP\", \"ActionButton1\", \"BOTTOM\", 0, -4)"
+        ))
+        .unwrap();
+    }
+
+    // A hidden bar changes nothing about the visible one.
+    assert!(
+        s.eval::<bool>("return ActionButton1:IsShown()").unwrap(),
+        "the main bar is untouched"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **The reference's action-bar constants are real globals, not comments.**
+///
+/// `ActionButton.lua:1-9` defines them; this file and `MultiBars.xml` cited them in comments and
+/// defined none. An addon reading one got nil — `zBar.lua:40` is the shape,
+/// `to = to or value.max or NUM_ACTIONBAR_BUTTONS` feeding a numeric `for`, which raises
+/// `'for' limit must be a number`. Only the use-probe could find it: nothing else touches anything.
+///
+/// `CURRENT_ACTIONBAR_PAGE` is asserted ABSENT on purpose. It is the reference's mutable page
+/// cursor and benilla does not page the main bar that way; a frozen 1 would be silently wrong
+/// forever, where nil fails loudly. Pinned so a later "completeness" pass cannot quietly add it.
+#[test]
+fn the_reference_action_bar_constants_are_defined() {
+    let s = UiScript::new().unwrap();
+    load_action_bar(&s);
+
+    for (name, want) in [
+        ("NUM_ACTIONBAR_PAGES", 6),
+        ("NUM_ACTIONBAR_BUTTONS", 12),
+        ("BOTTOMLEFT_ACTIONBAR_PAGE", 6),
+        ("BOTTOMRIGHT_ACTIONBAR_PAGE", 5),
+        ("LEFT_ACTIONBAR_PAGE", 4),
+        ("RIGHT_ACTIONBAR_PAGE", 3),
+    ] {
+        assert_eq!(
+            s.eval::<i64>(&format!("return {name}")).unwrap(),
+            want,
+            "{name} must be the reference's value"
+        );
+    }
+
+    // zBar's exact expression, which raised before these existed.
+    assert_eq!(
+        s.eval::<i64>("local to = nil or nil or NUM_ACTIONBAR_BUTTONS local n = 0 for i = 1, to do n = n + 1 end return n")
+            .unwrap(),
+        12,
+        "zBar.lua:40's numeric for must have a limit"
+    );
+
+    assert!(
+        s.eval::<bool>("return CURRENT_ACTIONBAR_PAGE == nil").unwrap(),
+        "CURRENT_ACTIONBAR_PAGE is mutable page state we do not keep — nil fails loudly, a frozen 1 lies"
+    );
+}
+
+/// **The reference's two-level action-button split, both halves inheritable by name.**
+///
+/// `ActionButtonTemplate` (ref ActionButtonTemplate.xml:3) is regions only and carries NO scripts;
+/// `ActionBarButtonTemplate` (ref ActionBarFrame.xml:4) inherits it and adds the handlers. Ours
+/// conflated them under one `Benilla*` name, so an addon inheriting either reference name got a
+/// bare frame — no art, no regions, and no error (1203's silent shape).
+///
+/// `zBar.xml:7` is the corpus shape: it inherits `ActionBarButtonTemplate`, wires its own OnLoad,
+/// and then reads `getglobal(button:GetName().."NormalTexture")` — a derived name it only has
+/// because the template declares `$parentNormalTexture`. That read is where it died.
+///
+/// The last assertion is the one that keeps our own bars safe: the alias must still resolve to the
+/// full thing, or 48 `inherits=` sites across four files silently lose their handlers.
+#[test]
+fn both_reference_action_button_templates_are_inheritable() {
+    let s = UiScript::new().unwrap();
+    load_action_bar(&s);
+
+    // zBar's exact shape: inherit the bar template, supply your own OnLoad.
+    let doc = benilla_ui::framexml::parse(
+        r#"<Ui>
+            <CheckButton name="ZLikeButton" inherits="ActionBarButtonTemplate" id="1">
+                <Anchors><Anchor point="CENTER"/></Anchors>
+            </CheckButton>
+            <CheckButton name="BareLikeButton" inherits="ActionButtonTemplate" id="1">
+                <Anchors><Anchor point="TOPLEFT"/></Anchors>
+            </CheckButton>
+        </Ui>"#,
+    )
+    .unwrap();
+    let report = benilla_ui::loader::load(&s, &doc, &|_| None);
+    assert!(
+        report.errors.is_empty(),
+        "loader errors: {:?}",
+        report.errors
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("unknown template")),
+        "both names must resolve: {:?}",
+        report.warnings
+    );
+
+    // The derived name zBar reads, on a button built from each half.
+    for owner in ["ZLikeButton", "BareLikeButton"] {
+        assert!(
+            s.eval::<bool>(&format!("return {owner}NormalTexture ~= nil"))
+                .unwrap(),
+            "{owner}NormalTexture — zBar.lua:88's read"
+        );
+        assert!(
+            s.eval::<bool>(&format!(
+                "return {owner}Icon ~= nil and {owner}Cooldown ~= nil"
+            ))
+            .unwrap(),
+            "{owner} must carry the template's regions"
+        );
+    }
+
+    // The base half carries NO handlers, exactly as the reference's does — an addon inheriting it
+    // wires its own, and must not silently receive ours.
+    assert!(
+        !s.eval::<bool>("return BareLikeButton:GetScript(\"OnClick\") ~= nil")
+            .unwrap(),
+        "ActionButtonTemplate is regions only; handlers belong to the bar half"
+    );
+    assert!(
+        s.eval::<bool>("return ZLikeButton:GetScript(\"OnClick\") ~= nil")
+            .unwrap(),
+        "ActionBarButtonTemplate carries the handler set"
+    );
+
+    // ...and our own alias still resolves to the full thing.
+    assert!(
+        s.eval::<bool>("return ActionButton1NormalTexture ~= nil and ActionButton1:GetScript(\"OnClick\") ~= nil")
+            .unwrap(),
+        "BenillaActionButtonTemplate's 48 inherits= sites must be untouched by the split"
+    );
 }

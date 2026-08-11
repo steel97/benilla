@@ -94,9 +94,9 @@ fn target_player_name(
 /// 16-parameter ceiling, and a named struct beats a nested tuple nobody can read.
 ///
 /// - `camera`/`clock` feed **`/shot`**, the framing instrument (decision 0600).
-/// - `liquids`/`interior` feed **`/liquid`**, the swim diagnostic (decision 0634 follow-up): the
-///   interior claim is what decides which liquid surfaces the swim query is allowed to see, so the
-///   two only mean anything together.
+/// - `world` feeds **`/liquid`**, the swim diagnostic (decision 0634 follow-up): the interior
+///   claim is what decides which liquid surfaces the swim query may see, and it arrives with the
+///   query rather than beside it.
 /// - `stores`/`self_store`/`factions`/`reputations` feed **`/reaction`**, the attackability
 ///   diagnostic (decision 0637): the exact inputs [`crate::target::ring_reaction`] judges on, so
 ///   "why is this unit not attackable" is one command instead of a guess.
@@ -106,15 +106,11 @@ pub(super) struct ChatProbes<'w, 's> {
         'w,
         's,
         &'static GlobalTransform,
-        (With<crate::player::WorldCamera>, Without<SelfPlayer>),
+        (With<benilla_world::view::WorldCamera>, Without<SelfPlayer>),
     >,
-    clock: Option<Res<'w, crate::lighting::GameClock>>,
-    liquids: Query<'w, 's, &'static crate::liquid::WaterChunkInfo>,
-    interior: Res<'w, crate::wmo_portal::CurrentWmoInterior>,
-    player_room: Res<'w, crate::wmo_portal::PlayerWmoRoom>,
-    camera_claim: Res<'w, crate::wmo_portal::CameraInteriorClaim>,
-    /// The placed buildings, so a room's whole-group submersion override resolves (1000).
-    placements: crate::liquid::RoomPlacements<'w, 's>,
+    clock: Option<Res<'w, benilla_world::lighting::GameClock>>,
+    /// The `/liquid` instrument's whole world side — the claims, the verdict, the candidates.
+    world: benilla_world::world_point::WorldPoint<'w, 's>,
     stores: Query<'w, 's, &'static crate::net::ObjectStore>,
     self_store: Query<'w, 's, &'static crate::net::ObjectStore, With<SelfPlayer>>,
     factions: Option<Res<'w, crate::target::Factions>>,
@@ -172,11 +168,7 @@ pub(super) fn drain_chat_input(
     let ChatProbes {
         camera: world_camera,
         clock,
-        liquids,
-        interior,
-        player_room,
-        camera_claim,
-        placements,
+        world,
         stores,
         self_store,
         factions,
@@ -264,7 +256,7 @@ pub(super) fn drain_chat_input(
             ParsedChat::Shot => {
                 // The framing instrument (decision 0600): the CURRENT camera pose, in the raw WoW
                 // coords a capture `Scenario` takes, echoed to chat and appended to
-                // `config_base()`/shots.txt so a chosen spot survives the session.
+                // `benilla-config/shots.txt` so a chosen spot survives the session.
                 let Ok(cam) = world_camera.single() else {
                     continue;
                 };
@@ -280,9 +272,10 @@ pub(super) fn drain_chat_input(
                     super::event::ChatEventKind::System,
                     format!("shot: {snippet}"),
                 ));
-                if let Some(base) = crate::login::config_base() {
-                    let _ = std::fs::create_dir_all(&base);
-                    let path = base.join("shots.txt");
+                if let Some(path) = crate::local_state::shots_path() {
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
                     let line = format!("{snippet}\n");
                     let appended = std::fs::OpenOptions::new()
                         .create(true)
@@ -310,16 +303,16 @@ pub(super) fn drain_chat_input(
                     continue;
                 };
                 let wow = benilla_assets::coords::bevy_to_wow(feet);
-                let claim = crate::liquid::player_claim(player_room, placements);
-                let eye = crate::liquid::camera_claim(camera_claim, placements);
-                let verdict = crate::liquid::liquid_at(liquids.iter(), wow, claim);
+                let claim = world.claim(benilla_world::world_point::Subject::Player);
+                let eye = world.claim(benilla_world::world_point::Subject::Eye);
+                let verdict = world.liquid_at(benilla_world::world_point::Subject::Player, wow);
                 let mut lines = vec![
                     format!(
                         "liquid: feet [{:.2}, {:.2}, {:.2}] · claim {claim:?} ({})",
                         wow[0],
                         wow[1],
                         wow[2],
-                        match interior.0 {
+                        match world.interior() {
                             Some(k) => format!(
                                 "wmo {} nameSet {} group {}",
                                 k.wmo_id, k.name_set, k.group_area_id
@@ -341,7 +334,8 @@ pub(super) fn drain_chat_input(
                         None => "liquid: VERDICT none — not in liquid".into(),
                     },
                 ];
-                let candidates = crate::liquid::describe_at(liquids.iter(), wow, claim);
+                let candidates =
+                    world.describe_liquid_at(benilla_world::world_point::Subject::Player, wow);
                 if candidates.is_empty() {
                     lines.push("liquid: no footprint covers this XY at all".into());
                 }
@@ -745,6 +739,17 @@ pub(super) fn drain_chat_input(
                 }
             }
             ParsedChat::Unknown => {
+                // Before the help line: an ADDON may claim it (decision 1195). The reference
+                // resolves `SlashCmdList` in the same pass as its own commands; ours runs after
+                // the boot table misses, which gives the same precedence — a shipped command can
+                // never be shadowed — without moving our handlers into Lua.
+                if let Some(rest) = msg.strip_prefix('/') {
+                    let rest = rest.trim();
+                    let (cmd, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                    if script.run_slash_command(cmd, args.trim()) {
+                        continue;
+                    }
+                }
                 // HELP_TEXT_SIMPLE (the ref's unknown-command reply, ChatEdit_ParseText l.2203).
                 chat_log.push_event(super::event::ChatEvent::text_only(
                     super::event::ChatEventKind::System,
@@ -845,4 +850,43 @@ pub(super) fn emote_send_eligible(emote_flags: u32, stand_state: u8, swimming: b
         return false;
     }
     true
+}
+
+/// Turn an addon's `SendChatMessage` calls into sends (decision 1199).
+///
+/// Its own system rather than a branch inside [`drain_chat_input`], for the reason
+/// `benilla_ui::script::chat_send`'s module doc gives: the box's drain runs the **slash grammar**
+/// and this path must not. An addon announcing `"/dance"` is saying six characters.
+///
+/// An unknown chat-type token is **reported, not guessed**. `SendChatMessage(msg, "RAID_WARNING")`
+/// silently going to /say is worse than not going: the addon believes it warned the raid.
+pub(super) fn drain_addon_chat_sends(
+    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    commands: Res<NetCommands>,
+    mut chat_log: ResMut<super::feed::ChatLog>,
+) {
+    let Some(mut script) = script else {
+        return;
+    };
+    for send in script.take_chat_sends() {
+        let Some(kind) = super::edit::SendType::from_token(&send.chat_type) else {
+            warn!(
+                "chat: SendChatMessage with unknown type {:?}",
+                send.chat_type
+            );
+            chat_log.push_event(super::event::ChatEvent::text_only(
+                super::event::ChatEventKind::System,
+                format!("Unknown chat type \"{}\".", send.chat_type),
+            ));
+            continue;
+        };
+        let cmd = ClientCommand::Chat {
+            kind: kind.wire(),
+            target: send.target,
+            text: send.text,
+        };
+        if commands.0.send(cmd).is_err() {
+            warn!("chat: not connected; addon line dropped");
+        }
+    }
 }

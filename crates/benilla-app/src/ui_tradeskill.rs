@@ -32,16 +32,16 @@ use benilla_ui::script::{
     TradeSkillDifficulty, TradeSkillReagent, TradeSkillRecipe, TradeSkillState, UiScript,
 };
 
-use crate::assets::{AssetSet, LockRecover, WorldAssets};
 use crate::creature_anim::{CastEvent, CastEventKind};
 use crate::entities::ItemDisplays;
 use crate::items::Items;
 use crate::net::{NetCommands, ObjectStore, SelfPlayer};
 use crate::ui_action::{cast_target, CastCommit, CastLadder, PlayerActions, Spells};
-use crate::ui_items::{count_of, item_icon};
+use crate::ui_items::{count_of, item_icon, InventoryScope};
 use crate::ui_script::UiInput;
 use crate::ui_spellbook::SkillLines;
 use crate::ui_unit::UnitFeed;
+use benilla_assets::{AssetSet, LockRecover, WorldAssets};
 
 /// Effect-47 opener casts intercepted by `ui_action::send_spell_cast` (the TryCast branch's
 /// benilla seam) — each entry is the opener's spell id, resolved to a skill line and opened by
@@ -259,7 +259,7 @@ fn resolve_recipe(
     let mut reagents = Vec::new();
     let mut num_available = u32::MAX;
     for &(entry, need) in d.reagents.iter().filter(|&&(e, n)| e != 0 && n != 0) {
-        let have = count_of(&store.0, items, entry);
+        let have = count_of(&store.0, items, entry, InventoryScope::CARRIED);
         let (name, icon) = match items.template(entry, 0, commands) {
             Some(t) => (Some(t.name.clone()), item_icon(icons, t.display_info_id)),
             None => (None, None),
@@ -314,7 +314,7 @@ fn resolve_recipe(
     // (Anvil/Forge/Cooking Fire; never red — module doc INTERIM).
     let mut tools = Vec::new();
     for &t in d.totems.iter().filter(|&&t| t != 0) {
-        let have = count_of(&store.0, items, t) > 0;
+        let have = count_of(&store.0, items, t, InventoryScope::CARRIED) > 0;
         if let Some(info) = items.template(t, 0, commands) {
             tools.push((info.name.clone(), have));
         }

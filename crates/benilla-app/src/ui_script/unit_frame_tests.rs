@@ -45,7 +45,7 @@ fn shipped_unit_frames_drive_end_to_end() {
 
     // No units yet: both frames hid themselves on their OnLoad's first update.
     let hidden: bool = s
-        .eval("return not BenillaPlayerFrame:IsVisible() and not BenillaTargetFrame:IsVisible()")
+        .eval("return not PlayerFrame:IsVisible() and not TargetFrame:IsVisible()")
         .unwrap();
     assert!(hidden, "frames hide while their units don't exist");
 
@@ -67,20 +67,18 @@ fn shipped_unit_frames_drive_end_to_end() {
         }),
     );
     s.fire_event("UNIT_HEALTH", vec![ScriptValue::Str("player".into())]);
-    assert!(s
-        .eval::<bool>("return BenillaPlayerFrame:IsVisible()")
-        .unwrap());
+    assert!(s.eval::<bool>("return PlayerFrame:IsVisible()").unwrap());
     let ok: bool = s
         .eval(
             r#"
-            local hb, pb = BenillaPlayerFrameHealthBar, BenillaPlayerFramePowerBar
+            local hb, pb = PlayerFrameHealthBar, PlayerFramePowerBar
             local _, hmax = hb:GetMinMaxValues()
             local _, pmax = pb:GetMinMaxValues()
             local r, g, b = pb:GetStatusBarColor()
             return hb:GetValue() == 72 and hmax == 100
                and pb:GetValue() == 45 and pmax == 80 and pb:IsVisible()
                and b == 1 and r == 0 -- mana blue
-               and BenillaPlayerFrameTextureFrameNameText:GetText() == "Unknown"
+               and PlayerFrameTextureFrameNameText:GetText() == "Unknown"
         "#,
         )
         .unwrap();
@@ -105,7 +103,7 @@ fn shipped_unit_frames_drive_end_to_end() {
     );
     s.fire_event("UNIT_NAME_UPDATE", vec![ScriptValue::Str("player".into())]);
     assert_eq!(
-        s.eval::<String>("return BenillaPlayerFrameTextureFrameNameText:GetText()")
+        s.eval::<String>("return PlayerFrameTextureFrameNameText:GetText()")
             .unwrap(),
         "Benilla"
     );
@@ -132,11 +130,11 @@ fn shipped_unit_frames_drive_end_to_end() {
     let ok: bool = s
         .eval(
             r#"
-            return BenillaTargetFrame:IsVisible()
-               and not BenillaTargetFramePowerBar:IsVisible()
-               and BenillaTargetFrameTextureFrameNameText:GetText() == "Young Wolf"
-               and BenillaTargetFrameTextureFrameLevelText:GetText() == "3"
-               and BenillaTargetFrameTextureFrameDeadText:GetText() == "" -- living target: no DEAD text
+            return TargetFrame:IsVisible()
+               and not TargetFramePowerBar:IsVisible()
+               and TargetFrameTextureFrameNameText:GetText() == "Young Wolf"
+               and TargetFrameTextureFrameLevelText:GetText() == "3"
+               and TargetFrameTextureFrameDeadText:GetText() == "" -- living target: no DEAD text
         "#,
         )
         .unwrap();
@@ -191,9 +189,7 @@ fn shipped_unit_frames_drive_end_to_end() {
     // Deselect: the target frame hides again, playing the lost-target kit (ref TargetFrame_OnHide).
     s.set_unit("target", None);
     s.fire_event("PLAYER_TARGET_CHANGED", vec![]);
-    assert!(!s
-        .eval::<bool>("return BenillaTargetFrame:IsVisible()")
-        .unwrap());
+    assert!(!s.eval::<bool>("return TargetFrame:IsVisible()").unwrap());
     assert_eq!(
         s.take_sounds(),
         vec![SoundRequest::KitName(
@@ -278,7 +274,7 @@ fn unit_combat_drives_the_player_hit_indicator() {
     let ok: bool = s
         .eval(
             r#"
-            local ind = BenillaPlayerFrameTextureFrameHitIndicator
+            local ind = PlayerFrameTextureFrameHitIndicator
             return ind:IsShown() ~= nil and tostring(ind:GetText()) == "17"
         "#,
         )
@@ -293,7 +289,7 @@ fn unit_combat_drives_the_player_hit_indicator() {
     // A spell crit: ×1.5 height (the CRITICAL arm), and the type>0 yellow.
     s.fire_event("UNIT_COMBAT", ev("player", "WOUND", "CRITICAL", 64, 4));
     let ok: bool = s
-        .eval("return tostring(BenillaPlayerFrameTextureFrameHitIndicator:GetText()) == \"64\"")
+        .eval("return tostring(PlayerFrameTextureFrameHitIndicator:GetText()) == \"64\"")
         .unwrap();
     assert!(ok, "spell crit paints ({:?})", s.errors());
     assert_eq!(
@@ -305,7 +301,7 @@ fn unit_combat_drives_the_player_hit_indicator() {
     // A full absorb: the word at ×0.75.
     s.fire_event("UNIT_COMBAT", ev("player", "WOUND", "ABSORB", 0, 0));
     let ok: bool = s
-        .eval("return BenillaPlayerFrameTextureFrameHitIndicator:GetText() == \"Absorb\"")
+        .eval("return PlayerFrameTextureFrameHitIndicator:GetText() == \"Absorb\"")
         .unwrap();
     assert!(ok, "full absorb paints the word ({:?})", s.errors());
     assert_eq!(
@@ -319,7 +315,7 @@ fn unit_combat_drives_the_player_hit_indicator() {
     let ok: bool = s
         .eval(
             r#"
-            local ind = BenillaPlayerFrameTextureFrameHitIndicator
+            local ind = PlayerFrameTextureFrameHitIndicator
             return ind:IsShown() ~= nil and ind:GetAlpha() == 1.0
         "#,
         )
@@ -327,7 +323,7 @@ fn unit_combat_drives_the_player_hit_indicator() {
     assert!(ok, "mid-hold: opaque ({:?})", s.errors());
     s.tick(0.8); // past fade-in + hold + fade-out (1.2 s total)
     assert!(
-        s.eval::<bool>("return BenillaPlayerFrameTextureFrameHitIndicator:IsShown() == nil")
+        s.eval::<bool>("return PlayerFrameTextureFrameHitIndicator:IsShown() == nil")
             .unwrap(),
         "the envelope ends in a Hide ({:?})",
         s.errors()
@@ -336,7 +332,7 @@ fn unit_combat_drives_the_player_hit_indicator() {
     // A target-token event leaves the (hidden) indicator alone.
     s.fire_event("UNIT_COMBAT", ev("target", "WOUND", "", 99, 0));
     assert!(
-        s.eval::<bool>("return BenillaPlayerFrameTextureFrameHitIndicator:IsShown() == nil")
+        s.eval::<bool>("return PlayerFrameTextureFrameHitIndicator:IsShown() == nil")
             .unwrap(),
         "a target event never touches the player indicator"
     );
@@ -388,7 +384,7 @@ fn left_clicking_the_player_frame_targets_self() {
 
     // Click the frame's centre through the real hit-test path (press + release on the same frame).
     let (cx, cy) = s
-        .eval::<(f64, f64)>("return BenillaPlayerFrame:GetCenter()")
+        .eval::<(f64, f64)>("return PlayerFrame:GetCenter()")
         .unwrap();
     s.mouse_button(cx as f32, cy as f32, "RightButton", true);
     s.mouse_button(cx as f32, cy as f32, "RightButton", false);
@@ -420,7 +416,7 @@ fn left_clicking_the_player_frame_targets_self() {
             guid: 0xA11CE,
         }],
         leader_index: 0, // we lead
-        raid_members: 0,
+        raid: Vec::new(),
         loot_method: "group".into(),
         master_looter: None,
         loot_threshold: 2,
@@ -509,7 +505,7 @@ fn raid_mark_clicks_through_the_nested_level() {
             guid: 0xA11CE,
         }],
         leader_index: 0, // we lead — the mark rows are leader-gated
-        raid_members: 0,
+        raid: Vec::new(),
         loot_method: "group".into(),
         master_looter: None,
         loot_threshold: 2,
@@ -517,7 +513,7 @@ fn raid_mark_clicks_through_the_nested_level() {
     s.resolve();
 
     let (cx, cy) = s
-        .eval::<(f64, f64)>("return BenillaPlayerFrame:GetCenter()")
+        .eval::<(f64, f64)>("return PlayerFrame:GetCenter()")
         .unwrap();
     s.mouse_button(cx as f32, cy as f32, "RightButton", true);
     s.mouse_button(cx as f32, cy as f32, "RightButton", false);
@@ -640,8 +636,8 @@ fn shipped_target_frame_runs_the_level_law() {
     let ok: bool = s
         .eval(
             r#"
-            local lvl = getglobal("BenillaTargetFrameTextureFrameLevelText")
-            local skull = getglobal("BenillaTargetFrameTextureFrameHighLevelTexture")
+            local lvl = getglobal("TargetFrameTextureFrameLevelText")
+            local skull = getglobal("TargetFrameTextureFrameHighLevelTexture")
             local c = GetDifficultyColor(8)
             return lvl:IsShown() ~= nil and skull:IsShown() == nil
                and tostring(lvl:GetText()) == "8"
@@ -669,8 +665,8 @@ fn shipped_target_frame_runs_the_level_law() {
     let ok: bool = s
         .eval(
             r#"
-            local lvl = getglobal("BenillaTargetFrameTextureFrameLevelText")
-            local skull = getglobal("BenillaTargetFrameTextureFrameHighLevelTexture")
+            local lvl = getglobal("TargetFrameTextureFrameLevelText")
+            local skull = getglobal("TargetFrameTextureFrameHighLevelTexture")
             return UnitLevel("target") == -1
                and skull:IsShown() ~= nil and lvl:IsShown() == nil
         "#,
@@ -697,8 +693,8 @@ fn shipped_target_frame_runs_the_level_law() {
     let ok: bool = s
         .eval(
             r#"
-            local lvl = getglobal("BenillaTargetFrameTextureFrameLevelText")
-            local skull = getglobal("BenillaTargetFrameTextureFrameHighLevelTexture")
+            local lvl = getglobal("TargetFrameTextureFrameLevelText")
+            local skull = getglobal("TargetFrameTextureFrameHighLevelTexture")
             return UnitIsCorpse("target") == nil
                and lvl:IsShown() ~= nil and skull:IsShown() == nil
                and tostring(lvl:GetText()) == "8"
@@ -726,7 +722,7 @@ fn shipped_target_frame_runs_the_level_law() {
     let ok: bool = s
         .eval(
             r#"
-            local skull = getglobal("BenillaTargetFrameTextureFrameHighLevelTexture")
+            local skull = getglobal("TargetFrameTextureFrameHighLevelTexture")
             return UnitIsCorpse("target") == 1 and skull:IsShown() ~= nil
         "#,
         )
@@ -805,16 +801,13 @@ fn pvp_icon_follows_the_three_branch_law() {
     // Unflagged: no icon, no sound.
     s.set_unit("player", Some(alliance_player(false, false)));
     s.fire_event("UNIT_FACTION", vec![ScriptValue::Str("player".into())]);
-    assert!(
-        !icon_shown(&s, "BenillaPlayerFrame"),
-        "unflagged shows none"
-    );
+    assert!(!icon_shown(&s, "PlayerFrame"), "unflagged shows none");
     assert!(s.take_sounds().is_empty(), "no sound while unflagged");
 
     // Flagged: the Alliance icon, and one igPVPUpdate for the flag change.
     s.set_unit("player", Some(alliance_player(true, false)));
     s.fire_event("UNIT_FACTION", vec![ScriptValue::Str("player".into())]);
-    assert!(icon_shown(&s, "BenillaPlayerFrame"));
+    assert!(icon_shown(&s, "PlayerFrame"));
     assert!(icon_path(&mut s, "UI-PVP-Alliance"), "faction leg art");
     assert_eq!(
         s.take_sounds(),
@@ -851,7 +844,7 @@ fn pvp_icon_follows_the_three_branch_law() {
     );
     s.fire_event("PLAYER_TARGET_CHANGED", vec![]);
     assert!(
-        !icon_shown(&s, "BenillaTargetFrame"),
+        !icon_shown(&s, "TargetFrame"),
         "flagged but sideless draws no icon"
     );
 
@@ -871,7 +864,7 @@ fn pvp_icon_follows_the_three_branch_law() {
         }),
     );
     s.fire_event("PLAYER_TARGET_CHANGED", vec![]);
-    assert!(icon_shown(&s, "BenillaTargetFrame"));
+    assert!(icon_shown(&s, "TargetFrame"));
     assert!(icon_path(&mut s, "UI-PVP-Horde"), "the target's own side");
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
@@ -1046,8 +1039,8 @@ fn target_frame_border_follows_the_classification_law() {
     let plain_on_player: bool = s
         .eval(
             r#"
-            local p = getglobal("BenillaPlayerFrameTextureFrameTexture")
-            return p ~= nil and BenillaPlayerFrame.frameTexture == nil
+            local p = getglobal("PlayerFrameTextureFrameTexture")
+            return p ~= nil and PlayerFrame.frameTexture == nil
         "#,
         )
         .unwrap();
@@ -1233,9 +1226,9 @@ fn a_feigning_target_paints_empty_bars_and_the_dead_text() {
     let alive: bool = s
         .eval(
             r#"
-            local hb, pb = BenillaTargetFrameHealthBar, BenillaTargetFramePowerBar
+            local hb, pb = TargetFrameHealthBar, TargetFramePowerBar
             return hb:GetValue() == 1200 and pb:GetValue() == 300
-               and BenillaTargetFrameTextureFrameDeadText:GetText() == ""
+               and TargetFrameTextureFrameDeadText:GetText() == ""
         "#,
         )
         .unwrap();
@@ -1245,24 +1238,22 @@ fn a_feigning_target_paints_empty_bars_and_the_dead_text() {
     s.set_unit("target", hunter(0, 0, true));
     s.fire_event("UNIT_HEALTH", vec![ScriptValue::Str("target".into())]);
     let (hp, hmax, mana, mmax): (f64, f64, f64, f64) = (
-        s.eval("return BenillaTargetFrameHealthBar:GetValue()")
+        s.eval("return TargetFrameHealthBar:GetValue()").unwrap(),
+        s.eval("local _, m = TargetFrameHealthBar:GetMinMaxValues() return m")
             .unwrap(),
-        s.eval("local _, m = BenillaTargetFrameHealthBar:GetMinMaxValues() return m")
-            .unwrap(),
-        s.eval("return BenillaTargetFramePowerBar:GetValue()")
-            .unwrap(),
-        s.eval("local _, m = BenillaTargetFramePowerBar:GetMinMaxValues() return m")
+        s.eval("return TargetFramePowerBar:GetValue()").unwrap(),
+        s.eval("local _, m = TargetFramePowerBar:GetMinMaxValues() return m")
             .unwrap(),
     );
     assert_eq!((hp, hmax), (0.0, 1500.0), "empty health bar, real track");
     assert_eq!((mana, mmax), (0.0, 900.0), "empty mana bar, real track");
     assert!(
-        s.eval::<bool>("return BenillaTargetFramePowerBar:IsVisible()")
+        s.eval::<bool>("return TargetFramePowerBar:IsVisible()")
             .unwrap(),
         "the mana bar empties, it does not disappear — UnitManaMax 0x5177e0 is ungated"
     );
     assert_eq!(
-        s.eval::<String>("return BenillaTargetFrameTextureFrameDeadText:GetText()")
+        s.eval::<String>("return TargetFrameTextureFrameDeadText:GetText()")
             .unwrap(),
         "DEAD",
         "TargetFrame_CheckDead's UnitHealth(unit) <= 0 test, tripped by the flag"
@@ -1278,9 +1269,9 @@ fn a_feigning_target_paints_empty_bars_and_the_dead_text() {
     let up: bool = s
         .eval(
             r#"
-            return BenillaTargetFrameHealthBar:GetValue() == 1200
-               and BenillaTargetFramePowerBar:GetValue() == 300
-               and BenillaTargetFrameTextureFrameDeadText:GetText() == ""
+            return TargetFrameHealthBar:GetValue() == 1200
+               and TargetFramePowerBar:GetValue() == 300
+               and TargetFrameTextureFrameDeadText:GetText() == ""
                and not UnitIsDead("target")
         "#,
         )
@@ -1320,13 +1311,13 @@ fn the_player_frame_flashes_zzz_while_resting() {
     let resting: bool = s
         .eval(
             r#"
-            local tf = "BenillaPlayerFrameTextureFrame"
+            local tf = "PlayerFrameTextureFrame"
             return getglobal(tf .. "StatusTexture"):IsShown()
                and getglobal(tf .. "RestIcon"):IsShown()
                and not getglobal(tf .. "AttackIcon"):IsShown()
-               and BenillaPlayerFrameStatusGlow:IsShown()
-               and BenillaPlayerFrameStatusGlowRestGlow:IsShown()
-               and not BenillaPlayerFrameStatusGlowAttackGlow:IsShown()
+               and PlayerFrameStatusGlow:IsShown()
+               and PlayerFrameStatusGlowRestGlow:IsShown()
+               and not PlayerFrameStatusGlowAttackGlow:IsShown()
                and not getglobal(tf .. "AttackBackground"):IsShown()
         "#,
         )
@@ -1338,12 +1329,12 @@ fn the_player_frame_flashes_zzz_while_resting() {
 
     // The pulse: two OnUpdate ticks move the ring's alpha (the 0.5 s triangle wave).
     let a0: f64 = s
-        .eval("return BenillaPlayerFrameTextureFrameStatusTexture:GetAlpha()")
+        .eval("return PlayerFrameTextureFrameStatusTexture:GetAlpha()")
         .unwrap();
-    s.run("BenillaPlayerFrame_OnUpdate(BenillaPlayerFrame, 0.25)")
+    s.run("this = PlayerFrame; PlayerFrame_OnUpdate(0.25)")
         .unwrap();
     let a1: f64 = s
-        .eval("return BenillaPlayerFrameTextureFrameStatusTexture:GetAlpha()")
+        .eval("return PlayerFrameTextureFrameStatusTexture:GetAlpha()")
         .unwrap();
     assert!(
         (a0 - a1).abs() > 0.1,
@@ -1353,7 +1344,7 @@ fn the_player_frame_flashes_zzz_while_resting() {
     // Swinging while resting: resting still wins (the ref's branch order).
     s.fire_event("PLAYER_ENTER_COMBAT", vec![]);
     assert!(
-        s.eval::<bool>("return BenillaPlayerFrameTextureFrameRestIcon:IsShown()")
+        s.eval::<bool>("return PlayerFrameTextureFrameRestIcon:IsShown()")
             .unwrap(),
         "resting outranks auto-attack"
     );
@@ -1364,11 +1355,11 @@ fn the_player_frame_flashes_zzz_while_resting() {
     let attacking: bool = s
         .eval(
             r#"
-            local tf = "BenillaPlayerFrameTextureFrame"
+            local tf = "PlayerFrameTextureFrame"
             return getglobal(tf .. "StatusTexture"):IsShown()
                and getglobal(tf .. "AttackIcon"):IsShown()
                and not getglobal(tf .. "RestIcon"):IsShown()
-               and BenillaPlayerFrameStatusGlowAttackGlow:IsShown()
+               and PlayerFrameStatusGlowAttackGlow:IsShown()
                and getglobal(tf .. "AttackBackground"):IsShown()
         "#,
         )
@@ -1380,11 +1371,11 @@ fn the_player_frame_flashes_zzz_while_resting() {
     let clear: bool = s
         .eval(
             r#"
-            local tf = "BenillaPlayerFrameTextureFrame"
+            local tf = "PlayerFrameTextureFrame"
             return not getglobal(tf .. "StatusTexture"):IsShown()
                and not getglobal(tf .. "RestIcon"):IsShown()
                and not getglobal(tf .. "AttackIcon"):IsShown()
-               and not BenillaPlayerFrameStatusGlow:IsShown()
+               and not PlayerFrameStatusGlow:IsShown()
                and not getglobal(tf .. "AttackBackground"):IsShown()
         "#,
         )
@@ -1491,8 +1482,8 @@ fn status_bar_text_paints_the_player_numerals_but_not_the_targets() {
     };
 
     // Off (the shipped default): the strings carry the numbers, and nothing paints.
-    assert!(!shown(&s, "BenillaPlayerFrameTextureFrameHealthBarText"));
-    assert!(!shown(&s, "BenillaPlayerFrameTextureFramePowerBarText"));
+    assert!(!shown(&s, "PlayerFrameTextureFrameHealthBarText"));
+    assert!(!shown(&s, "PlayerFrameTextureFramePowerBarText"));
 
     // On, through the switch's own event — no repaint, no damage taken.
     s.register_cvars([("statusBarText", "0")]);
@@ -1500,38 +1491,214 @@ fn status_bar_text_paints_the_player_numerals_but_not_the_targets() {
         .unwrap();
     s.tick(0.0);
     assert!(
-        shown(&s, "BenillaPlayerFrameTextureFrameHealthBarText"),
+        shown(&s, "PlayerFrameTextureFrameHealthBarText"),
         "your own health numerals pin on"
     );
     assert_eq!(
-        text(&s, "BenillaPlayerFrameTextureFrameHealthBarText"),
-        "72 / 100"
+        text(&s, "PlayerFrameTextureFrameHealthBarText"),
+        "72 / 100",
+        "bare numbers: the reference's \"Health\"/\"Rage\" labels were cut on the \
+         director's call (1147)"
     );
     assert_eq!(
-        text(&s, "BenillaPlayerFrameTextureFramePowerBarText"),
+        text(&s, "PlayerFrameTextureFramePowerBarText"),
         "45 / 80",
-        "the power bar reads its own resource — rage here"
+        "the power bar shows the number alone, whatever resource it is"
     );
 
-    // The target has no numerals to pin: 1.12 never makes its bars textLockable, so its numbers
-    // are hover-only there — and our bars have no hover yet, which is why the text regions are not
-    // declared at all rather than declared and permanently dark. The wiring is unconditional though (the
-    // shared OnLoad runs for the target too), so the day a hover lands they are one pair of
-    // FontStrings away.
+    // The target's stay dark with the switch ON: 1.12 never makes its bars textLockable, so the
+    // option does not reach them.
     assert!(
-        s.eval::<bool>(
-            "return BenillaTargetFrameTextureFrameHealthBarText == nil              and BenillaTargetFrameHealthBar.lockShow == 0"
-        )
-        .unwrap(),
-        "no target numerals, but the target's bars are wired for them"
+        !shown(&s, "TargetFrameTextureFrameHealthBarText"),
+        "the switch pins your own numbers, never the target's"
     );
+
+    // ...but the HOVER reveals them, which is how you read a target's health in 1.12 (1146).
+    s.run("BenillaUnitFrameBar_OnEnter(TargetFrameHealthBar)")
+        .unwrap();
+    assert!(shown(&s, "TargetFrameTextureFrameHealthBarText"));
+    assert_eq!(text(&s, "TargetFrameTextureFrameHealthBarText"), "50 / 100");
+    s.run("BenillaUnitFrameBar_OnLeave(TargetFrameHealthBar)")
+        .unwrap();
+    assert!(
+        !shown(&s, "TargetFrameTextureFrameHealthBarText"),
+        "and go away again — the lockShow refcount balances"
+    );
+
+    // The same hover works with the switch OFF, which is the point of it on YOUR frame too: the
+    // numbers are there when you go looking, without living on the bar.
+    s.run("SetCVar(\"statusBarText\", \"0\", \"STATUS_BAR_TEXT\")")
+        .unwrap();
+    s.tick(0.0);
+    assert!(!shown(&s, "PlayerFrameTextureFrameHealthBarText"));
+    s.run("BenillaUnitFrameBar_OnEnter(PlayerFrameHealthBar)")
+        .unwrap();
+    assert!(
+        shown(&s, "PlayerFrameTextureFrameHealthBarText"),
+        "hover shows them even with the option off"
+    );
+    s.run("BenillaUnitFrameBar_OnLeave(PlayerFrameHealthBar)")
+        .unwrap();
+    assert!(!shown(&s, "PlayerFrameTextureFrameHealthBarText"));
+    s.run("SetCVar(\"statusBarText\", \"1\", \"STATUS_BAR_TEXT\")")
+        .unwrap();
+    s.tick(0.0);
 
     // A health change repaints through the bar's own OnValueChanged, like the reference's.
     s.set_unit("player", Some(alive(31, 45, 1)));
     s.fire_event("UNIT_HEALTH", vec![ScriptValue::Str("player".into())]);
-    assert_eq!(
-        text(&s, "BenillaPlayerFrameTextureFrameHealthBarText"),
-        "31 / 100"
-    );
+    assert_eq!(text(&s, "PlayerFrameTextureFrameHealthBarText"), "31 / 100");
+
+    // A power-type change repaints the same way (it used to re-LABEL the bar too — 1147 cut that).
+    s.set_unit("player", Some(alive(31, 60, 3)));
+    s.fire_event("UNIT_DISPLAYPOWER", vec![ScriptValue::Str("player".into())]);
+    assert_eq!(text(&s, "PlayerFrameTextureFramePowerBarText"), "60 / 80");
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **The numerals do not collide** (decision 1147) — the pin for a bug the director caught on
+/// screen: the pet frame's two numeral strings overlapped each other and its name.
+///
+/// The cause was a bad transcription, not a bad seat. 1.12's pet bars are 70×8 at `(47,-22)` and
+/// `(47,-29)` — a **7 px pitch** for strings taller than that — so the reference does not centre the
+/// second one: it drops it clear, to `(82,-38)`, just under a bar that ends at −37. 1143 replaced
+/// those literals with "anchor each string to its own bar's centre", on a comparison that read the
+/// reference's TEXT offsets against our BAR offsets and concluded the geometry differed. It does
+/// not: our bars are byte-identical to the reference's, so its literals apply unchanged.
+///
+/// This asserts the PROPERTY, not the numbers, so it survives a future nudge (1145 moved the
+/// player's pair the day before this). Text metrics come from the harness's own measurer — a
+/// FontString with a single CENTER anchor and no measured size cannot pin either edge, so it falls
+/// back to its owner's rect and every string would appear to sit in the same box.
+#[test]
+fn no_two_numeral_strings_overlap_on_any_frame() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_unit_frames(&s);
+
+    let alive = |health: u32, power: u32| UnitState {
+        exists: true,
+        name: Some("Onehunter".into()),
+        health,
+        max_health: health,
+        level: 40,
+        power_type: 0,
+        power,
+        max_power: power,
+        dead: false,
+        reaction: 4,
+        ..UnitState::default()
+    };
+    s.set_unit("player", Some(alive(4122, 3300)));
+    s.set_unit("target", Some(alive(4122, 3300)));
+    s.set_unit("pet", Some(alive(256, 100)));
+    s.fire_event("PLAYER_ENTERING_WORLD", vec![]);
+    s.fire_event("PLAYER_TARGET_CHANGED", vec![]);
+    s.fire_event("UNIT_PET", vec![ScriptValue::Str("player".into())]);
+    s.register_cvars([("statusBarText", "0")]);
+    s.run("SetCVar(\"statusBarText\", \"1\", \"STATUS_BAR_TEXT\")")
+        .unwrap();
+    s.tick(0.0);
+
+    // The host's half of the measure round-trip, at the numerals' real font size: NumberFontNormal
+    // is ~14 px tall, and a digit runs ~7 px wide. The round-trip answers a frame late, so settle.
+    for _ in 0..4 {
+        let answers: Vec<(u32, f32, f32, u64)> = s
+            .fontstrings_needing_measure()
+            .into_iter()
+            .map(|r| (r.id, r.text.chars().count() as f32 * 7.0, 14.0, r.key))
+            .collect();
+        s.set_measured_text_unwrapped(&answers);
+        s.tick(0.05);
+        s.resolve();
+    }
+
+    // The pin is the SEPARATION between the two numeral seats, which is the thing that broke and
+    // the thing the reference authored deliberately. Not "the line boxes must not overlap": at a
+    // 14 px NumberFontNormal the reference's own player seats are 12 px apart, so the boxes DO
+    // overlap there while the ink (a digit's ~10 px cap height, centred) does not. Only a seat
+    // pitch well under the font is a real collision — the pet's was 7 px.
+    for (frame, upper, lower, want) in [
+        (
+            "player",
+            "PlayerFrameTextureFrameHealthBarText",
+            "PlayerFrameTextureFramePowerBarText",
+            12.0,
+        ),
+        (
+            "pet",
+            "PetFrameTextureFrameHealthBarText",
+            "PetFrameTextureFrameManaBarText",
+            11.0,
+        ),
+    ] {
+        let mid = |s: &UiScript, n: &str| -> f64 {
+            s.eval::<f64>(&format!("return ({n}:GetTop() + {n}:GetBottom()) / 2"))
+                .unwrap()
+        };
+        let apart = mid(&s, upper) - mid(&s, lower);
+        assert!(
+            (apart - want).abs() < 0.51,
+            "{frame}: the numerals sit {apart:.1} px apart, the reference authors {want:.0}"
+        );
+    }
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **`UnitFrame_OnEnter`/`OnLeave` exist under the REFERENCE's names, `this`-shaped, so an addon
+/// that hooks them is reached.**
+///
+/// `TipBuddy.lua:2770-2773` is the exact idiom, and it is the 1.12 customisation model in general:
+///
+/// ```lua
+/// originalUnitFrame_OnEnter = UnitFrame_OnEnter
+/// function UnitFrame_OnEnter() originalUnitFrame_OnEnter() … end
+/// ```
+///
+/// Against a missing global that captured nil and raised on the first hover. Note these are
+/// ADAPTERS, not renames: the reference's contract takes no arguments and reads `this`, ours takes
+/// the frame explicitly, so a rename would have reached our body with a nil frame — reachable but
+/// broken, which is worse than inert.
+///
+/// The same class as the Bagnon bag bug, and equally invisible to the corpus survey: it loads
+/// addons and fires events, but never hovers anything.
+#[test]
+fn the_unit_frame_hover_hooks_carry_the_references_names() {
+    let s = UiScript::new().unwrap();
+    load_unit_frames(&s);
+
+    assert!(
+        s.eval::<bool>(
+            "return type(UnitFrame_OnEnter) == 'function' \
+             and type(UnitFrame_OnLeave) == 'function'"
+        )
+        .unwrap(),
+        "the reference's names must exist for an addon to capture"
+    );
+
+    // TipBuddy's idiom, run for real against a live unit frame.
+    s.run(
+        r#"
+        HOVERS = 0
+        local original = UnitFrame_OnEnter
+        function UnitFrame_OnEnter()
+            HOVERS = HOVERS + 1
+            original()
+        end
+        this = PlayerFrame
+        UnitFrame_OnEnter()
+    "#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        s.eval::<i64>("return HOVERS").unwrap(),
+        1,
+        "the addon's replacement must run"
+    );
+    assert!(
+        s.errors().is_empty(),
+        "and calling through to the original must not raise: {:?}",
+        s.errors()
+    );
 }

@@ -210,12 +210,40 @@ pub enum Outline {
 }
 
 impl Outline {
-    /// Parse an OUTLINETYPE token (`"NONE"`/`"NORMAL"`/`"THICK"`, case-insensitive); unknown ⇒ `None`.
+    /// Parse the **XML** OUTLINETYPE attribute (`outline="NONE"/"NORMAL"/"THICK"`,
+    /// case-insensitive); unknown ⇒ `None`. This is *not* the Lua spelling — see [`Outline::flags`].
     pub fn parse(s: &str) -> Outline {
         match s.to_ascii_uppercase().as_str() {
             "NORMAL" => Outline::Normal,
             "THICK" => Outline::Thick,
             _ => Outline::None,
+        }
+    }
+
+    /// Parse a **Lua `SetFont` flags string** — a different vocabulary from the XML attribute
+    /// above, and mixing the two is a silent no-op: `SetFont(path, h, "OUTLINE")` through
+    /// [`Outline::parse`] matches nothing and lands on `NONE`.
+    ///
+    /// The reference reads the argument as a *set* of substrings against
+    /// `{0x1 OUTLINE, 0x4 THICKOUTLINE, 0x2 MONOCHROME}` (`0x811b10`, wow-re
+    /// `system/ui/scratch/widget-api-batch-benilla.md` Q8), which is why this is `contains` and not
+    /// equality — `"OUTLINE, MONOCHROME"` is a real thing addons write. MONOCHROME has no field
+    /// here (we model no glyph AA mode) and is ignored; `THICK` is checked first because
+    /// `"THICKOUTLINE"` contains `"OUTLINE"`.
+    ///
+    /// One function, three callers: `Button:SetFont`, `FontString:SetFont` and `Font:SetFont` all
+    /// delegate to the *same* impl in the reference (`0x79f210`), so they cannot be allowed to
+    /// disagree here. They did: the Font-object binding parsed its Lua flags with the XML reader,
+    /// so `GameFontNormal:SetFont(f, h, "OUTLINE")` silently cleared the outline instead of setting
+    /// it, while the FontString binding carried its own inline copy of this match.
+    pub fn flags(s: &str) -> Outline {
+        let s = s.to_ascii_uppercase();
+        if s.contains("THICK") {
+            Outline::Thick
+        } else if s.contains("OUTLINE") {
+            Outline::Normal
+        } else {
+            Outline::None
         }
     }
 
@@ -299,6 +327,28 @@ pub struct ExtractedQuad {
 /// The visual state of a region leaf (`Texture`/`FontString`), stored beside the arena because
 /// [`crate::widget::Region`] models only structure (kind/owner/layer), not paint. See [`object`]'s
 /// `SetTexture`/`SetVertexColor`/`SetText`.
+/// A two-stop linear gradient (`SetGradientAlpha`/`SetGradient`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gradient {
+    /// `true` for `"VERTICAL"`, `false` for `"HORIZONTAL"` — the client matches the token
+    /// case-insensitively and treats anything else as horizontal.
+    pub vertical: bool,
+    /// The gradient's two stops, RGBA. `SetGradient` (no alpha) sets both alphas to 1.
+    pub start: [f32; 4],
+    pub end: [f32; 4],
+}
+
+impl Gradient {
+    /// The single colour a one-tint quad can show for this gradient — the midpoint.
+    pub fn midpoint(&self) -> [f32; 4] {
+        let mut out = [0.0; 4];
+        for (i, chan) in out.iter_mut().enumerate() {
+            *chan = (self.start[i] + self.end[i]) / 2.0;
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct RegionData {
     /// Region-level visibility (`Show`/`Hide` on a Texture/FontString, XML `hidden=` — the real
@@ -333,6 +383,21 @@ pub(crate) struct RegionData {
     /// ARGB), which is why the XML alpha rides in the **texel** and multiplies with
     /// [`Self::vertex_color`] rather than being replaced by it.
     pub(crate) fill: Option<[f32; 4]>,
+    /// `SetGradientAlpha(orientation, r1,g1,b1,a1, r2,g2,b2,a2)` / `SetGradient(...)` — the two-stop
+    /// linear gradient the client generates into the same texture slot the colour form fills.
+    ///
+    /// **Stored in full, painted as its midpoint, and that gap is stated rather than implied.** The
+    /// UI renderer has one tint per quad (a colour region is the shared 1x1 white image tinted), so
+    /// there is nowhere yet to put a second stop; folding to the average is a *visible*
+    /// approximation and belongs to the director to judge (method §7). It is kept whole HERE so the
+    /// renderer can honour it later without another API change — the data is already right, only
+    /// the paint is coarse.
+    ///
+    /// Measured cost of the approximation on the corpus's biggest consumer: `FuBar_Panel.lua:144`
+    /// is `SetGradientAlpha("VERTICAL", 1,1,1,0, 1,1,1,0.5*t)` — **white at both stops, alpha
+    /// only**, i.e. a soft fade, and both textures are `Hide()`n on the next two lines. A uniform
+    /// half-alpha band instead of a fade is the whole difference there.
+    pub(crate) gradient: Option<Gradient>,
     /// The **vertex colour** (`SetVertexColor 0x79abd0` → `0x77f750`, writing `+0xb8`; a StatusBar's
     /// `SetStatusBarColor`; a FontString's `SetTextColor` and its font object's colour) — storage
     /// distinct from [`Self::fill`]/[`Self::texture`]'s `+0xcc`.
@@ -379,6 +444,19 @@ pub(crate) struct RegionData {
     /// from the owner frame's rect.
     pub(crate) anchors: Vec<Anchor>,
     /// FontString horizontal justification (`SetJustifyH`/XML `justifyH`); default CENTER.
+    /// `SetNonSpaceWrap` / `CanNonSpaceWrap` — FontString only (`0x79e9f0`/`0x79ead0`, wow-re's
+    /// widget-method batch). **State only here.** The real client's gx flag `0x40` feeds a
+    /// mid-word wrap carry and the fit-count terminator whose one consumer is the ellipsis
+    /// truncate at `0x771ec0`; our text layout has no ellipsis path, so honouring the value in
+    /// layout would mean inventing one. Stored and answered faithfully, unread by the renderer —
+    /// which is the honest position and is stated rather than left to be discovered.
+    ///
+    /// Default is ON (a no-arg `SetNonSpaceWrap()` also enables), so `None` reads as enabled.
+    /// `Texture:SetDesaturated(flag)` — the shader desaturation state (`0x79c1e0`, verified in
+    /// wow-re's ledger). **Stored; the renderer does not yet honour it**, which is exactly why the
+    /// binding answers "shader unsupported" — see `region.rs`'s `SetDesaturated`.
+    pub(crate) desaturated: bool,
+    pub(crate) non_space_wrap: Option<bool>,
     pub(crate) justify_h: JustifyH,
     /// FontString vertical justification (`SetJustifyV`/XML `justifyV`); default MIDDLE.
     pub(crate) justify_v: JustifyV,
@@ -388,9 +466,16 @@ pub(crate) struct RegionData {
     /// On-screen rotation about the region center (`SetRotation`, radians, counterclockwise-
     /// positive) — see [`QuadContent::Texture::rotation`].
     pub(crate) rotation: f32,
-    /// The named font object this FontString last resolved (`inherits=`/`SetFontObject`), for
-    /// `GetFontObject`. The object's paint is copied into the fields below at resolve time.
+    /// The named font object this FontString last resolved (`inherits=`/`SetFontObject`) — our
+    /// `FONTINSTANCE+0x028 parentFontObject`, and a **live** link: mutating that object
+    /// (`GameFontNormal:SetFont(…)`) re-paints this region through
+    /// [`script::font::propagate`](super::font::propagate). `GetFontObject` returns its handle.
+    /// The object's paint is eagerly copied into the fields below so every reader stays a plain
+    /// field read.
     pub(crate) font_object: Option<String>,
+    /// Which of the font properties below this region set **for itself** since its last
+    /// `SetFontObject` — our `FONTINSTANCE+0x038 explicitlySetMask`. See [`FontExplicit`].
+    pub(crate) font_explicit: FontExplicit,
     /// Resolved font face path (`SetFont`/`SetFontObject`). `None` = the renderer's default face.
     pub(crate) font_path: Option<String>,
     /// Resolved font height in logical px (`SetFont`/`SetFontObject`/`<FontHeight>`). `None` = default.
@@ -410,6 +495,38 @@ pub(crate) struct RegionData {
     /// [`UiScript::set_measured_text`]): the real client's layout asks its font engine for string
     /// metrics exactly like this (`fontstring.md`). `key` invalidates on text/font/wrap changes.
     pub(crate) measured: Option<MeasuredText>,
+}
+
+/// The per-property "this region set it itself, so it does not inherit" record — the real client's
+/// `FONTINSTANCE+0x038 explicitlySetMask` (wow-re `system/ui/scratch/fontstring.md`).
+///
+/// It exists for exactly one job: when a **font object is mutated**
+/// (`GameFontNormal:SetTextColor(…)`), every region inheriting it re-reads the object, and a
+/// property the region had overridden must survive that re-read. A dropdown row that does
+/// `SetFontObject(GameFontNormalSmall)` and then `SetTextColor(1, 0, 0)` keeps its red.
+///
+/// A fresh `SetFontObject` **clears the whole mask** — re-pointing at an object is a deliberate
+/// "take this object's paint", and `Dewdrop-2.0` re-runs exactly that pair on every row refresh
+/// (`SetFontObject` at l.2160-2166, then `SetTextColor` at l.2180), which only stays correct if the
+/// re-point wins. (Whether the real client's mask outlives a re-point is the one part of this the
+/// bytes have not yet been asked; the choice above is the one that leaves current behaviour
+/// untouched, and it is the *propagation* half — new behaviour either way — that the mask governs.)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FontExplicit {
+    /// `SetFont`'s path argument, or XML `font=`.
+    pub(crate) face: bool,
+    /// `SetFont`'s height argument, or XML `<FontHeight>`.
+    pub(crate) height: bool,
+    /// `SetFont`'s flags argument, or XML `outline=`.
+    pub(crate) outline: bool,
+    /// `SetTextColor`/`SetVertexColor`, or a `<FontString><Color>`.
+    pub(crate) color: bool,
+    /// Reserved for a region-level shadow setter; XML `<Shadow>` on the FontString itself.
+    pub(crate) shadow: bool,
+    /// `SetJustifyH`, or XML `justifyH=`.
+    pub(crate) justify_h: bool,
+    /// `SetJustifyV`, or XML `justifyV=`.
+    pub(crate) justify_v: bool,
 }
 
 /// A cached host measurement of a FontString's laid-out text (see [`RegionData::measured`]).

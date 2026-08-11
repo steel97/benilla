@@ -16,6 +16,10 @@ use benilla_dbc::{DbcParser, FieldType, Schema, SchemaField};
 
 mod chain;
 pub use chain::{Chain, ChainEntry};
+/// Where the WoW install is — the one resolver (decision 1175). Paired with [`Chain`]: this says
+/// *where*, that opens it.
+mod install;
+pub use install::{candidates, wow_data};
 mod characters;
 pub use characters::{
     CharCreateCatalog, CharSections, CharacterGeosets, DialRanges, EquipGeosets, StartOutfitItem,
@@ -33,6 +37,8 @@ mod itemsets;
 pub use itemsets::{load_item_sets, ItemSetCatalog, ItemSetInfo};
 mod itembagfamily;
 pub use itembagfamily::{load_item_bag_families, ItemBagFamilyCatalog};
+mod itemclass;
+pub use itemclass::{load_item_classes, ItemClassCatalog};
 mod itemsubclass;
 pub use itemsubclass::{load_item_sub_classes, ItemSubClassCatalog, ItemSubClassInfo};
 mod factions;
@@ -41,6 +47,8 @@ pub use factions::{
 };
 mod creature_types;
 pub use creature_types::{load_creature_type_flags, CreatureTypeFlags};
+mod languages;
+pub use languages::{load_default_languages, DefaultLanguages};
 mod creature_families;
 pub use creature_families::{
     load_creature_families, load_pet_food_names, CreatureFamilies, CreatureFamily, PetFoodNames,
@@ -222,6 +230,10 @@ mod area_poi;
 pub use area_poi::{load_area_poi_catalog, AreaPoi, AreaPoiCatalog};
 mod area_table;
 pub use area_table::{load_area_table_catalog, AreaTableCatalog, AreaTableRow};
+mod chat_channels;
+pub use chat_channels::{
+    flags as chat_channel_flags, load_chat_channels_catalog, ChatChannelRow, ChatChannelsCatalog,
+};
 mod race_sound;
 pub use race_sound::{load_exploration_sound_catalog, ExplorationSoundCatalog};
 mod zone_map;
@@ -657,11 +669,7 @@ mod tests {
     /// reached for it mid-investigation. Skips without the client data.
     #[test]
     fn registered_dbc_schemas_dump_the_shipped_tables() {
-        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return;
-        }
+        let data = crate::wow_data_or_skip!();
         let mut chain = open_chain(&data).expect("open chain");
         let out = std::env::temp_dir().join("benilla-schema-registry-test.csv");
         for table in [

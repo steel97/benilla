@@ -49,7 +49,17 @@ impl FootstepCatalog {
     /// ground-effect layer. `None` = silence: no/unknown effect layer (the client's −1 sentinel,
     /// module docs), or no lookup row for `(class, terrain)`.
     pub fn resolve(&self, footstep_class: u32, effect_id: Option<u32>) -> Option<(u32, u32)> {
-        let terrain = self.effect_terrain.get(&effect_id?).copied()?;
+        self.resolve_terrain(
+            footstep_class,
+            self.effect_terrain.get(&effect_id?).copied()?,
+        )
+    }
+
+    /// The same `(dry, splash)` answer from a `TerrainType` id **directly**, skipping the
+    /// `GroundEffectTexture` hop. This is the tail both legs of the client's down-ray share: the
+    /// ADT leg reaches a terrain id through the ground-effect layer, the WMO leg carries one in
+    /// the surface itself.
+    pub fn resolve_terrain(&self, footstep_class: u32, terrain: u32) -> Option<(u32, u32)> {
         let sound_class = self.terrain_sound.get(&terrain).copied()?;
         self.lookup.get(&(footstep_class, sound_class)).copied()
     }
@@ -61,8 +71,30 @@ impl FootstepCatalog {
     pub fn leaves_footprints(&self, effect_id: Option<u32>) -> bool {
         effect_id
             .and_then(|e| self.effect_terrain.get(&e))
-            .and_then(|t| self.terrain_flags.get(t))
+            .is_some_and(|&t| self.terrain_leaves_footprints(t))
+    }
+
+    /// The same `TerrainType.Flags` bit 0 gate from a terrain id **directly** — the form both legs
+    /// of the down-ray share, since the WMO leg carries a terrain id rather than an effect layer.
+    /// Set on exactly Snow (3) and Sand (7) in the shipped data; the unauthored WMO default
+    /// `10 "None"` is clear, which is why a building's floor takes no prints.
+    pub fn terrain_leaves_footprints(&self, terrain: u32) -> bool {
+        self.terrain_flags
+            .get(&terrain)
             .is_some_and(|flags| flags & 1 != 0)
+    }
+
+    /// The `TerrainType` id under a ground-effect layer — the chain's first hop on its own.
+    /// Exposed for the `surface_here` probe, which has to show *where* the chain lands, and where
+    /// it falls off, not just the kit it ends at.
+    pub fn terrain_of(&self, effect_id: u32) -> Option<u32> {
+        self.effect_terrain.get(&effect_id).copied()
+    }
+
+    /// A `TerrainType`'s `SoundID` — the `FootstepTerrainLookup` axis the kit is chosen on.
+    /// Companion to [`Self::terrain_of`]; the same map [`Self::resolve`] walks.
+    pub fn sound_class_of(&self, terrain: u32) -> Option<u32> {
+        self.terrain_sound.get(&terrain).copied()
     }
 
     pub fn len(&self) -> usize {
@@ -172,21 +204,13 @@ pub fn load_footprint_textures(chain: &mut Chain) -> Result<HashMap<u32, String>
 mod tests {
     use super::*;
 
-    fn vanilla_data_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data")
-    }
-
     /// The full chain resolves on real 5875 data: a Metallic-terrain effect under footstep
     /// class 8 yields the byte-decoded kits (650 dry / 1063 splash); the humanoid class 7
     /// resolves the `CharacterMediumLarge*` kits (560 Dirt with no effect, 562 Grass on a
     /// grass-terrain effect — the character-in-Elwynn case); an unknown class stays silent.
     #[test]
     fn real_footstep_chain_resolves() {
-        let data = vanilla_data_dir();
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return;
-        }
+        let data = crate::wow_data_or_skip!();
         let mut chain = crate::open_chain(&data).expect("open chain");
         let cat = load_footstep_catalog(&mut chain).expect("load footstep catalog");
         assert_eq!(cat.len(), 179, "all lookup rows load");
@@ -237,11 +261,7 @@ mod tests {
     /// the `textures\Footsteps\*` ink paths.
     #[test]
     fn footprint_gate_and_textures_on_real_data() {
-        let data = vanilla_data_dir();
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return;
-        }
+        let data = crate::wow_data_or_skip!();
         let mut chain = crate::open_chain(&data).expect("open chain");
         let cat = load_footstep_catalog(&mut chain).expect("load footstep catalog");
         let printing: std::collections::BTreeSet<u32> = cat

@@ -1,6 +1,12 @@
 //! Footsteps (decision 0070 slice 3): the `$FSD` anim tag resolved through the terrain-type
-//! chain — `ground effect under the unit → TerrainType → × the unit's footstep class →
+//! chain — `surface under the unit → TerrainType → × the unit's footstep class →
 //! FootstepTerrainLookup → SoundEntries`.
+//!
+//! **The surface is [`benilla_world::surface`]'s to answer, not this module's** (decision 1161). It is the
+//! client's two-leg down-ray: a building that owns the column supplies its own floor's material,
+//! and only outdoors does the ADT ground-effect layer decide. Reading the ADT unconditionally is
+//! what put a snow crunch under the Kharanos inn's floorboards. `None` there is the reference's
+//! `−1` and means silent — never "ask the other leg".
 //!
 //! **Trigger: `$FSD` and nothing else** (decision 1080). A footfall is two disjoint channels in
 //! the client's event dispatcher `0x5ffbd0` — `$FSD → 0x623390` is the *sound*, the per-foot side
@@ -33,18 +39,14 @@
 use bevy::prelude::*;
 
 use benilla_assets::coords::bevy_to_wow;
-use benilla_assets::AdtTile;
 use benilla_formats::FootstepCatalog;
 
-use crate::assets::{AssetSet, LockRecover, WorldAssets};
 use crate::creature_anim::{is_footstep_sound, move_flags, AnimSoundEvent, MovementState};
 use crate::entities::CollisionHeight;
-use crate::liquid::{unit_claim, water_surface_at, WaterChunkInfo};
 use crate::net::{NetEntity, ObjectStore};
 use crate::player::swim_enter_depth;
-use crate::schedule::WorldStage;
-use crate::terrain_stream::{ground_effect_under, TerrainStreamer};
-use crate::wmo_portal::UnitWmoRoom;
+use benilla_assets::{AssetSet, LockRecover, WorldAssets};
+use benilla_world::schedule::WorldStage;
 
 use super::creature::CreatureVoices;
 use super::kit::{play_kit, KitRef, SoundCategory, SoundKits};
@@ -76,12 +78,7 @@ fn footstep_sounds(
     // GlobalTransform: a mounted unit's steps are the MOUNT model's own tags, fired by the
     // mount CHILD entity — whose local Transform is the seat-relative ~origin. World position
     // is the only correct read for both parented and top-level sources (0441 fold-back).
-    units: Query<(
-        &NetEntity,
-        &GlobalTransform,
-        Option<&CollisionHeight>,
-        Option<&UnitWmoRoom>,
-    )>,
+    units: Query<(&NetEntity, &GlobalTransform, Option<&CollisionHeight>)>,
     // The handler's state gates read the ROOT unit — a mount child's `$FSD` is the rider's
     // footfall, and it is the RIDER's stealth/hover/ghost the client tests (`0x623390`'s `this`
     // is the unit the mount model's event stream is registered against, wow-re
@@ -90,10 +87,7 @@ fn footstep_sounds(
     root_state: Query<(Option<&ObjectStore>, Option<&MovementState>)>,
     footsteps: Option<Res<Footsteps>>,
     voices: Option<Res<CreatureVoices>>,
-    streamer: Res<TerrainStreamer>,
-    adt_tiles: Res<Assets<AdtTile>>,
-    water: Query<&WaterChunkInfo>,
-    placements: crate::liquid::RoomPlacements,
+    world: benilla_world::world_point::WorldPoint,
     kits: Option<ResMut<SoundKits>>,
     assets: Option<Res<WorldAssets>>,
     mut out: NonSendMut<SoundOutput>,
@@ -113,7 +107,7 @@ fn footstep_sounds(
         if !is_footstep_sound(&ev.ident) {
             continue;
         }
-        let Ok((net, transform, collision, room)) = units.get(ev.entity) else {
+        let Ok((net, transform, collision)) = units.get(ev.entity) else {
             continue;
         };
         // The three state gates, on the root unit (module docs): hover · stealth · player ghost.
@@ -138,17 +132,24 @@ fn footstep_sounds(
         };
         // Wading picks the splash slot; swimming (deeper than the wade ceiling) is silent.
         let wow = bevy_to_wow(transform.translation());
-        // The unit's own room claim (0696) — it used to pass "no claim", so every unit walking
-        // under an ADT lake picked the splash slot on dry indoor stone.
-        let depth = water_surface_at(water.iter(), wow, unit_claim(room, &placements))
+        // The unit's own room claim (0696) — before it, every unit walking under an ADT lake
+        // picked the splash slot on dry indoor stone.
+        let who = benilla_world::world_point::Subject::Unit(ev.entity);
+        let depth = world
+            .water_surface_at(who, wow)
             .map(|s| s - wow[2])
             .filter(|d| *d > 0.0);
         let wade_max = swim_enter_depth(collision.copied().unwrap_or_default().0);
         if depth.is_some_and(|d| d > wade_max) {
             continue;
         }
-        let effect = ground_effect_under(&streamer, &adt_tiles, transform.translation());
-        let Some((dry, splash)) = footsteps.0.resolve(class, effect) else {
+        // What is under the foot — the WMO leg when a building owns this column, the ADT ground
+        // effect otherwise ([`benilla_world::surface`]). `None` is the client's −1: silent, and never a
+        // reason to fall back to the ground beneath a floor.
+        let Some(terrain) = world.terrain_type(&footsteps.0, who, transform.translation()) else {
+            continue;
+        };
+        let Some((dry, splash)) = footsteps.0.resolve_terrain(class, terrain) else {
             continue; // no row for this class/terrain: silent (ethereal classes)
         };
         let kit = match depth {
@@ -158,6 +159,15 @@ fn footstep_sounds(
         if kit == 0 {
             continue;
         }
+        // Which leg answered, and what it said. The wrong-surface family is invisible in the kit
+        // name alone once two legs can produce one (a `*Dirt` step is right indoors and wrong on a
+        // dirt road ten yards away), so the next report should not need a DBC dump to triage.
+        debug!(
+            "footstep: {} terrain {terrain} class {class} kit {kit}",
+            world
+                .room_group(who)
+                .map_or_else(|| "adt".to_string(), |g| format!("wmo g{g}"))
+        );
         if let Err(e) = play_kit(
             &mut kits,
             &assets,

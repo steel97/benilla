@@ -1,5 +1,5 @@
 //! **Footprint decals** — the prints a walking unit leaves on snow and sand (B212, decisions
-//! 1006/1012): the fourth client of the shared surface-decal projector ([`crate::decal`]), drawn
+//! 1006/1012): the fourth client of the shared surface-decal projector ([`benilla_world::decal`]), drawn
 //! on the shared effect stream like the blob shadow, but **spawn-once**: a print is projected the
 //! frame its foot plants and the cached triangles replay every frame until the fade retires it —
 //! exactly the reference's own shape (baked once at spawn over collector-gathered ground
@@ -7,8 +7,11 @@
 //!
 //! **The mechanism — wow-re §5 cross-checked** (`footprint-decals.md`, folded back in 1012):
 //! - **Surface gate**: `TerrainType.Flags & 1` (`0x699eb6`) — set on exactly **Snow** and
-//!   **Sand** — resolved under the unit through the same ground-effect → TerrainType chain the
-//!   footstep sounds ride ([`benilla_formats::FootstepCatalog::leaves_footprints`]).
+//!   **Sand** — on the surface [`benilla_world::surface`] resolves under the unit, the *same* value the
+//!   footstep sound uses. The reference resolves it once per unit into `CGUnit+0xc60` and the
+//!   decal, the spray and `$FSD` all read that one dword (wow-re `wmo-footstep-surface.md` F3), so
+//!   indoors the gate reads the building's own floor: a tavern's floorboards take no prints while
+//!   the snow outside its door does (decision 1161).
 //! - **Trigger**: each per-foot animation event tag (`$xL*`/`$xR*`; the same [`AnimSoundEvent`]
 //!   stream the sounds read). **`$FSD` is sound-only** — a quadruped whose run authors only
 //!   `$FSD` leaves no prints, faithfully. Position = the event record's authored offset through
@@ -41,26 +44,18 @@
 
 use std::collections::VecDeque;
 
-use avian3d::prelude::Collider;
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
-use benilla_assets::AdtTile;
-
-use crate::assets::{AssetSet, LockRecover, WorldAssets};
-use crate::blob_shadow::SHADOW_RASTER_BIAS;
-use crate::collision::GroundDecalSurface;
 use crate::creature_anim::{footfall_side, move_flags, AnimSoundEvent, MovementState};
-use crate::decal::{project_decal, DecalFrame};
 use crate::entities::{BoneAttach, Creatures};
 use crate::net::{NetEntity, ObjectStore, SelfPlayer};
-use crate::particles::buffer::{
-    begin_effect_frame, EffectBlend, EffectDrawSpec, EffectFog, EffectQuads, EffectVertex,
-};
-use crate::player::WorldCamera;
-use crate::schedule::WorldStage;
 use crate::sound::footsteps::Footsteps;
-use crate::terrain_stream::{ground_effect_under, TerrainStreamer};
+use benilla_assets::{AssetSet, LockRecover, WorldAssets};
+use benilla_world::decal::{DecalFrame, WorldDecal};
+use benilla_world::particles::buffer::{begin_effect_frame, EffectVertex};
+use benilla_world::schedule::WorldStage;
+use benilla_world::view::WorldCamera;
 
 /// Print lifetime, spawn to gone — the reference's 6000 ms (byte-verified, wow-re
 /// `footprint-decals.md`: `t = 1 − age/6000`, die at `t < 0`).
@@ -179,9 +174,8 @@ fn spawn_footprints(
     footsteps: Option<Res<Footsteps>>,
     creatures: Option<Res<Creatures>>,
     ink: Option<Res<FootprintInk>>,
-    streamer: Res<TerrainStreamer>,
-    adt_tiles: Res<Assets<AdtTile>>,
-    surfaces: Query<&Collider, With<GroundDecalSurface>>,
+    world: benilla_world::world_point::WorldPoint,
+    decals: WorldDecal,
     mut prints: ResMut<Footprints>,
 ) {
     if events.is_empty() {
@@ -243,11 +237,17 @@ fn spawn_footprints(
         {
             continue;
         }
-        // The surface gate, read under the foot itself (a beach edge prints per-foot).
-        if !footsteps
-            .0
-            .leaves_footprints(ground_effect_under(&streamer, &adt_tiles, foot))
-        {
+        // The surface gate, on the SAME terrain type the footstep sound used: the reference
+        // resolves it once per unit (`CGUnit+0xc60`) and the decal, the spray and `$FSD` all read
+        // that one dword (wow-re `wmo-footstep-surface.md` F3). So this reads the UNIT's surface,
+        // not a per-foot sample of the ground — indoors that is the building's own floor, which is
+        // why a tavern's floorboards take no prints while the snow outside its door does.
+        let terrain = world.terrain_type(
+            &footsteps.0,
+            benilla_world::world_point::Subject::Unit(ev.entity),
+            transform.translation(),
+        );
+        if !terrain.is_some_and(|t| footsteps.0.terrain_leaves_footprints(t)) {
             continue;
         }
         // Print frame: length along the unit's facing, width across, yawed to the facing.
@@ -279,9 +279,8 @@ fn spawn_footprints(
         };
         let mirror = side == b'R';
         let mut verts = Vec::new();
-        let projected = project_decal(
+        let projected = decals.project(
             &mut verts,
-            &surfaces,
             &frame,
             |_| 1.0,
             |x, z| {
@@ -342,7 +341,7 @@ fn push_footprints(
     time: Res<Time>,
     cam: Query<Entity, With<WorldCamera>>,
     lane: Option<Res<FootprintLane>>,
-    mut quads: ResMut<EffectQuads>,
+    mut draw: benilla_world::particles::buffer::WorldEffectDraw,
     mut prints: ResMut<Footprints>,
 ) {
     let now = time.elapsed_secs();
@@ -359,26 +358,19 @@ fn push_footprints(
     let Some(lane) = lane else { return };
     for print in prints.own.iter().chain(prints.shared.iter()) {
         let alpha = fade(now - print.spawned);
-        let start = quads.begin();
-        quads.verts.extend(print.verts.iter().map(|v| EffectVertex {
+        let mut batch = draw
+            .batch(cam, print.texture)
+            .anchored(print.anchor)
+            .rung(
+                PRINT_SORT_BIAS,
+                benilla_world::sky_order::Rung::SHADOW_RASTER,
+            )
+            .owner(lane.0);
+        batch.extend(print.verts.iter().map(|v| EffectVertex {
             color: [v.color[0], v.color[1], v.color[2], v.color[3] * alpha],
             ..*v
         }));
-        quads.commit_tris(
-            start,
-            EffectDrawSpec {
-                cam,
-                texture: print.texture,
-                blend: EffectBlend::Alpha,
-                fog: EffectFog::Off,
-                lit: false,
-                anchor: print.anchor,
-                bias: PRINT_SORT_BIAS,
-                raster_bias: SHADOW_RASTER_BIAS,
-                main_entity: lane.0,
-                light: None,
-            },
-        );
+        batch.tris();
     }
 }
 

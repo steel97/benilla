@@ -3,22 +3,11 @@
 //! Skips (passes) when the client isn't present, so CI without assets stays green.
 //! Document: place a legally-owned 1.12.1 client's `Data` dir at the repo root `WoW/`.
 
-use std::path::PathBuf;
-
 use benilla_formats::{open_chain, Chain};
-
-fn vanilla_data_dir() -> PathBuf {
-    // crates/benilla-formats -> repo root -> WoW/Data
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data")
-}
 
 #[test]
 fn reads_spell_dbc_from_vanilla_chain() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
 
@@ -37,11 +26,7 @@ fn reads_spell_dbc_from_vanilla_chain() {
 
 #[test]
 fn resolves_and_reads_across_archive_types() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     // One `Chain` (the `&self` AssetReader backend and the `&mut` streaming loaders are now the same
     // type) must resolve and read across archive kinds — DBC (dbc/patch.MPQ), a UI BLP, and a
@@ -67,11 +52,7 @@ fn resolves_and_reads_across_archive_types() {
 
 #[test]
 fn culls_constant_zero_alpha_m2_batches() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
 
     // OrgrimmarFloatingEmbers' only render batch is an 84-yd box with a transparency-weight track of
@@ -103,11 +84,7 @@ fn culls_constant_zero_alpha_m2_batches() {
 
 #[test]
 fn suppresses_white1_invisible_trap_placeholder() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
 
     // The `SpellObject_InvisibleTrap` placeholder (GameObject displayId 1287 — Fire-Festival fury zones,
@@ -141,11 +118,7 @@ fn suppresses_white1_invisible_trap_placeholder() {
 
 #[test]
 fn decodes_a_blp_icon_to_png() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let bytes = chain
@@ -163,11 +136,7 @@ fn decodes_a_blp_icon_to_png() {
 
 #[test]
 fn dumps_taxinodes_to_csv() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let bytes = chain
@@ -194,11 +163,7 @@ fn dumps_taxinodes_to_csv() {
 
 #[test]
 fn meshes_an_elwynn_terrain_tile() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let (tx, ty) = benilla_formats::find_tile_near(&mut chain, "Azeroth", -8840.56, 489.7)
@@ -311,11 +276,7 @@ fn meshes_an_elwynn_terrain_tile() {
 
 #[test]
 fn terrain_chunks_carry_unit_upward_mcnr_normals() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let (tx, ty) = benilla_formats::find_tile_near(&mut chain, "Azeroth", -8840.56, 489.7)
@@ -378,11 +339,7 @@ fn terrain_chunks_carry_unit_upward_mcnr_normals() {
 ///    the 0.01% ceiling below still catches loudly.
 #[test]
 fn terrain_fans_wind_ccw_seen_from_above() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let (tx, ty) = benilla_formats::find_tile_near(&mut chain, "Azeroth", -8840.56, 489.7)
@@ -437,11 +394,7 @@ fn terrain_fans_wind_ccw_seen_from_above() {
 
 #[test]
 fn terrain_is_watertight_at_chunk_seams() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let (tx, ty) = benilla_formats::find_tile_near(&mut chain, "Azeroth", -8840.56, 489.7)
@@ -491,11 +444,7 @@ fn terrain_is_watertight_at_chunk_seams() {
 
 #[test]
 fn loads_a_block_of_elwynn_tiles() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let tiles = benilla_formats::load_tiles_around(&mut chain, "Azeroth", -8840.56, 489.7, 1)
@@ -514,11 +463,7 @@ fn loads_a_block_of_elwynn_tiles() {
 
 #[test]
 fn reads_and_decodes_a_terrain_texture() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let (tx, ty) = benilla_formats::find_tile_near(&mut chain, "Azeroth", -8840.56, 489.7)
@@ -540,11 +485,7 @@ fn reads_and_decodes_a_terrain_texture() {
 
 #[test]
 fn resolves_creature_models_from_dbcs() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let catalog =
@@ -590,11 +531,7 @@ fn resolves_creature_models_from_dbcs() {
 
 #[test]
 fn resolves_gameobject_models_from_dbc() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let catalog = benilla_formats::load_gameobject_catalog(&mut chain)
@@ -627,11 +564,7 @@ fn resolves_gameobject_models_from_dbc() {
 
 #[test]
 fn loads_classic_models_with_cosmetic_chunks() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     // These vanilla M2s aborted `parse_m2` with "failed to fill whole buffer" on stock wow-m2 0.6.4
@@ -665,11 +598,7 @@ fn span3(ps: &[[f32; 3]]) -> [f32; 3] {
 
 #[test]
 fn decodes_m2_collision_hulls() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
 
     // Golden vectors hand-verified against the raw bytes 2026-06-02. The
@@ -733,11 +662,7 @@ fn decodes_m2_collision_hulls() {
 
 #[test]
 fn filters_wmo_collidable_triangles_by_mopy() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
 
     // Golden vector: the binary-verified client filter (collide iff `!(flags & 0x04 DETAIL)`,
@@ -779,11 +704,7 @@ fn filters_wmo_collidable_triangles_by_mopy() {
 
 #[test]
 fn derives_the_wmo_window_glass_law_from_momt() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
 
     // Golden vectors for the three MOMT window/glass mechanisms (wow-re `wmo-lit-selector` §1,
@@ -849,11 +770,7 @@ fn derives_the_wmo_window_glass_law_from_momt() {
 
 #[test]
 fn reads_authentic_atmosphere_from_light_dbc() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let cat = benilla_formats::LightCatalog::load(&mut chain).expect("load Light DBCs");
 
@@ -923,11 +840,7 @@ fn reads_authentic_atmosphere_from_light_dbc() {
 /// the reference's constant ~33% near veil under rain. A clamp regression here silently kills the veil.
 #[test]
 fn reads_elwynn_storm_fog_endpoints() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let cat = benilla_formats::LightCatalog::load(&mut chain).expect("load Light DBCs");
 
@@ -961,11 +874,7 @@ fn reads_elwynn_storm_fog_endpoints() {
 
 #[test]
 fn reads_map_directories_from_map_dbc() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let cat = benilla_formats::load_map_catalog(&mut chain).expect("load Map.dbc");
 
@@ -985,11 +894,7 @@ fn reads_map_directories_from_map_dbc() {
 
 #[test]
 fn decodes_azeroth_wdl_against_apitrace_ground_truth() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
 
     // Eastern Kingdoms distant-terrain heightmap.
@@ -1052,11 +957,7 @@ fn decodes_azeroth_wdl_against_apitrace_ground_truth() {
 /// view — dense fiery orange and dense pure green — which a wrong pair of row numbers would not.
 #[test]
 fn magma_and_slime_submersion_read_the_fixed_global_light_params() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let cat = benilla_formats::LightCatalog::load(&mut chain).expect("load Light DBCs");
     let to255 = |c: [f32; 3]| {
@@ -1189,11 +1090,7 @@ fn magma_and_slime_submersion_read_the_fixed_global_light_params() {
 /// Weazel's Crater; this pins the window at the coordinates they reported.
 #[test]
 fn the_wdl_window_contains_the_cameras_own_tile() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
     let wdl = benilla_formats::WdlFile::load(&mut chain, "Kalimdor").expect("load Kalimdor.wdl");
 
@@ -1235,11 +1132,7 @@ fn the_wdl_window_contains_the_cameras_own_tile() {
 /// case rather than passing on an absent file.
 #[test]
 fn tombstoned_paths_never_fall_through_to_the_base_copy() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
 
     // Tombstoned by `patch.MPQ`; still present, in full, in `model.MPQ` (measured: 386416 / 437456).
     const DELETED: [&str; 2] = [
@@ -1296,11 +1189,7 @@ fn tombstoned_paths_never_fall_through_to_the_base_copy() {
 /// roots name a skybox no group ever asks for (`benilla-extract skyboxscan`).
 #[test]
 fn reads_the_wmo_skybox_and_its_per_group_gate() {
-    let data = vanilla_data_dir();
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = open_chain(&data).expect("open vanilla patch chain");
 
     let city = chain
@@ -1337,4 +1226,98 @@ fn reads_the_wmo_skybox_and_its_per_group_gate() {
         0,
         "and not one of its groups asks for one"
     );
+}
+
+/// **The footstep chain's WMO leg, on the shipped bytes** (decision 1161, bug B236's sequel).
+///
+/// `MOMT+0x20` is a `TerrainType.dbc` id, and this is the evidence for that claim rather than a
+/// format doc: across every root WMO in the archive the dword only ever takes ids the table
+/// actually has, and `10 "None"` — the unauthored default — dominates. The Kharanos inn is the
+/// reported case: it authors `None` on all 20 materials, so the reference gives a walker its
+/// generic dry kit and NO footprint, where reading the ADT beneath the floor gives snow and snow
+/// prints.
+#[test]
+fn wmo_ground_type_is_a_terrain_type_id() {
+    let data = benilla_formats::wow_data_or_skip!();
+    let mut chain = open_chain(&data).expect("open vanilla patch chain");
+    let cat = benilla_formats::load_footstep_catalog(&mut chain).expect("footstep catalog");
+
+    // The Kharanos inn ("Thunderbrew Distillery" is the AREA name; the model is snow_Inn).
+    let inn = chain
+        .read_file("World\\wmo\\KhazModan\\Buildings\\Dwarven_Inn\\snow_Inn\\Snow_Inn.wmo")
+        .expect("the Kharanos inn root");
+    let inn = benilla_formats::parse_wmo_root(&inn).expect("inn root parses");
+    let ground = inn.material_ground_types();
+    assert_eq!(ground.len(), 20, "the inn's material count");
+    assert!(
+        ground.iter().all(|&g| g == 10),
+        "every Kharanos inn material is the unauthored `None`: {ground:?}"
+    );
+
+    // `None` is not silence — it is a real row, and it is the quiet generic step.
+    assert_eq!(
+        cat.sound_class_of(10),
+        Some(0),
+        "TerrainType 10 -> SoundID 0"
+    );
+    assert!(
+        !cat.terrain_leaves_footprints(10),
+        "a WMO floor takes no prints"
+    );
+    assert!(
+        cat.terrain_leaves_footprints(3) && cat.terrain_leaves_footprints(7),
+        "Snow and Sand are the print surfaces"
+    );
+    assert_eq!(
+        cat.resolve_terrain(7, 10).map(|(dry, _)| dry),
+        Some(560),
+        "class 7 indoors: CharacterMediumLargeDirt"
+    );
+    assert_eq!(
+        cat.resolve_terrain(7, 3).map(|(dry, _)| dry),
+        Some(563),
+        "class 7 on snow: CharacterMediumLargeSnow — what the ADT-only chain wrongly played inside"
+    );
+
+    // The value-domain argument, over every root WMO in the archive: nothing outside the table.
+    let roots: Vec<String> = chain
+        .list()
+        .expect("chain listing")
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".wmo")
+                && !l
+                    .strip_suffix(".wmo")
+                    .and_then(|s| s.rsplit('_').next())
+                    .is_some_and(|t| t.len() == 3 && t.chars().all(|c| c.is_ascii_digit()))
+        })
+        .collect();
+    assert_eq!(roots.len(), 815, "root WMOs in the 5875 archive");
+    let (mut total, mut none, mut multi) = (0usize, 0usize, 0usize);
+    for name in &roots {
+        let Ok(bytes) = chain.read_file(name) else {
+            continue;
+        };
+        let Ok(root) = benilla_formats::parse_wmo_root(&bytes) else {
+            continue;
+        };
+        let g = root.material_ground_types();
+        for &v in &g {
+            assert!(
+                cat.sound_class_of(v).is_some(),
+                "{name}: ground_type {v} is not a TerrainType id"
+            );
+            total += 1;
+            none += usize::from(v == 10);
+        }
+        multi += usize::from(g.iter().collect::<std::collections::HashSet<_>>().len() > 1);
+    }
+    assert_eq!(
+        (total, none),
+        (10_299, 10_075),
+        "the 5875 ground_type census"
+    );
+    assert_eq!(multi, 121, "roots authoring more than one surface");
 }

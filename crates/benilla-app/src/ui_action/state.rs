@@ -23,6 +23,7 @@
 //! §2a fold-back: reagents, forms, stealth, aura states (the Execute-family target dependence),
 //! the works.
 
+use crate::ui_items::{count_of, InventoryScope};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -55,7 +56,7 @@ pub(super) struct StateMemory {
     last_generation: Option<u64>,
     engaged: bool,
     auto_repeat: Option<u32>,
-    /// Last `dbg_trace` "cd tick" stamp — the once-per-second gate (trace runs only).
+    /// Last `benilla_assets::trace` "cd tick" stamp — the once-per-second gate (trace runs only).
     last_cd_trace: Option<Instant>,
 }
 
@@ -334,7 +335,7 @@ pub(super) fn feed_action_state(
     let gen_changed = memory.last_generation != Some(cooldowns.generation);
     memory.last_generation = Some(cooldowns.generation);
     // The cooldown-clock trace (`WOW_MOVE_TRACE` sink, tag "cd"): once per second.
-    let trace_cd = crate::dbg_trace::enabled()
+    let trace_cd = benilla_assets::trace::enabled()
         && memory
             .last_cd_trace
             .is_none_or(|t| now.duration_since(t).as_secs_f32() >= 1.0);
@@ -443,7 +444,7 @@ pub(super) fn feed_action_state(
                 if st.cooldown.is_some() && trace_cd {
                     // The store (Instant clock) vs the widget (GetTime clock) — the sink
                     // stamps the wall time, so drift between the two clocks reads directly.
-                    crate::dbg_trace::line(
+                    benilla_assets::trace::line(
                         "cd",
                         &format!(
                             "tick action={} rem={}ms dur={}ms engine_now={ui_now:.3}",
@@ -460,7 +461,9 @@ pub(super) fn feed_action_state(
                 // put a stack number under a mount (Class 15) on the bar.
                 st.consumable = template.as_ref().is_some_and(|t| t.is_consumable());
                 let count = me
-                    .map(|(s, _, _, _)| crate::ui_items::count_of(&s.0, &items, button.action))
+                    .map(|(s, _, _, _)| {
+                        count_of(&s.0, &items, button.action, InventoryScope::CARRIED)
+                    })
                     .unwrap_or(0);
                 // Worn on any equipment slot (0..18) — the green border's IsEquippedAction.
                 st.equipped = me.is_some_and(|(s, _, _, _)| {
@@ -511,8 +514,8 @@ pub(super) fn feed_action_state(
         if (n.current, n.auto_repeat) != (o.current, o.auto_repeat) {
             state_changed = true;
         }
-        if n.cooldown != o.cooldown && crate::dbg_trace::enabled() {
-            crate::dbg_trace::line(
+        if n.cooldown != o.cooldown && benilla_assets::trace::enabled() {
+            benilla_assets::trace::line(
                 "cd",
                 &format!(
                     "push action={action} cooldown={:?} engine_now={:.3}",
@@ -869,11 +872,7 @@ mod tests {
     /// Skips without client data.
     #[test]
     fn the_water_bits_split_the_5875_data_the_way_the_gate_assumes() {
-        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-        if !data.is_dir() {
-            eprintln!("skipping: vanilla client not present at {}", data.display());
-            return;
-        }
+        let data = benilla_formats::wow_data_or_skip!();
         let mut chain = benilla_formats::open_chain(&data).expect("open chain");
         let catalog = benilla_formats::load_spell_catalog(&mut chain).expect("Spell.dbc");
 

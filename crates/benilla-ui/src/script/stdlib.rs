@@ -38,19 +38,51 @@ pub(super) fn sandbox(lua: &Lua) -> mlua::Result<()> {
         g.set(name, Value::Nil)?;
     }
 
-    // A `debugstack` stub: real addons call it in error paths; returning "" keeps them running.
+    // `debugstack([start [, count1 [, count2]]])` — a REAL traceback, not the `""` stub this used
+    // to be.
+    //
+    // The stub was justified as "real addons call it in error paths; returning \"\" keeps them
+    // running", and that was true of the addons that only ever DISPLAY it. It is false of the ones
+    // that PARSE it, and the biggest family in the corpus is one of those: `FuBarPlugin-2.0.lua:752`
+    // derives every plugin's own folder with
+    // `string.find(debugstack(6, 1, 0), "\\AddOns\\(.*)\\")`, then formats the capture into an
+    // icon path. Against `""` the find returns nil, `folderName` stays nil, and the plugin dies in
+    // `format` — 20 corpus addons, every one of them a FuBar plugin, and the error surfaced as a
+    // `format` complaint three frames away from the cause.
+    //
+    // `start` is the stack level to begin at and defaults to 1, matching the client's own callers
+    // (`debugstack(6, 1, 0)` walks past FuBar's own wrapper frames to the plugin file). The two
+    // count arguments bound how many frames are shown at the top and bottom; mlua's traceback does
+    // not take them, so they are accepted and ignored — stated rather than silently dropped, and
+    // harmless because every corpus caller passes a shape whose whole purpose is "give me the
+    // frames", never an exact line count.
     g.set(
         "debugstack",
-        lua.create_function(|_, _: Variadic<Value>| Ok(String::new()))?,
+        lua.create_function(|lua, args: Variadic<Value>| {
+            let start = match args.first() {
+                Some(Value::Integer(i)) => *i as usize,
+                Some(Value::Number(n)) => *n as usize,
+                _ => 1,
+            };
+            // A level past the top of the stack is not an error here, it is an empty trace — the
+            // same shape the old stub returned, so a caller that guessed too deep still gets a
+            // string rather than a raise.
+            Ok(lua
+                .traceback(None, start)
+                .and_then(|t| t.to_str().map(|s| s.to_owned()))
+                .unwrap_or_default())
+        })?,
     )?;
 
     // Text-only `loadstring`: compile a *source* string (never bytecode). Returns `function` on
     // success or `(nil, errmsg)` on failure — the stock `loadstring` contract. `set_mode(Text)`
     // makes mlua reject a binary chunk (the `\27Lua` signature), the "loadstring of bytecode
     // rejected" guarantee.
+    // The BOM strip and the `#`-line skip ride along, because in the reference they live *inside*
+    // `luaL_loadbuffer`/`luaX_setinput` — the same door `loadstring` goes through (decision 1193).
     let loadstring = lua.create_function(
         |lua, (src, chunkname): (mlua::String, Option<mlua::String>)| {
-            let bytes = src.as_bytes().to_vec();
+            let bytes = crate::source::chunk(&src.as_bytes()).to_vec();
             let name = match &chunkname {
                 Some(n) => format!("={}", n.to_str()?),
                 None => "=(loadstring)".to_string(),
@@ -72,6 +104,26 @@ pub(super) fn sandbox(lua: &Lua) -> mlua::Result<()> {
 
 /// Install the WoW stdlib layer (aliases, `strsplit` family, positional `format`, …).
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
+    // The default `geterrorhandler()` reports into the same channel a failed handler uses, so an
+    // addon's `geterrorhandler()(msg)` surfaces where every other script error does rather than
+    // vanishing (decision 1195). Named with the `__benilla_` prefix because it is host plumbing,
+    // not a 1.12 global — the reference's default handler is FrameXML's `_ERRORMESSAGE`.
+    lua.globals().set(
+        "__benilla_script_error",
+        lua.create_function(|lua, msg: mlua::Value| {
+            let text = match &msg {
+                mlua::Value::String(s) => s.to_string_lossy(),
+                other => format!("{other:?}"),
+            };
+            lua.app_data_mut::<super::Model>()
+                .expect("model app_data")
+                .errors
+                .push(text);
+            Ok(())
+        })?,
+    )?;
+
+    install_time(lua)?;
     lua.load(WOW_STDLIB)
         .set_name("=[benilla wow stdlib]")
         .set_mode(mlua::ChunkMode::Text)
@@ -82,17 +134,29 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 /// The stdlib layer, in Lua. One place, so each alias is the one-liner the task calls for and the
 /// `format`/`strsplit` logic is readable. Runs once at construction.
 const WOW_STDLIB: &str = r#"
--- ── the nine probe-found bare-global aliases (+ strlower/strrep) ────────────────────────────────
+-- ── the bare string family ─────────────────────────────────────────────────────────────────────
+-- Every name here is present in the REAL 1.12 client's global table — the in-world `_G` captured
+-- from the running reference client (wow-5875-re's item-13 fixture, 19,572 entries), which is the
+-- authority this file now answers to (decision 1189).
+--
+-- 1187 also installed `strmatch`, `strrev`, `gmatch`, `strlenutf8` and `strcmputf8i` from
+-- Blizzard's *Era* enumeration, to get a Classic Era addon further. **None of them exist in
+-- 1.12** — `string.match`/`gmatch` are Lua 5.1 additions the 5.0 client never had — and Era is
+-- not our target. They are gone; adding a global the client does not have is how an addon that
+-- feature-detects gets sent down a path we cannot honour.
 strlen  = string.len
 strsub  = string.sub
 strupper = string.upper
 strlower = string.lower
 strrep  = string.rep
 strfind = string.find
+strbyte = string.byte
+strchar = string.char
 gsub    = string.gsub
 tinsert = table.insert
 tremove = table.remove
-getn    = table.getn or function(t) return #t end
+-- `getn`, `sort`, `foreach` and `foreachi` are bound by `lua50` (decision 1194), which owns the
+-- 5.0 shapes of `table.getn`/`setn` and must not be shadowed by a second implementation here.
 
 -- ── the bare math aliases (the same 1.12 global family; the reference FrameXML uses them
 -- unqualified — WorldMapFrame's overlay pool calls ceil/mod, CooldownFrame floor, …). `mod` is
@@ -103,8 +167,13 @@ abs   = math.abs
 max   = math.max
 min   = math.min
 sqrt  = math.sqrt
-mod   = math.fmod
+mod   = math.mod        -- 5.0's name for fmod; `math.fmod` is removed by `lua50` (decision 1194)
 random = math.random
+-- `randomseed` is an ENGINE global in 1.12 exactly like `random` beside it (the captured `_G` types
+-- both `function engine`), and it is the half that was missing: `IgniteStatus` calls it at file
+-- scope in its OnLoad and dies on `attempt to call global 'randomseed'`. Seeding a PRNG is the one
+-- thing an addon does that has no FrameXML counterpart to copy, so the bare name is all it has.
+randomseed = math.randomseed
 -- `PI` is an ENGINE global in 1.12, not a FrameXML one: the reference reads it bare (UIParent.lua's
 -- `elapsedTime * 2 * PI * ROTATIONS_PER_SECOND`, TabardFrame.lua l.61-68) and no shipped FrameXML
 -- file ever assigns it (grepped over the whole 1.12 extraction) — so the client supplies it, here,
@@ -116,6 +185,67 @@ function sin(d) return math.sin(math.rad(d)) end
 function cos(d) return math.cos(math.rad(d)) end
 rad = math.rad
 deg = math.deg
+-- The rest of the bare math family, each verified present in the real 1.12 client's global
+-- table (decision 1189's captured `_G`; 1187 had reached for Blizzard's Era enumeration).
+-- `tan` and the inverses follow sin/cos into DEGREES — same family, same convention; that is
+-- consistent-with the verified sin/cos finding rather than separately byte-verified, and it is
+-- the convention every addon rotation helper assumes (`atan2` returning degrees is why
+-- `atan2(dy, dx)` feeds a texture rotation directly).
+function tan(d) return math.tan(math.rad(d)) end
+function asin(x) return math.deg(math.asin(x)) end
+function acos(x) return math.deg(math.acos(x)) end
+function atan(x) return math.deg(math.atan(x)) end
+function atan2(y, x) return math.deg(math.atan2(y, x)) end
+exp = math.exp
+log = math.log
+log10 = math.log10
+frexp = math.frexp
+ldexp = math.ldexp
+
+-- ── the debug* family: six verified STUBS and two real ones ────────────────────────────────────
+--
+-- wow-re carved all eight (`system/ui/scratch/lua-dialect.md` §3a, and the 2026-08-11 batch):
+-- `debuginfo`, `debugload`, `debugprint`, `debugdump`, `debugbreak` and `debugtimestamp` are
+-- **byte-identical `xor eax,eax; ret` stubs** — three bytes, no `call`, no memory write. They
+-- cannot print, log, write or set a global, and they return ZERO Lua values. So these are not
+-- no-ops we invented under a real name (the "absent capability" class 1203 named); they are the
+-- reference's own no-ops, transcribed.
+--
+-- That is what lets `BasicControls.xml` stop guarding its `debuginfo()` call and transcribe
+-- `_ERRORMESSAGE` verbatim, which it now does.
+--
+-- `debugprofilestart`/`debugprofilestop` are the two that are REAL (RDTSC via `0x4293d0`): start
+-- latches, stop answers the elapsed milliseconds since it. Modelled on `GetTime`'s own clock —
+-- the same monotonic session seconds the tick advances — because benilla has no cycle counter and
+-- an addon uses these to time its own work, which milliseconds answer honestly.
+do
+    local function noop() end
+    debuginfo = noop
+    debugload = noop
+    debugprint = noop
+    debugdump = noop
+    debugbreak = noop
+    debugtimestamp = noop
+
+    local profileStart = 0
+    function debugprofilestart() profileStart = GetTime() end
+    function debugprofilestop() return (GetTime() - profileStart) * 1000 end
+end
+
+-- ── the error handler (decision 1195) ──────────────────────────────────────────────────────────
+-- `seterrorhandler(f)` / `geterrorhandler()` are ENGINE globals in 1.12 (the captured `_G` says
+-- so), and `_ERRORMESSAGE` — the default handler they start out holding — is FrameXML's. That
+-- split is why the pair lives here and the default is a plain function rather than a Rust binding:
+-- our own transcribed UI can replace it exactly as the reference's `UIErrorsFrame` does.
+--
+-- The idiom this exists for is `geterrorhandler()(msg)` — an addon's pcall wrapper reporting a
+-- caught error the way the client would. Without the pair that line is `attempt to call a nil
+-- value` INSIDE an error path, which turns a recoverable addon fault into a dead addon.
+do
+    local handler = function(msg) __benilla_script_error(msg) end
+    function seterrorhandler(f) handler = f end
+    function geterrorhandler() return handler end
+end
 
 -- ── _G accessors (RF-0023 getglobal/setglobal: _G[name] get/set) ───────────────────────────────
 function getglobal(name) return _G[name] end
@@ -289,3 +419,173 @@ do
     format = reformat
 end
 "#;
+
+/// `time()` and `date([format [, when]])` — engine globals in the 1.12 client's own `_G`, slots 34
+/// and 33 of its base registry (`0x7035a0` / `0x7033a0`, wow-re `lua-dialect.md`).
+///
+/// They are Lua 5.0's `os.time`/`os.date` hoisted to globals, and we lacked both because the
+/// sandbox strips `os` wholesale. `time` was the top name in the session-start
+/// `attempt to call global` row (6 addons); `date` is a handful more. Every corpus `time()` site is
+/// the same shape — an epoch stamp persisted into SavedVariables and compared across sessions
+/// (`FTC_Save[k].LastCheck = time()`) — so it has to be real wall-clock seconds, not a
+/// session-relative clock like `GetTime`.
+///
+/// **UTC, and that is a stated divergence.** `os.date` uses LOCAL time and this uses UTC, because
+/// resolving a local offset needs a timezone database and this tree has no date dependency at all
+/// (deliberately — the format crates here are all in-repo). The corpus's uses are a debug
+/// timestamp, a "last scanned" string, and `%M:%S` over a DURATION; only the first two shift, and
+/// they shift by a constant. Fixing it means a tz source, not a different algorithm.
+fn install_time(lua: &Lua) -> mlua::Result<()> {
+    let g = lua.globals();
+    g.set("time", lua.create_function(|_, ()| Ok(unix_seconds()))?)?;
+    g.set(
+        "date",
+        lua.create_function(|_, (fmt, when): (Option<String>, Option<i64>)| {
+            // Bare `date()` is `%c`, as in Lua — `Recap.lua:2690` calls it with no arguments.
+            let fmt = fmt.unwrap_or_else(|| "%c".to_string());
+            Ok(format_epoch(when.unwrap_or_else(unix_seconds), &fmt))
+        })?,
+    )?;
+    Ok(())
+}
+
+/// Wall-clock seconds since the Unix epoch. Before the epoch is not a state a game client is in;
+/// a clock that somehow reports it clamps to 0 rather than raising inside an addon's file scope.
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+const DAYS: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// Broken-down UTC time from an epoch second: (year, month 1-12, day 1-31, hour, min, sec,
+/// weekday 0=Sunday, yearday 1-366).
+///
+/// The civil-from-days conversion is Howard Hinnant's, shifted to a March-based year so the leap
+/// day lands at the end and no month-length table is needed. Chosen over a hand-rolled loop because
+/// it is a known-correct closed form with no accumulation error, which matters for the "persisted
+/// last session, compared this session" use every corpus caller has.
+fn civil_from_epoch(secs: i64) -> (i64, u32, u32, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hour, min, sec) = (
+        (rem / 3600) as u32,
+        ((rem % 3600) / 60) as u32,
+        (rem % 60) as u32,
+    );
+    // 1970-01-01 was a Thursday (4).
+    let weekday = (days + 4).rem_euclid(7) as u32;
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if month <= 2 { y + 1 } else { y };
+
+    // Day of the year, from the same conversion applied to Jan 1.
+    let jan1 = days_from_civil(year, 1, 1);
+    let yearday = (days - jan1 + 1) as u32;
+    (year, month, day, hour, min, sec, weekday, yearday)
+}
+
+/// Days since the epoch for a civil date — the inverse of the above, used only for `%j`.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The `strftime` subset the corpus actually uses, plus the obvious neighbours.
+///
+/// Bounded on purpose: the specifiers here are the ones read off real call sites —
+/// `%H:%M:%S` (AceDebug), `%A, %B %d, %Y - %H:%M` (FuBar_PotHerbFu), `%M:%S` (FuBar_AnkhTimerFu),
+/// `%c` (bare `date()`). An unknown specifier is emitted VERBATIM rather than swallowed, so a
+/// format this does not know shows up in the output instead of silently vanishing.
+fn format_epoch(secs: i64, fmt: &str) -> String {
+    let (year, month, day, hour, min, sec, wday, yday) = civil_from_epoch(secs);
+    let mut out = String::with_capacity(fmt.len() + 16);
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let Some(spec) = chars.next() else {
+            out.push('%');
+            break;
+        };
+        let hour12 = match hour % 12 {
+            0 => 12,
+            h => h,
+        };
+        match spec {
+            'a' => out.push_str(&DAYS[wday as usize][..3]),
+            'A' => out.push_str(DAYS[wday as usize]),
+            'b' | 'h' => out.push_str(&MONTHS[(month - 1) as usize][..3]),
+            'B' => out.push_str(MONTHS[(month - 1) as usize]),
+            'c' => out.push_str(&format!(
+                "{} {} {:2} {:02}:{:02}:{:02} {}",
+                &DAYS[wday as usize][..3],
+                &MONTHS[(month - 1) as usize][..3],
+                day,
+                hour,
+                min,
+                sec,
+                year
+            )),
+            'd' => out.push_str(&format!("{day:02}")),
+            'H' => out.push_str(&format!("{hour:02}")),
+            'I' => out.push_str(&format!("{hour12:02}")),
+            'j' => out.push_str(&format!("{yday:03}")),
+            'm' => out.push_str(&format!("{month:02}")),
+            'M' => out.push_str(&format!("{min:02}")),
+            'p' => out.push_str(if hour < 12 { "AM" } else { "PM" }),
+            'S' => out.push_str(&format!("{sec:02}")),
+            'w' => out.push_str(&format!("{wday}")),
+            'x' => out.push_str(&format!("{month:02}/{day:02}/{:02}", year.rem_euclid(100))),
+            'X' => out.push_str(&format!("{hour:02}:{min:02}:{sec:02}")),
+            'y' => out.push_str(&format!("{:02}", year.rem_euclid(100))),
+            'Y' => out.push_str(&format!("{year}")),
+            '%' => out.push('%'),
+            // Unknown: verbatim, so it is visible rather than swallowed.
+            other => {
+                out.push('%');
+                out.push(other);
+            }
+        }
+    }
+    out
+}

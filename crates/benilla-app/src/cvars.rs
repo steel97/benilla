@@ -8,7 +8,7 @@
 //!   verified CVar registration defaults (wow-re `benilla-pins.md` B10, quoted in
 //!   [`crate::sound::SoundConfig`]), `uiScale`/`farclip` are benilla's shipped defaults —
 //!   and a test welds each string to the constant it mirrors so they cannot drift.
-//! - **Boot**: read `benilla/config.toml` ([`crate::local_state`]) and apply it to the knob
+//! - **Boot**: read `benilla-config/config.toml` ([`crate::local_state`]) and apply it to the knob
 //!   resources; when the UI VM exists, register the table and push the resolved session values
 //!   so `GetCVar` answers what the client is actually doing.
 //! - **Sync**: drain Lua `SetCVar` changes into the knob resources each frame and mark the
@@ -29,7 +29,6 @@ use std::time::Instant;
 use bevy::prelude::*;
 
 use crate::chat_bubble::BubbleConfig;
-use crate::clutter::ClutterConfig;
 use crate::minimap::MinimapZoom;
 use crate::nameplates::NameConfig;
 use crate::player::camera::{LookConfig, ZoomLimit, MOUSE_SPEED_RANGE};
@@ -37,13 +36,28 @@ use crate::sound::SoundConfig;
 use crate::target::ClickConfig;
 use crate::ui_loot::LootConfig;
 use crate::ui_script::UiScaleCvar;
-use crate::view::{ViewDistance, FARCLIP_RANGE};
 use benilla_ui::script::UiScript;
 use benilla_ui::widget::MINIMAP_ZOOM_LEVELS;
+use benilla_world::clutter::ClutterConfig;
+use benilla_world::view::{ViewDistance, FARCLIP_RANGE};
 
 /// The host-backed CVars: `(registered name, default)`. Grows one row per knob a settings page
 /// actually wires — never ahead of the knob (see the module doc).
 pub(crate) const REGISTERED: &[(&str, &str)] = &[
+    // The realm the session is on — a REAL 1.12 CVar (`0x83f2d0`, persisted, wow-re
+    // `savedvariables-protocol.md`: the client builds its SavedVariables path from it), and a live
+    // Lua consumer in the strongest sense the honest-tree rule asks for. `Ace/AceState.lua:27` does
+    // `ace.trim(GetCVar("realmName"))` inside `SetGameState`, which every Ace addon runs at
+    // PLAYER_ENTERING_WORLD — so a nil there was `gsub(nil)` and took the whole Ace family down.
+    // 18 corpus folders read the name.
+    //
+    // The default is EMPTY, deliberately and not as a guess: the value is written from the session's
+    // real realm the moment addons load (`ui_script::addons::load_third_party`), so the default only
+    // ever describes a client that has not connected. wow-re records a string
+    // `"Last realm connected to"` beside the registration, but that reads like the CVar's HELP text
+    // rather than its value and nothing here needs to resolve it — `""` is what `ace.trim` handles
+    // cleanly, and inventing a realm name would be worse than admitting we have none yet.
+    ("realmName", ""),
     ("MasterVolume", "1"),
     ("SoundVolume", "1"),
     ("MusicVolume", "0.4"),
@@ -55,6 +69,12 @@ pub(crate) const REGISTERED: &[(&str, &str)] = &[
     ("MasterSoundEffects", "1"),
     ("EnableMusic", "1"),
     ("EnableAmbience", "1"),
+    // Zone reverb (1153). The binary registers this one `"1"` (`0x4573be`) and we register it
+    // `"0"` — the only row here that knowingly leaves the registrar's default, because the
+    // reference's reverb is EAX-over-hardware and that hardware has not existed since Vista:
+    // `"1"` would ship audio the real client has never actually produced (bug B236).
+    // `SoundConfig::reverb` carries the evidence.
+    ("SoundReverb", "0"),
     ("uiScale", "0.9"),
     ("farclip", "777"),
     // The Controls-page trio (0961). `deselectOnClick`/`mouseInvertPitch` are 1.12's own
@@ -177,6 +197,8 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
         "mastersoundeffects" => knobs.sound.enabled = v != 0.0,
         "enablemusic" => knobs.sound.music_enabled = v != 0.0,
         "enableambience" => knobs.sound.ambience_enabled = v != 0.0,
+        // The client's own parse for this one is literally `!= 0` too (`0x4574d0`: `setne al`).
+        "soundreverb" => knobs.sound.reverb = v != 0.0,
         "uiscale" => knobs.scale.0 = v.clamp(0.5, 1.5),
         "farclip" => knobs.view.farclip = v.clamp(*FARCLIP_RANGE.start(), *FARCLIP_RANGE.end()),
         "deselectonclick" => knobs.click.deselect_on_click = v != 0.0,
@@ -215,7 +237,7 @@ fn zoom_index(v: f32) -> u8 {
     v.clamp(0.0, f32::from(MINIMAP_ZOOM_LEVELS - 1)) as u8
 }
 
-/// Startup: read `benilla/config.toml` (absent file = all defaults, not an error) and apply it
+/// Startup: read `benilla-config/config.toml` (absent file = all defaults, not an error) and apply it
 /// to the knob resources — except keys the environment overrides this session (their resources
 /// already read the env var in their `Default`s). The VM does not exist yet; [`sync_cvars`]
 /// seeds the table when it does.
@@ -324,7 +346,7 @@ fn sync_cvars(
     if !persist.registered {
         script.register_cvars(REGISTERED.iter().copied());
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 22] = [
+        let session: [(&str, String); 23] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -332,6 +354,7 @@ fn sync_cvars(
             ("MasterSoundEffects", flag(sound.enabled)),
             ("EnableMusic", flag(sound.music_enabled)),
             ("EnableAmbience", flag(sound.ambience_enabled)),
+            ("SoundReverb", flag(sound.reverb)),
             ("uiScale", scale.0.to_string()),
             ("farclip", view.farclip.to_string()),
             ("deselectOnClick", flag(click.deselect_on_click)),
@@ -463,11 +486,18 @@ mod tests {
 
     /// Every registered default IS the code constant it mirrors — parse-compared so "1" vs
     /// "1.0" cannot fail it, welded so neither side can drift alone.
+    ///
+    /// **The numeric ones**, which was every one of them until `realmName` — the first
+    /// string-valued CVar in the table, and the reason this now filters rather than unwraps. It is
+    /// asserted on its own terms in
+    /// [`the_only_string_valued_cvar_is_the_realm_and_it_defaults_empty`]; a `parse::<f32>()` over
+    /// the whole table would either panic (it did) or quietly need every future string CVar to be
+    /// numeric.
     #[test]
     fn registered_defaults_mirror_the_code_truths() {
         let d: BTreeMap<&str, f32> = REGISTERED
             .iter()
-            .map(|(n, v)| (*n, v.parse::<f32>().unwrap()))
+            .filter_map(|(n, v)| v.parse::<f32>().ok().map(|f| (*n, f)))
             .collect();
         let sound = SoundConfig::default();
         assert_eq!(d["MasterVolume"], sound.master);
@@ -477,6 +507,9 @@ mod tests {
         assert_eq!(d["MasterSoundEffects"] != 0.0, sound.enabled);
         assert_eq!(d["EnableMusic"] != 0.0, sound.music_enabled);
         assert_eq!(d["EnableAmbience"] != 0.0, sound.ambience_enabled);
+        // Welded like the rest — and deliberately NOT the binary's registrar "1" (1153).
+        assert_eq!(d["SoundReverb"] != 0.0, sound.reverb);
+        assert!(!sound.reverb, "zone reverb ships off (decision 1153)");
         assert_eq!(d["uiScale"], DEFAULT_UI_SCALE);
         // ViewDistance::default() reads $WOW_FARCLIP; the registered default mirrors the
         // env-less 777 literal (view.rs doc: "Default 777").
@@ -791,5 +824,30 @@ mod tests {
         let hand = "# my note\n[cvars]\nFarclip = \"500\"\n";
         let parsed: LocalConfig = toml::from_str(hand).unwrap();
         assert_eq!(parsed.cvars.get("Farclip").map(String::as_str), Some("500"));
+    }
+    /// **`realmName` is the table's one string-valued CVar, and it defaults EMPTY.**
+    ///
+    /// Empty rather than a guess: the value is written from the session's real realm by
+    /// `set_realm_name`, so the default only ever describes a client that has not connected.
+    /// wow-re records `"Last realm connected to"` beside the registration, but that reads like the
+    /// CVar's HELP text rather than its value, and nothing here needs it resolved — `""` is what
+    /// `Ace/AceState.lua:27`'s `ace.trim(GetCVar("realmName"))` handles cleanly, and inventing a
+    /// realm name would be worse than admitting we have none yet.
+    ///
+    /// Pinned as "the ONE" so a second string CVar has to come here and think about the numeric
+    /// test above rather than silently widening it.
+    #[test]
+    fn the_only_string_valued_cvar_is_the_realm_and_it_defaults_empty() {
+        let strings: Vec<&str> = REGISTERED
+            .iter()
+            .filter(|(_, v)| v.parse::<f32>().is_err())
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(strings, vec!["realmName"]);
+        let realm = REGISTERED
+            .iter()
+            .find(|(n, _)| *n == "realmName")
+            .map(|(_, v)| *v);
+        assert_eq!(realm, Some(""));
     }
 }

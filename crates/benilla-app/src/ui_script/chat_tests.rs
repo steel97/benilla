@@ -274,14 +274,10 @@ fn chat_click_dismisses_a_stuck_spell_but_not_an_item() {
 
     // Drag Fireball off its book button (press → past the 4px threshold → the payload is up).
     let (l, r, t, b) = (
-        s.eval::<f32>("return BenillaSpellButton1:GetLeft()")
-            .unwrap(),
-        s.eval::<f32>("return BenillaSpellButton1:GetRight()")
-            .unwrap(),
-        s.eval::<f32>("return BenillaSpellButton1:GetTop()")
-            .unwrap(),
-        s.eval::<f32>("return BenillaSpellButton1:GetBottom()")
-            .unwrap(),
+        s.eval::<f32>("return SpellButton1:GetLeft()").unwrap(),
+        s.eval::<f32>("return SpellButton1:GetRight()").unwrap(),
+        s.eval::<f32>("return SpellButton1:GetTop()").unwrap(),
+        s.eval::<f32>("return SpellButton1:GetBottom()").unwrap(),
     );
     let (x1, y1) = ((l + r) * 0.5, (t + b) * 0.5);
     s.mouse_button(x1, y1, "LeftButton", true);
@@ -338,7 +334,7 @@ fn chat_click_dismisses_a_stuck_spell_but_not_an_item() {
             slots,
         }),
     );
-    s.run("C_Container.PickupContainerItem(0, 1)").unwrap();
+    s.run("PickupContainerItem(0, 1)").unwrap();
     assert!(s.cursor_item().is_some(), "fixture: the item is held");
     s.mouse_button(cx, cy, "LeftButton", true);
     s.mouse_button(cx, cy, "LeftButton", false);
@@ -347,4 +343,308 @@ fn chat_click_dismisses_a_stuck_spell_but_not_an_item() {
         "a chat click never touches an item payload"
     );
     assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+// ── ChatTypeInfo: the addon-facing color table ────────────────────────────────────────────────
+
+/// `ChatTypeInfo` carries the shipped default chat colors twice: once in `assets/ui/ChatFrame.xml`
+/// for addons to read, and once in [`crate::ui_chat::default_color`] for our own feed to render.
+/// Both are the same wow-re byte table (`chat-color-table.md`, the static registry at
+/// `.rdata 0x804710`) — so this is the gate that makes the duplication safe: every kind we model
+/// must agree to the byte, and the table's shape (`sticky`/`id`) must be the reference's.
+#[test]
+fn chat_type_info_matches_the_host_color_table() {
+    use crate::ui_chat::{default_color, ChatEventKind as K};
+
+    /// Each modeled kind and its `ChatTypeInfo` key — the reference's own spellings.
+    const PAIRS: &[(&str, K, i64)] = &[
+        ("SAY", K::Say, 1),
+        ("PARTY", K::Party, 2),
+        ("RAID", K::Raid, 3),
+        ("GUILD", K::Guild, 4),
+        ("OFFICER", K::Officer, 5),
+        ("YELL", K::Yell, 6),
+        ("WHISPER", K::Whisper, 7),
+        ("WHISPER_INFORM", K::WhisperInform, 8),
+        ("EMOTE", K::Emote, 9),
+        ("TEXT_EMOTE", K::TextEmote, 10),
+        ("SYSTEM", K::System, 11),
+        ("MONSTER_SAY", K::MonsterSay, 12),
+        ("MONSTER_YELL", K::MonsterYell, 13),
+        ("MONSTER_EMOTE", K::MonsterEmote, 14),
+        ("MONSTER_WHISPER", K::MonsterWhisper, 27),
+        ("CHANNEL", K::Channel, 15),
+        ("CHANNEL_JOIN", K::ChannelJoin, 16),
+        ("CHANNEL_LEAVE", K::ChannelLeave, 17),
+        ("CHANNEL_NOTICE", K::ChannelNotice, 19),
+        ("CHANNEL_NOTICE_USER", K::ChannelNoticeUser, 20),
+        ("CHANNEL_LIST", K::ChannelList, 18),
+        ("AFK", K::Afk, 21),
+        ("DND", K::Dnd, 22),
+        ("IGNORED", K::Ignored, 23),
+        ("SKILL", K::Skill, 24),
+        ("LOOT", K::Loot, 25),
+        ("MONEY", K::Money, 87),
+        ("COMBAT_XP_GAIN", K::CombatXpGain, 46),
+        ("RAID_LEADER", K::RaidLeader, 88),
+        ("RAID_WARNING", K::RaidWarning, 89),
+        ("RAID_BOSS_EMOTE", K::RaidBossEmote, 91),
+        ("BATTLEGROUND", K::Battleground, 93),
+        ("BATTLEGROUND_LEADER", K::BattlegroundLeader, 94),
+        ("BG_SYSTEM_NEUTRAL", K::BgSystemNeutral, 83),
+        ("BG_SYSTEM_ALLIANCE", K::BgSystemAlliance, 84),
+        ("BG_SYSTEM_HORDE", K::BgSystemHorde, 85),
+    ];
+
+    let s = chat_frame();
+    for (name, kind, want_id) in PAIRS {
+        let (r, g, b, id): (f64, f64, f64, i64) = s
+            .eval(&format!(
+                r#"local i = ChatTypeInfo["{name}"] return i.r, i.g, i.b, i.id"#
+            ))
+            .unwrap_or_else(|e| panic!(r#"ChatTypeInfo["{name}"]: {e}"#));
+        let got = [
+            (r * 255.0).round() as u8,
+            (g * 255.0).round() as u8,
+            (b * 255.0).round() as u8,
+        ];
+        assert_eq!(got, default_color(*kind), r#"ChatTypeInfo["{name}"] color"#);
+        // `id` is GetChatTypeIndex's 1-based registry slot, asserted EXACTLY rather than as a
+        // range: four of these ship the same FFDBB7 and a range check would let a transposition
+        // inside that family through with both colors still matching.
+        assert_eq!(id, *want_id, r#"ChatTypeInfo["{name}"].id"#);
+    }
+}
+
+/// The table's *shape*, transcribed rather than derived: the reference's 105 keys, its five sticky
+/// types (the set `ui_chat::edit`'s `SendType::sticky` already quotes), the two keys FrameXML
+/// declares that the engine's color registry does not contain, and the ten boot-seeded channel
+/// extras. An addon reads `.sticky` and `.id` as often as it reads the color.
+#[test]
+fn chat_type_info_has_the_references_shape() {
+    let s = chat_frame();
+
+    let count: i64 = s
+        .eval("local n = 0 for _ in pairs(ChatTypeInfo) do n = n + 1 end return n")
+        .unwrap();
+    assert_eq!(count, 105, "the reference declares 105 keys");
+
+    let sticky: String = s
+        .eval(
+            "local t = {} for k, v in pairs(ChatTypeInfo) do if v.sticky == 1 then \
+             table.insert(t, k) end end table.sort(t) return table.concat(t, \" \")",
+        )
+        .unwrap();
+    assert_eq!(sticky, "BATTLEGROUND GUILD PARTY RAID SAY");
+
+    // REPLY and COMBAT_ERROR are declared by FrameXML and absent from the engine's 94-entry
+    // registry, so GetChatTypeIndex answers 0 for both — but their COLORS differ, which is the
+    // trap this asserts. Nothing ever writes COMBAT_ERROR. REPLY is written by hand inside the
+    // UPDATE_CHAT_COLOR handler, which mirrors WHISPER into it (ChatFrame.lua l.1357-1365), so
+    // its end state is WHISPER's FF80FF. Seeding both white reads as symmetric and is wrong.
+    for (name, want) in [
+        ("REPLY", [255u8, 128, 255]),
+        ("COMBAT_ERROR", [255, 255, 255]),
+    ] {
+        let (id, r, g, b): (i64, f64, f64, f64) = s
+            .eval(&format!(
+                r#"local i = ChatTypeInfo["{name}"] return i.id, i.r, i.g, i.b"#
+            ))
+            .unwrap();
+        assert_eq!(id, 0, r#""{name}".id — not in the engine's registry"#);
+        let got = [
+            (r * 255.0).round() as u8,
+            (g * 255.0).round() as u8,
+            (b * 255.0).round() as u8,
+        ];
+        assert_eq!(got, want, r#""{name}" color"#);
+    }
+
+    // The extras: CHANNEL1..CHANNEL10, indices 95..104, each the live CHANNEL entry's FFC0C0.
+    for n in 1..=10 {
+        let (id, r, g, b): (i64, f64, f64, f64) = s
+            .eval(&format!(
+                r#"local i = ChatTypeInfo["CHANNEL{n}"] return i.id, i.r, i.g, i.b"#
+            ))
+            .unwrap();
+        assert_eq!(id, 94 + n, "CHANNEL{n}.id");
+        let rgb = [
+            (r * 255.0).round() as u8,
+            (g * 255.0).round() as u8,
+            (b * 255.0).round() as u8,
+        ];
+        assert_eq!(rgb, [255, 192, 192], "CHANNEL{n} color");
+    }
+}
+
+/// **Every event name we fire is a key the reference's own `ChatTypeInfo` carries.**
+/// `ChatFrame_OnEvent` recovers the type with `strsub(event, 10)` and indexes
+/// `ChatTypeInfo[type]` with it — a name that misses that table is a name whose colour, id and
+/// sticky flag an addon cannot look up, so this is the check that our `CHAT_MSG_*` spellings are
+/// the reference's and not ours.
+///
+/// Swept over `ChatEventKind::ALL` rather than a second hand-written list, so a kind added without
+/// a matching table key fails here instead of shipping a name nothing can resolve.
+#[test]
+fn fired_event_names_are_all_chat_type_info_keys() {
+    use crate::ui_chat::{event_name, ChatEventKind as K};
+
+    let s = chat_frame();
+    for &kind in K::ALL {
+        let name = event_name(kind);
+        let key = name
+            .strip_prefix("CHAT_MSG_")
+            .unwrap_or_else(|| panic!("{name}: every fired chat event is CHAT_MSG_-prefixed"));
+        let present: bool = s
+            .eval(&format!(r#"return ChatTypeInfo["{key}"] ~= nil"#))
+            .unwrap();
+        assert!(present, r#"{name} → ChatTypeInfo["{key}"] is missing"#);
+    }
+}
+
+// ── The seven chat windows (NUM_CHAT_WINDOWS) ────────────────────────────────────────────────
+//
+// benilla shipped two windows against a constant the reference sets to seven. Everything below is
+// a claim about the five that were missing, checked against the shipped `ChatFrame.xml` itself
+// rather than against the loader's idea of it.
+
+/// `NUM_CHAT_WINDOWS = 7` (ref ChatFrame.lua l.5) and every index it promises resolves to a real
+/// `ScrollingMessageFrame`. _LazyPig walks exactly this loop and indexes the result with no nil
+/// guard (`LazyPig.lua:1992`), so the constant without the frames is worse than neither.
+#[test]
+fn every_window_num_chat_windows_promises_is_a_real_frame() {
+    let s = chat_frame();
+    assert_eq!(s.eval::<i64>("return NUM_CHAT_WINDOWS").unwrap(), 7);
+    for i in 1..=7 {
+        let ok: bool = s
+            .eval(&format!(
+                "local f = getglobal('ChatFrame{i}') \
+                 return f ~= nil and f.AddMessage ~= nil and f:GetID() == {i}"
+            ))
+            .unwrap();
+        assert!(ok, "ChatFrame{i} is a real message frame carrying its id");
+    }
+}
+
+/// The corpus walk itself, verbatim from `_LazyPig/LazyPig.lua:1992` down to the unguarded
+/// `getglobal(...):IsVisible()` that used to die at i=3.
+#[test]
+fn the_lazypig_window_walk_survives_all_seven_indices() {
+    let s = chat_frame();
+    let visible: i64 = s
+        .eval(
+            "local n = 0\n\
+             for i = 1, NUM_CHAT_WINDOWS do\n\
+               local ChatFrame = getglobal('ChatFrame'..i)\n\
+               if ChatFrame:IsVisible() then n = n + 1 end\n\
+             end\n\
+             return n",
+        )
+        .unwrap();
+    assert_eq!(visible, 1, "only the selected dock window is visible");
+}
+
+/// ChatFrame3..7 ship hidden and with no `isDocked`, the reference's own chat-cache state
+/// (`DOCKED 0 / SHOWN 0`). This is not cosmetic: `Outfitter.lua:3099` reaches an UNGUARDED
+/// `getglobal('ChatFrame'..i..'Tab'):GetText()` for any window that is visible *or* docked, and we
+/// build no tabs past ChatFrame1Tab. The same reason keeps `isDocked` off ChatFrame2, whose
+/// "Combat Log" tab is deliberately unbuilt.
+#[test]
+fn the_undocked_windows_are_hidden_and_carry_no_is_docked() {
+    let s = chat_frame();
+    for i in 2..=7 {
+        let shown: bool = s.eval(&format!("return ChatFrame{i}:IsShown()")).unwrap();
+        assert!(!shown, "ChatFrame{i} ships hidden");
+        let docked: bool = s
+            .eval(&format!("return ChatFrame{i}.isDocked ~= nil"))
+            .unwrap();
+        assert!(!docked, "ChatFrame{i} carries no isDocked");
+    }
+    // And therefore the Outfitter walk never reaches a tab that does not exist.
+    let ok: bool = s
+        .eval(
+            "for i = 1, NUM_CHAT_WINDOWS do\n\
+               local f = getglobal('ChatFrame'..i)\n\
+               if f and (f:IsVisible() or f.isDocked) then\n\
+                 local tab = getglobal('ChatFrame'..i..'Tab')\n\
+                 if not tab then return false end\n\
+                 local _ = tab:GetText()\n\
+               end\n\
+             end\n\
+             return true",
+        )
+        .unwrap();
+    assert!(ok, "the Outfitter tab walk never touches a missing tab");
+}
+
+/// `GetChatWindowInfo`'s `shown` is not an independent opinion — it must agree with the frame the
+/// shipped XML actually built, or an addon that trusts the getter and an addon that trusts the
+/// frame will disagree about the same window. The drift guard between the Rust table and the XML.
+#[test]
+fn get_chat_window_info_shown_matches_the_shipped_frames() {
+    let s = chat_frame();
+    for i in 1..=7 {
+        let agrees: bool = s
+            .eval(&format!(
+                "local _, _, _, _, _, _, shown = GetChatWindowInfo({i})\n\
+                 return (shown ~= nil) == ChatFrame{i}:IsShown()"
+            ))
+            .unwrap();
+        assert!(
+            agrees,
+            "window {i}: GetChatWindowInfo disagrees with the frame"
+        );
+    }
+}
+
+/// A named debug sink is a real ring of its own: `ChatFrame3:AddMessage` (IgniteStatus does this
+/// seven times, TipBuddy once, Radar guarded, and AceDebug's `debugFrame` stores the frame) lands
+/// in ChatFrame3 and nowhere near the window the player is reading.
+#[test]
+fn a_line_added_to_chat_frame3_lands_in_chat_frame3_only() {
+    let mut s = chat_frame();
+    s.add_chat_message("ChatFrame1", "a real line", 1.0, 1.0, 1.0);
+    s.run("ChatFrame3:AddMessage('Radar: debug', 1, 1, 0)")
+        .unwrap();
+    assert_eq!(
+        s.eval::<i64>("return ChatFrame3:GetNumMessages()").unwrap(),
+        1
+    );
+    assert_eq!(
+        s.eval::<i64>("return ChatFrame1:GetNumMessages()").unwrap(),
+        1
+    );
+    // Hidden, so nothing of it reaches the screen.
+    s.resolve();
+    assert!(
+        text_color(&s.extract(), "Radar: debug").is_none(),
+        "a hidden window renders nothing"
+    );
+}
+
+/// `FCF_SelectDockFrame(frame)` — the corpus idiom (CustomNameplates.lua:69, Roid-Macros
+/// Utility.lua:40) is "un-hide the default chat frame before printing into it". It takes a FRAME,
+/// where ours takes a dock id; and it RAISES on a window benilla cannot dock rather than returning
+/// quietly and leaving the caller's next AddMessage in a window that is still hidden.
+#[test]
+fn fcf_select_dock_frame_selects_by_frame_and_raises_for_an_undocked_one() {
+    let s = chat_frame();
+    s.run("FCF_SelectDockFrame(ChatFrame2)").unwrap();
+    let (one, two): (bool, bool) = (
+        s.eval("return ChatFrame1:IsShown()").unwrap(),
+        s.eval("return ChatFrame2:IsShown()").unwrap(),
+    );
+    assert!(!one && two, "selecting the Combat Log swaps the dock");
+
+    s.run("if not DEFAULT_CHAT_FRAME:IsVisible() then FCF_SelectDockFrame(DEFAULT_CHAT_FRAME) end")
+        .unwrap();
+    assert!(
+        s.eval::<bool>("return ChatFrame1:IsShown()").unwrap(),
+        "the corpus guard brings the default frame back"
+    );
+
+    assert!(
+        s.run("FCF_SelectDockFrame(ChatFrame5)").is_err(),
+        "an undocked window raises — benilla has no dock model for it (0288 §2)"
+    );
 }

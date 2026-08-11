@@ -17,8 +17,23 @@ anyhow = "1.0.102"
 bevy = { version = "0.18.1", features = ["android-game-activity"] }
 clap = { version = "4.6.1", features = ["derive"] }
 
-# No `[patch.crates-io]`: the WoW format + protocol stack is fully in-repo (decision 0021), so there
-# are no warcraft-rs / wow_messages crates (or forks of them) anywhere in the tree.
+# The WoW format + protocol stack is fully in-repo (decision 0021), so there are no warcraft-rs /
+# wow_messages crates (or forks of them) anywhere in the tree. That is still true and is why this
+# section stood empty for the project's whole life.
+#
+# The one entry below is not a fork of a WoW crate at all. `lua-src` compiles the Lua the client's
+# addon VM runs on, and the 1.12 corpus needs one opcode that Lua 5.1 deleted — the iterator-less
+# generic-for (`for k, v in someTable do`), which 183 of 218 corpus addons are reached by and which
+# is the first session-start error for 60 of them. It is an OPCODE, so no layer above the VM can
+# reach it: not a library function, not a global, not a metamethod.
+#
+# The fork is currently BYTE-IDENTICAL to upstream's 5.1.5 sources, and is landed that way on
+# purpose: the pipeline is proven transparent before the behavioural payload goes into it, so that
+# when the suite moves, the patch is the only thing that could have moved it. The payload waits on
+# an RE answer about what the real client's own Lua does — stock Lua 5.0 is corroboration, not the
+# authority. `third_party/lua-src/BENILLA.md` has the current state and the verifying command.
+[patch.crates-io]
+lua-src = { path = "third_party/lua-src" }
 
 # Optimize *dependencies* even in dev builds. avian/parry collision math (and wgpu/bevy render) is
 # unusably slow at opt-level 0 — a plain `cargo run` crawls to <1 fps once physics is doing real work.
@@ -48,3 +63,19 @@ opt-level = 1
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+# The director's play loop (decision 1157): `release` plus incremental compilation. `benilla-app` is one crate of
+# ~243k lines, and release is non-incremental by cargo's default, so a one-line edit re-optimizes
+# all of it — measured 2m47s (43s frontend, ~121s LLVM at opt-level 3) against a 1.8s stamp rebuild
+# and a 2.5s no-op. Incremental caches both halves per codegen unit, so an edit pays for what it
+# touched. Cargo applies `incremental` to workspace members ONLY (verified: `target/debug/incremental`
+# holds our 16 crates and zero registry deps), so the ~760 dependencies stay non-incremental and
+# sccache-cacheable — 0192's wrapper and the cold-slot build are untouched.
+#
+# Why a separate profile rather than flipping `release`: incremental raises the codegen-unit count
+# and drops cross-unit inlining, which is a real codegen difference. The FPS campaign grades on
+# default `release` (0736) and same-day A/B is the law, so the graded profile must not quietly
+# change under it. Run it as `cargo play` (the alias in `.cargo/config.toml`).
+[profile.play]
+inherits = "release"
+incremental = true

@@ -81,7 +81,7 @@ fn shown_skills_page() -> UiScript {
             skill(415, "Cloth", 1, 1, false, (8, "Armor Proficiencies", 6)),
         ],
     });
-    s.run(r#"ToggleCharacter("BenillaSkillFrame")"#).unwrap();
+    s.run(r#"ToggleCharacter("SkillFrame")"#).unwrap();
     s.resolve();
     s
 }
@@ -90,13 +90,11 @@ fn shown_skills_page() -> UiScript {
 fn row(s: &mut UiScript, i: u32) -> (String, [f32; 4]) {
     let text = s
         .eval::<String>(&format!(
-            "return BenillaSkillRankFrame{i}SkillRank:GetText() or \"\""
+            "return SkillRankFrame{i}SkillRank:GetText() or \"\""
         ))
         .unwrap();
     let c = s
-        .eval::<(f32, f32, f32, f32)>(&format!(
-            "return BenillaSkillRankFrame{i}:GetStatusBarColor()"
-        ))
+        .eval::<(f32, f32, f32, f32)>(&format!("return SkillRankFrame{i}:GetStatusBarColor()"))
         .unwrap();
     (text, [c.0, c.1, c.2, c.3])
 }
@@ -106,7 +104,7 @@ fn row(s: &mut UiScript, i: u32) -> (String, [f32; 4]) {
 fn row_bg(s: &mut UiScript, i: u32) -> [f32; 4] {
     let c = s
         .eval::<(f32, f32, f32, f32)>(&format!(
-            "return BenillaSkillRankFrame{i}Background:GetVertexColor()"
+            "return SkillRankFrame{i}Background:GetVertexColor()"
         ))
         .unwrap();
     [c.0, c.1, c.2, c.3]
@@ -116,8 +114,7 @@ fn row_bg(s: &mut UiScript, i: u32) -> [f32; 4] {
 fn a_single_rank_line_paints_gray_with_no_rank_text() {
     let mut s = shown_skills_page();
     assert!(
-        s.eval::<bool>("return BenillaSkillFrame:IsVisible()")
-            .unwrap(),
+        s.eval::<bool>("return SkillFrame:IsVisible()").unwrap(),
         "the Skills page is up"
     );
 
@@ -184,13 +181,13 @@ fn a_single_rank_line_paints_gray_with_no_rank_text() {
     s.run("SetSelectedSkill(2) BenillaSkillFrame_Update()")
         .unwrap();
     assert_eq!(
-        s.eval::<String>("return BenillaSkillDetailBarSkillRank:GetText() or \"\"")
+        s.eval::<String>("return SkillDetailBarSkillRank:GetText() or \"\"")
             .unwrap(),
         "",
         "the detail pane's own bar is a proficiency too"
     );
     assert_eq!(
-        s.eval::<(f32, f32, f32, f32)>("return BenillaSkillDetailBarBackground:GetVertexColor()")
+        s.eval::<(f32, f32, f32, f32)>("return SkillDetailBarBackground:GetVertexColor()")
             .unwrap(),
         (1.0, 1.0, 1.0, 0.5),
         "including its trough (the shared PaintBar; ref SkillFrame.lua:376)"
@@ -209,11 +206,7 @@ fn a_single_rank_line_paints_gray_with_no_rank_text() {
 /// without client data.
 #[test]
 fn a_real_hunters_block_lists_exactly_what_the_reference_client_lists() {
-    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../WoW/Data");
-    if !data.is_dir() {
-        eprintln!("skipping: vanilla client not present at {}", data.display());
-        return;
-    }
+    let data = benilla_formats::wow_data_or_skip!();
     let mut chain = benilla_formats::open_chain(&data).expect("open chain");
     let catalog = benilla_formats::load_skill_line_catalog(&mut chain).expect("skill lines");
 
