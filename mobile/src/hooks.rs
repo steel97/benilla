@@ -32,8 +32,6 @@ pub fn register_hooks() {
         // enable sound
         embedded_asset!(app, "assets/mobile/joystick/Knob.png");
         embedded_asset!(app, "assets/mobile/joystick/Outline.png");
-        app.init_state::<UnmuteSoundState>();
-        app.add_systems(PreUpdate, unmute_sound_system.after(InputSystems));
 
         // virtual joystick
         app.add_plugins(VirtualJoystickPlugin::<String>::default())
@@ -47,18 +45,6 @@ pub fn register_hooks() {
         app.insert_resource(TapOffset(0.0));
         app.add_systems(Update, emulate_input_system.after(update_joystick));
     });
-}
-
-// unmute
-#[derive(States, Debug, Clone, Eq, PartialEq, Hash)]
-pub enum UnmuteSoundState {
-    Value(i32),
-}
-
-impl Default for UnmuteSoundState {
-    fn default() -> Self {
-        UnmuteSoundState::Value(0)
-    }
 }
 
 #[derive(Message, Debug, Clone, PartialEq, Eq, Hash)]
@@ -98,37 +84,6 @@ impl VirtualJoystickAction<String> for BaseAction {
             consumed: false,
         });
     }
-}
-
-pub fn unmute_sound_system(
-    mut input: ResMut<ButtonInput<KeyCode>>,
-    state: Res<State<UnmuteSoundState>>,
-    mut next_state: ResMut<NextState<UnmuteSoundState>>,
-) {
-    let UnmuteSoundState::Value(state) = **state;
-    let mut cur_state = state;
-
-    if cur_state > 2 {
-        return;
-    }
-
-    if cur_state == 0 {
-        input.press(KeyCode::ControlLeft);
-        input.press(KeyCode::ShiftLeft);
-    }
-
-    if cur_state > 0 {
-        input.press(KeyCode::KeyM);
-    }
-
-    if cur_state > 1 {
-        input.release(KeyCode::ControlLeft);
-        input.release(KeyCode::ShiftLeft);
-        input.release(KeyCode::KeyM);
-    }
-
-    cur_state += 1;
-    next_state.set(UnmuteSoundState::Value(cur_state));
 }
 
 // joystick
