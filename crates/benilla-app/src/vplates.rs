@@ -9,8 +9,14 @@
 //!   bound to **V / Shift-V** by FrameXML `Bindings.xml` (asset-sourced default, like TAB).
 //! - **Gate**: never the own unit; never `NOT_SELECTABLE` (UNIT_FIELD_FLAGS bit 25); enemy bit
 //!   covers reaction ≤ neutral, friendly bit ≥ friendly; **max 20 yd**, hardcoded; **no
-//!   occlusion** (a 2-D overlay — plates draw through walls); snap, no smoothing; no
-//!   anti-overlap. (The friendly-totem exclusion waits on totems existing.)
+//!   occlusion** (a 2-D overlay — plates draw through walls); snap, no smoothing. Anti-overlap
+//!   there *is*, since 0367 found the shared solver ([`crate::smart_rect`]) — this file's older
+//!   "no anti-overlap" was the census that missed it. And the sphere is bounded by the frustum:
+//!   the unit must be **in view** ([`crate::ui_pass::project_overlay`]) or the reference
+//!   **destroys** the plate outright (`0x60f600`, before the 20-yard cull — wow-re
+//!   `nameplate-offscreen-cull.md`, §5-VERIFIED 2026-08-15); it is never clamped in from
+//!   off-screen, which is what ours did (1341/1344).
+//!   (The friendly-totem exclusion waits on totems existing.)
 //! - **Anchor**: the same overhead head point (`0x608640`, [`overhead_anchor`]) **+ 2/3 yd**
 //!   (`[0x80abfc]`), projected per frame (`0x483ee0`); the plate's **TOP-CENTER** lands on the
 //!   point (it hangs below — §8 Q5) and is edge-clamped half a plate inside the screen;
@@ -230,6 +236,30 @@ fn con_color(pl_level: u32, unit_level: u32) -> [f32; 4] {
     }
 }
 
+/// Snap a logical-pixel coordinate onto the **device** pixel grid — the plate's texel alignment
+/// (a benilla divergence: the reference draws at fractional device coords).
+///
+/// The plate rect is snapped so the sharp-resampled border art blits 1:1 and reads crisp instead
+/// of bilinear-smeared (0188). Alignment is a property of the **framebuffer**, though, and the
+/// quad lane is *logical* px ([`crate::ui_pass`]: 1 world unit = 1 logical px) — so the plain
+/// `round()` this shipped with quantized the plate to `scale_factor` PHYSICAL pixels: two pixels
+/// of stepping on the 2× display we develop and play on, against a world that slides continuously
+/// underneath. At a fractional scale (1.25/1.5, the Windows norm) it did not land on a texel
+/// boundary at all — the crispness it was bought for was an accident of an integer scale factor.
+///
+/// Snapping on the device grid keeps the 1:1 blit, is correct at any scale factor, and halves the
+/// stepping at 2×: measured over a Goldshire walk at 1440×810 (the `vpl` trace), the extra
+/// displacement the snap adds to a plate's glide fell from a median 0.33 / max 0.99 logical px per
+/// frame to 0.21 / 0.49. What is left is the ±½ device pixel every crisp UI pays.
+///
+/// **Shared with the chat bubble** ([`crate::chat_bubble`]), like [`plate_basis`]/[`gx_px`]: it is
+/// the same outside-UIParent overlay family sliding over the same world, so it is the same snap
+/// law. The bubble shipped on a plain logical `round()` — this function's own bug, at the one site
+/// that never got the fix — which is 1398's finding.
+pub(crate) fn device_snap(v: f32, scale: f32) -> f32 {
+    (v * scale).round() / scale
+}
+
 /// The knee of the plate's gx basis — **a director-pinned DEVIATION from the byte law**
 /// (0185/0186). The real client's plates grow diagonal-linear without limit (wow-re §9,
 /// byte-closed: ~294 px plate + em-29 name at 2560×1440, bilinear-softened) — the director
@@ -418,6 +448,7 @@ fn drive_vplates(
     // The overhead-anchor inputs ([`overhead_anchor`]).
     anchor_q: (
         Query<&BoneAttach>,
+        Query<&benilla_world::rig_anim::RigPose>,
         Query<&OverheadFallback>,
         Query<&GlobalTransform>,
         Query<(), With<crate::entities::mount::MountChild>>,
@@ -531,8 +562,16 @@ fn drive_vplates(
         if !friendly && store.is_some_and(|s| s.0.unit_reads_dead()) {
             continue;
         }
-        // Project the plate point: the overhead anchor + 2/3 yd, per frame, no smoothing. A
-        // point behind the camera draws nothing (the plate has no clamp — offscreen is gone).
+        // Project the plate point: the overhead anchor + 2/3 yd, per frame, no smoothing — and
+        // honour the projector's ACCEPT verdict ([`crate::ui_pass::project_overlay`]): behind the
+        // camera or outside the viewport, there is no plate. That is the reference's own law, and
+        // a hard one — `0x60f600` **destroys** the plate frame on a false verdict, before it ever
+        // reaches the seat (wow-re `nameplate-offscreen-cull.md`, §5-VERIFIED 2026-08-15).
+        //
+        // Ours instead ran an off-screen point into the seat, whose clamp translates a rect from
+        // anywhere bodily onto the screen: **30% of every drawn plate** was a unit nobody could
+        // see, pinned to a border, claiming bucket space and shoving the plates of units you can
+        // (1341 — two thirds of them while standing still, and 90% of the reported jitter).
         let anchor = overhead_anchor(
             entity,
             tf,
@@ -540,13 +579,17 @@ fn drive_vplates(
             &anchor_q.1,
             &anchor_q.2,
             &anchor_q.3,
+            &anchor_q.4,
         );
-        let Ok(screen) = cam.world_to_viewport(&cam_tf, anchor + Vec3::Y * PLATE_LIFT) else {
+        let Some(screen) =
+            crate::ui_pass::project_overlay(cam, &cam_tf, anchor + Vec3::Y * PLATE_LIFT, viewport)
+        else {
             continue;
         };
         cands.push((
             screen.distance_squared(sort_pt),
             screen,
+            anchor,
             rank,
             is_player,
             entity,
@@ -555,7 +598,7 @@ fn drive_vplates(
         ));
     }
     cands.sort_by(|a, b| a.0.total_cmp(&b.0));
-    for (_, screen, rank, is_player, entity, guid, store) in cands {
+    for (_, screen, anchor, rank, is_player, entity, guid, store) in cands {
         plates.0.insert(entity);
 
         // The target-highlight relative alpha: target (or nobody targeted) opaque, others 0x7F.
@@ -591,14 +634,48 @@ fn drive_vplates(
             screen.y + ph,
         );
         let solved = bucket.resolve(desired, viewport);
-        // The rect SNAPS to whole logical pixels (benilla divergence, texel alignment): the
-        // solved corner is fractional and a half-pixel offset would bilinear-smear the fill
-        // bitmap (and blur text). Snap the LEFT edge (not the center): an odd width would put a
-        // snapped center's edges back on half-pixels. The CLAIM takes the snapped rect, so
-        // later plates dodge exactly what is drawn.
-        let top = solved.min.y.round();
-        let left = solved.min.x.round();
+        // The rect snaps to the device pixel grid ([`device_snap`]) — the LEFT edge, not the
+        // centre: an odd width would put a snapped centre's edges back between texels. The CLAIM
+        // takes the snapped rect, so later plates dodge exactly what is drawn.
+        let top = device_snap(solved.min.y, scale);
+        let left = device_snap(solved.min.x, scale);
         let plate = Rect::new(left, top, left + pw, top + ph);
+        // **The jitter decomposition** (`WOW_MOVE_TRACE` tag `vpl`, one line per plate per frame):
+        // the world anchor, the camera pose that projected it, the raw projected point, the
+        // solver's answer, and the snapped rect — so "the plates are jittery when moving" is
+        // attributed to one of the four (a moving anchor, a noisy camera, a flipping solve, the
+        // pixel snap) from numbers rather than from the eye. It rides the shared trace — tag-
+        // filtered, one line per plate — and not the `WOW_VPLATE_TRACE` eprintlns beside it, whose
+        // four unbuffered writes per plate per frame would distort the frame pacing the question
+        // is about (the 0880 lesson).
+        if benilla_assets::trace::enabled_for("vpl") {
+            let (cp, cf) = (cam_pose.translation, cam_pose.forward());
+            benilla_assets::trace::line(
+                "vpl",
+                &format!(
+                    "e={} vp=({:.0},{:.0}) anchor=[{:.4},{:.4},{:.4}] cam=[{:.4},{:.4},{:.4}] \
+                     fwd=[{:.4},{:.4},{:.4}] scr=({:.3},{:.3}) solved=({:.3},{:.3}) plate=({:.1},{:.1})",
+                    entity.index(),
+                    viewport.x,
+                    viewport.y,
+                    anchor.x,
+                    anchor.y,
+                    anchor.z,
+                    cp.x,
+                    cp.y,
+                    cp.z,
+                    cf.x,
+                    cf.y,
+                    cf.z,
+                    screen.x,
+                    screen.y,
+                    solved.min.x,
+                    solved.min.y,
+                    plate.min.x,
+                    plate.min.y,
+                ),
+            );
+        }
         bucket.claim(plate);
         rects.0.push((plate, entity));
         let hover = cursor.is_some_and(|c| plate.contains(c));
@@ -791,15 +868,15 @@ fn plate_text(
     color: [f32; 4],
     trace: bool,
 ) {
-    // Shape at the nearest baked atlas size, then rescale the quads to the exact target em
-    // around the anchor (the combat_text unbaked-size recipe) — plate ems are window-derived
-    // (8 at 768, 11 at 1080, [`text_px`]) and mostly absent from the baked set.
-    let shaped = atlas.snap_size(px);
+    // Laid out AT the target em. Plate ems are window-derived (8 at 768, 11 at 1080,
+    // [`text_px`]) and so landed on almost nothing in the old fixed size ladder: every plate on
+    // screen used to be shaped at the nearest rung and rescaled about the anchor. Since decision
+    // 1342 the raster follows the request, so the rescale — and its sub-pixel scatter — is gone.
+    let mut e = atlas.lock();
     let spec = FontSpec {
         path: None,
-        height: Some(shaped),
+        height: Some(px),
         outline: Outline::None,
-        paint_halo: true,
         alpha_gradient: None,
     };
     let justify = Justify {
@@ -807,7 +884,7 @@ fn plate_text(
         v: JustifyV::Middle,
     };
     let mut main = layout_text_quads(
-        atlas,
+        &mut e,
         text,
         Rect::from_center_size(anchor, Vec2::ZERO),
         color,
@@ -815,17 +892,9 @@ fn plate_text(
         Z_TEXT,
         spec,
     );
+    drop(e);
     if main.is_empty() {
         return;
-    }
-    let s = px / shaped;
-    for q in main.iter_mut() {
-        q.rect = Rect::new(
-            anchor.x + (q.rect.min.x - anchor.x) * s,
-            anchor.y + (q.rect.min.y - anchor.y) * s,
-            anchor.x + (q.rect.max.x - anchor.x) * s,
-            anchor.y + (q.rect.max.y - anchor.y) * s,
-        );
     }
     // Seat by measured INK, then the shadow is the same run offset one step right+down.
     let dy = {
@@ -867,7 +936,7 @@ fn plate_text(
             y1 = y1.max(q.rect.max.y);
         }
         eprintln!(
-            "vplate-trace: text {text:?} px={px:.1} shaped={shaped:.1} ink=({x0:.1},{y0:.1})..({x1:.1},{y1:.1}) anchor=({:.1},{:.1})",
+            "vplate-trace: text {text:?} px={px:.1} ink=({x0:.1},{y0:.1})..({x1:.1},{y1:.1}) anchor=({:.1},{:.1})",
             anchor.x, anchor.y
         );
     }
@@ -933,6 +1002,27 @@ mod tests {
         assert_eq!(CON_RED[1], 25.0 / 255.0);
         assert_eq!(CON_ORANGE[2], 63.0 / 255.0);
         assert_eq!(CON_GREEN[1], 178.0 / 255.0);
+    }
+
+    /// The snap is on the DEVICE grid, not the logical one. At the 2× scale we develop on, a
+    /// logical `round()` moved the plate two physical pixels at a time; this moves it one, which
+    /// is the smallest step that still lands the border blit on a texel boundary. Pinned so the
+    /// `scale` argument can't be "simplified" away back into `round()`.
+    #[test]
+    fn the_plate_snaps_on_the_device_grid_not_the_logical_one() {
+        // 2× display: the grid is every half logical pixel, and every snapped value is a whole
+        // number of PHYSICAL pixels.
+        for (v, want) in [(10.0, 10.0), (10.2, 10.0), (10.3, 10.5), (10.6, 10.5)] {
+            let got = device_snap(v, 2.0);
+            assert_eq!(got, want, "{v} at 2×");
+            assert_eq!((got * 2.0).fract(), 0.0, "{got} is a whole physical pixel");
+        }
+        // 1×: unchanged from the old law.
+        assert_eq!(device_snap(10.4, 1.0), 10.0);
+        assert_eq!(device_snap(10.6, 1.0), 11.0);
+        // 1.5× (the Windows norm), where a logical round() was never texel-aligned at all.
+        assert_eq!((device_snap(10.4, 1.5) * 1.5).fract(), 0.0);
+        assert_eq!((device_snap(10.9, 1.5) * 1.5).fract(), 0.0);
     }
 
     /// Plate text ems ride the gx DIAGONAL like the frame geometry, growth-damped past the

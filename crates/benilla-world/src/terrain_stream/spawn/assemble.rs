@@ -6,6 +6,8 @@
 
 use benilla_assets::{M2Model, ModelSubmesh};
 use benilla_formats::ModelBlend;
+use bevy::camera::primitives::Aabb;
+use bevy::camera::visibility::NoAutoAabb;
 use bevy::mesh::MeshTag;
 use bevy::prelude::*;
 use bevy::render::render_resource::Buffer;
@@ -19,11 +21,14 @@ use crate::model_render::{ModelKind, ModelPart};
 use benilla_assets::materials::WowModelMaterial;
 
 /// What one placement's animation host armed, for the consumers that spawn alongside its submeshes.
-/// Both fields are *per placement*, not per model: the joint set is this instance's, and `arm` is
+/// All fields are *per placement*, not per model: the anchors are this instance's, and `arm` is
 /// this instance's own anim root, whose live player names the sequence it is currently playing.
 pub struct PlacementHost {
-    /// Bone-indexed joint entities — an emitter or ribbon rides its host bone's joint off this.
-    pub joints: Vec<Entity>,
+    /// `(bone, anchor)` — the consumer anchors this placement minted (decision 1365): one entity
+    /// per bone something actually rides, registered in the host's `RigPose` (its compose passes
+    /// re-seat them) and pre-minted here for every emitter and ribbon bone the model authors, so
+    /// the fx spawns that run after the pose buffer is attached only look entities up.
+    anchors: Vec<(u16, Entity)>,
     /// This placement's anim-root entity. It rides the returned entity list so it despawns with the
     /// placement, but it is **not geometry** — a caller tagging "everything this placement draws"
     /// has to be able to leave it out, or it lands in a cull that can only fail open on a boundless
@@ -37,6 +42,18 @@ pub struct PlacementHost {
     /// (decision 0768), so a captured slot goes stale within about a second and the consumer has to
     /// resolve against the live player instead.
     pub arm: Option<Entity>,
+}
+
+impl PlacementHost {
+    /// The anchor standing in for `bone` — what `joints.get(bone)` used to answer. `None` = the
+    /// bone hosts nothing this placement consumes (or is outside the skeleton): the consumer
+    /// falls back exactly as it did on a missing joint.
+    pub fn anchor(&self, bone: u16) -> Option<Entity> {
+        self.anchors
+            .iter()
+            .find(|&&(b, _)| b == bone)
+            .map(|&(_, e)| e)
+    }
 }
 
 /// Spawn a model's submeshes at `transform` with the full doodad/WMO component set. Returns the spawned
@@ -73,6 +90,12 @@ pub fn spawn_model_entities(
     interior_slot: Option<u16>,
     radius: f32,
     local_center: Vec3,
+    // The model's authored **all-animation** bound in Bevy model-local space
+    // ([`super::m2_anim_bound`]) — what an ANIMATED placement's submeshes are culled with instead of
+    // their bind-pose mesh bound, which the joint palette has left behind (decision 1259). `None` for
+    // WMO group geometry (no M2 header) and for a model with no authored box; a static placement
+    // ignores it and keeps the tighter per-batch bound.
+    anim_bound: Option<Aabb>,
     // `Some((model, now))` for an M2 placement: the doodad-animation gate (decision 0130) — an
     // animated model spawns joints + the skinned twins; `now` is the clock origin. `None` for WMO
     // group geometry.
@@ -84,6 +107,9 @@ pub fn spawn_model_entities(
     // `rgb_anim` loop registers its material here so `tick_anim_materials` re-samples the
     // shared tint each frame.
     tint_reg: &mut crate::doodad_anim::TintAnimMaterials,
+    // The shared delta table both registries slot into (decision 1381) — registration allocates
+    // here and bakes the slot into the material.
+    anim_table: &mut crate::mat_anim_table::MatAnimTable,
     // `Some(anchor)` for a prop spawned ON a streamed entity (the WMO-gameobject path): a boneless
     // model's billboard cards FOLLOW this anchor (`BillboardCard::following` — the entity-path law,
     // decision 0153) instead of baking a world pivot, so they track the moving owner and
@@ -112,7 +138,7 @@ pub fn spawn_model_entities(
     // (0 render batches — the InstancePortal swirl, whose two emitters sit on the spinning rotor
     // bones) still needs its joints driven. Only a model with nothing but billboard cards and no
     // emitters/ribbons spawns no host.
-    let host = m2
+    let mut host = m2
         .filter(|(m, _)| {
             submeshes.iter().any(|s| s.billboard.is_none())
                 || !m.emitters.is_empty()
@@ -121,9 +147,7 @@ pub fn spawn_model_entities(
         .and_then(|(m, _)| crate::doodad_anim::spawn_anim_host(commands, m, transform));
     // Captures freeze material-alpha clocks at 0 (deterministic frames) — read the env once.
     let mat_frozen = crate::dev_state::deterministic_run();
-    let skin = host
-        .as_ref()
-        .map(|h| (h.joints.clone(), h.inverse_bindposes.clone()));
+    let animated = host.is_some();
     let rig_root = host.as_ref().map(|h| h.root);
     if let Some(h) = &host {
         out.push(h.root);
@@ -172,6 +196,19 @@ pub fn spawn_model_entities(
         // distance-fades with its doodad (below — the halo must cull when the lamp does), so it
         // keeps its fade twin and its `DoodadFade`.
         let steady_interior_prop = interior_probe && sub.billboard.is_none();
+        // **Does this batch need a material of its own?** (decision 1408.) A batch whose UV or tint
+        // loop differs between sequences cannot share one: the registries are keyed by material,
+        // so a shared one has no instance to ask which sequence is playing — and these placements
+        // re-roll their variation independently every window (0768), so at any instant they are on
+        // different slots. Keying the material by this placement's anim host gives each its own
+        // registry entry, its own table row, and its own sequence. Everything else — every batch in
+        // the world but a measured 28 on this lane, 49 corpus-wide of 24103 (`uvslotscan`) — keeps
+        // the shared material it always had.
+        //
+        // No host ⇒ no sequence to read ⇒ share, and stay at the built seed: a per-sequence batch
+        // on a model the content gate declined is exactly today's frozen behaviour, not a new one.
+        let per_seq = sub.uv_seq.is_some() || sub.rgb_seq.is_some();
+        let seq_owner = per_seq.then_some(rig_root).flatten();
         let cutout = model_material(
             mat_cache,
             materials,
@@ -194,7 +231,9 @@ pub fn spawn_model_entities(
             sub.wmo_batch,
             sub.sidn,
             sub.window,
+            false, // the world streamer never spawns a skybox
             light,
+            seq_owner,
         );
         // The blend twin for the distance-fade feather pass (reuse the cutout when already blend, or when
         // this is a non-fading interior prop). A MULTIPLY batch (Mod/Mod2x — the weapon-rack
@@ -235,23 +274,67 @@ pub fn spawn_model_entities(
                 sub.wmo_batch,
                 sub.sidn,
                 sub.window,
+                false, // the world streamer never spawns a skybox
                 light,
+                seq_owner,
             )
         };
         // Register both variants' materials for the per-frame UV scroll (idempotent per material —
         // every instance of the batch lands on the same deduped handle).
-        if let Some(anim) = &sub.uv_anim {
-            uv_reg.0.entry(cutout.id()).or_insert_with(|| anim.clone());
-            uv_reg.0.entry(blend.id()).or_insert_with(|| anim.clone());
+        // A period-0 loop is a constant the material seed already wrote (`sample(0.0)` IS its
+        // forever value) — registering it would buy a per-frame re-write of the same number
+        // (1375), so only a real loop enters the registry.
+        // The per-placement lane first: its set replaces the shared loop outright, and it only
+        // arms when this placement actually has a host to read a sequence from.
+        if let (Some(seqs), Some(host)) = (sub.uv_seq.as_ref(), seq_owner) {
+            for id in [cutout.id(), blend.id()] {
+                crate::doodad_anim::register_uv(
+                    uv_reg,
+                    anim_table,
+                    materials,
+                    id,
+                    crate::doodad_anim::UvLoop::PerSeq {
+                        seqs: seqs.clone(),
+                        host,
+                    },
+                );
+            }
+        } else if let Some(anim) = sub.uv_anim.as_ref().filter(|a| a.period > 0.0) {
+            for id in [cutout.id(), blend.id()] {
+                crate::doodad_anim::register_uv(
+                    uv_reg,
+                    anim_table,
+                    materials,
+                    id,
+                    crate::doodad_anim::UvLoop::Shared(anim.clone()),
+                );
+            }
         }
         // …and for the per-frame tint re-sample (the animated M2Color RGB, same shared clock —
         // the same invisible seq-band phase divergence as the UV scroll, recorded there).
-        if let Some(anim) = &sub.rgb_anim {
-            tint_reg
-                .0
-                .entry(cutout.id())
-                .or_insert_with(|| anim.clone());
-            tint_reg.0.entry(blend.id()).or_insert_with(|| anim.clone());
+        if let (Some(seqs), Some(host)) = (sub.rgb_seq.as_ref(), seq_owner) {
+            for id in [cutout.id(), blend.id()] {
+                crate::doodad_anim::register_tint(
+                    tint_reg,
+                    anim_table,
+                    materials,
+                    id,
+                    crate::doodad_anim::TintLoop::PerSeq {
+                        seqs: seqs.clone(),
+                        host,
+                    },
+                );
+            }
+        } else if let Some(anim) = sub.rgb_anim.as_ref().filter(|a| a.period > 0.0) {
+            for id in [cutout.id(), blend.id()] {
+                crate::doodad_anim::register_tint(
+                    tint_reg,
+                    anim_table,
+                    materials,
+                    id,
+                    crate::doodad_anim::TintLoop::Shared(anim.clone()),
+                );
+            }
         }
         // `MeshTag` is the per-instance lighting/fade scalar: an interior prop carries its SH-probe
         // slot index here (the shader evaluates the folded probe instead of the sky base);
@@ -270,14 +353,12 @@ pub fn spawn_model_entities(
         // lamp does instead of hanging in the air far past it. The mesh is centred at the pivot, so the
         // fade centre is `ZERO` (→ the entity's world translation = the pivot).
         let (entity, fade_center) = if let Some(info) = &sub.billboard {
-            // An animated doodad's card rides its billboard bone's live joint (the swinging
-            // lamp's glow follows the swing — 0153 follow-up; the joint frame bakes the pivot,
-            // 0130 rig identity). A static doodad keeps the fixed placement-baked pivot.
-            let card = match skin
-                .as_ref()
-                .and_then(|(joints, _)| joints.get(info.bone as usize))
-            {
-                Some(&joint) => BillboardCard::following_joint(info, joint),
+            // An animated doodad's card rides its billboard bone's live anchor (the swinging
+            // lamp's glow follows the swing — 0153 follow-up; the anchor frame bakes the pivot,
+            // the 0130 rig identity carried into the collapsed lane by 1365). A static doodad
+            // keeps the fixed placement-baked pivot.
+            let card = match host.as_mut().and_then(|h| h.anchor(commands, info.bone)) {
+                Some(anchor) => BillboardCard::following_joint(info, anchor),
                 None => match card_owner {
                     Some(anchor) => BillboardCard::following(info, anchor),
                     None => BillboardCard::new(info, transform),
@@ -300,9 +381,11 @@ pub fn spawn_model_entities(
             ));
             // The build-time Aabb, inserted explicitly: the static form is `RENDER_WORLD`-only,
             // so Bevy's `calculate_bounds` can race extraction — and the exterior cull fails
-            // OPEN on a missing bound (0832's rule, extended to the model lane).
+            // OPEN on a missing bound (0832's rule, extended to the model lane). `NoAutoAabb`
+            // says the bound is OURS: see the ordinary-part insert below for what derives it
+            // otherwise, and what that cost.
             if let Some(aabb) = stat_aabb {
-                card_entity.insert(*aabb);
+                card_entity.insert((*aabb, NoAutoAabb));
             }
             (card_entity.id(), Vec3::ZERO)
         } else {
@@ -312,8 +395,7 @@ pub fn spawn_model_entities(
             // (decision 0863, `doodad_anim::lazy`). The twin comes from the app-built forms
             // (0834); a lane that didn't request it (or a contract break) simply never promotes,
             // rather than arm the picker with a joint-less "skinned" mesh.
-            let skinned_mesh = skin
-                .is_some()
+            let skinned_mesh = animated
                 .then(|| forms.skin.and_then(|s| s.get(batch_idx)).cloned())
                 .flatten();
             let mut part_entity = commands.spawn((
@@ -329,10 +411,27 @@ pub fn spawn_model_entities(
                 mesh_tag,
             ));
             // Every part now spawns static, so every part carries the build-time Aabb (the
-            // RENDER_WORLD rule above). It stays through a promote: the skinned twin shares the
-            // bind-pose geometry, so the bound is the same one `calculate_bounds` used to derive.
-            if let Some(aabb) = stat_aabb {
-                part_entity.insert(*aabb);
+            // RENDER_WORLD rule above).
+            //
+            // For an ANIMATED placement that bind-pose bound is a lie, because the joints move the
+            // vertices while this entity's transform stays at the placement origin. Widen to the
+            // model's authored all-animation box (decision 1259) — the union, never the replacement,
+            // so the 152 corpus models whose authored box does not fully contain their own bind pose
+            // still bound their geometry. A billboard card is exempt: its entity transform FOLLOWS
+            // its joint every frame, so its own small bound travels with what it draws.
+            //
+            // **`NoAutoAabb` is what makes that bound survive** (decision 1261). Bevy's
+            // `calculate_bounds` runs TWO queries: one that inserts a bound where there is none,
+            // and one that **overwrites an existing bound** on `Changed<Mesh3d>`. The lazy rig
+            // swaps `Mesh3d` static → skinned at this placement's first draw-gate wake
+            // (`doodad_anim::lazy`), and the skinned twin shares the BIND-POSE geometry — so the
+            // second query recomputed the very box 1259 had just widened, and the birds went back
+            // to blinking a second after they streamed in. The bound here is authored, not derived;
+            // this component is how that is said.
+            if let Some(aabb) =
+                cull_bound(stat_aabb.as_ref(), animated.then_some(anim_bound).flatten())
+            {
+                part_entity.insert((aabb, NoAutoAabb));
             }
             if let Some(sm) = skinned_mesh {
                 part_entity.insert(crate::doodad_anim::SkinnedTwin {
@@ -342,12 +441,10 @@ pub fn spawn_model_entities(
                 lazy_parts.push(part_entity.id());
             }
             let entity = part_entity.id();
-            if skin.is_some() {
-                if let Some(root) = rig_root {
-                    commands
-                        .entity(entity)
-                        .insert(crate::rig_palette::RigPart(root));
-                }
+            if let Some(root) = rig_root {
+                commands
+                    .entity(entity)
+                    .insert(crate::rig_palette::RigPart(root));
                 // The draw-gate list is about visibility, not skinning — the bind-pose fallback
                 // part still represents the placement.
                 skinned_meshes.push(entity);
@@ -361,6 +458,17 @@ pub fn spawn_model_entities(
         // same way since the 0355 re-lane gave the probe-slot payload its own alpha field (bits
         // 0..=15) — the 0130-era "partial alpha can't show on the colour payload" deferral is
         // collected (bug B30: the Undercity lightshaft's authored 0.10/0.05 dimming).
+        // The scan marker (1375), same predicate as the registration above — so a marked row
+        // always has a registry key to match, and `tick_anim_materials` never has to visit an
+        // unmarked one.
+        if sub.uv_anim.as_ref().is_some_and(|a| a.period > 0.0)
+            || sub.rgb_anim.as_ref().is_some_and(|a| a.period > 0.0)
+            || seq_owner.is_some()
+        {
+            commands
+                .entity(entity)
+                .insert(crate::doodad_anim::AnimMatPart);
+        }
         if let Some(anim) = &sub.alpha_anim {
             commands
                 .entity(entity)
@@ -390,8 +498,21 @@ pub fn spawn_model_entities(
     // or, for a meshless (particles-only) host, iff the placement's fade sphere is in the draw
     // set (the same 0171 law its emitters gate on).
     let arm = host.as_ref().and_then(|h| h.seq.map(|_| h.root));
-    if let Some(h) = host {
+    let placement_host = host.map(|mut h| {
         let now = m2.map(|(_, now)| now).unwrap_or_default();
+        // Pre-mint the fx consumers' anchors (decision 1365) while the pose buffer is still in
+        // hand: exactly the bones the model authors emitters/ribbons on, nothing speculative —
+        // the fx spawns that run after this only look the entities up ([`PlacementHost::anchor`]).
+        if let Some((m, _)) = m2 {
+            for bone in m
+                .emitters
+                .iter()
+                .map(|e| e.def.bone)
+                .chain(m.ribbons.iter().map(|r| r.def.bone))
+            {
+                h.anchor(commands, bone);
+            }
+        }
         commands.entity(h.root).insert(DoodadAnimHost {
             meshes: skinned_meshes,
             fade: (radius, transform.transform_point(local_center)),
@@ -414,15 +535,84 @@ pub fn spawn_model_entities(
         // (chimney smoke) never takes a slot, which under the eager design it wasted one on.
         if !lazy_parts.is_empty() {
             commands.entity(h.root).insert(crate::doodad_anim::LazyRig {
-                joints: h.joints.clone(),
+                bones: h.bones(),
                 ibp: h.inverse_bindposes.clone(),
                 parts: lazy_parts,
             });
         }
+        let root = h.root;
+        let anchors = h.finish(commands);
+        PlacementHost { anchors, root, arm }
+    });
+    (out, placement_host)
+}
+
+/// The `Aabb` a placed submesh is culled with: its build-time bind-pose bound, widened by the
+/// model's authored all-animation box when this placement animates (decision 1259).
+///
+/// It is a **union**, not a swap, for one measured reason: 152 of the 9315 M2s that carry geometry
+/// author a header box that does not fully contain their own bind-pose vertices (worst case
+/// `Spells\Teleport.m2`, 19.9 yd short). The reference never notices — it tests the box's
+/// *circumsphere*, which swallows the shortfall — so a bare swap would be the one way this change
+/// could cull geometry the reference draws.
+fn cull_bound(stat: Option<&Aabb>, anim: Option<Aabb>) -> Option<Aabb> {
+    match (stat, anim) {
+        (Some(s), Some(a)) => Some(Aabb::from_min_max(
+            Vec3::from(s.min().min(a.min())),
+            Vec3::from(s.max().max(a.max())),
+        )),
+        (Some(s), None) => Some(*s),
+        (None, a) => a,
     }
-    (
-        out,
-        skin.zip(rig_root)
-            .map(|((joints, _), root)| PlacementHost { joints, root, arm }),
-    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug's own numbers (`benilla-extract animboundscan`, `World\critter\birds\Bird01.m2`):
+    /// a 1.2 × 1.8 × 0.23 yd bind-pose box, and an authored all-animation box 67 × 18 × 7 yd that
+    /// reaches ~37 yd past it. Culled by the bind pose, the bird is dropped while its drawn
+    /// geometry is still on screen.
+    #[test]
+    fn an_animated_placements_bound_covers_the_whole_flight_path() {
+        // Bevy-space conversions of Bird01's two boxes (WoW (x,y,z) -> Bevy (-y, z, -x)).
+        let bind = Aabb::from_min_max(
+            Vec3::new(-0.863, 9.359, -3.536),
+            Vec3::new(0.915, 9.586, -2.366),
+        );
+        let authored = Aabb::from_min_max(
+            Vec3::new(-4.219, 8.816, -30.547),
+            Vec3::new(13.571, 16.019, 36.605),
+        );
+        let widened = cull_bound(Some(&bind), Some(authored)).expect("a bound");
+        // Every corner of the authored box is inside the widened bound. `Aabb` stores
+        // centre/half-extents, so the reconstructed corners carry a float epsilon — hence the
+        // tolerance, which is ~7 orders of magnitude below anything a cull can see.
+        const EPS: f32 = 1e-4;
+        assert!((widened.min() - EPS).cmple(authored.min()).all());
+        assert!((widened.max() + EPS).cmpge(authored.max()).all());
+        // …and the bind-pose bound alone was ~37 yd short of it along the flight axis.
+        assert!(authored.max().z - bind.max().z > 36.0);
+    }
+
+    /// The union arm, not a swap: an authored box that fails to contain the bind pose (152 corpus
+    /// models do) must not shrink the bound.
+    #[test]
+    fn a_short_authored_box_never_shrinks_the_bound() {
+        let bind = Aabb::from_min_max(Vec3::splat(-5.0), Vec3::splat(5.0));
+        let authored = Aabb::from_min_max(Vec3::new(-40.0, -1.0, -1.0), Vec3::new(40.0, 1.0, 1.0));
+        let b = cull_bound(Some(&bind), Some(authored)).expect("a bound");
+        assert!(Vec3::from(b.min()).abs_diff_eq(Vec3::new(-40.0, -5.0, -5.0), 1e-4));
+        assert!(Vec3::from(b.max()).abs_diff_eq(Vec3::new(40.0, 5.0, 5.0), 1e-4));
+    }
+
+    /// A static placement is untouched — it keeps the tighter per-batch bind-pose bound.
+    #[test]
+    fn a_static_placement_keeps_its_per_batch_bound() {
+        let bind = Aabb::from_min_max(Vec3::splat(-1.0), Vec3::splat(1.0));
+        let b = cull_bound(Some(&bind), None).expect("a bound");
+        assert!(Vec3::from(b.min()).abs_diff_eq(Vec3::splat(-1.0), 1e-4));
+        assert!(Vec3::from(b.max()).abs_diff_eq(Vec3::splat(1.0), 1e-4));
+    }
 }

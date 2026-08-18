@@ -163,9 +163,13 @@ impl ProbeShield {
 /// unattended session logs in with (method.md "The local vmangos server"). Nothing else is ours to
 /// modify: `one` is the director's, and a bystander test account is not a probe.
 fn is_probe_account(user: &str) -> bool {
-    let user = user.to_ascii_lowercase();
-    user.strip_prefix("probe")
-        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    // Byte-wise (a &str slice at 5 would panic mid-char on non-ASCII input; bytes can't).
+    let Some((prefix, digits)) = user.as_bytes().split_at_checked(5) else {
+        return false;
+    };
+    prefix.eq_ignore_ascii_case(b"probe")
+        && !digits.is_empty()
+        && digits.iter().all(u8::is_ascii_digit)
 }
 
 /// Whether this run wants GM mode **off** — `WOW_GM=off`, or an explicit `gm:off` in `WOW_RIG`.
@@ -173,7 +177,10 @@ fn is_probe_account(user: &str) -> bool {
 /// factions, hostility, colours, threat, damage or timers. An explicit ask always beats the
 /// default, and the rig's token is an explicit ask: two modules must not send `.gm` at each other,
 /// so the one with the spec in front of it wins (0651's rig owns its own `gm:` step).
-fn wants_gm_off() -> bool {
+///
+/// [`crate::preflight`] reads it too — the banner has to know a `.gm off` is on its way out before
+/// it accuses the run of measuring through GM mode.
+pub(crate) fn wants_gm_off() -> bool {
     std::env::var("WOW_GM").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
         || std::env::var("WOW_RIG").is_ok_and(|spec| rig_asks_for_gm_off(&spec))
 }
@@ -190,9 +197,13 @@ fn rig_asks_for_gm_off(spec: &str) -> bool {
     })
 }
 
-/// Whether `WOW_GOD=off` asked for an unshielded run.
+/// Whether `WOW_GOD=off` asked for an unshielded run — a launch-time knob, read once (the shield
+/// drive asks every frame).
 fn disabled_by_env() -> bool {
-    std::env::var("WOW_GOD").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("WOW_GOD").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+    });
+    *OFF
 }
 
 /// Classify one `CHAT_MSG_SYSTEM` line as an answer about god mode. `None` = not about it.

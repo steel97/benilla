@@ -13,6 +13,10 @@ use benilla_ui::widget::FrameHandle;
 use crate::ui_pass::{UiQuad, UvRect};
 use crate::ui_text::{layout_text_quads, layout_text_quads_links, UiFontAtlas};
 
+/// `WOW_TEXT_PROBE=1` — launch-time knob, read once (the check ran per Text quad per frame).
+static TEXT_PROBE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("WOW_TEXT_PROBE").as_deref() == Ok("1"));
+
 /// The `QuadContent::Text` payload minus the text itself — the region's resolved style, passed
 /// verbatim from the destructure at the [`super::drive_script`] call site.
 pub(super) struct TextStyle {
@@ -79,7 +83,6 @@ pub(super) fn emit(
             host.scale * host.font_scale,
         ),
         outline: style.outline,
-        paint_halo: true,
         alpha_gradient: style.alpha_gradient,
     };
     // The focused edit box's text draws WINDOWED (`0x77da80`): the scroll window's substring,
@@ -121,7 +124,7 @@ pub(super) fn emit(
     if let Some(ui) = ebox {
         let drawn = &text[ui.display_from.min(text.len())..];
         let (x0, top, cell_h) =
-            crate::ui_text::line_origin(atlas, drawn, host.rect, draw_justify, spec);
+            crate::ui_text::line_origin(&mut atlas.lock(), drawn, host.rect, draw_justify, spec);
         ebox_geom = Some((x0, top, cell_h));
         text_clip = Some(host.clip.map_or(host.rect, |c| c.intersect(host.rect)));
         if !ui.multi_line {
@@ -155,6 +158,8 @@ pub(super) fn emit(
                 color: [hc[0], hc[1], hc[2], hc[3] * host.alpha],
                 additive: false,
                 circular: false,
+                desaturated: false,
+                premultiplied: false,
                 clip: text_clip,
                 rotation: 0.0,
                 mask: None,
@@ -171,24 +176,25 @@ pub(super) fn emit(
     // gate inside is geometric and needs no fixed-vs-measured flag. Computed before the shadow
     // so the shadow pass draws the same display string (the client's shadow is a second draw of
     // the same truncated CGxString).
-    let ellipsized = if ebox.is_none() && !matches!(host.target, ZTarget::Frame(_)) {
-        crate::ui_text::ellipsize_to_fit(atlas, draw_text, draw_rect, spec)
-    } else {
-        None
+    let ellipsized = match host.target {
+        ZTarget::Region(region) if ebox.is_none() => {
+            crate::ui_text::ellipsize_to_fit(atlas, region, draw_text, draw_rect, spec)
+        }
+        _ => None,
     };
     if let Some(display) = ellipsized.as_deref() {
         draw_text = display;
     }
     // The probe prints the DISPLAY string (post-ellipsis, post-editbox-window) — what this pass
     // actually draws, which is what a truncation report needs to show.
-    let probe = std::env::var("WOW_TEXT_PROBE").as_deref() == Ok("1");
+    let probe = *TEXT_PROBE;
     if probe {
         // For the focused edit box, also the two numbers that must agree: where the engine puts the
         // caret (`caret=`, advance-table-derived) and how wide the text this pass actually draws is
         // (`ink=`). They diverge by the width of the markup when the advance table is measured over
         // the raw buffer — the caret-out-in-space report (decision 1075) as a pair of numbers.
         let ebox_geom = ebox.map(|ui| {
-            let ink = crate::ui_text::measure_text(atlas, draw_text, None, spec).0;
+            let ink = crate::ui_text::measure_text(&mut atlas.lock(), draw_text, None, spec).0;
             format!(" caret={:.1} ink={ink:.1}", ui.caret_x * host.scale)
         });
         info!(
@@ -207,9 +213,9 @@ pub(super) fn emit(
     // the stable z-sort keeps it behind the glyph pass. Offset is WoW y-up (`y="-1"` = down) →
     // y-down screen dy = −y. Markup color codes inside the text tint the shadow run too (v1
     // corner, invisible for solid-color strings). The shadow is a single flat offset copy —
-    // never itself outlined (an outlined shadow would be a muddy black blob), so it suppresses
-    // the halo PAINT only: it keeps the font's true outline for the step law, laying out
-    // identically to its fill (a shadow with different steps would smear under long strings).
+    // never itself outlined — it lays out identically to its fill (a shadow with different steps
+    // would smear under long strings) and redraws the same composite cells in the shadow color,
+    // where the ring's black is indistinguishable from the shadow's.
     if let (Some(sh), Some((dx, dy))) = (style.shadow, shadow_delta) {
         // WHOLE pixels (`shadow_offset_px`, computed above): the shadow is a rigid copy of the
         // fill, so its displacement must be an integer in the rect's own space — see that fn for
@@ -220,12 +226,9 @@ pub(super) fn emit(
             draw_rect.max.x + dx,
             draw_rect.max.y + dy,
         );
-        let shadow_spec = crate::ui_text::FontSpec {
-            paint_halo: false,
-            ..spec
-        };
+        let shadow_spec = crate::ui_text::FontSpec { ..spec };
         let mut sq = layout_text_quads(
-            atlas,
+            &mut atlas.lock(),
             draw_text,
             srect,
             sh.color,
@@ -255,7 +258,7 @@ pub(super) fn emit(
         // for the engine's click hit-test (y-down → y-up flip).
         let mut spans = Vec::new();
         let g = layout_text_quads_links(
-            atlas,
+            &mut atlas.lock(),
             text,
             host.rect,
             base_color,
@@ -284,7 +287,7 @@ pub(super) fn emit(
         g
     } else {
         layout_text_quads(
-            atlas,
+            &mut atlas.lock(),
             draw_text,
             draw_rect,
             base_color,
@@ -339,6 +342,8 @@ pub(super) fn emit(
                 color: [1.0, 1.0, 1.0, host.alpha],
                 additive: false,
                 circular: false,
+                desaturated: false,
+                premultiplied: false,
                 clip: text_clip,
                 rotation: 0.0,
                 mask: None,

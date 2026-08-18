@@ -107,7 +107,7 @@
           the two states are authored rather than driven. The mixin port comes with the addon
           list. Width is era's text+40 law via an OnUpdate measure poll; the era's
           measure-at-the-medium-font quirk is deliberately dropped (~6 units of padding).
-        - **Search WORKS (0984)** — the era SettingsPanel mechanism transcribed (the Script
+        - **Search WORKS (0984)** — the era SettingsPanel mechanism re-expressed (the Script
           block's search section): label-tag substring match scored by matched length,
           results grouped under clickable category heads ordered by best score, a matched
           child pulls its parent row in, "Search Results" title with Defaults hidden while
@@ -158,7 +158,7 @@
           page went LIVE in 0992 (the three UnitName* checkbox rows).
         - **The window rides a scale knob** (slice B): fonts ride frame scale engine-wide now
           (the 0219 §2 divergence closed), so ERA_WINDOW_SCALE × the era checkFit shrink
-          (UIPanelUpdateScaleForFit, transcribed in this file) sizes the whole window; 0.78 is
+          (UIPanelUpdateScaleForFit, re-expressed in this file) sizes the whole window; 0.78 is
           the director's-eye starting point, live-tunable. The knob is SHARED: it stands in for
           the era client's UIParent scale (smaller than our 1.12 768-canvas on modern screens),
           so every era-shaped window wears it — GameMenuFrame.xml reads it in its OnShow.
@@ -207,7 +207,7 @@
         function OptionsFrame_UpdateScale()
             -- The era panel is registered `checkFit = 1`: the panel manager also shrinks it to
             -- fit a small screen (UIPanelUpdateScaleForFit: min over width/height ratios
-            -- against the panel + 20 units of air each way, capped at 1) — transcribed here.
+            -- against the panel + 20 units of air each way, capped at 1) — re-expressed here.
             local k = ERA_WINDOW_SCALE
             local wFit = GetScreenWidth() / 940
             local hFit = GetScreenHeight() / 744
@@ -248,7 +248,7 @@
             bg:SetVertexColor(0.196, 0.388, 0.8)
         end
 
-        -- The selection — 1.14's OptionsList_SelectButton/_ClearSelection pair, verbatim
+        -- The selection — 1.14's OptionsList_SelectButton/_ClearSelection pair, re-expressed
         -- (OptionsFrameTemplates.lua l.107-121): the selected row's wash goes GOLD (1,1,0)
         -- and locks on; every other row drops back to the blue hover tint, wash off. The
         -- white selected label is LockHighlight's own text state, carried by the font swap.
@@ -308,7 +308,7 @@
             end
         end
 
-        -- ── Search (0984): the era SettingsPanel mechanism, transcribed ─────────────────────
+        -- ── Search (0984): the era SettingsPanel mechanism, re-expressed ────────────────────
         -- Blizzard_SettingsPanel.lua l.566-692 + Blizzard_Settings.lua l.65-77, cut to our
         -- static rows: a setting's search tag is its LABEL uppercased (the era's default tag
         -- is exactly the setting name — SettingControls.lua l.773); a query matches by plain
@@ -615,7 +615,7 @@
                 "RowEnableAll", "RowMaster", "RowSound", "RowMusic", "RowAmbience",
                 "RowEnableMusic", "RowEnableAmbience",
             },
-            Graphics = { "RowUiScale", "RowWorldDetail" },
+            Graphics = { "RowUiScale", "RowWorldDetail", "RowVerticalSync" },
             Nameplates = { "RowPlayerNames", "RowNpcNames", "RowOwnName" },
             -- The stock globals that were already defined AND consumed when 1134 opened the store
             -- (1136; Buff Durations 1139), in the reference's own on-screen order — its Basic
@@ -953,7 +953,7 @@
                 -- would read as moved-off-"0.4").
                 local str = string.gsub(string.format("%.2f", value), "%.?0+$", "")
                 if row.deferred then
-                    -- era CommitFlag.Apply, transcribed (Blizzard_Setting.lua's staged
+                    -- era CommitFlag.Apply, re-expressed (Blizzard_Setting.lua's staged
                     -- SetValue half): the control shows the new value, the ENGINE keeps the
                     -- old one, and the CVar moves only when Apply commits — dragging a
                     -- slider that rescales itself mid-drag is exactly what this flag
@@ -1475,7 +1475,10 @@
         </Scripts>
     </Frame>
 
-    <Frame name="OptionsFrame" frameStrata="HIGH" enableMouse="true" hidden="true">
+    <!-- `toplevel` restored (ref OptionsFrame.xml l.3) — same class as the B180/Bagnon dialog
+         (decision 1318). NOTE our strata is HIGH where the ref is DIALOG; left as-is, flagged in
+         the record rather than silently changed. -->
+    <Frame name="OptionsFrame" frameStrata="HIGH" toplevel="true" enableMouse="true" hidden="true">
         <Size><AbsDimension x="920" y="724"/></Size>
         <Anchors><Anchor point="CENTER"/></Anchors>
         <!-- The 1.14 System-window dialog, verbatim (BACKDROP_DIALOG_32_32 — wow-ui-source
@@ -2072,6 +2075,22 @@
                                                 })
                                             </OnLoad></Scripts>
                                         </Frame>
+                                        <Frame name="$parentRowVerticalSync" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowWorldDetail" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowWorldDetail" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                -- Vertical Sync: 1.12's own Video Options checkbox
+                                                -- 5 (gxVSync), over the window's present mode.
+                                                -- The reference row carries gxRestart = 1; ours
+                                                -- does not and must not be marked deferred --
+                                                -- wgpu swaps the presentation interval live, so
+                                                -- the box takes effect as you click it.
+                                                OptionsRow_OnLoad(self, "gxVSync", "Vertical Sync",
+                                                    "OPTION_TOOLTIP_VERTICAL_SYNC")
+                                            </OnLoad></Scripts>
+                                        </Frame>
                                     </Frames>
                                 </Frame>
                                 <!-- The COMBAT page (decision 1134) — the first page whose rows
@@ -2486,7 +2505,7 @@
                                      on uncheck only), then the section list — 19 dual-mode rows under
                                      the shared faux-scroll kit, sections collapsed by default — and
                                      the 1.12 window's message line (KEY_BOUND / the red steal / the
-                                     wheel refusal) at the foot. -->
+                                     refused key string) at the foot. -->
                                 <!-- enableMouse: the page catches the wheel ITSELF on any point no
                                      child claims (hit-testing only sees mouse-enabled frames —
                                      pointer.rs; rows are plain Frames, so a spin over a row's name

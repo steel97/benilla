@@ -73,7 +73,7 @@ use benilla_ui::toc::Toc;
 /// The render column — the one question every column here was blind to: *did this addon put
 /// anything on screen?* Its own module because it is its own concern (and this file is well over
 /// the size budget); its header is the design and the honest bounds.
-mod render;
+pub mod render;
 #[cfg(test)]
 mod render_tests;
 /// The use column — *does the thing it drew survive being **touched**?* Its own module for the
@@ -394,6 +394,12 @@ fn manifest_path(root: &Path, name: &str) -> Option<PathBuf> {
         .map(|e| e.path())
 }
 
+/// The per-addon VM-instruction bound (see its use in [`survey_one`]) — the ONE number, shared
+/// with the live client's world-entry arming (decision 1306) so the corpus measurement behind it
+/// (heaviest legitimate addon 4M, 214 of 218 under 1M) cannot drift apart from the bound players
+/// actually run under.
+const ADDON_INSTRUCTION_BUDGET: u64 = crate::ui_script::addons::LOAD_INSTRUCTION_BUDGET;
+
 fn survey_one(
     root: &Path,
     name: &str,
@@ -434,6 +440,20 @@ fn survey_one(
             }
         }
     };
+    // **A time bound, so one non-terminating addon cannot take the whole survey with it.**
+    //
+    // 1247 met the failure this exists for: `date("*t")` returned a string where Lua returns a
+    // table, so an addon's `while` never ended and the 218-addon run simply stopped finishing —
+    // no roster to diff, no column to compare, no error row to read, and the cause found by
+    // bisecting the corpus BY HAND. A wrong number is recoverable; an instrument that does not
+    // return is not.
+    //
+    // The budget is MEASURED, not guessed. Across the corpus at the time of writing, 214 of 218
+    // addons execute fewer than 1M VM instructions in a whole survey (the counter's resolution);
+    // the heaviest legitimate one is Enchantrix at 4M, then FuBar_CTRaid and BigWigs at 1M. So
+    // this is ~50x the heaviest real addon — far enough out that a fixture growing new seats
+    // cannot drift into it, and near enough that a runaway reports in about a second.
+    script.set_instruction_budget(ADDON_INSTRUCTION_BUDGET);
     script.set_screen_size(1024.0, 768.0);
     // Before anything runs: the AddOn API must answer for the whole installed set, not for nothing.
     // `None` roots because a survey must never read or write the director's real saved variables
@@ -832,13 +852,26 @@ fn drive_session_start(script: &mut UiScript, name: &str, deps: &[String]) -> Ve
     // (`load_dependencies`) and there is no reason session errors should differ — charging it here
     // would count one library's fault once per addon that embeds it, which is the whole reason
     // one-VM-per-addon exists.
+    //
+    // **Attribution is by the RAISING CHUNK now, not by which event window the raise fell in**
+    // (decision 1226 — recorded when this was still window-based, fixed here). The window proxy
+    // broke on the shape it was written for: AceAddon drains its ENTIRE `nextAddon` queue on any
+    // `ADDON_LOADED` it sees (`AceAddon-2.0.lua:104-105`) and calls each consumer's
+    // `OnInitialize` there (`:230`). So the SURVEYED addon's own code runs inside a DEPENDENCY's
+    // window, and firing deps outside the mark charged those raises to nobody — the whole
+    // FuBar/Ace family was silently OVER-reported as surviving. `Region:SetParent` landing made
+    // FuBar_FuXPFu flip `ok -> fail` and that looked like a regression; it was this.
+    //
+    // Every `ADDON_LOADED` fires inside the mark now, and the dependency exemption is applied
+    // afterwards by asking WHOSE FILE raised. Chunk names have been truthful since 1217
+    // (`@Interface\AddOns\<Folder>\<File>`), which is what makes the honest key available at all.
+    let before = script.errors().len();
     for dep in deps {
         script.fire_event(
             "ADDON_LOADED",
             vec![benilla_ui::script::ScriptValue::Str(dep.clone())],
         );
     }
-    let before = script.errors().len();
     script.fire_event(
         "ADDON_LOADED",
         vec![benilla_ui::script::ScriptValue::Str(name.to_string())],
@@ -849,7 +882,37 @@ fn drive_session_start(script: &mut UiScript, name: &str, deps: &[String]) -> Ve
     for _ in 0..10 {
         script.tick(0.1);
     }
-    script.errors().split_off(before)
+    let raised = script.errors().split_off(before);
+    raised
+        .into_iter()
+        .filter(|e| !raised_inside_a_dependencys_own_file(e, name, deps))
+        .collect()
+}
+
+/// Does this raise belong to a DEPENDENCY's file rather than the surveyed addon's?
+///
+/// The rule `load_dependencies` already states for load errors, now enforceable for session errors
+/// too: *a library that fails is its own row; blaming its consumers would count one fault once per
+/// addon that embeds it.* Only the FIRST line is consulted — that is the raise site; the frames
+/// below it are the call path, and a consumer calling into a library that then raises is still the
+/// library's fault, exactly as it is at load time.
+///
+/// **Conservative on purpose.** A chunk that names no addon folder at all — our own FrameXML, an
+/// `[string "Frame:OnEvent"]` handler — is KEPT, because the surveyed addon is what drove it. Only
+/// a chunk that positively names one of this addon's own dependencies is dropped. Getting that
+/// backwards would swing the column the other way, and the whole point of 1226 is that a proxy
+/// which errs silently in one direction is how the number drifted in the first place.
+fn raised_inside_a_dependencys_own_file(err: &str, name: &str, deps: &[String]) -> bool {
+    let Some(first) = err.lines().next() else {
+        return false;
+    };
+    // The surveyed addon's own folder always wins, even when a dependency's name is a substring of
+    // a path inside it.
+    if first.contains(&format!("\\{name}\\")) || first.starts_with(&format!("{name}\\")) {
+        return false;
+    }
+    deps.iter()
+        .any(|d| first.contains(&format!("\\{d}\\")) || first.starts_with(&format!("{d}\\")))
 }
 
 /// Invoke the reference's own UI entry points, so an addon's OVERRIDES actually execute.
@@ -1018,22 +1081,48 @@ fn missing_templates(script: &UiScript, root: &Path, name: &str, toc: &Toc) -> V
             let Some(close) = rest[open..].find(')') else {
                 continue;
             };
-            let Some(fourth) = rest[open + 1..open + close].split(',').nth(3) else {
+            // Split the ARGUMENT LIST at depth 0 only. A plain `split(',')` cuts inside nested
+            // calls and strings, and it produced a phantom: AceGUI's
+            //
+            //     CreateFrame("ScrollFrame", format("%s@%s@%s", Type, "ScrollFrame", …), backdrop, …)
+            //
+            // has its 4th comma-separated chunk INSIDE `format(...)`, so the census reported a
+            // missing template literally named `ScrollFrame` — which is a frame KIND, not a
+            // template, and named nothing that was ever missing. One of four rows in that table was
+            // fiction (1210/1218/1227, the fourth time a ranking here has opened with one).
+            let args = &rest[open + 1..open + close];
+            let mut depth = 0i32;
+            let mut quote: Option<char> = None;
+            let mut fields: Vec<&str> = Vec::new();
+            let mut start = 0usize;
+            for (bi, c) in args.char_indices() {
+                match (quote, c) {
+                    (Some(q), c) if c == q => quote = None,
+                    (Some(_), _) => {}
+                    (None, '"' | '\'') => quote = Some(c),
+                    (None, '(' | '[' | '{') => depth += 1,
+                    (None, ')' | ']' | '}') => depth -= 1,
+                    (None, ',') if depth == 0 => {
+                        fields.push(&args[start..bi]);
+                        start = bi + 1;
+                    }
+                    _ => {}
+                }
+            }
+            fields.push(&args[start..]);
+            let Some(fourth) = fields.get(3) else {
                 continue;
             };
             let f = fourth.trim();
-            // A quoted literal, either quote style. `inherits` is a comma-separated LIST in
-            // FrameXML and `CreateFrame` takes the same shape, so split it.
+            // A quoted literal, either quote style, taken WHOLE. This used to split the literal on
+            // commas, on the belief that the fourth argument is a list; it is not — 1.12 looks up
+            // the string it was handed, once.
             let lit = f
                 .strip_prefix('"')
                 .and_then(|s| s.strip_suffix('"'))
                 .or_else(|| f.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')));
-            if let Some(lit) = lit {
-                wanted.extend(
-                    lit.split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty()),
-                );
+            if let Some(lit) = lit.filter(|s| !s.is_empty()) {
+                wanted.insert(lit.to_string());
             }
         }
     }
@@ -1074,10 +1163,13 @@ fn missing_inherits(script: &UiScript, root: &Path, name: &str, toc: &Toc) -> Ve
             let Some(end) = rest[1..].find(quote) else {
                 continue;
             };
+            // ONE name, verbatim — the attribute value is what the loader looks up, commas and
+            // spaces included. Splitting here made the census ask about names the loader never
+            // asks for: a comma list would be reported as two missing templates when the real
+            // lookup misses once, on the whole string.
             wanted.extend(
-                rest[1..1 + end]
-                    .split(',')
-                    .map(|s| s.trim().to_string())
+                [rest[1..1 + end].to_string()]
+                    .into_iter()
                     .filter(|s| !s.is_empty()),
             );
         }
@@ -1121,6 +1213,52 @@ fn source_files(root: &Path, name: &str, toc: &Toc) -> Vec<String> {
 /// edit by anything sharing the checkout moves the headline with no rebuild and no announcement.
 pub fn framexml_digest() -> String {
     crate::ui_script::framexml_digest()
+}
+
+/// Every name our VM publishes into `_G`, with its Lua type — **no addons loaded**.
+///
+/// The other half of decision 1189's diff. 1189 established that the authoritative 1.12 surface is
+/// already captured (the running client's in-world `_G`, 19,572 entries, vendored here as
+/// `reference/1.12-globals.tsv`) and compared our table against it *once*, by hand. Nothing has
+/// re-run it since, so the comparison has been drifting ever since — which is the failure mode this
+/// project keeps writing records about: a measurement taken once and then cited as though it were
+/// current.
+///
+/// Deliberately addon-free. The question is what OUR interface publishes, and an addon's own globals
+/// would inflate both directions of the diff with names that belong to nobody but that addon.
+///
+/// The dump runs in Lua rather than reaching into the registry from Rust, because `_G` is the thing
+/// an addon actually sees — the same reasoning that made the reference side a live capture instead
+/// of the binary's registration table.
+pub fn surface() -> Vec<(String, String)> {
+    let Ok(mut script) = UiScript::new() else {
+        return Vec::new();
+    };
+    script.set_instruction_budget(ADDON_INSTRUCTION_BUDGET);
+    script.set_screen_size(1024.0, 768.0);
+    script.register_addons(Vec::new(), None, None, None);
+    seat_a_session(&mut script);
+    let _ = crate::ui_script::load_default_ui(&script);
+
+    let dump: String = script
+        .eval(
+            r#"
+            local out = {}
+            for k, v in pairs(_G) do
+              if type(k) == "string" then
+                out[table.getn(out) + 1] = k .. "\t" .. type(v)
+              end
+            end
+            table.sort(out)
+            return table.concat(out, "\n")
+        "#,
+        )
+        .unwrap_or_default();
+
+    dump.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(n, t)| (n.to_string(), t.to_string()))
+        .collect()
 }
 
 /// The real `GlobalStrings.lua`, read once off the install's patch chain.
@@ -1181,6 +1319,14 @@ fn seat_a_session(script: &mut UiScript) {
     // empty addon registry: a state the real client cannot be in.
     script.register_cvars(crate::cvars::REGISTERED.iter().copied());
     script.set_realm_name("Harness");
+    // THE BIND POINT. `GetBindLocation()` answered `""` in every VM, and a logged-in character with
+    // no hearth location is not a state one is in — the server sends `SMSG_BINDPOINTUPDATE` at
+    // login, before any addon runs. Same argument as the purse and the nil faction group.
+    //
+    // Three corpus addons read it, in three separate files (FuBar_TransporterFu, Necrosis,
+    // _LazyPig), and one of them CONCATENATES the result — so an empty seat is the difference
+    // between exercising their path and not.
+    script.set_bind_location("Stormwind City");
     script.set_unit(
         "player",
         Some(benilla_ui::script::UnitState {
@@ -1206,6 +1352,249 @@ fn seat_a_session(script: &mut UiScript) {
             ..Default::default()
         }),
     );
+
+    // ── A POPULATED world, not merely an inhabited one ──────────────────────────────────────
+    //
+    // The columns above answer "did it raise"; the render column answers "did it draw". Until
+    // now the survey seated a player into an EMPTY world — no buffs, no target, no live
+    // cooldown — so a buff bar, a target frame or a cooldown-text addon drew nothing and landed
+    // in the drew-nothing list beside the pure libraries. `CT_BuffMod` declares 29 frames with
+    // none hidden at birth and `ElkBuffBar` 3: neither was failing to build, both had nothing to
+    // put in them.
+    //
+    // That made "nothing to draw" and "failed to draw" share a row, and the second is the one
+    // worth finding. Seating content separates them — and, more usefully, exposes the addons
+    // that only fail WHEN there is something to draw, which no empty-world column can reach.
+    //
+    // Deliberately minimal and deliberately ordinary: one buff, one target, one occupied action
+    // with a running cooldown. Not a stress fixture — a Tuesday.
+    script.set_auras(
+        "player",
+        Some(vec![benilla_ui::script::AuraState {
+            spell_id: 1243,
+            name: Some("Power Word: Fortitude".into()),
+            icon: Some("Interface\\Icons\\Spell_Holy_WordFortitude".into()),
+            count: 1,
+            helpful: true,
+            cancelable: true,
+            ..Default::default()
+        }]),
+    );
+    script.set_unit(
+        "target",
+        Some(benilla_ui::script::UnitState {
+            exists: true,
+            name: Some("Target Dummy".into()),
+            health: 80,
+            max_health: 100,
+            level: 60,
+            power_type: 0,
+            power: 50,
+            max_power: 100,
+            class: Some("Warrior".into()),
+            class_file: Some("WARRIOR".into()),
+            ..Default::default()
+        }),
+    );
+    script.set_action(
+        1,
+        Some(benilla_ui::script::ActionSlot {
+            texture: Some("Interface\\Icons\\Ability_SteelMelee".into()),
+            kind: 0x00,
+            action: 100,
+            count: 0,
+            consumable: false,
+        }),
+    );
+    script.set_action_state(
+        1,
+        Some(benilla_ui::script::ActionState {
+            usable: true,
+            // (startTime ms, duration ms, enable) — a cooldown with time left on it, which is
+            // what a cooldown-text addon (OmniCC, CooldownCount) needs before it draws anything.
+            cooldown: Some((1, 30_000, true)),
+            ..Default::default()
+        }),
+    );
+    // A SPELLBOOK. A level-60 warrior with an empty one is a state no real character is in — the
+    // same argument this fixture already makes for a nil `UnitFactionGroup` and an empty CVar
+    // table, and it costs an addon the same way: `TheoryCraftEngine.lua:306` is
+    // `name, texture, offset, numSpells = GetSpellTabInfo(1)` then `for i=1, numSpells`, so an
+    // empty book is `'for' limit must be a number` and the addon dies at session start. The verb
+    // was never the problem — `GetSpellTabInfo` already returns all four values — the FIXTURE was.
+    //
+    // Deliberately modest, and the reason is 1209's: a fixture that seats everything stops
+    // resembling a session anyone has, and every row it lights up is one nobody can attribute. Two
+    // tabs and four spells is a Tuesday. `Attack` is slot 1 because it is on every warrior's, and
+    // three corpus addons look for exactly that name.
+    // THE QUEST LOG. `GetNumQuestLogEntries()` answered `0, 0`, so every quest addon's walk ran
+    // zero times — the same shape as the 0-copper purse below and the empty spellbook: not a bug
+    // anywhere, just a path nothing ever entered. Five corpus addons walk this API (AtlasQuest,
+    // EQL3, FuBar_QuestsFu, QuestHistory, QuestItem).
+    //
+    // A HEADER AND TWO QUESTS, and each piece is here to be a shape the API distinguishes rather
+    // than to be plausible scenery:
+    //  · a zone HEADER row, because `GetQuestLogTitle`'s `isHeader` is a different row kind and an
+    //    addon that indexes rows without checking it walks straight into one;
+    //  · an IN-PROGRESS quest with two objectives, one finished and one not — so a leaderboard walk
+    //    sees both states, and `%d/%d` progress is mid-way rather than 0 or complete;
+    //  · a COMPLETE quest (`complete = 1`), the other end of `isComplete`'s 1/-1/nil.
+    // Not seated: a FAILED quest (-1) and a TIMED one. Both are real states, and both are states a
+    // character is only briefly in — 1209's rule that a row nobody can attribute is worth less than
+    // one nobody lit applies to fixtures too.
+    {
+        use benilla_ui::script::{QuestLogEntryView, QuestLogObjectiveView, QuestLogState};
+        let objective = |text: &str, cur: u32, req: u32| QuestLogObjectiveView {
+            text: text.into(),
+            kind: "monster".into(),
+            finished: cur >= req,
+            cur,
+            req,
+        };
+        let header = QuestLogEntryView {
+            quest_id: 0,
+            title: "Elwynn Forest".into(),
+            is_header: true,
+            ..Default::default()
+        };
+        let in_progress = QuestLogEntryView {
+            quest_id: 62,
+            title: "The Fargodeep Mine".into(),
+            level: 10,
+            objectives: vec![
+                objective("Kobold Miner slain: 8/12", 8, 12),
+                objective("Kobold Vermin slain: 6/6", 6, 6),
+            ],
+            ..Default::default()
+        };
+        let done = QuestLogEntryView {
+            quest_id: 176,
+            title: "Kobold Candles".into(),
+            level: 8,
+            complete: 1,
+            ..Default::default()
+        };
+        script.set_quest_log(QuestLogState {
+            entries: vec![header, in_progress, done],
+            num_quests: 2,
+            detail: None,
+        });
+    }
+
+    // THE PURSE. `GetMoney()` answered **0 copper** for every addon in every VM — and a level-60
+    // with literally no money is not a state a character is in; it is the same "state the real
+    // client cannot be in" the nil `UnitFactionGroup` below is seated for. Money addons are a whole
+    // genre in this corpus (Accountant, the CT_* expense trackers, every auction and vendor addon),
+    // and they all compute with this number.
+    //
+    // **12_345_678 copper — 1234g 56s 78c — and the digits are the point.** A round figure is what
+    // a fixture reaches for and it is exactly the value that hides bugs: any of `gold`, `silver`
+    // and `copper` being zero lets a broken coin-format or a `mod`/`floor` slip read as correct.
+    // All three non-zero means a formatter that drops a field, or divides in the wrong order, has
+    // nowhere to hide. Non-zero also matters on its own: an addon that guards `if GetMoney() > 0`
+    // never ran its body here.
+    script.set_money(12_345_678);
+
+    // EQUIPPED GEAR. Every `GetInventoryItem*("player", slot)` answered the empty shape, and a
+    // level-60 with no equipment at all is a state no character reaches — the same argument the
+    // spellbook and the backpack landed on.
+    //
+    // Three slots, not nineteen: head, chest and main hand. A fully-geared doll would be a state a
+    // real session presents, but it would also light up every path at once, and 1209's rule is
+    // that a row nobody can attribute is worth less than one nobody lit. Three is enough for an
+    // addon that WALKS the slots to reach real items, empty ones, and the ammo slot's absence.
+    {
+        let mut slots: benilla_ui::script::InventorySlots = Default::default();
+        slots[1] = Some(equip_slot(12640, "Lionheart Helm"));
+        slots[5] = Some(equip_slot(11726, "Bloodmail Hauberk"));
+        slots[16] = Some(equip_slot(871, "Flurry Axe"));
+        script.set_inventory_slots(slots);
+    }
+    // THE BACKPACK. `GetContainerNumSlots(0)` answered 0 — and a character with no backpack has
+    // never existed: bag 0 is 16 slots from level 1, before a single bag is bought. Same argument
+    // as the spellbook above and the nil `UnitFactionGroup` below it, and the same expectation:
+    // seating a state every character is in should LOSE rows, because a path nothing walked is a
+    // path nothing tested.
+    //
+    // Backpack only, and deliberately: bags 1..4 are equipped bags, which a fresh character does
+    // NOT have, so seating them would manufacture a state rather than expose one. Two items in
+    // sixteen slots — the rest empty, which is itself a shape bag addons must handle.
+    {
+        let mut slots = std::collections::HashMap::new();
+        slots.insert(1, bag_slot(6948, "Hearthstone", 1));
+        slots.insert(5, bag_slot(2589, "Linen Cloth", 12));
+        script.set_container(
+            0,
+            Some(benilla_ui::script::ContainerState {
+                name: Some("Backpack".into()),
+                num_slots: 16,
+                slots,
+            }),
+        );
+    }
+    script.set_spellbook(benilla_ui::script::SpellBookState {
+        tabs: vec![
+            benilla_ui::script::SpellTabView {
+                name: "General".into(),
+                texture: Some("Interface\\Icons\\INV_Misc_QuestionMark".into()),
+                offset: 0,
+                num_spells: 2,
+            },
+            benilla_ui::script::SpellTabView {
+                name: "Arms".into(),
+                texture: Some("Interface\\Icons\\Ability_Rogue_Eviscerate".into()),
+                offset: 2,
+                num_spells: 2,
+            },
+        ],
+        slots: vec![
+            spell_slot(6603, "Attack", None),
+            spell_slot(78, "Heroic Strike", Some("Rank 1")),
+            spell_slot(100, "Charge", Some("Rank 1")),
+            spell_slot(772, "Rend", Some("Rank 1")),
+        ],
+    });
+}
+
+/// One seated equipment slot — full durability, so no alert region lights up.
+fn equip_slot(item_id: u32, name: &str) -> benilla_ui::script::InvSlotView {
+    benilla_ui::script::InvSlotView {
+        item_id,
+        icon: Some("Interface\\Icons\\INV_Misc_QuestionMark".into()),
+        count: 1,
+        quality: 2,
+        name: Some(name.to_string()),
+        // FULL durability on purpose. The setter recomputes the eleven alert statuses and fires
+        // UPDATE_INVENTORY_ALERTS, so a worn item would light DurabilityFrame's regions — a
+        // VISIBLE change, and this fixture's job is to present a plausible session, not to drive
+        // the alert law. Undamaged gear is the ordinary case anyway.
+        durability: Some((100, 100)),
+        link: Some(format!("|cff1eff00|Hitem:{item_id}:0:0:0|h[{name}]|h|r")),
+        ..Default::default()
+    }
+}
+
+/// One seated backpack slot.
+fn bag_slot(item_id: u32, name: &str, count: u32) -> benilla_ui::script::ContainerSlot {
+    benilla_ui::script::ContainerSlot {
+        texture: Some("Interface\\Icons\\INV_Misc_QuestionMark".into()),
+        count,
+        quality: Some(1),
+        item_id,
+        link: Some(format!("|cffffffff|Hitem:{item_id}:0:0:0|h[{name}]|h|r")),
+        ..Default::default()
+    }
+}
+
+/// One seated spellbook slot — the fields a book reader actually reads, defaulted otherwise.
+fn spell_slot(spell_id: u32, name: &str, rank: Option<&str>) -> benilla_ui::script::SpellSlotView {
+    benilla_ui::script::SpellSlotView {
+        spell_id,
+        name: name.to_string(),
+        rank: rank.map(str::to_string),
+        texture: Some("Interface\\Icons\\INV_Misc_QuestionMark".into()),
+        ..Default::default()
+    }
 }
 
 /// Every string key in the VM's `_G`.
@@ -2235,6 +2624,35 @@ pub fn blocked_by(reports: &[AddonReport], pattern: &str) -> Vec<(String, String
 /// A plain substring match against the row as printed, over all four method tables, each hit
 /// labelled with the table it came from — so `--why "EditBox:SetFontObject"` names the addons and
 /// `--why SetFontObject` finds every table that mentions it.
+/// Which addons carry `pattern` in one of the three demand lists — the read-back those rankings
+/// never had.
+///
+/// Every ranked table above is a **count**, and until this existed nothing could ask which addons a
+/// count was made of. That is not a theoretical gap: `GetChannelList` ranked 4 while exactly one
+/// corpus addon's source names it, and establishing that took a hand-rolled grep across a corpus
+/// whose entries are symlinks (so `grep -r` silently reads none of them). A number you cannot open
+/// is a claim rather than a measurement — the same lesson `--why`'s error read-back learned in
+/// 1210/1218/1227, applied to the other three tables.
+///
+/// Matched case-insensitively on a substring, exactly like the error read-back, so a half-remembered
+/// name still finds its row.
+pub fn wanters(
+    reports: &[AddonReport],
+    pattern: &str,
+    pick: impl Fn(&AddonReport) -> &Vec<String>,
+) -> Vec<(String, String)> {
+    let needle = pattern.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for r in reports {
+        for n in pick(r) {
+            if n.to_ascii_lowercase().contains(&needle) {
+                out.push((r.name.clone(), n.clone()));
+            }
+        }
+    }
+    out
+}
+
 pub fn method_rows_matching(reports: &[AddonReport], pattern: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for r in reports {
@@ -2841,6 +3259,68 @@ mod dependency_tests {
     /// dependency's OWN handler raising is the dependency's row, never its consumers'. Those
     /// events fire outside the error-capture window, so one library's fault cannot be counted once
     /// per addon that embeds it.
+    /// **A consumer's OWN code raising inside a DEPENDENCY's window is the consumer's row.**
+    ///
+    /// 1226's finding, now enforced. `AceAddon-2.0.lua:104-105` drains its entire `nextAddon` queue
+    /// on ANY `ADDON_LOADED` it sees and calls each consumer's `OnInitialize` there (`:230`). So
+    /// the surveyed addon's own file runs inside a dependency's window — and while attribution was
+    /// by window, those raises were charged to nobody and the whole FuBar/Ace family read as
+    /// surviving when it was not.
+    ///
+    /// Attribution is by the raising CHUNK now, which 1217 made truthful. The fixture is AceAddon's
+    /// shape reduced: the library drains a queue on the first ADDON_LOADED it sees, whoever it
+    /// names, and the consumer's callback raises from the consumer's own file.
+    ///
+    /// The second half is the half that must not regress: the LIBRARY's own raise, in the same
+    /// window, still belongs to the library.
+    #[test]
+    fn a_consumers_raise_inside_a_dependency_window_is_the_consumers_row() {
+        let tmp =
+            std::env::temp_dir().join(format!("benilla-harness-attrib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let write = |name: &str, toc: &str, file: &str, body: &str| {
+            let dir = tmp.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{name}.toc")), toc).unwrap();
+            std::fs::write(dir.join(file), body).unwrap();
+        };
+        // AceAddon's shape: drain every queued consumer on the FIRST ADDON_LOADED, whoever it names.
+        write(
+            "QueueLib",
+            "## Interface: 11200\nlib.lua\n",
+            "lib.lua",
+            "QueueLibQueue = {}\n\
+             QueueLibFrame = CreateFrame(\"Frame\")\n\
+             QueueLibFrame:RegisterEvent(\"ADDON_LOADED\")\n\
+             QueueLibFrame:SetScript(\"OnEvent\", function()\n\
+             while table.getn(QueueLibQueue) > 0 do\n\
+             local f = table.remove(QueueLibQueue, 1) f()\n\
+             end\n\
+             end)\n",
+        );
+        // The consumer queues a callback that raises from ITS OWN file.
+        write(
+            "QueueUser",
+            "## Interface: 11200\n## Dependencies: QueueLib\nuse.lua\n",
+            "use.lua",
+            "table.insert(QueueLibQueue, function() error(\"consumer init blew up\") end)\n",
+        );
+
+        let reports = survey(&tmp);
+        let of = |n: &str| reports.iter().find(|r| r.name == n).unwrap();
+
+        assert!(
+            of("QueueUser")
+                .session_errors
+                .iter()
+                .any(|e| e.contains("consumer init blew up")),
+            "the consumer's own file raised — window or not, it is the consumer's row: {:?}",
+            of("QueueUser").session_errors
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn each_loaded_addon_gets_its_own_addon_loaded_event() {
         let tmp = std::env::temp_dir().join(format!(
@@ -3295,6 +3775,144 @@ mod dependency_tests {
         seat_a_session(&mut script);
         let _ = crate::ui_script::load_default_ui(&script);
         script
+    }
+
+    /// **The session fixture is LIVE**, asserted through the same Lua surface an addon sees.
+    ///
+    /// A fixture that silently fails to seat reads EXACTLY like a fixture that exposed nothing —
+    /// both are "net +0" — and this arc has already been fooled once by a measurement that
+    /// returned an empty answer for a tooling reason (1242's note on `grep`). The backpack seat
+    /// produced no corpus delta at all; this is what makes that a finding rather than a
+    /// possibility.
+    ///
+    /// It is also a guard: delete a seat and this fails, instead of the columns quietly shifting
+    /// and the next A/B attributing the move to whatever landed beside it.
+    #[test]
+    fn the_seated_session_is_visible_from_lua() {
+        let s = seated_vm();
+
+        // The backpack — 16 slots from level 1, two of them filled. Exposed nothing, verifiably.
+        assert_eq!(s.eval::<i64>("return GetContainerNumSlots(0)").unwrap(), 16);
+        assert_eq!(
+            s.eval::<String>("return GetBagName(0)").unwrap(),
+            "Backpack"
+        );
+        assert_eq!(
+            s.eval::<i64>("local _, c = GetContainerItemInfo(0, 5) return c")
+                .unwrap(),
+            12,
+            "the Linen Cloth stack"
+        );
+        // Bags 1..4 are deliberately NOT seated: a fresh character has no equipped bags, and
+        // seating them would manufacture a state rather than expose one.
+        assert_eq!(s.eval::<i64>("return GetContainerNumSlots(1)").unwrap(), 0);
+
+        // The quest log — asserted through the API an addon actually walks, not the state struct.
+        // `GetNumQuestLogEntries` returns (rows, quests): THREE rows but TWO quests, because the
+        // header is a row and not a quest. An addon that conflates the two indexes off the end.
+        assert_eq!(
+            s.eval::<(i64, i64)>("return GetNumQuestLogEntries()")
+                .unwrap(),
+            (3, 2),
+            "three rows, two quests — the header is a row"
+        );
+        assert_eq!(
+            s.eval::<String>("local t = GetQuestLogTitle(1) return t")
+                .unwrap(),
+            "Elwynn Forest"
+        );
+        assert!(
+            s.eval::<bool>("local _,_,_,h = GetQuestLogTitle(1) return h and true or false")
+                .unwrap(),
+            "row 1 is the header"
+        );
+        // Both ends of isComplete: nil for in-progress, 1 for complete.
+        assert!(s
+            .eval::<Option<i64>>("local _,_,_,_,_,c = GetQuestLogTitle(2) return c")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            s.eval::<i64>("local _,_,_,_,_,c = GetQuestLogTitle(3) return c")
+                .unwrap(),
+            1
+        );
+        // A leaderboard walk sees a finished objective AND an unfinished one — the pair a
+        // one-objective fixture cannot show.
+        s.run("SelectQuestLogEntry(2)").unwrap();
+        assert_eq!(
+            s.eval::<i64>("return GetNumQuestLeaderBoards()").unwrap(),
+            2
+        );
+        assert_eq!(
+            s.eval::<(bool, bool)>(
+                "local _,_,f1 = GetQuestLogLeaderBoard(1)                  local _,_,f2 = GetQuestLogLeaderBoard(2) return f1, f2"
+            )
+            .unwrap(),
+            (false, true),
+            "one objective outstanding, one done"
+        );
+
+        // The bind point — a plain string, and the reason it is seated is that an addon
+        // CONCATENATES it (`Necrosis.lua:1089`), where an empty answer reads as no hearth at all.
+        assert_eq!(
+            s.eval::<String>("return GetBindLocation()").unwrap(),
+            "Stormwind City"
+        );
+
+        // The purse — and asserted as its three coin fields, not as one number, because that is the
+        // whole reason the value is 1234g 56s 78c rather than something round. A seat that reads
+        // back as 12345678 but breaks down wrong is the bug this shape exists to catch.
+        assert_eq!(s.eval::<i64>("return GetMoney()").unwrap(), 12_345_678);
+        assert_eq!(
+            s.eval::<(i64, i64, i64)>(
+                "local m = GetMoney()                  return floor(m / 10000), mod(floor(m / 100), 100), mod(m, 100)"
+            )
+            .unwrap(),
+            (1234, 56, 78),
+            "gold/silver/copper are each non-zero, so no field can be dropped unnoticed"
+        );
+
+        // Equipped gear — head, chest, main hand, with the rest empty. Also exposed nothing.
+        assert_eq!(
+            s.eval::<String>(r#"return GetInventoryItemTexture("player", 16)"#)
+                .unwrap(),
+            "Interface\\Icons\\INV_Misc_QuestionMark"
+        );
+        assert!(
+            s.eval::<String>(r#"return GetInventoryItemLink("player", 5)"#)
+                .unwrap()
+                .contains("Bloodmail Hauberk"),
+            "the chest slot's link"
+        );
+        assert_eq!(
+            s.eval::<i64>(r#"return GetInventoryItemQuality("player", 1)"#)
+                .unwrap(),
+            2
+        );
+        // An EMPTY slot still answers the absent shape — the case an addon walking 1..19 hits most.
+        assert!(s
+            .eval::<bool>(r#"return GetInventoryItemLink("player", 10) == nil"#)
+            .unwrap());
+        // The slot ids come from the same table `GetInventorySlotInfo` serves, so a walk that
+        // resolves names to ids lands on the seated items rather than past them.
+        assert_eq!(
+            s.eval::<i64>(r#"return GetInventorySlotInfo("MainHandSlot")"#)
+                .unwrap(),
+            16
+        );
+
+        // The spellbook, as the positive control — this seat DID move the columns (+2).
+        assert_eq!(
+            s.eval::<String>(r#"return GetSpellName(1, "spell")"#)
+                .unwrap(),
+            "Attack"
+        );
+        assert_eq!(
+            s.eval::<String>(r#"local _, r = GetSpellName(1, "spell") return r"#)
+                .unwrap(),
+            "",
+            "and its rank is the empty string, not nil"
+        );
     }
 
     fn wanted(names: &[&str]) -> BTreeSet<String> {

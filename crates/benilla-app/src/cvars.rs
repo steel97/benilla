@@ -36,6 +36,7 @@ use crate::sound::SoundConfig;
 use crate::target::ClickConfig;
 use crate::ui_loot::LootConfig;
 use crate::ui_script::UiScaleCvar;
+use crate::video::VideoConfig;
 use benilla_ui::script::UiScript;
 use benilla_ui::widget::MINIMAP_ZOOM_LEVELS;
 use benilla_world::clutter::ClutterConfig;
@@ -111,6 +112,16 @@ pub(crate) const REGISTERED: &[(&str, &str)] = &[
     // out-of-box look is hover-only numerals. That default is BEHAVIOUR-derived, not byte-read —
     // 1.12's registrar value for this var is not pinned in wow-re yet.
     ("statusBarText", "0"),
+    // Enhanced Tooltips (B230): 1.12's `UberTooltips`, the *Enhanced Tooltips* checkbox
+    // (`UIOptionsFrame.lua:15`, `USE_UBERTOOLTIPS`). **No host knob** — its consumers are Lua, and
+    // there are three: PetActionBar.xml forks the whole tooltip on it (a token's own text with the
+    // binding appended, vs the engine's pet-spell channel), ActionBar.xml and StanceBar.xml fork
+    // their anchor. Registered "1" — byte-read, not behaviour-derived: WoW.exe `0x48fdd9`, default
+    // string `0x82e748`, with the sibling rows `BlockTrades`→"0" and `UnitNameRenderMode`→"2"
+    // confirming the layout. Those three Lua sites each carried the reference's fork in prose and
+    // then collapsed it to this default, on the stated premise that benilla shipped no CVar state
+    // for anything to move. That premise expired with 0954, and this row is what un-collapses them.
+    ("UberTooltips", "1"),
     // The two chat-bubble switches (1139): 1.12's own registrar CVars over the bubble gate,
     // which held them as `const bool` from 0598 until this window had a page for them.
     // `ChatBubbles` is the reference's registered "1"; `ChatBubblesParty` is ON where the binary
@@ -124,6 +135,26 @@ pub(crate) const REGISTERED: &[(&str, &str)] = &[
     // [`crate::minimap::MinimapZoom`], the widget's live index is seeded from it at UI load.
     ("minimapZoom", "3"),
     ("minimapInsideZoom", "3"),
+    // The addon version gate (decision 1292): 1.12's own `checkAddonVersion`, the *Load out of
+    // date AddOns* checkbox INVERTED. Registrar default "1" = check enforced = box unticked —
+    // byte-verified (wow-re `addon-version-gate.md` §1.1: the key appears in Config.wtf exactly
+    // while force-load is on and vanishes when it is turned off, `SaveConfig 0x63d980`'s
+    // skip-default rule). No host knob: its consumers are the load walk (via the persisted value,
+    // [`CvarPersist::addon_version_check`]) and the gate's live per-query read in the VM.
+    ("checkAddonVersion", "1"),
+    // Vertical Sync — 1.12's own `gxVSync`, the Video Options checkbox at index 5
+    // (`OptionsFrame.lua`'s `OptionsFrameCheckButtons["VERTICAL_SYNC"]`, in the install's
+    // FrameXML). The knob is [`crate::video::VideoConfig::vsync`], which the window's
+    // `present_mode` follows.
+    //
+    // Default "1" is BEHAVIOUR-derived, not byte-read: 1.12's registrar value for this var is not
+    // pinned in wow-re, and "1" is what benilla actually ships — the primary window is born at
+    // `PresentMode::default()` (Fifo), and a test in `video.rs` welds the two together.
+    //
+    // Two knowing departures from the reference row, both stated on [`crate::video`]: its
+    // `gxRestart = 1` does not apply (wgpu swaps the presentation interval live, so the box takes
+    // effect on click), and `$WOW_NOVSYNC=1` overrides it session-only, below.
+    ("gxVSync", "1"),
 ];
 
 /// `config.toml`'s shape: a `[cvars]` table of `Name = "value"` strings (CVars are strings in
@@ -144,11 +175,28 @@ pub(crate) struct CvarPersist {
     file: BTreeMap<String, String>,
     /// Lowercased names whose value came from an env var this session (never saved).
     env_overridden: HashSet<String>,
-    /// The engine table has been registered + seeded (once, when the VM first exists).
-    registered: bool,
+    /// The engine table has been registered + seeded — **once per VM**, not once per process
+    /// (decision 1290). A login builds a fresh VM, so the seed has to happen again: an
+    /// unregistered table answers every `GetCVar` with nil, and [`save_config`] composes
+    /// `config.toml` out of that same table.
+    registered: crate::ui_script::VmMemo<bool>,
     /// A change since the last save; `last_change` drives the one-quiet-second debounce.
     dirty: bool,
     last_change: Option<Instant>,
+}
+
+impl CvarPersist {
+    /// The persisted `checkAddonVersion` (decision 1292) — what the addon load walk gates on.
+    /// Read from the persist state rather than the VM because the walk runs while the VM's CVar
+    /// table does not exist yet (registration is a per-VM `Update` seed, 1291); the 1291 fold
+    /// keeps this current across reloads, so it is the value the reference's live read would see.
+    /// Absent = the registrar default: check ON.
+    pub(crate) fn addon_version_check(&self) -> bool {
+        self.file
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("checkAddonVersion"))
+            .is_none_or(|(_, v)| v != "0")
+    }
 }
 
 /// How long a dirty config sits before the save fires — long enough to coalesce a slider drag,
@@ -179,6 +227,7 @@ struct Knobs<'a> {
     minimap: &'a mut MinimapZoom,
     bubbles: &'a mut BubbleConfig,
     zoom: &'a mut ZoomLimit,
+    video: &'a mut VideoConfig,
 }
 
 /// Apply one CVar to its knob resource (parse + the knob's own clamp). `false` = not a knob this
@@ -212,9 +261,9 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
         "unitnameplayer" => knobs.names.player = v != 0.0,
         "unitnamenpc" => knobs.names.npc = v != 0.0,
         "unitnameown" => knobs.names.own = v != 0.0,
-        // A CVar with no HOST knob, because its consumer is Lua (1140). Known — so the caller
-        // dirties the config and the value persists — with nothing to apply on this side.
-        "statusbartext" => {}
+        // Two CVars with no HOST knob, because their consumers are Lua (1140, B230). Known — so
+        // the caller dirties the config and the value persists — with nothing to apply this side.
+        "statusbartext" | "ubertooltips" => {}
         // The two bubble switches (1139) — flags, like every other pair here.
         "chatbubbles" => knobs.bubbles.all = v != 0.0,
         "chatbubblesparty" => knobs.bubbles.party = v != 0.0,
@@ -226,6 +275,13 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
         // in range whichever path it takes.
         "minimapzoom" => knobs.minimap.outdoor = zoom_index(v),
         "minimapinsidezoom" => knobs.minimap.inside = zoom_index(v),
+        // The addon version gate (1292): no host knob — the load walk reads the persisted value
+        // and the gate reads the live table — but a KNOWN key, so a toggle dirties the config
+        // and persists (the statusBarText posture).
+        "checkaddonversion" => {}
+        // Vertical Sync — a flag like every other checkbox here. `video::apply_present_mode`
+        // watches the value and pushes it to the window; nothing else reads it.
+        "gxvsync" => knobs.video.vsync = v != 0.0,
         _ => return false,
     }
     true
@@ -255,6 +311,7 @@ fn load_config(
     mut minimap: ResMut<MinimapZoom>,
     mut bubbles: ResMut<BubbleConfig>,
     mut zoom: ResMut<ZoomLimit>,
+    mut video: ResMut<VideoConfig>,
 ) {
     let mut knobs = Knobs {
         sound: &mut sound,
@@ -268,6 +325,7 @@ fn load_config(
         minimap: &mut minimap,
         bubbles: &mut bubbles,
         zoom: &mut zoom,
+        video: &mut video,
     };
     if std::env::var_os("WOW_UI_SCALE").is_some() {
         persist.env_overridden.insert("uiscale".into());
@@ -278,6 +336,11 @@ fn load_config(
     // The clutter A/B env drives the same knob WorldDetail lands on — same session-only law.
     if std::env::var_os("WOW_CLUTTER_DENSITY").is_some() {
         persist.env_overridden.insert("worlddetail".into());
+    }
+    // `$WOW_NOVSYNC=1` is the measurement uncap: session-only, exactly like the taste-iteration
+    // overrides above. Pinning it into the config would make an instrument run sticky.
+    if crate::video::novsync_env() {
+        persist.env_overridden.insert("gxvsync".into());
     }
     let Some(path) = crate::local_state::config_path() else {
         return; // hermetic capture, or no install — session-only state
@@ -339,14 +402,27 @@ fn sync_cvars(
     mut minimap: ResMut<MinimapZoom>,
     mut bubbles: ResMut<BubbleConfig>,
     mut zoom: ResMut<ZoomLimit>,
+    mut video: ResMut<VideoConfig>,
 ) {
     let Some(mut script) = script else {
         return;
     };
-    if !persist.registered {
+    if persist.registered.claim(&script) {
+        // The config file's values go in FIRST (decision 1291): registration — ours below, or an
+        // addon's `RegisterCVar` later — starts a key at its saved value. This is what carries a
+        // knobless CVar (`statusBarText`) and an addon-declared one across a VM replacement; the
+        // knob-derived session rows below still win for every key a host knob backs, and an
+        // env-overridden key keeps its env value the same way (its knob carries it).
+        script.set_cvar_saved_base(
+            persist
+                .file
+                .iter()
+                .filter(|(k, _)| !persist.env_overridden.contains(&k.to_ascii_lowercase()))
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
         script.register_cvars(REGISTERED.iter().copied());
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 23] = [
+        let session: [(&str, String); 24] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -373,11 +449,11 @@ fn sync_cvars(
             ("ChatBubblesParty", flag(bubbles.party)),
             ("minimapZoom", minimap.outdoor.to_string()),
             ("minimapInsideZoom", minimap.inside.to_string()),
+            ("gxVSync", flag(video.vsync)),
         ];
         for (name, value) in session {
             script.set_cvar_host(name, &value);
         }
-        persist.registered = true;
     }
     // Take the changes BEFORE touching the knobs: constructing `Knobs` deref-muts every knob
     // resource, which trips Bevy change detection even when nothing is written — and the
@@ -398,6 +474,7 @@ fn sync_cvars(
         minimap: &mut minimap,
         bubbles: &mut bubbles,
         zoom: &mut zoom,
+        video: &mut video,
     };
     for (name, value) in changes {
         if apply_to_knobs(&name, &value, &mut knobs) {
@@ -405,6 +482,110 @@ fn sync_cvars(
             persist.last_change = Some(Instant::now());
         }
     }
+}
+
+/// Fold the dying VM's CVar table into the persist state — the session edge's half of decision
+/// 1291's bridge (the seed in [`sync_cvars`] is the other). Called from
+/// [`crate::ui_script::end_ui_session`] **after** the shutdown events (an addon's
+/// `PLAYER_LOGOUT` handler may `SetCVar`, and in the reference that write lands in an
+/// engine-side store that survives) and **before** the VM is replaced.
+///
+/// Two steps, both about the writes the per-frame sync never got to see:
+/// 1. drain the dying VM's change queue into the host knobs — a `SetCVar` in the final frame
+///    would otherwise be overwritten by the stale knob when the next VM's seed runs;
+/// 2. fold the table into `persist.file` with the same compose the saver uses, so the next VM's
+///    saved base — and the next save — both start from what the player actually set.
+///
+/// `dirty` is left alone: if nothing changed, the fold is an identity; if something did, the
+/// change that did it already marked the config dirty.
+#[allow(clippy::type_complexity)] // one Option per knob resource, the same census sync_cvars keeps
+pub(crate) fn fold_dying_vm_cvars(world: &mut World) {
+    // Every param is `Option` because this runs from an exclusive edge function, not the app's
+    // schedule: a test world or a stripped scenario may not carry the cvar plugin at all, and
+    // "no persist state" simply means there is no file to bridge — not a panic.
+    let mut state: bevy::ecs::system::SystemState<(
+        Option<NonSendMut<UiScript>>,
+        Option<ResMut<CvarPersist>>,
+        Option<ResMut<SoundConfig>>,
+        Option<ResMut<UiScaleCvar>>,
+        Option<ResMut<ViewDistance>>,
+        Option<ResMut<LookConfig>>,
+        Option<ResMut<ClickConfig>>,
+        Option<ResMut<LootConfig>>,
+        Option<ResMut<NameConfig>>,
+        Option<ResMut<ClutterConfig>>,
+        Option<ResMut<MinimapZoom>>,
+        Option<ResMut<BubbleConfig>>,
+        Option<ResMut<ZoomLimit>>,
+        Option<ResMut<VideoConfig>>,
+    )> = bevy::ecs::system::SystemState::new(world);
+    let (
+        script,
+        persist,
+        sound,
+        scale,
+        view,
+        look,
+        click,
+        loot,
+        names,
+        clutter,
+        minimap,
+        bubbles,
+        zoom,
+        video,
+    ) = state.get_mut(world);
+    let (Some(mut script), Some(mut persist)) = (script, persist) else {
+        return;
+    };
+    let changes = script.take_cvar_changes();
+    if !changes.is_empty() {
+        // The knobs exist whenever the app is real (each plugin inits its own); a world that
+        // carries CvarPersist but not the knobs is a partial test rig, where dropping the
+        // final-frame drain is the right degradation — the fold below still preserves the file.
+        if let (
+            Some(mut sound),
+            Some(mut scale),
+            Some(mut view),
+            Some(mut look),
+            Some(mut click),
+            Some(mut loot),
+            Some(mut names),
+            Some(mut clutter),
+            Some(mut minimap),
+            Some(mut bubbles),
+            Some(mut zoom),
+            Some(mut video),
+        ) = (
+            sound, scale, view, look, click, loot, names, clutter, minimap, bubbles, zoom, video,
+        ) {
+            let mut knobs = Knobs {
+                sound: &mut sound,
+                scale: &mut scale,
+                view: &mut view,
+                look: &mut look,
+                click: &mut click,
+                loot: &mut loot,
+                names: &mut names,
+                clutter: &mut clutter,
+                minimap: &mut minimap,
+                bubbles: &mut bubbles,
+                zoom: &mut zoom,
+                video: &mut video,
+            };
+            for (name, value) in changes {
+                if apply_to_knobs(&name, &value, &mut knobs) {
+                    persist.dirty = true;
+                    persist.last_change = Some(Instant::now());
+                }
+            }
+        }
+    }
+    let snapshot = script.cvars_snapshot();
+    if snapshot.is_empty() {
+        return; // a VM that never registered (a capture) has nothing to say about the file
+    }
+    persist.file = compose_file(&persist.file, &persist.env_overridden, &snapshot);
 }
 
 /// Compose the file to save: the previous file as the merge base, every registered var that
@@ -462,6 +643,16 @@ fn save_config(
         return;
     };
     let snapshot = script.cvars_snapshot();
+    // **An empty table is not a player who cleared their settings.** The file is composed from the
+    // VM's live table, so a VM whose table was never registered would compose the player's
+    // `config.toml` back out *stripped* — a silent, irreversible loss of everything they had set.
+    // The seed above is what keeps that from happening; this is the floor under it, because the
+    // failure is one-way and the next regression in that seed must not be able to reach the disk.
+    if snapshot.is_empty() {
+        warn!("config: the VM has no registered cvars — refusing to compose the file from nothing");
+        persist.dirty = false; // nothing to save, and retrying every frame changes nothing
+        return;
+    }
     let cvars = compose_file(&persist.file, &persist.env_overridden, &snapshot);
     let body = toml::to_string(&LocalConfig {
         cvars: cvars.clone(),
@@ -545,6 +736,9 @@ mod tests {
         assert_eq!(d["minimapZoom"], f32::from(zoom.outdoor));
         assert_eq!(d["minimapInsideZoom"], f32::from(zoom.inside));
         assert_eq!(zoom.outdoor, benilla_ui::widget::MINIMAP_DEFAULT_ZOOM);
+        // VSync welds to the video knob, which in turn welds to the window literal's boot
+        // mode (`video::tests`) — so the registered "1" cannot drift from what we ship.
+        assert_eq!(d["gxVSync"] != 0.0, VideoConfig::default().vsync);
     }
 
     #[test]
@@ -566,6 +760,7 @@ mod tests {
         let mut minimap = MinimapZoom::default();
         let mut bubbles = BubbleConfig::default();
         let mut zoom = ZoomLimit::default();
+        let mut video = VideoConfig::default();
         let mut knobs = Knobs {
             sound: &mut sound,
             scale: &mut scale,
@@ -578,6 +773,7 @@ mod tests {
             minimap: &mut minimap,
             bubbles: &mut bubbles,
             zoom: &mut zoom,
+            video: &mut video,
         };
         assert!(apply_to_knobs("MusicVolume", "0.7", &mut knobs));
         assert_eq!(knobs.sound.music, 0.7);
@@ -695,6 +891,7 @@ mod tests {
             .init_resource::<MinimapZoom>()
             .init_resource::<BubbleConfig>()
             .init_resource::<ZoomLimit>()
+            .init_resource::<VideoConfig>()
             .add_plugins(CvarPlugin);
         app.insert_non_send_resource(UiScript::new().unwrap());
 
@@ -763,6 +960,7 @@ mod tests {
             .init_resource::<MinimapZoom>()
             .init_resource::<BubbleConfig>()
             .init_resource::<ZoomLimit>()
+            .init_resource::<VideoConfig>()
             .add_plugins(CvarPlugin);
         app.insert_non_send_resource(UiScript::new().unwrap());
         app.update();

@@ -100,10 +100,23 @@ pub(crate) fn load_font_registry(script: &UiScript) -> Vec<String> {
 /// `identity` is `(realm, character)`, which names this character's AddOn enable-state file — the
 /// reference keys `AddOns.txt` per character too. `None` (no pick yet, a capture) means every
 /// discovered addon is enabled, the same answer an absent file gives.
+///
+/// `version_check` is the persisted `checkAddonVersion` — the *Load out of date AddOns* toggle,
+/// inverted — resolved by the caller because at load time this VM's own CVar table does not
+/// exist yet (registration is a per-VM `Update` seed, decision 1291); the persisted value is the
+/// truth the reference's live read would land on, since the session edge folds the dying VM's
+/// table into it before any rebuild reads it.
 pub(crate) fn load_ingame_ui(
     script: &mut UiScript,
     identity: Option<&(String, String)>,
+    version_check: bool,
 ) -> Vec<String> {
+    // The whole load edge runs bounded (decision 1306): the reference files sourced off the
+    // player's own chain, our builtin, and every addon (which re-arms per addon in
+    // `load_third_party`). A chunk that never returns fails as a load error instead of freezing
+    // the client on the loading screen; the caller disarms once the edge is done
+    // (`lifecycle::load_ingame_ui_on_world_entry`), so the session's steady state runs unhooked.
+    script.set_instruction_budget(super::addons::LOAD_INSTRUCTION_BUDGET);
     // The reference FrameXML this client SOURCES off the patch chain rather than transcribing
     // ([`super::reference_ui`], whose header is the rule). It runs FIRST, before our own files,
     // precisely so that every global we define ourselves overwrites the reference's — its
@@ -114,7 +127,11 @@ pub(crate) fn load_ingame_ui(
     failures.extend(bootstrap_positions(script));
     // `&mut` from here down: each addon's `ADDON_LOADED` fires as that addon finishes, which is
     // the reference's own interleaving (`0x51f5ad`, per addon) rather than a batch at the end.
-    failures.extend(super::addons::load_third_party(script, identity));
+    failures.extend(super::addons::load_third_party(
+        script,
+        identity,
+        version_check,
+    ));
     failures
 }
 

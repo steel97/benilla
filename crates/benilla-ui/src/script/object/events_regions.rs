@@ -134,19 +134,139 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         })?,
     )?;
     // Regions
+    // `CreateTexture(name, layer, inheritsFrom)` — the third argument accepted for the same reason
+    // and with the same resolver, though the demand is a rounding error beside FontString's: of
+    // 1329 corpus call sites exactly TWO pass a third argument, and one of those passes `nil`
+    // (CustomNameplates:437, a four-argument later-client form). Accepted rather than skipped
+    // because dropping it silently is the very class this fixes, and one real site is still a site.
     m.set(
         "CreateTexture",
         lua.create_function(
-            |lua, (this, name, layer): (Table, Option<String>, Option<String>)| {
-                create_region(lua, &this, RegionKind::Texture, name, layer)
+            |lua,
+             (this, name, layer, inherits): (
+                Table,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )| {
+                let wrapper = create_region(lua, &this, RegionKind::Texture, name, layer)?;
+                if let Some(from) = inherits.as_deref().filter(|s| !s.is_empty()) {
+                    apply_region_inherits(lua, &wrapper, from)?;
+                }
+                Ok(wrapper)
             },
         )?,
     )?;
+    // ── The title region: Frame:CreateTitleRegion() / GetTitleRegion() ──────────────────────────
+    //
+    // wow-re `system/ui/scratch/widget-api-batch-benilla.md` Q6 (`0x773910` / `0x773820`). Four
+    // details, each one a coin-flip a reimplementation loses:
+    //
+    //  · **It reads NO argument at all** — nothing in `0x773910`-`0x773a1f` touches Lua index 2. So
+    //    `CustomNameplates/options.lua:73`'s `CreateTitleRegion(optionsFrame)` is harmless and
+    //    identical to the no-arg call, rather than an error or a differently-parented region.
+    //  · **It is IDEMPOTENT, destructively.** One region per frame (`CSimpleFrame+0xA8`): a second
+    //    call runs ClearAllPoints on the existing one and returns THE SAME OBJECT — so calling it
+    //    on an XML-declared `<TitleRegion>` silently wipes that region's anchors. Returning a
+    //    fresh region instead would leave the first one hit-testing forever.
+    //  · **A fresh one has NO anchors** and does nothing until `SetPoint`/`SetAllPoints`. Both
+    //    corpus consumers immediately call `SetAllPoints`, which is the whole-window drag idiom.
+    //  · **`GetTitleRegion` answers 1 value (nil)** when there is none — note the asymmetry with
+    //    `GetBackdrop`, which answers 0 values. Q6 flags it explicitly; both converged
+    //    independently there, so both are reproduced here.
+    // **ONE NAMED DIVERGENCE, because it is a superset and 1189 is what a superset costs.** Q6 says
+    // the object answers *exactly* the 19 Region methods — no Show/Hide, no scripts, no textures.
+    // Ours answers the whole shared region table, because Texture/FontString/Title use one
+    // metatable here, so `titleRegion:SetTexture(…)` is accepted where the reference would raise
+    // `attempt to call method`. It is inert rather than wrong — a title region never draws (the
+    // extract skips its kind outright), so a texture or a Hide set on one changes nothing — but an
+    // addon that FEATURE-DETECTS would see a method the real client does not have. Splitting the
+    // metatable is the fix; it is not free, and nothing in the corpus asks, so this is recorded
+    // rather than hidden.
+    m.set(
+        "CreateTitleRegion",
+        lua.create_function(|lua, this: Table| {
+            let owner = frame_handle_of(lua, &this)?;
+            let existing = {
+                let model = lua.app_data_ref::<Model>().expect("model");
+                model.arena.frame(owner).and_then(|f| f.title_region)
+            };
+            if let Some(rh) = existing {
+                let id = {
+                    let mut model = lua.app_data_mut::<Model>().expect("model");
+                    let d = model.region_data.entry(rh).or_default();
+                    let changed = !d.anchors.is_empty();
+                    d.anchors.clear();
+                    if changed {
+                        model.touch_layout();
+                    }
+                    model.region_id(rh)
+                };
+                return region_wrapper(lua, id);
+            }
+            let wrapper = create_region(lua, &this, RegionKind::Title, None, None)?;
+            let id = decode_id(&wrapper)?;
+            let mut model = lua.app_data_mut::<Model>().expect("model");
+            let rh = *model
+                .id_to_region
+                .get(&id)
+                .expect("the region we just created is registered");
+            if let Some(f) = model.arena.frame_mut(owner) {
+                f.title_region = Some(rh);
+            }
+            Ok(wrapper)
+        })?,
+    )?;
+    m.set(
+        "GetTitleRegion",
+        lua.create_function(|lua, this: Table| {
+            let owner = frame_handle_of(lua, &this)?;
+            let found = {
+                let mut model = lua.app_data_mut::<Model>().expect("model");
+                model
+                    .arena
+                    .frame(owner)
+                    .and_then(|f| f.title_region)
+                    .map(|rh| model.region_id(rh))
+            };
+            match found {
+                Some(id) => Ok(Value::Table(region_wrapper(lua, id)?)),
+                // ONE value, and it is nil — not zero values. See the `GetBackdrop` asymmetry above.
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+
+    // The THIRD argument is `inheritsFrom`, and we were dropping it on the floor.
+    //
+    // 49 corpus call sites across 5 distinct addons pass one — AckisRecipeList (28),
+    // CustomNameplates (10), _LazyPig (6), LibAboutPanel (4), ColorPickerPlus (1) — and **every one
+    // of them names a FONT OBJECT**: GameFontNormalSmall (15), GameFontNormal (11),
+    // GameFontHighlightSmall (10), GameFontHighlight (9), GameFontNormalLarge (3), GameFontDisable.
+    // Five separate addons, so this is not one library file replicated (1207 checked, not assumed).
+    // Ignoring it is 1203's class exactly: the addon asks for a font, we accept the call, and the
+    // string comes out in whatever the default is with no failure anywhere.
+    //
+    // The resolution order is carved (`0x773c30`): the FONT-object registry FIRST (`0x773d39`,
+    // create=0), and only on a font miss the template registry (`0x773d47`). This routes through
+    // the `SetFontObject` binding rather than reaching into the model, which is the same call the
+    // XML `<FontString inherits=>` path makes — one implementation of "apply a font object", not
+    // two that can drift.
     m.set(
         "CreateFontString",
         lua.create_function(
-            |lua, (this, name, layer): (Table, Option<String>, Option<String>)| {
-                create_region(lua, &this, RegionKind::FontString, name, layer)
+            |lua,
+             (this, name, layer, inherits): (
+                Table,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )| {
+                let wrapper = create_region(lua, &this, RegionKind::FontString, name, layer)?;
+                if let Some(from) = inherits.as_deref().filter(|s| !s.is_empty()) {
+                    apply_region_inherits(lua, &wrapper, from)?;
+                }
+                Ok(wrapper)
             },
         )?,
     )?;
@@ -173,8 +293,9 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
 /// * **`OnKeyDown` / `OnKeyUp` / `OnChar`** (14 + 1 + 4 corpus sites over 13 addons) — **raising,
 ///   and now unblocked**: the delivery law was the second §5 this work dispatched, and it landed
 ///   (wow-re `scratch/frame-key-script-delivery.md`). benilla still has none of the machinery it
-///   describes — no `EnableKeyboard`, no keyboard index, keys routed straight to the focused
-///   EditBox — so the names stay out until it exists, which is the whole rule above. What has to
+///   describes — `EnableKeyboard`/`IsKeyboardEnabled` now exist and the flag round-trips, but there
+///   is still no keyboard index and no strata walk, and keys are routed straight to the focused
+///   EditBox — so the names stay out until that exists, which is the whole rule above. What has to
 ///   get built, so the next pass does not have to re-derive it:
 ///
 ///   The frame must be in the hit-test root's **kind-0 / kind-1 bucket**
@@ -265,6 +386,44 @@ fn get_script(lua: &Lua, this: &Table, name: &str) -> mlua::Result<Value> {
         Value::Table(t) => t.get::<Value>(kind),
         _ => Ok(Value::Nil),
     }
+}
+
+/// `CreateTexture`/`CreateFontString`'s third argument — `inheritsFrom` — in the carved order.
+///
+/// **Font-object registry first, template registry second** (`0x773d39` then `0x773d47`). That
+/// order is not cosmetic: `inherits=` is one attribute over two namespaces, and every corpus caller
+/// of this argument names a font object, so a template-first resolver would miss all 49 of them.
+///
+/// A name in NEITHER registry raises, which is the same contract 1253 established for `CreateFrame`
+/// and the same bytes (`luaL_error`, `0x87957c` / `0x879544`, which never returns).
+///
+/// A name that IS a registered template but not a font object is a deliberate gap rather than a
+/// silent one: the lookup succeeded, so the reference would not raise, and re-interpreting a
+/// template node onto an existing region is a different mechanism from applying a font object. It
+/// warns and leaves the region usable — the distinction 1253 drew between *the lookup missing* and
+/// *the result being unusable*. Zero corpus callers reach it.
+fn apply_region_inherits(lua: &Lua, wrapper: &Table, from: &str) -> mlua::Result<()> {
+    use mlua::ObjectLike;
+    // The font object is applied through the binding the XML path uses, so there is one
+    // implementation of "apply a font object" rather than two that can drift apart.
+    if wrapper.call_method::<()>("SetFontObject", from).is_ok() {
+        return Ok(());
+    }
+    let is_template = {
+        let model = lua.app_data_ref::<Model>().expect("model");
+        let templates = model.framexml_templates.borrow();
+        templates.contains_key(from) || templates.keys().any(|k| k.eq_ignore_ascii_case(from))
+    };
+    if is_template {
+        let mut model = lua.app_data_mut::<Model>().expect("model");
+        model.warnings.push(format!(
+            "CreateTexture/CreateFontString: '{from}' is a registered TEMPLATE, not a font object;              the region is created but the template's content is not applied (no corpus caller              does this)"
+        ));
+        return Ok(());
+    }
+    Err(mlua::Error::runtime(format!(
+        "Couldn't find inherited node \"{from}\""
+    )))
 }
 
 fn create_region(

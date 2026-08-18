@@ -97,6 +97,171 @@ fn loading_the_shipped_ui_queues_no_sounds() {
 /// a white slab over its autocast ring and another under its tab row. Every gate was green.
 ///
 /// The shape half runs everywhere; the resolve half needs client data and skips without it (a
+/// The autocast **corner brackets** (`UI-AutoCastableOverlay`), per template — the sibling pin to
+/// the shine's, and the same invariant: not a magic size, but the **bracket square against its
+/// button**, which is the thing an eye actually reads.
+///
+/// The art fills only the middle `33/64` of the texture, so the drawn size decides where the
+/// brackets land. The reference gets this right on the pet button (58 x 0.5156 = 29.9 on 30) and
+/// loose on the spell book (60 x 0.5156 = 30.9 on 37 — three units inside each edge). Decision
+/// 1393 carries the pet button's ratio across; this test is what keeps it carried, and what will
+/// catch a third template added with a borrowed number.
+#[test]
+fn the_autocast_brackets_reach_each_buttons_corners() {
+    use benilla_ui::framexml::{Element, TopLevel};
+
+    /// The fraction of `UI-AutoCastableOverlay.blp` the bracket art actually covers, measured off
+    /// the shipped BLP (`benilla-extract blp`): art bbox 15..47 of 64.
+    const ART: f32 = 33.0 / 64.0;
+
+    fn dim(el: &Element, tag: &str, axis: &str) -> Option<f32> {
+        el.children
+            .iter()
+            .find(|c| c.tag.eq_ignore_ascii_case(tag))
+            .and_then(|n| n.children.first())
+            .and_then(|d| {
+                d.attrs()
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(axis))
+                    .map(|(_, v)| v.clone())
+            })
+            .and_then(|v| v.parse().ok())
+    }
+
+    /// Walk a template, carrying the nearest enclosing button size down to the overlay.
+    fn walk(el: &Element, button: Option<f32>, out: &mut Vec<(String, f32, f32)>) {
+        let button = dim(el, "Size", "x")
+            .filter(|_| el.tag.ends_with("Button"))
+            .or(button);
+        let name = el
+            .attrs()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("name"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        if name.ends_with("AutoCastable") {
+            if let (Some(size), Some(btn)) = (dim(el, "Size", "x"), button) {
+                out.push((name.clone(), size * ART, btn));
+            }
+        }
+        for child in &el.children {
+            walk(child, button, out);
+        }
+    }
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ui");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("assets/ui") {
+        let path = entry.expect("entry").path();
+        if path.extension().is_none_or(|e| e != "xml") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read");
+        for item in benilla_ui::framexml::parse(&src).expect("parse").items {
+            match item {
+                TopLevel::Font(el) | TopLevel::Template(el) | TopLevel::Instance(el) => {
+                    walk(&el, None, &mut found)
+                }
+                TopLevel::Include(_) | TopLevel::Script(_) => {}
+            }
+        }
+    }
+    assert_eq!(found.len(), 2, "expected two autocast overlays: {found:?}");
+    for (name, brackets, button) in &found {
+        assert!(
+            (brackets / button - 0.997).abs() < 0.01,
+            "{name}: a {brackets:.1}-unit bracket square on a {button}-unit button is {:.3}x — the \
+             pet button's is 0.997x, which is what puts brackets IN the corners (decision 1393)",
+            brackets / button
+        );
+    }
+}
+
+/// Every shipped autocast-shine token, and the rim/viewport ratio each one asks for — the one
+/// place the widget's geometry is decided, so the one place to pin it.
+///
+/// The pet button is the REFERENCE's own numbers (`setAllPoints` on 30x30 at `scale="1.2"`), and
+/// its ratio is why that button reads as a rim: the rim square is 1.024x its viewport, so it runs
+/// ON the edge and the widget's scissor halves every star (1387/1391).
+///
+/// The spell book is **one deliberate deviation** (decision 1392). The reference writes
+/// `scale="1.22"` into a 36-unit viewport — a 0.87x rim that floats clear of the edge, is never
+/// clipped, and washes the icon; the real 1.12 client looks the same way (director-checked), so
+/// this is taste, not fidelity. We write 1.44 to borrow the pet button's ratio. This test is what
+/// stops that drifting, or being "corrected" back to 1.22 by someone who only read the ref.
+#[test]
+fn the_shine_tokens_ask_for_the_rims_we_meant() {
+    use benilla_ui::framexml::{Element, TopLevel};
+
+    fn walk(el: &Element, out: &mut Vec<(String, f32, f32)>) {
+        for (key, value) in el.attrs() {
+            let scale = crate::autocast_shine::token_model_scale(value);
+            let is_token = key.eq_ignore_ascii_case("file")
+                && value.starts_with(crate::autocast_shine::SHINE_TOKEN);
+            if let (true, Some(scale)) = (is_token, scale) {
+                let view = el
+                    .children
+                    .iter()
+                    .find(|c| c.tag.eq_ignore_ascii_case("Size"))
+                    .and_then(|sz| sz.children.first())
+                    .and_then(|d| {
+                        d.attrs()
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("x"))
+                            .map(|(_, v)| v.to_string())
+                    })
+                    .and_then(|v| v.parse::<f32>().ok())
+                    // No <Size> means setAllPoints on the pet button, which is 30x30.
+                    .unwrap_or(30.0);
+                out.push((
+                    el.attrs()
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("name"))
+                        .map(|(_, v)| v.to_string())
+                        .unwrap_or_default(),
+                    0.02 * 1280.0 * scale,
+                    view,
+                ));
+            }
+        }
+        for child in &el.children {
+            walk(child, out);
+        }
+    }
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ui");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("assets/ui") {
+        let path = entry.expect("entry").path();
+        if path.extension().is_none_or(|e| e != "xml") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read");
+        for item in benilla_ui::framexml::parse(&src).expect("parse").items {
+            match item {
+                TopLevel::Font(el) | TopLevel::Template(el) | TopLevel::Instance(el) => {
+                    walk(&el, &mut found)
+                }
+                TopLevel::Include(_) | TopLevel::Script(_) => {}
+            }
+        }
+    }
+    assert_eq!(
+        found.len(),
+        2,
+        "expected exactly two shine tokens: {found:?}"
+    );
+    for (name, rim, view) in &found {
+        assert!(
+            (rim / view - 1.024).abs() < 1e-3,
+            "{name}: a {rim}-unit rim in a {view}-unit viewport is {:.3}x, not the pet button's \
+             1.024x — a rim that does not reach its own viewport edge is never clipped, and reads \
+             as a wash rather than a rim (decisions 1387/1392)",
+            rim / view
+        );
+    }
+}
+
 /// hand-kept list of real file names would rot into agreeing with itself — the `text=` sweep's
 /// argument below). Resolution goes through the renderer's own `sprite_candidates`, not a copy of it —
 /// including its `.blp`/`.tga` fallback, so the sweep accepts exactly what the renderer accepts.
@@ -119,7 +284,11 @@ fn every_shipped_texture_path_resolves_in_the_client_archives() {
             let archive_path = ["file", "bgfile", "edgefile"]
                 .contains(&key.to_ascii_lowercase().as_str())
                 && !value.is_empty();
-            if archive_path {
+            // The autocast-shine token (decision 1383) is a REGISTRATION, not an archive path:
+            // conversion intercepts it before the resolver and it draws nothing, so it is
+            // exempt — through the token's OWN parser, so a typo'd token (or an unparseable
+            // `scale=` suffix) still fails this sweep as the white quad it would actually be.
+            if archive_path && crate::autocast_shine::token_model_scale(value).is_none() {
                 out.push((file.to_string(), el.tag.clone(), value.clone()));
             }
         }
@@ -502,4 +671,107 @@ fn every_shipped_font_object_is_published_as_a_lua_global() {
         );
         assert!(height > 0.0, "{name}: height {height}");
     }
+}
+
+/// **Two reference templates addons INHERIT, and the silence that hid them.**
+///
+/// `TargetBuffButtonTemplate` (ref `TargetFrame.xml`) and `MainMenuBarMicroButton` (ref
+/// `MainMenuBarMicroButtons.xml`) are declared by the reference and were not by us. An unresolved
+/// `inherits=` is **silent** — no load error, no session error, nothing in any harness column — so
+/// a consumer just gets a button with no size, no hit-rect and no scripts, and nothing anywhere
+/// says so. They surfaced only in the report's missing-TEMPLATES ranking.
+///
+/// Asserted through what a consumer actually gets: inherit the template, then read back the
+/// geometry and the script the reference confers.
+#[test]
+fn the_inheritable_reference_templates_confer_their_shape() {
+    let mut s = benilla_ui::script::UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    assert!(super::load_default_ui(&s).is_empty());
+
+    // `CT_UnitFrames/CT_TargetFrame.xml:4` builds its own virtual template on top of this one, so
+    // the inherit has to work through a second hop as well as directly.
+    s.run(
+        r#"
+        BuffProbe = CreateFrame("Button", "BuffProbe", UIParent, "TargetBuffButtonTemplate")
+        MicroProbe = CreateFrame("Button", "MicroProbe", UIParent, "MainMenuBarMicroButton")
+        "#,
+    )
+    .unwrap();
+    s.resolve();
+
+    assert_eq!(
+        s.eval::<(f64, f64)>("return BuffProbe:GetWidth(), BuffProbe:GetHeight()")
+            .unwrap(),
+        (21.0, 21.0),
+        "the buff button carries the reference's 21x21"
+    );
+    assert!(
+        s.eval::<bool>("return BuffProbeIcon ~= nil").unwrap(),
+        "$parentIcon is the region a consumer getglobals to set the texture"
+    );
+    assert!(
+        s.eval::<bool>(r#"return BuffProbe:GetScript("OnEnter") ~= nil"#)
+            .unwrap(),
+        "the tooltip script comes with the template"
+    );
+
+    assert_eq!(
+        s.eval::<(f64, f64)>("return MicroProbe:GetWidth(), MicroProbe:GetHeight()")
+            .unwrap(),
+        (29.0, 58.0)
+    );
+    assert!(s
+        .eval::<bool>(r#"return MicroProbe:GetScript("OnEnter") ~= nil"#)
+        .unwrap());
+    assert!(s.errors().is_empty(), "no script errors: {:?}", s.errors());
+}
+
+/// **`CursorUpdate` / `CursorOnUpdate` — the inspect-cursor pair, transcribed from FrameXML.**
+///
+/// Both are `framexml` origin in `reference/1.12-globals.tsv` (while `ResetCursor` and
+/// `ShowInspectCursor` beside them are `engine`), so they are ours to write rather than to bind.
+/// Two corpus addons call `CursorUpdate` and one calls `CursorOnUpdate`; it is also one of the
+/// blockers on two reference templates addons inherit, and the sourced `ContainerFrame.lua` calls
+/// it from its keyring fork.
+#[test]
+fn the_inspect_cursor_pair_takes_both_arms() {
+    let mut s = benilla_ui::script::UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    assert!(super::load_default_ui(&s).is_empty());
+
+    // Both exist as functions — the shape a caller checks before hooking.
+    assert_eq!(
+        s.eval::<(String, String)>("return type(CursorUpdate), type(CursorOnUpdate)")
+            .unwrap(),
+        ("function".into(), "function".into())
+    );
+
+    // **The no-ctrl arm, which is the one that runs in practice.** `this.hasItem` is read as a
+    // plain truthy field, so a frame that never sets it simply takes `ResetCursor` — this is why
+    // the pair is safe to ship before anything sets that field.
+    s.run(
+        r#"
+        CursorProbe = CreateFrame("Frame", "CursorProbe", UIParent)
+        this = CursorProbe
+        CursorUpdate()
+        this = nil
+        "#,
+    )
+    .unwrap();
+    assert!(
+        s.errors().is_empty(),
+        "the ResetCursor arm runs clean: {:?}",
+        s.errors()
+    );
+
+    // `CursorOnUpdate` gates on tooltip ownership, so with the tooltip unowned it must do nothing
+    // at all rather than reach through to the cursor.
+    s.run("this = CursorProbe CursorOnUpdate() this = nil")
+        .unwrap();
+    assert!(
+        s.errors().is_empty(),
+        "the unowned-tooltip gate short-circuits: {:?}",
+        s.errors()
+    );
 }

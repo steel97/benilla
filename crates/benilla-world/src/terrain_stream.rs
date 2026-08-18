@@ -25,7 +25,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::Face;
 
 use crate::clutter::{scatter_tile_clutter, ClutterConfig, GroundClutter};
-use crate::collision::{GroundDecalSurface, PickOccluder};
+use crate::collision::{walk_layers, GroundDecalSurface, PickOccluder};
 use crate::interior::WmoResidency;
 use crate::lighting::SharedLightBuffer;
 use crate::liquid::{spawn_liquids, LiquidAssets};
@@ -42,11 +42,13 @@ mod collider;
 mod furnish;
 mod queries;
 mod spawn;
+mod weld;
 
-use collider::{finish_colliders, terrain_collider_data};
+use collider::{finish_colliders, impassable_wall_data, terrain_collider_data};
 use furnish::furnish_tile_cells;
 use spawn::prop_light::WmoDoodadInst;
 use spawn::spawn_loaded_placements;
+use weld::{flush_hull_welds, HullWelds};
 // The WMO prop-light machinery lives spawn-side (0830's named carve, executed in 0832); the two
 // outside consumers — `crate::interior` and `crate::entities`' `wmo_props` — keep their
 // `terrain_stream::X` paths, same as the `queries` items below.
@@ -55,7 +57,7 @@ pub use spawn::prop_light::{fold_interior_probe, PropLobeLight};
 // doodad-prop path's spawner (`crate::entities`' `wmo_props`: the ship's sails ride the streamed
 // gameobject entity, and its cargo hulls ride the boat's kinematic body).
 pub use collider::{build_collider_task, placement_collider_data, PendingCollider};
-pub use spawn::{m2_fade, point_light, spawn_model_entities};
+pub use spawn::{m2_anim_bound, m2_fade, point_light, spawn_model_entities};
 // The position queries + area authority (their home is `queries`; paths stay `terrain_stream::X`).
 use queries::update_current_area;
 pub use queries::{
@@ -132,9 +134,16 @@ struct TileState {
     placements: Vec<u32>,
     /// The tile's water-surface entities (tile-exclusive, like the terrain mesh — despawned on unload).
     liquid: Vec<Entity>,
+    /// The tile's impassable-chunk wall collider, if it authors any (decision 1266). Its own static
+    /// body rather than a child of the root, matching the per-WMO walk/camera bakes: two colliders
+    /// with different audiences are two bodies, not a nested one.
+    wall: Option<Entity>,
     /// The tile's per-chunk `ClutterChunk` entities (tile-exclusive; their lazily-built clutter meshes
     /// are children, so despawning these cascades to them).
     clutter: Vec<Entity>,
+    /// The welded map-doodad hull colliders this tile owns (decision 1369): batches of the hulls
+    /// whose placements registered here first, despawned with the tile like [`Self::wall`].
+    welds: Vec<Entity>,
 }
 
 /// Doodad/WMO placements spawned **once** and shared across the tiles that reference them — the client's
@@ -172,6 +181,10 @@ struct Placement {
     portal_instance: Option<Entity>,
     /// How many loaded tiles reference this placement; despawned when it hits zero.
     refs: u32,
+    /// The first tile to register this placement — loaded at that moment by construction. For an
+    /// M2 doodad this is its hull weld's owner tile (decision 1369; the lifetime argument is in
+    /// `weld`'s module doc). WMO placements never read it: their prop hulls weld per placement.
+    owner: (i32, i32),
 }
 
 /// How much of the world the streamer wants around the view focus is actually there. Written each
@@ -203,6 +216,13 @@ pub struct WorldLoadProgress {
     pub colliders_pending: usize,
     /// Focus-neighbourhood placements not yet spawned (the wait instrument's term).
     pub placements_pending: usize,
+    /// **Which tile these facts are about** — the focus tile the streamer computed this frame.
+    /// `None` until the streamer first runs (and again after `release_world`). The settle release
+    /// compares it against the tile under the avatar's own feet and refuses the resident release on
+    /// a mismatch (decision 1336): residency published for one tile must never unfreeze a body
+    /// standing on another — the fail-closed guard that makes any future focus/snap ordering
+    /// regression cost a logged 6 s timeout instead of a silent fall through the world.
+    pub focus_tile: Option<(i32, i32)>,
 }
 
 impl WorldLoadProgress {
@@ -325,6 +345,20 @@ impl ViewFocus {
     pub(crate) fn body_pos(&self) -> Option<[f32; 3]> {
         self.body
     }
+
+    /// Is there a body **and** is the world under it the one it is standing in?
+    ///
+    /// The area authority's gate (1287) — the same bit [`ViewFocus::paced`] carries, read through
+    /// its own name because it answers a different question here. Through entry, a teleport and a
+    /// world swap the body has been snapped but its destination is still streaming, so the leaf
+    /// area under it is whatever tile happens to be resident: at first login that is the pre-snap
+    /// position's — the map centre, Eastern Plaguelands on map 0 and The Barrens on map 1 — and a
+    /// beat later the outdoor parent of an interior whose WMO claim has not landed yet. Publishing
+    /// those makes the client announce, play the music of, and join the channels of zones the
+    /// player was never in.
+    pub(crate) fn body_settled(&self) -> bool {
+        self.body.is_some() && self.paced
+    }
 }
 
 /// **Where the world streams from when nothing else can say** — the Human start (Northshire),
@@ -413,6 +447,7 @@ impl Plugin for TerrainPlugin {
             .init_resource::<TerrainStreamer>()
             .init_resource::<StreamActivity>()
             .init_resource::<Placements>()
+            .init_resource::<HullWelds>()
             .init_resource::<crate::model_forms::ModelForms>()
             .init_resource::<CurrentArea>()
             // **The streaming chain lives in `WorldStage::Stream`** — the load-bearing half of the
@@ -431,6 +466,7 @@ impl Plugin for TerrainPlugin {
                     stream_terrain,
                     furnish_tile_cells,
                     spawn_loaded_placements,
+                    flush_hull_welds,
                     sync_interior_volumes,
                 )
                     .chain()
@@ -520,6 +556,7 @@ fn stream_terrain(
     // reason as `asset_stores`.
     location: (Option<Res<CurrentMap>>, Option<Res<MapCatalogRes>>),
     mut load_progress: Option<ResMut<WorldLoadProgress>>,
+    mut welds: ResMut<HullWelds>,
 ) {
     let (mut materials, mut meshes, wdts, _time, mut activity) = asset_stores;
     let (current_map, map_catalog) = location;
@@ -547,7 +584,13 @@ fn stream_terrain(
             state.map_dir,
             state.tiles.len()
         );
-        drop_streamed_world(&mut commands, &mut state, placements, &mut activity);
+        drop_streamed_world(
+            &mut commands,
+            &mut state,
+            placements,
+            &mut welds,
+            &mut activity,
+        );
         state.map_dir = Some(dir.clone());
         state.wdt = Some(asset_server.load(format!("mpq://World/Maps/{dir}/{dir}.wdt")));
         state.wdt_ungated = false;
@@ -706,7 +749,9 @@ fn stream_terrain(
                     furnished: false,
                     placements: Vec::new(),
                     liquid: Vec::new(),
+                    wall: None,
                     clutter: Vec::new(),
+                    welds: Vec::new(),
                 },
             );
         }
@@ -740,6 +785,12 @@ fn stream_terrain(
         // (attached by `finish_colliders`) so a tile streaming in never hitches the frame. It rides the
         // tile root's lifecycle — gone when the tile despawns, no separate bookkeeping.
         let collider_data = terrain_collider_data(&adt.chunks);
+        // …and, separately, the tile's impassable-chunk fences (decision 1266, report B129). A
+        // SECOND collider because the audience is the point: the reference's fence is emitted only
+        // into the movement box gather, and its segment/ray path never reads the flag at all. So —
+        // the walk layer, where the body sees it and the camera boom does not, and unmarked, so it
+        // neither takes the selection ring nor clamps the mouse pick. An authored wall is not scenery.
+        let wall_data = impassable_wall_data(&adt.chunks);
         // The tile ROOT draws nothing: it carries the collider and the surface roles, and its MCNK
         // cells hang off it as children — one drawn object per 33.333 yd chunk. That is the unit the
         // exterior-scene cull needs (decision 0780; a 533 yd slab the camera stands on intersects
@@ -762,6 +813,15 @@ fn stream_terrain(
             ));
         }
         tile.entity = Some(tile_ent.id());
+        tile.wall = wall_data.map(|(verts, tris)| {
+            commands
+                .spawn(PendingCollider::new(
+                    build_collider_task(verts, tris),
+                    Some(walk_layers()),
+                    true,
+                ))
+                .id()
+        });
         tile.material = Some(material);
         activity.tiles_spawned += 1;
 
@@ -770,7 +830,7 @@ fn stream_terrain(
         // not contain its origin, so the shade is resolved at spawn via a global lookup (see
         // `doodad_ground_shade` / `spawn_loaded_placements`) — the reference's own per-frame model.
         for d in &adt.doodads {
-            register_doodad(placements, &asset_server, d);
+            register_doodad(placements, &asset_server, d, (tx, ty));
             tile.placements.push(d.unique_id);
         }
         for w in &adt.wmos {
@@ -829,7 +889,17 @@ fn stream_terrain(
         let spawned = |c: &(i32, i32)| state.tiles.get(c).is_some_and(|t| t.furnished);
         p.total = desired.len();
         p.ready = desired.iter().filter(|c| spawned(c)).count();
-        p.focus_resident = state.tiles.get(&(cx, cy)).is_none_or(|t| t.furnished);
+        p.focus_tile = Some((cx, cy));
+        // Resident = the focus tile is furnished — judged from the DESIRED set, not from the
+        // presence of a `state.tiles` entry: a desired tile whose request hasn't landed yet is
+        // absent from the map, and "no entry" must read as *not there*, never as "nothing to wait
+        // for". The vacuous arm is only for ground the WDT never authors (map edge, open ocean,
+        // a WMO-only map) — waiting there would hang forever on terrain that cannot exist.
+        p.focus_resident = if desired.contains(&(cx, cy)) {
+            state.tiles.get(&(cx, cy)).is_some_and(|t| t.furnished)
+        } else {
+            true
+        };
         // The focus neighbourhood's placements join the accounting (bar + scene term). A placement
         // is *up* once its own model spawned AND its WMO props (each an M2 arriving on its own
         // schedule) have — the furniture the reveal would otherwise pop in. Placements of tiles not
@@ -892,7 +962,12 @@ fn stream_terrain(
 
 /// Register one M2 doodad placement: bump the refcount if it's already known, else load its model and
 /// record it (spawned later by [`spawn_loaded_placements`] once the asset is ready).
-fn register_doodad(placements: &mut Placements, asset_server: &AssetServer, d: &Doodad) {
+fn register_doodad(
+    placements: &mut Placements,
+    asset_server: &AssetServer,
+    d: &Doodad,
+    tile: (i32, i32),
+) {
     if let Some(p) = placements.by_id.get_mut(&d.unique_id) {
         p.refs += 1;
         return;
@@ -914,6 +989,7 @@ fn register_doodad(placements: &mut Placements, asset_server: &AssetServer, d: &
             doodads: Vec::new(),
             portal_instance: None,
             refs: 1,
+            owner: tile,
         },
     );
 }
@@ -941,6 +1017,7 @@ fn register_wmo(placements: &mut Placements, asset_server: &AssetServer, w: &Wmo
             doodads: Vec::new(),
             portal_instance: None,
             refs: 1,
+            owner: (0, 0), // unread for WMOs — their prop hulls weld per placement (1369)
         },
     );
 }
@@ -960,6 +1037,7 @@ fn drop_streamed_world(
     commands: &mut Commands,
     state: &mut TerrainStreamer,
     placements: &mut Placements,
+    welds: &mut HullWelds,
     activity: &mut StreamActivity,
 ) {
     for ((_tx, _ty), t) in state.tiles.drain() {
@@ -973,6 +1051,11 @@ fn drop_streamed_world(
         release_placement(commands, placements, GLOBAL_WMO_UID, activity);
     }
     placements.materials.clear();
+    // The weld accumulators describe the world just dropped. Cleared HERE and not left to the
+    // flush system's dead-key discard, because tile keys are not unique across maps: the new
+    // map's tiles are requested (and their `TileState`s inserted) on this very frame, so a stale
+    // accumulator could weld the previous map's geometry into a same-numbered fresh tile.
+    welds.clear();
 }
 
 /// Expire the placement material dedup by **distance** (decision 0793) — the within-map half of
@@ -999,6 +1082,7 @@ fn release_world(
     mut forms: ResMut<crate::model_forms::ModelForms>,
     mut progress: Option<ResMut<WorldLoadProgress>>,
     mut activity: ResMut<StreamActivity>,
+    mut welds: ResMut<HullWelds>,
 ) {
     if state.tiles.is_empty() && state.map_dir.is_none() {
         return;
@@ -1011,7 +1095,13 @@ fn release_world(
     // cache in one deterministic sweep instead — nothing world-scoped may survive a logout, and
     // an entry whose asset another holder keeps resident would otherwise pin its meshes forever.
     forms.clear();
-    drop_streamed_world(&mut commands, &mut state, &mut placements, &mut activity);
+    drop_streamed_world(
+        &mut commands,
+        &mut state,
+        &mut placements,
+        &mut welds,
+        &mut activity,
+    );
     state.map_dir = None;
     state.wdt = None;
     state.wdt_ungated = false;
@@ -1023,10 +1113,10 @@ fn release_world(
 }
 
 fn despawn_tile_owned(commands: &mut Commands, t: &TileState) {
-    if let Some(e) = t.entity {
+    for e in t.entity.into_iter().chain(t.wall) {
         commands.entity(e).try_despawn();
     }
-    for &e in t.liquid.iter().chain(&t.clutter) {
+    for &e in t.liquid.iter().chain(&t.clutter).chain(&t.welds) {
         commands.entity(e).try_despawn();
     }
 }

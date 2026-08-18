@@ -24,7 +24,8 @@
     slots, so it has to detour out of the container API to describe one. benilla's keyring is an
     ordinary container (id -2, decision 0765): its slots come through `GetContainerItemInfo` and
     `GameTooltip:SetBagItem` like every other bag's. So the detour is not merely unavailable here
-    (neither `KeyRingButtonIDToInvSlotID` nor `CursorUpdate` is a binding) — it is *wrong* here,
+    (`KeyRingButtonIDToInvSlotID` is not a binding here; `CursorUpdate` now is, transcribed from
+    UIParent.lua into UiPanels.xml, so only half the detour is missing) — it is *wrong* here,
     and supplying the two verbs would buy an empty tooltip, because our keyring items were never
     fed into the inventory-slot space it reads.
 
@@ -78,5 +79,29 @@
             end
             refItemButtonOnEnter(button)
         end
+
+        -- ── `updateContainerFrameAnchors` — a no-op here, and that IS the benilla answer ────────
+        -- The reference's body (l.480-489) opens `while ContainerFrame1.bags[index] do` and walks
+        -- the twelve `ContainerFrame1..12` windows it owns, positioning each into columns. benilla
+        -- does not build those windows at all — our bags are `BagFrame.xml`'s own, and they
+        -- position themselves. `ui_script::manifest` already records the same difference one
+        -- function over: *"ToggleBackpack walks twelve ContainerFrames we do not build; ours walks
+        -- our windows."*
+        --
+        -- So this is not a stub standing in for something missing: there is nothing here for it to
+        -- anchor, and the reference body raises `attempt to index global 'ContainerFrame1'` the
+        -- moment anything calls it. FIVE corpus addons did — Bongos, Bongos_ActionBar and the
+        -- CT_BarMod family all HOOK it (`BLIZZARD_Original_updateContainerFrameAnchors` in the
+        -- traceback) and then call through, so the raise landed inside a Blizzard file with our
+        -- bag layout nowhere in the stack.
+        --
+        -- Deliberately silent rather than warned: an addon calling this on every bag update would
+        -- turn a warn-once into a warn-always, and unlike the cases in the section above nothing is
+        -- LOST by doing nothing — the windows it would have moved are already where our own layout
+        -- put them. The header's "never silently stubbed" rule is about absent capability; this is
+        -- present capability with a different owner.
+        function updateContainerFrameAnchors()
+        end
+
     ]]></Script>
 </Ui>

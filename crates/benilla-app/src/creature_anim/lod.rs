@@ -53,7 +53,7 @@ use bevy::prelude::*;
 use benilla_assets::{WmoGroupNav, WmoModel, WmoPortalRef};
 
 use crate::entities::mount::MountBody;
-use crate::net::SelfPlayer;
+use crate::net::Embodied;
 use crate::target::SelectionRadius;
 use benilla_world::view::WorldCamera;
 use benilla_world::wmo_portal::{UnitWmoRoom, WmoPortalInstance, WmoRoom};
@@ -77,7 +77,7 @@ const FALLBACK_RADIUS: f32 = 6.0;
 /// portal-PVS room test (decision 0739 — see the module doc's "room leg"). PostUpdate,
 /// before [`AnimationSystems`] — a wake drops the marker in time for the same frame's pose
 /// evaluation, so the re-appearing unit samples the absolute-clock pose with no stale
-/// frame. Exempt: the self-avatar (the camera rides its attachment-17 pivot, and it must keep
+/// frame. Exempt: the body we drive (the camera rides its attachment-17 pivot, and it must keep
 /// animating faded-out in first person) and its mount child. `WOW_NO_ANIM_LOD=1` disables
 /// parking — the live-probe A/B lever; `WOW_NO_ROOM_LOD=1` disables only the room leg.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)] // one Bevy system's full input set
@@ -90,7 +90,7 @@ pub(super) fn gate_rig_animation(
             &GlobalTransform,
             Option<&SelectionRadius>,
             Has<AnimParked>,
-            Has<SelfPlayer>,
+            Has<Embodied>,
             Option<&MountBody>,
             Option<&UnitWmoRoom>,
         ),
@@ -102,9 +102,17 @@ pub(super) fn gate_rig_animation(
         // events), `go_anim`'s state machine arms the player regardless of the marker, and the
         // wake samples the absolute clock. Booth/studio rigs are entity-joint-lane (no
         // `RigPose`), so this query can never park the character pane.
-        With<RigPose>,
+        //
+        // `Without<DoodadAnimHost>` (decision 1365): placed doodads joined the collapsed lane,
+        // and their draw gate (`doodad_anim::gate_doodad_anim`) owns their `AnimParked` marker —
+        // it parks on the composed draw verdict + fade sphere, the doodad lane's own law, and
+        // two writers to one marker would fight every frame the two policies disagree.
+        (
+            With<RigPose>,
+            Without<benilla_world::doodad_anim::DoodadAnimHost>,
+        ),
     >,
-    self_hosts: Query<Has<SelfPlayer>>,
+    self_hosts: Query<Has<Embodied>>,
     instances: Query<&WmoPortalInstance>,
     wmos: Res<Assets<WmoModel>>,
     mut out_since: Local<EntityHashMap<f32>>,
@@ -616,11 +624,11 @@ mod tests {
         let mut app = app();
         spawn_camera(&mut app);
         let (behind, behind_joint) = spawn_rig(&mut app, Vec3::Z * 50.0);
-        app.world_mut().entity_mut(behind).insert(SelfPlayer);
+        app.world_mut().entity_mut(behind).insert(Embodied);
         advance(&mut app, PARK_AFTER_SECS + 0.2, 4);
         assert!(
             !app.world().entity(behind).contains::<AnimParked>(),
-            "SelfPlayer never parks, wherever the camera points"
+            "the active mover never parks, wherever the camera points"
         );
         // And its bones keep animating — the exemption is live evaluation, not just the marker.
         let before = bone(&app, behind_joint);

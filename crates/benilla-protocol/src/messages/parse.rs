@@ -11,10 +11,11 @@ use crate::wire::{
 };
 
 use super::{
-    action_bar, area_trigger, attack, bank, channel, chat, combat_log, death, duel, gameobject,
-    gossip, group, items, loot, mail, mirror_timer, monster_move, movement, opcode, page_text, pet,
-    progression, quest, social, spellbook, spells, taxi, trade, trainer, update_object, vendor,
-    world_state, Character, CreatureQueryInfo, MoveMode, ServerPacket, SpeedKind,
+    action_bar, area_trigger, attack, bank, binder, channel, chat, combat_log, death, duel,
+    gameobject, gossip, group, guild, items, loot, mail, mirror_timer, monster_move, movement,
+    opcode, page_text, pet, progression, quest, social, spellbook, spells, taxi, trade, trainer,
+    update_object, vendor, world_state, Character, CreatureQueryInfo, MoveMode, ServerPacket,
+    SpeedKind,
 };
 
 /// Read one `SMSG_FORCE_*_SPEED_CHANGE` body — `[packed mover guid][u32 counter][f32 speed]`,
@@ -286,6 +287,16 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
                 area,
             }
         }
+        opcode::SMSG_BINDER_CONFIRM => ServerPacket::BinderConfirm {
+            binder: binder::read_binder_confirm(&mut r)?,
+        },
+        opcode::SMSG_PLAYERBOUND => {
+            let bound = binder::read_player_bound(&mut r)?;
+            ServerPacket::PlayerBound {
+                binder: bound.binder,
+                area: bound.area,
+            }
+        }
         opcode::SMSG_SET_PROFICIENCY => {
             // vmangos SetProficiency::AppendBodyTo (Packets/Skill.cpp): u8 itemClass + u32 mask.
             let item_class = read_u8(&mut r)?;
@@ -314,12 +325,25 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
         opcode::SMSG_TEXT_EMOTE => {
             let guid = read_u64_le(&mut r)?;
             let text_emote = read_u32_le(&mut r)?;
+            // Read and dropped on purpose — `emoteNum` selects neither the sentence nor the voice
+            // kit on the receive side (wow-re `ui/scratch/text-emote-composition.md` §3).
             let _emote_num = read_u32_le(&mut r)?;
-            let namelen = read_u32_le(&mut r)?;
+            // The target's name, length-prefixed **including its NUL** (vmangos writes a lone
+            // `0x00` and `namelen == 1` when there was no target). Trimmed at the first NUL, so an
+            // untargeted emote arrives as the empty string — which is precisely the "untargeted"
+            // bit of the sentence-form selector, not a missing value.
+            let namelen = read_u32_le(&mut r)? as usize;
+            let mut name = Vec::with_capacity(namelen.min(64));
             for _ in 0..namelen {
-                read_u8(&mut r)?; // the target's name — chat consumes it later; audio keys on ids
+                name.push(read_u8(&mut r)?);
             }
-            ServerPacket::TextEmote { guid, text_emote }
+            let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            let target_name = String::from_utf8_lossy(&name[..end]).into_owned();
+            ServerPacket::TextEmote {
+                guid,
+                text_emote,
+                target_name,
+            }
         }
         opcode::SMSG_EMOTE => {
             let emote_id = read_u32_le(&mut r)?;
@@ -745,6 +769,9 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
             }
             ServerPacket::SetFactionStanding { standings }
         }
+        opcode::SMSG_SET_FACTION_VISIBLE => ServerPacket::SetFactionVisible {
+            list_id: read_u32_le(&mut r)?,
+        },
         opcode::SMSG_NAME_QUERY_RESPONSE => {
             let guid = read_u64_le(&mut r)?;
             let name = read_cstring(&mut r)?;
@@ -828,6 +855,10 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
         opcode::SMSG_GAMEOBJECT_CUSTOM_ANIM => {
             let (guid, anim_id) = gameobject::read_gameobject_custom_anim(&mut r)?;
             ServerPacket::GameObjectCustomAnim { guid, anim_id }
+        }
+        opcode::SMSG_GAMEOBJECT_DESPAWN_ANIM => {
+            let guid = gameobject::read_gameobject_despawn_anim(&mut r)?;
+            ServerPacket::GameObjectDespawnAnim { guid }
         }
         // Both fishing verdicts are empty-bodied (the opcode IS the message).
         opcode::SMSG_FISH_NOT_HOOKED => ServerPacket::FishNotHooked,
@@ -956,6 +987,26 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
             ServerPacket::FriendStatus(social::read_friend_status(&mut r)?)
         }
         opcode::SMSG_WHO => ServerPacket::WhoResults(social::read_who(&mut r)?),
+        // The guild family (bodies in `guild`). The two big ones are caches — a query response
+        // fills the guild-id→identity cache, the roster replaces the whole membership — and the
+        // three small ones are notifications. `SMSG_GUILD_ROSTER`'s member loop carries the
+        // family's one conditional field; see `guild::read_guild_roster`.
+        opcode::SMSG_GUILD_QUERY_RESPONSE => {
+            ServerPacket::GuildQueryResponse(guild::read_guild_query_response(&mut r)?)
+        }
+        opcode::SMSG_GUILD_ROSTER => ServerPacket::GuildRoster(guild::read_guild_roster(&mut r)?),
+        opcode::SMSG_GUILD_EVENT => ServerPacket::GuildEvent(guild::read_guild_event(&mut r)?),
+        opcode::SMSG_GUILD_COMMAND_RESULT => {
+            ServerPacket::GuildCommandResult(guild::read_guild_command_result(&mut r)?)
+        }
+        opcode::SMSG_GUILD_INVITE => {
+            let (inviter, guild) = guild::read_guild_invite(&mut r)?;
+            ServerPacket::GuildInvite { inviter, guild }
+        }
+        opcode::SMSG_GUILD_DECLINE => ServerPacket::GuildDecline {
+            name: guild::read_guild_decline(&mut r)?,
+        },
+        opcode::SMSG_GUILD_INFO => ServerPacket::GuildInfo(guild::read_guild_info(&mut r)?),
         // The observer speed legs (decision 0441): a unit we don't control changed speed — a
         // creature or mid-spline player (SPLINE family), or a freely-moving player (MOVE_SET
         // family, which carries a fresh pose too). No ack on either.
@@ -985,6 +1036,12 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
         // `HandleMountSpecialAnimOpcode` — `data << GetObjectGuid()`, full 8 bytes, not packed).
         opcode::SMSG_MOUNTSPECIAL_ANIM => ServerPacket::MountSpecialAnim {
             guid: read_u64_le(&mut r)?,
+        },
+        // The control handoff: PACKED guid (unlike the flourish above) + one byte (VERIFIED
+        // vmangos `Server/Packets/Misc.cpp:677-682` — `WriteAsPacked()`, then `uint8 allowMove`).
+        opcode::SMSG_CLIENT_CONTROL_UPDATE => ServerPacket::ClientControlUpdate {
+            mover: read_packed_guid(&mut r)?,
+            allow_move: read_u8(&mut r)? != 0,
         },
         // The taxi/flight-master family (decision 0484): the map (SHOWTAXINODES), a status
         // answer/first-visit learn (TAXINODE_STATUS), the activate verdict, and the multi-hop

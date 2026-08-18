@@ -47,6 +47,36 @@
         -- where the reference registers them here. That divergence is recorded in `slash.rs`.
         SlashCmdList = {}
 
+        -- ── ChatTypeGroup / OtherMenuChatTypeGroups — declared, and deliberately EMPTY ────────
+        -- The reference builds `ChatTypeGroup` at ChatFrame.lua l.115-348: 68 entries mapping a
+        -- chat TYPE to the list of `CHAT_MSG_*` events that belong to it, which its
+        -- `ChatFrame_RegisterForMessages` walks to register events on a chat window.
+        --
+        -- Declared here for the same reason `SlashCmdList` above is: an addon REGISTERS ITS OWN
+        -- chat type at file scope, and a missing table is not a missing feature — it is
+        -- `attempt to index global 'ChatTypeGroup'` on the addon's very first chunk. CT_RaidAssist
+        -- does exactly that three lines apart (`CT_RaidAssist.lua:59` assigns
+        -- `ChatTypeGroup["CTRAID"]`, `:63` tinserts into `OtherMenuChatTypeGroups`), and it dies
+        -- there — taking `CT_RA_OnEvent` with it, which is why FOUR MORE corpus addons
+        -- (CT_RABossMods, FixCTGroups, FuBar_CTRaid, SmartRes) die on that function being nil.
+        -- One missing table, five addons.
+        --
+        -- **EMPTY, not populated, and that is the honest shape rather than a shortcut.** Two
+        -- reasons, in order of weight:
+        --   · The 68 entries are 233 lines of the reference's own Lua. We RUN the reference's
+        --     files where we can (1234) and write our own where we cannot; what we do not do is
+        --     paste its source into a repo that mirrors publicly.
+        --   · Nothing would read them. Measured across the 218-addon corpus with `grep -a`:
+        --     CT_RaidAssist is the ONLY addon that touches either table, and it only WRITES. Not
+        --     one addon reads a group out.
+        --
+        -- The divergence that leaves, stated rather than discovered: our chat frames do not
+        -- register through this table at all — `ui_chat` routes host-side, the same split
+        -- `SlashCmdList` records above. So an addon that adds a group gets no routing from it.
+        -- That is the `ChatFrame_OnEvent` architecture question, not this table's.
+        ChatTypeGroup = {}
+        OtherMenuChatTypeGroups = {}
+
         -- ── ChatTypeInfo — the per-chat-type table addons read colors out of ──────────────────
         -- Declared HERE because the 1.12 client declares it at the top of ChatFrame.lua, and it
         -- is an ADDON-FACING table before it is ours: `local info = ChatTypeInfo["SAY"]` then
@@ -200,7 +230,7 @@
         chatType("BATTLEGROUND",                         1,  93, 255, 127,   0)
         chatType("BATTLEGROUND_LEADER",                  0,  94, 255, 219, 183)
 
-        -- ── BenillaFCF: the FloatingChatFrame behaviors, transcribed (ref FloatingChatFrame.lua)
+        -- ── BenillaFCF: the FloatingChatFrame behaviors, re-expressed (ref FloatingChatFrame.lua)
         -- Quoted constants: CHAT_TAB_SHOW_DELAY=0.2, CHAT_FRAME_FADE_TIME=0.15,
         -- DEFAULT_CHATFRAME_ALPHA=0.25, CHAT_BUTTON_FLASH_TIME=0.5,
         -- MESSAGE_SCROLLBUTTON_INITIAL_DELAY=0, MESSAGE_SCROLLBUTTON_SCROLL_DELAY=0.05.
@@ -211,6 +241,11 @@
             oldX = 0, oldY = 0,
             reveal = 0,             -- 0..1 master fade the tab/texture alphas scale by
             revealTarget = 0,
+            -- What the apply block below last WROTE, so an unchanged frame writes nothing
+            -- (decision 1396). -1 is unreachable for both, so the first pass always applies.
+            appliedReveal = -1,
+            appliedSelected = -1,
+            tabsSettled = false,    -- both tabs' host-measured label widths have landed
             flashTab = 0,           -- tab id whose whisper flash runs (0 = none), 0288 P4 wires it
             flashLeft = 0,          -- remaining flash seconds (ref: 60s, blink 0.25/0.25)
         }
@@ -298,17 +333,22 @@
             BenillaFCF.flashLeft = 60
         end
 
-        -- PanelTemplates_TabResize(5, tab), transcribed: the ref sizes every docked tab to its
+        -- PanelTemplates_TabResize(5, tab), re-expressed: the ref sizes every docked tab to its
         -- label (FCF_DockUpdate) — middle slice = text width + 5, tab = middle + the two 16px
         -- caps; the flash/highlight bands follow the Left/Right pieces by anchor. The label
-        -- width is host-measured (GetStringWidth), so early frames may see 0 — the OnUpdate
-        -- below re-applies until it settles, then the change-guard makes this a no-op.
+        -- width is host-measured (GetStringWidth), so early frames may see 0. It RETURNS whether
+        -- the width is known yet — which is what lets FCF_OnUpdate's apply gate keep polling
+        -- until the measurement lands and then stop for good (decision 1396). Without that
+        -- answer the gate would have to choose between polling forever and shipping tabs stuck
+        -- at their authored width on whichever session measured late.
         function BenillaFCF_TabResize(tab)
             local w = getglobal(tab:GetName() .. "Text"):GetStringWidth()
-            if w == 0 or tab.benillaTabTextW == w then return end
+            if w == 0 then return false end
+            if tab.benillaTabTextW == w then return true end
             tab.benillaTabTextW = w
             getglobal(tab:GetName() .. "Middle"):SetWidth(w + 5)
             tab:SetWidth(w + 5 + 32)
+            return true
         end
 
         -- The hover rect: the dock's rect expanded by the ref's MouseIsOver pads
@@ -359,16 +399,43 @@
 
             -- Apply: tabs at 1.0 (selected) / 0.5 (unselected) × reveal; the selected window's
             -- background+borders at 0.25 × reveal (ref: fade oldAlpha↔DEFAULT_CHATFRAME_ALPHA).
-            for i = 1, 2 do
-                local tab = getglobal("ChatFrame" .. i .. "Tab")
-                if tab then
-                    local a = (i == BenillaFCF.selected) and 1.0 or 0.5
-                    tab:SetAlpha(a * s.reveal)
-                    BenillaFCF_TabResize(tab)
+            --
+            -- GATED on everything the writes below depend on — the reveal, the selected tab, and
+            -- whether the label measurements have landed (decision 1396). **The reference needs
+            -- no gate because it does not do this here at all**: ref FCF_OnUpdate hands the fade
+            -- to UIFrameFadeIn/Out, and UIFrameFade_OnUpdate walks only the frames still fading,
+            -- so a settled dock costs nothing. This transcription inlined the ramp and lost that
+            -- property with it, and ~24 getglobals, two table builds and ~20 SetAlpha calls then
+            -- ran every frame of every session to write the values that were already there —
+            -- 36 us/frame, the largest single handler in the client (1395 measured it). The
+            -- guard restores the reference's own behaviour rather than inventing one.
+            if s.reveal ~= s.appliedReveal or s.selected ~= s.appliedSelected then
+                for i = 1, 2 do
+                    local tab = getglobal("ChatFrame" .. i .. "Tab")
+                    if tab then
+                        tab:SetAlpha(((i == s.selected) and 1.0 or 0.5) * s.reveal)
+                    end
+                    for _, t in ipairs(BenillaFCF_Textures(i)) do
+                        t:SetAlpha(0.25 * s.reveal)
+                    end
                 end
-                for _, t in ipairs(BenillaFCF_Textures(i)) do
-                    t:SetAlpha(0.25 * s.reveal)
+                s.appliedReveal = s.reveal
+                s.appliedSelected = s.selected
+            end
+
+            -- The tab widths are a SEPARATE trigger and get their own latch, deliberately: they
+            -- depend on a host measurement rather than on the fade, and folding them into the
+            -- gate above would tie the alphas to a width that can legitimately never arrive (an
+            -- empty label measures 0 forever) — the apply block would then run every frame again
+            -- for a reason having nothing to do with what it writes. Polls until both land, then
+            -- stops for good.
+            if not s.tabsSettled then
+                local settled = true
+                for i = 1, 2 do
+                    local tab = getglobal("ChatFrame" .. i .. "Tab")
+                    if tab and not BenillaFCF_TabResize(tab) then settled = false end
                 end
+                s.tabsSettled = settled
             end
 
             -- The whisper flash blink (0.25 on / 0.25 off, 60s — ref UIFrameFlash args).
@@ -440,7 +507,7 @@
             end
         end
 
-        -- ── BenillaUIMenu: the 1.12 UIMenu kit, transcribed (ref UIMenu.lua — the chat menu's
+        -- ── BenillaUIMenu: the 1.12 UIMenu kit, re-expressed (ref UIMenu.lua — the chat menu's
         -- row engine: fixed 16px rows in a tooltip-backdrop box, a 2 s no-hover timeout that
         -- walks up parentMenu chains, nested submenus opened on row hover). Constants quoted.
         -- Scoped here because the chat menu is its only consumer; a second consumer graduates

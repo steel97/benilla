@@ -127,8 +127,7 @@ fn the_shipped_pet_bar_drives_end_to_end() {
         "no pet, no shelf"
     );
 
-    // A pet appears. The tick is what runs the bar's OnUpdate, i.e. the sparkle trail — it is an
-    // animation, so it exists from the first frame after the repaint, not from the repaint.
+    // A pet appears.
     s.set_pet_actions(true, true, true, hunter_slots());
     s.fire_event("PET_BAR_UPDATE", vec![]);
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
@@ -178,16 +177,19 @@ fn the_shipped_pet_bar_drives_end_to_end() {
         "Attack + Defensive are lit; Claw is not"
     );
 
-    // Autocast: the static ring on the one slot that allows it, and the sparkle trail running.
+    // Autocast: the static ring on the one slot that allows it, and the shine MARKER on the one
+    // slot where it is running — the native lane's registration (decision 1383): the extract
+    // carries the token, never sparks, and `autocast_shine::emit_shine` draws the trails at it
+    // on the append lane while the script layer stays settled.
     assert_eq!(
         textures(&quads, "Interface\\Buttons\\UI-AutoCastableOverlay"),
         1,
         "only Claw can autocast"
     );
     assert_eq!(
-        textures(&quads, "Interface\\Buttons\\GlowStar"),
-        32,
-        "4 emitters x 8 trail stars, on the one autocasting slot"
+        textures(&quads, "benilla:autocast-shine:1.2"),
+        1,
+        "the shine marker on Claw alone — enabled, not merely allowed"
     );
 
     // Geometry, quoted from the ref: the bar's TOPLEFT is MainMenuBar's BOTTOMLEFT +(36,97),
@@ -201,14 +203,14 @@ fn the_shipped_pet_bar_drives_end_to_end() {
         (72.0, 56.0, 102.0, 86.0)
     );
 
-    // The pet goes: the bar hides again, sparkles and all.
+    // The pet goes: the bar hides again, shine marker and all.
     s.set_pet_actions(false, true, true, Vec::new());
     s.fire_event("PET_BAR_UPDATE", vec![]);
     s.tick(0.05);
     s.resolve();
     let gone = s.extract();
     assert_eq!(textures(&gone, "Interface\\PetActionBar\\UI-PetBar"), 0);
-    assert_eq!(textures(&gone, "Interface\\Buttons\\GlowStar"), 0);
+    assert_eq!(textures(&gone, "benilla:autocast-shine:1.2"), 0);
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
@@ -335,24 +337,21 @@ fn a_disabled_bar_greys_rather_than_hides() {
         2,
         "the bar is still on screen"
     );
-    // `SetDesaturation` has no shader path in this engine, so the grey is the reference's own
-    // no-shader fallback: vertex colour 0.5 (UiPanels.xml's transcription).
-    let tint = quads
+    // Since decision 1327 `SetDesaturation` takes its SHADER arm — the icon carries the greyscale
+    // flag to the renderer and keeps its own tint, rather than the reference's no-shader 0.5
+    // vertex-colour fallback (which is what this asserted while nothing greyed).
+    let grey = quads
         .iter()
         .find_map(|q| match &q.content {
             QuadContent::Texture {
                 path: Some(p),
-                color,
+                desaturated,
                 ..
-            } if p == "Interface\\Icons\\Ability_Druid_Rake" => Some(*color),
+            } if p == "Interface\\Icons\\Ability_Druid_Rake" => Some(*desaturated),
             _ => None,
         })
         .expect("Claw's icon");
-    assert_eq!(
-        tint.map(|c| [c[0], c[1], c[2]]),
-        Some([0.5, 0.5, 0.5]),
-        "a disabled bar greys every icon on it"
-    );
+    assert!(grey, "a disabled bar greys every icon on it");
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
@@ -628,6 +627,156 @@ fn the_keybind_pair_pushes_and_casts_without_the_clicks_forks() {
     assert!(
         s.take_pet_actions().is_empty(),
         "an unnamed slot queues nothing"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+// The autocast trail's MOTION tests (the B228 corner-walk goldens, the 1321 truncating-clock
+// law, the no-seam continuity pin) live with the drawing now: `crate::autocast_shine`'s own
+// test module — the script layer no longer moves a single spark (decision 1383).
+
+/// The pet bar plus the three files its TOOLTIP needs, in the TOC's own order: Fonts.xml (the
+/// colour codes that wrap the binding), GameTooltip.xml (the plate), and UIParent.xml — already a
+/// prerequisite for the managed stack — for `GetBindingText`, which renders the key.
+fn load_pet_bar_with_tooltip(s: &UiScript) {
+    for file in [
+        "Fonts.xml",
+        "UiPanels.xml",
+        "UIParent.xml",
+        "GameTooltip.xml",
+        "Cooldown.xml",
+        "ActionBar.xml",
+        "PetActionBar.xml",
+    ] {
+        load_xml(s, file);
+    }
+}
+
+/// A hunter bar hovered through the REAL gesture, with the real binding registry and the real CVar
+/// table behind it — `mouse_move` runs the shipped `<OnEnter>` with `this` bound, which is the only
+/// way this fork gets exercised the way nazriel exercised it.
+///
+/// Buttons are 30 px chained +8 from the bar's own origin: button 1 spans x[72,102] y[56,86] ⇒
+/// centre (87,71), button 4's left = 72 + 3·38 ⇒ centre (201,71) — the geometry
+/// `clicks_route_through_the_attack_toggle_fork` already leans on.
+const ATTACK_BUTTON: (f32, f32) = (87.0, 71.0);
+const CLAW_BUTTON: (f32, f32) = (201.0, 71.0);
+
+fn hovered_pet_bar() -> UiScript {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    // The real command set and the real registered defaults, the way the app's own seed installs
+    // them — so `GetBindingKey("BONUSACTIONBUTTON1")` answers CTRL-1 (its byte-real default) and
+    // `GetCVar("UberTooltips")` answers "1" (its byte-read registrar value) rather than nil.
+    s.register_bindings(&crate::bindings::registry_commands());
+    s.register_cvars(crate::cvars::REGISTERED.iter().copied());
+    load_pet_bar_with_tooltip(&s);
+    declare_token_strings(&s);
+    s.set_pet_actions(true, true, true, hunter_slots());
+    s.fire_event("PET_BAR_UPDATE", vec![]);
+    s.resolve();
+    s
+}
+
+fn tooltip_line1(s: &UiScript) -> String {
+    s.eval::<String>("return GameTooltipTextLeft1:GetText() or \"\"")
+        .unwrap()
+}
+
+/// **B230 — Attack/Follow/Stay name their keybinding; the pet's own spells do not.**
+///
+/// nazriel: *"On 1.12 when you hover over Attack, Follow, Stay pet action buttons they show the
+/// keybinding - which is not the case with Benilla"*. The reference agrees with him and is
+/// narrower than "the pet bar": `PetActionButton_OnEnter` (PetActionBarFrame.lua l.285-305) forks
+/// on `isToken or UberTooltips == "0"`, and only THAT branch concatenates
+/// `NORMAL_FONT_COLOR_CODE.." ("..GetBindingText(GetBindingKey("BONUSACTIONBUTTON"..id), "KEY_")..")"`.
+/// The other branch is a bare `SetPetAction` and appends nothing — so a fix that suffixed every
+/// slot would be wrong, and the control below is what says ours doesn't.
+///
+/// The exact string is pinned, colour codes and all, because the ref's concatenation puts the
+/// colour BEFORE the space (`Attack|cffffd200 (CTRL-1)|r`, not `Attack |cffffd200(CTRL-1)|r` —
+/// which is what MicroMenu.xml's different-shaped version of the same idea produces).
+#[test]
+fn token_tooltips_name_their_binding_and_pet_spells_do_not() {
+    let mut s = hovered_pet_bar();
+
+    s.mouse_move(ATTACK_BUTTON.0, ATTACK_BUTTON.1);
+    s.resolve();
+    assert_eq!(
+        tooltip_line1(&s),
+        "Attack|cffffd200 (CTRL-1)|r",
+        "a command token carries BONUSACTIONBUTTON1's key in the normal-font colour"
+    );
+    // Uber on + a token ⇒ still the default corner; only the CVar-off leg owner-anchors.
+    assert!(
+        s.eval::<bool>("return GameTooltip.default ~= nil").unwrap(),
+        "a token's plate takes the default corner while UberTooltips is on"
+    );
+
+    // The CONTROL: slot 4 is Claw, a real pet spell, and it goes through the engine channel —
+    // its name, and nothing in parentheses.
+    s.mouse_move(CLAW_BUTTON.0, CLAW_BUTTON.1);
+    s.resolve();
+    let claw = tooltip_line1(&s);
+    assert_eq!(claw, "Claw", "a pet SPELL renders through SetPetAction");
+    assert!(
+        !claw.contains('('),
+        "…and appends no binding: {claw:?} (the ref's other branch)"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The append is UNCONDITIONAL in that branch, so an unbound row really does render empty
+/// parentheses — `GetBindingText` answers `""` for a nil key (UIParent.xml, transcribed from the
+/// ref's own l.1819-1821), and nothing guards the `"("`. That is the reference's behaviour, not a
+/// slip of ours: MicroButtonTooltipText guards its own suffix and this one does not.
+///
+/// Stock it is unreachable — BONUSACTIONBUTTON1-10 default to CTRL-1..CTRL-0 — so it takes a
+/// deliberate unbind to see, which is exactly what this does.
+#[test]
+fn an_unbound_token_row_renders_the_references_empty_parentheses() {
+    let mut s = hovered_pet_bar();
+    s.run(r#"SetBinding("CTRL-1")"#).unwrap();
+    assert!(
+        s.eval::<Option<String>>(r#"return GetBindingKey("BONUSACTIONBUTTON1")"#)
+            .unwrap()
+            .is_none(),
+        "the row really is unbound now"
+    );
+
+    s.mouse_move(ATTACK_BUTTON.0, ATTACK_BUTTON.1);
+    s.resolve();
+    assert_eq!(
+        tooltip_line1(&s),
+        "Attack|cffffd200 ()|r",
+        "unbound: the parentheses stay, empty — the ref's own unguarded concatenation"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The CVar is the fork's OTHER half, and it is not decoration: with `UberTooltips` off, a real pet
+/// SPELL stops going through the engine channel and takes the token branch too — same built text,
+/// same binding suffix — and the plate moves from the screen corner to beside the button
+/// (`SetOwner(this, "ANCHOR_RIGHT")`). Both are the reference's, in the same five lines.
+///
+/// This is also the row's reason to exist in `cvars::REGISTERED`: benilla registers `UberTooltips`
+/// at all because these Lua sites read it (the honest-tree rule's live-consumer half).
+#[test]
+fn ubertooltips_off_takes_the_spells_through_the_token_branch_and_moves_the_plate() {
+    let mut s = hovered_pet_bar();
+    s.set_cvar_engine("UberTooltips", "0");
+
+    s.mouse_move(CLAW_BUTTON.0, CLAW_BUTTON.1);
+    s.resolve();
+    assert_eq!(
+        tooltip_line1(&s),
+        "Claw|cffffd200 (CTRL-4)|r",
+        "with the CVar off a pet spell is built here too, binding and all"
+    );
+    assert!(
+        s.eval::<bool>("return GameTooltip:IsOwned(PetActionButton4)")
+            .unwrap(),
+        "…and the plate sits beside the button, not at the screen corner"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }

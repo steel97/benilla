@@ -18,8 +18,9 @@ use crate::net::{Guid, NetEntity, ObjectStore, SelfPlayer};
 use crate::player::CameraControl;
 use crate::ui_script::PointerOverUi;
 use benilla_world::collision::PickOccluder;
-use benilla_world::interact::{ray_mesh_bounds, ray_posed_mesh, PickParts, WorldObject};
-use benilla_world::model_render::ModelKind;
+use benilla_world::interact::{
+    ray_mesh_bounds, ray_posed_mesh, CreaturePickPart, GoPickPart, PickParts,
+};
 use benilla_world::view::WorldCamera;
 
 use super::{Hovered, HoveredObject, PickOcclusion};
@@ -98,7 +99,12 @@ pub(super) fn update_hover(
     // pick outranks everything in the halo retry, so the hover doesn't strobe between two units).
     mut last_pick: Local<Option<Entity>>,
     // Unit roots: pose + scale, the playing animation (for its bounds sphere), the descriptor store
-    // (alive-vs-dead sets the pass-2 priority), and the part children.
+    // (alive-vs-dead sets the pass-2 priority), the part children — and whether the body is drawn
+    // at all. **You cannot click what is not in the scene** (decision 1277): a body the
+    // exterior-scene election sent to pass 2 never reaches the reference's draw list, so it takes
+    // no mouseover, no sword cursor and no click. This lane used to ray-test every unit root with a
+    // `Guid` and never ask, which is how the director could still target Tanaris mobs through a
+    // sealed cavern ceiling after their models had correctly stopped drawing.
     roots: Query<
         (
             Entity,
@@ -109,6 +115,7 @@ pub(super) fn update_hover(
             Option<&ObjectStore>,
             Option<&Children>,
             Option<&crate::entities::mount::MountChild>,
+            Option<&InheritedVisibility>,
         ),
         (With<Guid>, Without<SelfPlayer>),
     >,
@@ -117,9 +124,19 @@ pub(super) fn update_hover(
     child_sets: Query<&Children>,
     // A part child's mesh + its palette-rig link (the rig its vertices pose through).
     parts: Query<(&Mesh3d, &benilla_world::rig_palette::RigPart)>,
-    // Fallback path: a unit's pickable mesh children — `WorldObject` kind, model-local `Aabb`, world
+    // Fallback path: a unit's pickable mesh children, by [`CreaturePickPart`] (stamped beside the
+    // part's `WorldObject` at the attach sites, fallback cube included — the archetype filter that
+    // replaced a per-frame kind-compare over every streamed row) — model-local `Aabb`, world
     // transform, and the link to the streamed parent (whose `Guid` we resolve the hit to).
-    meshes: Query<(&ChildOf, &Aabb, &GlobalTransform, &WorldObject)>,
+    meshes: Query<
+        (
+            &ChildOf,
+            &Aabb,
+            &GlobalTransform,
+            Option<&InheritedVisibility>,
+        ),
+        With<CreaturePickPart>,
+    >,
     units: Query<&Guid, Without<SelfPlayer>>,
 ) {
     hovered.target = None;
@@ -160,8 +177,15 @@ pub(super) fn update_hover(
     // Units the faithful path *owns* (they have skinned parts): excluded from the AABB fallback
     // even when the broad phase rejects them — the reference wouldn't click them there either.
     let mut faithful: HashSet<Entity> = HashSet::new();
-    for (entity, gt, net, anims, drv, store, children, mount_child) in &roots {
+    for (entity, gt, net, anims, drv, store, children, mount_child, drawn) in &roots {
         if !matches!(net.kind, EntityKind::Unit | EntityKind::Player) {
+            continue;
+        }
+        // Not drawn ⇒ not clickable (see the query's note). Deliberately BEFORE `faithful.insert`
+        // below, so an undrawn unit is not claimed by the faithful path either — otherwise it
+        // would merely be excluded from the AABB fallback and stay unpickable by accident rather
+        // than by rule.
+        if !drawn.is_none_or(|v| v.get()) {
             continue;
         }
         let Some(children) = children else { continue };
@@ -246,13 +270,14 @@ pub(super) fn update_hover(
     // ── Fallback for skinless units only: the model-bounds box test (pre-RE interim) ────────────
     // A unit's parts are separate meshes; testing each and keeping the closest parent is equivalent
     // to testing the union. `dir` is normalized, so `t` is a world distance like the hits above.
-    for (child_of, aabb, gt, obj) in &meshes {
-        if obj.kind != ModelKind::Creature {
+    for (child_of, aabb, gt, drawn) in &meshes {
+        // …and the same rule on the skinless fallback: a part inherits its root's pass-2 verdict.
+        if !drawn.is_none_or(|v| v.get()) {
             continue;
         }
         let parent = child_of.parent();
         if faithful.contains(&parent) || units.get(parent).is_err() {
-            continue; // posed-mesh-tested above, or not a targetable unit (e.g. a GameObject part)
+            continue; // posed-mesh-tested above, or not a targetable unit (e.g. the self player)
         }
         if let Some(t) = ray_mesh_bounds(origin, dir, aabb, gt) {
             if best.is_none_or(|(bt, _)| t < bt) {
@@ -332,9 +357,10 @@ pub(super) fn update_hovered_object(
     // means pass 1 + the unit halo already own the mouseover, so the GO pass 2 stays shut.
     unit_hovered: Res<Hovered>,
     mut hovered: ResMut<HoveredObject>,
-    // Every pickable GameObject part carries `WorldObject { kind: GameObject }` (units/doodads/WMOs
-    // carry other kinds and are excluded — units have their own posed-mesh pick).
-    go_parts: Query<(Entity, &WorldObject)>,
+    // Every pickable GameObject part carries [`GoPickPart`] (stamped beside its
+    // `WorldObject { kind: GameObject }` at the attach sites; units/doodads/WMOs never enter this
+    // query — units have their own posed-mesh pick).
+    go_parts: Query<Entity, With<GoPickPart>>,
     child_of: Query<&ChildOf>,
     guids: Query<&Guid>,
     stores: Query<&ObjectStore>,
@@ -370,14 +396,12 @@ pub(super) fn update_hovered_object(
     // hoverable through the railing, and the hull shows no gear or tooltip.
     let pickable: bevy::platform::collections::HashSet<Entity> = go_parts
         .iter()
-        .filter(|(_, o)| o.kind == ModelKind::GameObject)
-        .filter(|(e, _)| {
-            let root = child_of.get(*e).map_or(*e, |c| c.parent());
+        .filter(|&e| {
+            let root = child_of.get(e).map_or(e, |c| c.parent());
             !stores
                 .get(root)
                 .is_ok_and(|s| matches!(s.0.gameobject_type_id(), 11 | 14 | 15))
         })
-        .map(|(e, _)| e)
         .collect();
     if pickable.is_empty() {
         *last_pick = None;

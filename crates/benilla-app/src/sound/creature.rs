@@ -18,12 +18,14 @@ use benilla_protocol::EntityKind;
 
 use crate::creature_anim::AnimSoundEvent;
 use crate::entities::mount::{MountBody, MountChild};
-use crate::net::{NetEntity, ObjectStore};
+use crate::net::{NetEntity, ObjectStore, SelfPlayer};
 use benilla_assets::{AssetSet, LockRecover, WorldAssets};
 use benilla_world::schedule::WorldStage;
 
 use super::kit::{
-    play_kit, play_kit_ext, source_kit_playing, stop_source_kit, KitRef, SoundCategory, SoundKits,
+    bark_chance_pass, play_kit, play_kit_ext, source_kit_playing, stop_source_kit,
+    unit_voice_playing, voice_category, KitRef, SoundCategory, SoundKits, STAND_CHANCE,
+    STAND_COOLDOWN,
 };
 use super::{AudioListener, SoundConfig, SoundOutput};
 
@@ -103,10 +105,29 @@ fn death_vocals(
 
 /// The aggro/alert flare vocals (`SMSG_AI_REACTION` → the net bridge; decision 0280): HOSTILE →
 /// the aggro bark (CreatureSoundData col 10), ALERT → the alert bark (col 13) — pure audio, like
-/// the client (`0x6056e0` plays no animation/UI on either leg). INTERIM, named: the client's
-/// per-unit priority voice channel (a HOSTILE bark never interrupts a playing bark) and ALERT's
-/// RNG sometimes-skip gate (`0x623520`) aren't modeled — vocals here play unconditionally, like
-/// the exertion/injury family.
+/// the client (`0x6056e0` plays no animation/UI on either leg).
+///
+/// **HOSTILE rides the unit's one-shot voice channel, and that is not a nicety** (decision 1399,
+/// wow-re `object-layer/scratch/smsg-ai-reaction.md`): the bark goes out through `0x623a40(0)`,
+/// which stores its channel in `[unit+0xb20]` with category 0 latched in `[unit+0xb24]` —
+/// **the lowest category in the table, so it never interrupts a playing bark and a repeat is
+/// dropped while one is live** ([`unit_voice_playing`]). The wire does not send this packet
+/// sparingly: vmangos fires `SMSG_AI_REACTION` HOSTILE from `Unit::Attack` on every target
+/// acquisition *and* from `Unit::SendPetAIReaction` on every pet autocast and self-picked
+/// target (`PetAI::DoAttack`, `PetAI::UpdateAI`'s autocast leg), so a hunter's pet in a normal
+/// fight draws them in bursts. Played ungated, a level-60 bear pet fired its 3.166 s
+/// `mBearAggroA.wav` **63 times in two minutes** — three copies inside a single frame, then a
+/// ~10 Hz run — which is up to thirty overlapping copies of one roar, and is what the director
+/// heard as a phasing, stuttering, constantly-growling bear. The reference receives the same
+/// packets and collapses them at this slot.
+///
+/// **ALERT is a different route, and is faithfully unconditional** — pinned since, decision 1401.
+/// It reaches `vtable+0x88(8,0)` → `0x623490` → col 13, and it *is* rolled, but the class-8
+/// threshold is **100** and the compare is inclusive, so `P = 1`. (wow-re's `smsg-ai-reaction.md`
+/// calling ALERT "probabilistic" was too strong, and has been corrected at the table.) Its one
+/// real gate is a mute while a **server-pushed** object sound is live on the unit — the
+/// `SMSG_PLAY_OBJECT_SOUND` (opcode `0x278`) registry, an opcode benilla does not implement at
+/// all — so nothing is owed here until that lands. ALERT stores no latch and stays off the slot.
 #[allow(clippy::too_many_arguments)]
 fn ai_reaction_vocals(
     mut reactions: MessageReader<crate::net::AiReactionMessage>,
@@ -149,7 +170,27 @@ fn ai_reaction_vocals(
         if kit == 0 {
             continue;
         }
-        if let Err(e) = play_kit(
+        // The `[unit+0xb20]` gate. Only HOSTILE latches the slot; ALERT neither tests nor stores
+        // it here (see the doc comment) and stays on the plain play.
+        if !r.hostile {
+            if let Err(e) = play_kit(
+                &mut kits,
+                &assets,
+                &mut out,
+                &config,
+                listener,
+                KitRef::Id(kit),
+                Some(transform.translation),
+                SoundCategory::Sfx,
+            ) {
+                warn!("alert vocal (kit {kit}): {e:#}");
+            }
+            continue;
+        }
+        if unit_voice_playing(&out, r.unit) {
+            continue; // category 0 is the lowest: a live bark wins, this one is dropped
+        }
+        if let Err(e) = play_kit_ext(
             &mut kits,
             &assets,
             &mut out,
@@ -158,6 +199,10 @@ fn ai_reaction_vocals(
             KitRef::Id(kit),
             Some(transform.translation),
             SoundCategory::Sfx,
+            None,
+            Some(r.unit),
+            false,
+            Some(voice_category::HOSTILE),
         ) {
             warn!("aggro vocal (kit {kit}): {e:#}");
         }
@@ -247,6 +292,7 @@ fn creature_body_loops(
                 None,
                 Some(entity),
                 true,
+                None,
             ) {
                 warn!("body loop (kit {desired}): {e:#}");
             }
@@ -263,12 +309,38 @@ fn creature_body_loops(
 /// carrying the mount's display — so they already resolve the mount's voice row, the split-
 /// entity shape of the client's mounted redirect (`0x60c480`: `+0xb44 ?: +0xb40` — wow-re
 /// `mount-composition.md` Q4, 0441 fold-back).
+///
+/// **The three tag families gate differently, and the difference is byte-exact** (wow-re
+/// `sound/scratch/creature-vocal-gates.md`, decision 1401):
+///
+/// - **`$FD1..$FD4` → fidget 1..4, ungated.** `0x6232c0` → `0x623440` → `0x6230a0` reads
+///   `row[+0x38 + 4*(n-1)]` literally and touches no gate at all. A zero slot bails silently, with
+///   no fallback to another column.
+/// - **`$WNG`/`$WGG` → wing flap/glide, also ungated — but by *constant*, not by construction.**
+///   Both take the class-bark route (`0x5fff9c` pushes class 7, `0x5fff78` class 10, into
+///   `[vtable+0x88]`), so they *are* rolled — against thresholds of **100**, which the inclusive
+///   compare makes a tautology. They sit outside the mute guard `{0,1,2,3,8}` and run on the
+///   uncapped bus. Playing them unconditionally is faithful; it is worth knowing that it is
+///   faithful for a reason living in a table rather than in the control flow.
+/// - **`$FDX` → the stand vocal, gated three times over**, which is what this function had wrong:
+///   the local-player skip (`0x6236c2` — you never hear your own), then a **40.6 %** chance roll
+///   ([`STAND_CHANCE`]), then a **10 s cooldown on one world-global timestamp**
+///   ([`STAND_COOLDOWN`]). Ungated, a crocodile croaks every 4 s forever: `Crocodile.m2` keys
+///   `$FDX` at t=0.000 of a 4.000 s **loop-flag** Stand variation carrying 45 % of the variation
+///   weight, and a t=0 key re-fires on every wrap. Row 136's stand column is kit 571
+///   `BasiliskStand2`, so it is audible — and it is the only model in 5875 that authors `$FDX`
+///   *and* reaches a nonzero stand column (censused across all 20 models that reach one of the 19
+///   rows carrying a stand kit).
 #[allow(clippy::too_many_arguments)]
 fn creature_anim_vocals(
     mut events: MessageReader<AnimSoundEvent>,
     // GlobalTransform: the mount child's local Transform is the seat-relative ~origin — world
     // position is the only correct read for both parented and top-level sources.
-    units: Query<(&NetEntity, &GlobalTransform)>,
+    units: Query<(&NetEntity, &GlobalTransform, Has<SelfPlayer>)>,
+    // The class-5 window. A `Local` is exactly one instance, which is the point: the reference's
+    // `[0xc4e0e4]` is a single timestamp for the whole world, not one per unit.
+    mut stand_window: Local<Option<std::time::Duration>>,
+    time: Res<Time>,
     voices: Option<Res<CreatureVoices>>,
     kits: Option<ResMut<SoundKits>>,
     assets: Option<Res<WorldAssets>>,
@@ -283,13 +355,30 @@ fn creature_anim_vocals(
         return;
     };
     let listener = listener.pos;
+    let now = time.elapsed();
     for ev in events.read() {
-        let Ok((net, transform)) = units.get(ev.entity) else {
+        let Ok((net, transform, is_self)) = units.get(ev.entity) else {
             continue;
         };
         let Some(voice) = net.display_id.and_then(|d| voices.0.for_display(d)) else {
             continue;
         };
+        // `$FDX`'s three gates, in the reference's own order. All of them run BEFORE the
+        // column-is-zero bail below, and the window is stamped on any *allowed* attempt — so a
+        // silent or distance-culled stand vocal burns the ten seconds for every creature in the
+        // world, exactly as `0x623290` does.
+        if ev.ident == *b"$FDX" {
+            if is_self {
+                continue; // `0x6236c2`: you never hear your own stand vocal
+            }
+            if !bark_chance_pass(STAND_CHANCE, kits.roll()) {
+                continue;
+            }
+            if stand_window.is_some_and(|last| now < last + STAND_COOLDOWN) {
+                continue;
+            }
+            *stand_window = Some(now);
+        }
         let kit = match &ev.ident {
             b"$FD1" => voice.fidget[0],
             b"$FD2" => voice.fidget[1],
@@ -389,4 +478,89 @@ pub(super) fn plugin(app: &mut App) {
             )
                 .in_set(WorldStage::Present),
         );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::kit::occupies_voice_slot;
+    use super::*;
+
+    /// **The measured report.** Every `SMSG_AI_REACTION` HOSTILE arrival for the director's bear
+    /// pet in one traced session (2026-08-17, `RUST_LOG=benilla_app::sound=debug`), in seconds
+    /// from the first: 63 of them inside 19 s — three inside a single frame, then a ~1.53 s
+    /// metronome, then two ~10 Hz runs. vmangos sends them that fast by design (`Unit::Attack`
+    /// fires one on every target acquisition, `Unit::SendPetAIReaction` one on every pet autocast
+    /// and every self-picked target — `PetAI::DoAttack` and `PetAI::UpdateAI`'s autocast leg), so
+    /// this is the traffic the client is *supposed* to survive.
+    const BEAR_BURST_S: [f32; 63] = [
+        0.000, 0.000, 0.000, 1.417, 2.950, 4.481, 5.997, 7.530, 9.046, 10.589, 10.670, 10.792,
+        12.312, 12.413, 12.546, 12.603, 12.713, 12.813, 12.912, 13.013, 13.112, 13.214, 13.315,
+        13.424, 13.528, 13.624, 13.740, 13.829, 13.928, 14.032, 14.137, 14.239, 14.331, 14.449,
+        14.545, 14.646, 14.745, 14.847, 16.393, 16.499, 16.684, 16.789, 16.909, 17.013, 17.096,
+        17.205, 17.303, 17.411, 17.540, 17.612, 17.711, 17.811, 17.920, 18.032, 18.111, 18.232,
+        18.340, 18.418, 18.553, 18.623, 18.728, 18.827, 18.928,
+    ];
+
+    /// Kit 478 `BearAggro` has exactly one variation, `mBearAggroA.wav` — **3.166 s** at
+    /// 22 050 Hz, measured off the install. Long enough that the burst above stacks up to some
+    /// thirty copies of one roar over each other, which is what the director heard as phasing.
+    const BEAR_AGGRO_S: f32 = 3.166;
+
+    /// Replay a burst through the `[unit+0xb20]` slot and return the arrivals that actually
+    /// sounded. The slot holds at most one live channel; the pump reaps it when the sound stops,
+    /// and that reap IS the handle release.
+    fn barks_that_sound(arrivals: &[f32], clip: f32) -> Vec<f32> {
+        let bear = Entity::from_raw_u32(1).expect("valid entity id");
+        let mut slot: Option<(Option<Entity>, Option<u8>, f32)> = None;
+        let mut sounded = Vec::new();
+        for &t in arrivals {
+            if slot.is_some_and(|(_, _, ends)| ends <= t) {
+                slot = None;
+            }
+            if slot.is_some_and(|(src, v, _)| occupies_voice_slot(src, v, bear)) {
+                continue; // category 0 is the lowest — a live bark wins, this one is dropped
+            }
+            slot = Some((Some(bear), Some(voice_category::HOSTILE), t + clip));
+            sounded.push(t);
+        }
+        sounded
+    }
+
+    /// **The bug and the fix, on the measured data** (decision 1399). Ungated — what benilla
+    /// did — every arrival sounds: 63 overlapping 3.166 s roars. Through the voice slot the same
+    /// burst is five barks, no two of them overlapping.
+    #[test]
+    fn the_voice_slot_collapses_the_measured_bear_burst() {
+        assert_eq!(
+            BEAR_BURST_S.len(),
+            63,
+            "ungated, every arrival sounds — the reported symptom",
+        );
+
+        let sounded = barks_that_sound(&BEAR_BURST_S, BEAR_AGGRO_S);
+        assert_eq!(
+            sounded,
+            vec![0.0, 4.481, 9.046, 12.312, 16.393],
+            "the slot admits a bark only once the last one has finished",
+        );
+        for pair in sounded.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= BEAR_AGGRO_S,
+                "two barks {pair:?} overlap — the phasing the report describes",
+            );
+        }
+    }
+
+    /// The slot is **per unit**, not global: a second bear beside the first keeps its own voice.
+    /// A world-wide throttle would have collapsed the burst too, and would have been wrong.
+    #[test]
+    fn the_voice_slot_is_per_unit() {
+        let (a, b) = (
+            Entity::from_raw_u32(1).expect("valid entity id"),
+            Entity::from_raw_u32(2).expect("valid entity id"),
+        );
+        let barking = (Some(a), Some(voice_category::HOSTILE));
+        assert!(occupies_voice_slot(barking.0, barking.1, a));
+        assert!(!occupies_voice_slot(barking.0, barking.1, b));
+    }
 }

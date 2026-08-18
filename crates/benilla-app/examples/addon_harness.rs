@@ -1,7 +1,7 @@
 //! `addon_harness` — load a folder of addons, one per VM, and print what happened.
 //!
 //! ```text
-//! cargo run -q -p benilla-app --example addon_harness -- <folder> [--verbose] [--why <substr>] [--status <file>] [--diff <file>]
+//! cargo run -q -p benilla-app --example addon_harness -- <folder> [--verbose] [--why <substr>] [--deep [n]] [--status <file>] [--diff <file>]
 //! ```
 //!
 //! The instrument decision 1188 phase 6 asks for: *"which addons work" is a number that can be
@@ -17,15 +17,231 @@ use benilla_app::addon_harness;
 /// failure to its call site needed the frames below it, and the addon/file/line only appear there.
 const WHY_TRACEBACK_LINES: usize = 8;
 
+/// Print a ranked demand table — and **say what was dropped**.
+///
+/// Every one of these lists is a queue, and each was printed as a silent top-N. A silent cut reads
+/// as "that is the whole list", and this arc has one expensive instance of exactly that: the
+/// "a reference frame we do not build" class was swept, found clean, and recorded CLOSED — while
+/// `ShapeshiftBarLeft` sat below the cut with two addons behind it, and stayed there until an
+/// addon's first error named it (1219's class, first regions). The sweep was honest; the list it
+/// swept was not complete and did not say so.
+///
+/// So the tail is now stated: how many rows, and how many addon-mentions, were not shown. The
+/// caller keeps its own `take` — this only refuses to hide the remainder.
+///
+/// `--deep [n]` overrides every caller's `take` (see [`DEEP`]). 1242 made the cut VISIBLE and
+/// rejected raising it — an unreadable report helps nobody. But "visible" only tells a sweep that
+/// rows exist; it still cannot read them, and `--why` opens one name at a time, which is no way to
+/// walk 1930 of them. So the cut stays where it is for the report, and a sweep asks for the rest.
+fn ranked(rows: Vec<(String, usize)>, take: usize) {
+    let take = DEEP.get().copied().flatten().unwrap_or(take);
+    let total = rows.len();
+    for (name, count) in rows.iter().take(take) {
+        println!("    {count:>4}  {name}");
+    }
+    if total > take {
+        let tail: usize = rows[take..].iter().map(|(_, c)| c).sum();
+        println!(
+            "    …{} more rows below the cut ({tail} addon-mentions) — TRUNCATED, not exhausted; \
+             `--why <name>` opens any row.",
+            total - take
+        );
+    }
+}
+
+/// The `--deep` override, set once in `main`. `Some(n)` shows `n` rows of EVERY ranked list;
+/// `--deep` with no number means all of them. Absent, each list keeps the `take` its caller chose.
+static DEEP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+
+/// The row's frame names, bounded for the line and **saying so when it bounds**.
+///
+/// `RenderReport::frames` carries every named frame now; the cap that used to live in the
+/// collection (and silently evicted the very names a test asserted on) lives here instead.
+fn render_frames(frames: &[String]) -> String {
+    use benilla_app::addon_harness::render::MAX_NAMED_FRAMES;
+    // `--deep` opens THIS bound too. It was added for the ranked tables, but the principle is one
+    // principle: a bounded view is fine, a bounded view you cannot open is not.
+    let cap = DEEP.get().copied().flatten().unwrap_or(MAX_NAMED_FRAMES);
+    if frames.len() <= cap {
+        return frames.join(",");
+    }
+    format!("{},+{} more", frames[..cap].join(","), frames.len() - cap)
+}
+
+/// Our `_G` against the captured 1.12 `_G` — decision 1189's diff, re-runnable.
+///
+/// 1189 did this once, by hand, and its finding was that **a superset is not free**: 1.12 addons
+/// branch on presence (`if SomeName then`), so a name we publish that the reference does not have
+/// can route an addon down a path the real client never takes. That makes BOTH directions of this
+/// diff interesting, and the extra-names side the one nothing else in this harness can see — every
+/// other ranking here is demand-driven, so it can only ever report what an addon *asked* for.
+///
+/// The reference side is `reference/1.12-globals.tsv`, itself generated from wow-re's live capture.
+/// `lod` rows are the twelve LoadOnDemand `Blizzard_*` addons' names, unioned in by 1200 because a
+/// live dump misses them unless the player opened those windows; they are counted separately rather
+/// than silently folded in, since "absent from us" means something different for a window nobody
+/// opened.
+fn surface_report(deep: bool, dump_path: Option<String>) {
+    let tsv = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../reference/1.12-globals.tsv"
+    );
+    let Ok(text) = std::fs::read_to_string(tsv) else {
+        eprintln!("cannot read the reference surface at {tsv}");
+        std::process::exit(1);
+    };
+
+    let mut reference: std::collections::BTreeMap<String, String> = Default::default();
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        let mut f = line.split('\t');
+        if let (Some(name), Some(kind)) = (f.next(), f.next()) {
+            if !name.is_empty() {
+                reference.insert(name.to_string(), kind.to_string());
+            }
+        }
+    }
+
+    let ours: std::collections::BTreeMap<String, String> =
+        addon_harness::surface().into_iter().collect();
+
+    // `--surface-dump <file>` writes our raw `_G` as `name<TAB>type`, the same shape the reference
+    // TSV has, so the two can be joined by anything. The printed report answers the questions I
+    // thought to ask; a sweep two sessions from now will have different ones, and re-deriving our
+    // side by scraping a human-readable report is exactly how a measurement quietly goes wrong.
+    if let Some(path) = dump_path {
+        let body: String = ours
+            .iter()
+            .map(|(n, k)| format!("{n}\t{k}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        match std::fs::write(&path, format!("# our _G — {} names\n{body}", ours.len())) {
+            Ok(()) => println!("  wrote {} names to {path}", ours.len()),
+            Err(e) => eprintln!("  could not write {path}: {e}"),
+        }
+    }
+
+    println!("\n  SURFACE DIFF — our _G vs the captured 1.12 _G (decision 1189)");
+    println!("  FrameXML digest : {}", addon_harness::framexml_digest());
+    println!("  reference names : {}", reference.len());
+    println!("  ours            : {}", ours.len());
+
+    // Absent from us, by the reference's own type — a function we lack is a different problem from
+    // a string we lack, and `lod` is a third thing again.
+    let mut missing_by_kind: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    for (name, kind) in &reference {
+        if !ours.contains_key(name) {
+            missing_by_kind
+                .entry(kind.as_str())
+                .or_default()
+                .push(name.as_str());
+        }
+    }
+    println!("\n  ABSENT FROM US, by the reference's type:");
+    for (kind, names) in &missing_by_kind {
+        println!("    {:<10} {}", kind, names.len());
+    }
+
+    // The direction 1189 cared about and nothing else here can see.
+    //
+    // **Split by OUR type, because the total on its own misleads.** Most of these are `table` — the
+    // frame and region names our own FrameXML publishes, which differ from Blizzard's simply
+    // because our XML is our own reimplementation and names its pieces itself. That is not the
+    // hazard 1189 described. The hazard is a **function**: `if SomeApiName then` is how a 1.12
+    // addon feature-tests, and a verb we publish that the client never had can route it down a path
+    // the real client never takes. So the function row is the one to read first, and the one a
+    // future landing should be able to drive to zero.
+    let extra: Vec<(&str, &str)> = ours
+        .iter()
+        .filter(|(n, _)| !reference.contains_key(n.as_str()))
+        .map(|(n, k)| (n.as_str(), k.as_str()))
+        .collect();
+    let mut extra_by_kind: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    for (name, kind) in &extra {
+        extra_by_kind.entry(kind).or_default().push(name);
+    }
+    println!(
+        "\n  PUBLISHED BY US, ABSENT FROM 1.12 ({}) — a superset is not free (1189):",
+        extra.len()
+    );
+    for (kind, names) in &extra_by_kind {
+        let note = match *kind {
+            "function" => "  <- the ones an addon feature-tests; read these first",
+            "table" => "  <- mostly our own FrameXML's frame/region names",
+            _ => "",
+        };
+        println!("    {:<10} {}{}", kind, names.len(), note);
+    }
+    // Functions in full even without --deep: it is the row that matters and it has to be readable.
+    //
+    // Split again on the `Benilla` prefix, which is the difference between a name that CAN collide
+    // with an addon's expectations and one that cannot. Nothing in the 1.12 corpus feature-tests
+    // `BenillaBagSlot_OnClick`; our own namespace is safe by construction, and leaving 443 of those
+    // in the list would bury the ones that are not.
+    if let Some(fns) = extra_by_kind.get("function") {
+        let (ours_ns, unprefixed): (Vec<&&str>, Vec<&&str>) = fns
+            .iter()
+            .partition(|n| n.starts_with("Benilla") || n.starts_with("BENILLA"));
+        println!(
+            "\n  ...of those functions: {} are Benilla*-namespaced (cannot collide), {} are NOT:",
+            ours_ns.len(),
+            unprefixed.len()
+        );
+        for chunk in unprefixed.chunks(4) {
+            let row: Vec<&str> = chunk.iter().map(|s| **s).collect();
+            println!("      {}", row.join("  "));
+        }
+        println!(
+            "    ^ read these: an unprefixed verb 1.12 lacks is what `if SomeName then` finds.\n      \
+             Most are our own UI's helpers (KeyBindings_*, Options*), which are only\n      \
+             a naming question — but a POST-1.12 API name here is 1189's hazard exactly, because an\n      \
+             addon that feature-tests it takes a branch written for a client we are not."
+        );
+    }
+    if deep {
+        for (kind, names) in &extra_by_kind {
+            if *kind == "function" {
+                continue;
+            }
+            println!("\n  ...EXTRA {} ({}):", kind, names.len());
+            for chunk in names.chunks(4) {
+                println!("      {}", chunk.join("  "));
+            }
+        }
+    }
+
+    if deep {
+        for (kind, names) in &missing_by_kind {
+            println!("\n  ABSENT FROM US — {} ({}):", kind, names.len());
+            for chunk in names.chunks(4) {
+                println!("      {}", chunk.join("  "));
+            }
+        }
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(root) = args.next() else {
         eprintln!(
-            "usage: addon_harness <folder of addons> [--verbose] [--why <blocker substring>]"
+            "usage: addon_harness <folder of addons> [--verbose] [--why <blocker substring>]\n   \
+             or: addon_harness --surface   (our _G vs the captured 1.12 surface; takes no corpus)"
         );
         std::process::exit(2);
     };
     let rest: Vec<String> = args.collect();
+
+    // `--surface` — decision 1189's comparison, made re-runnable. It needs no corpus, so it is
+    // handled before the root is used for anything.
+    if root == "--surface" || rest.iter().any(|a| a == "--surface") {
+        let dump_path = rest
+            .iter()
+            .position(|a| a == "--surface-dump")
+            .and_then(|i| rest.get(i + 1))
+            .cloned();
+        surface_report(rest.iter().any(|a| a == "--deep"), dump_path);
+        return;
+    }
+
     let verbose = rest.iter().any(|a| a == "--verbose");
     // `--why <substring>` — the addons behind one row, with their verbatim errors. The
     // ranked table collapses quoted names by design (1193); this is the read-back, and two of this
@@ -65,6 +281,13 @@ fn main() {
         .position(|a| a == "--diff")
         .and_then(|i| rest.get(i + 1))
         .cloned();
+    // `--deep [n]`: open the tails. A bare `--deep` (or one followed by the next flag) means all.
+    let deep = rest.iter().position(|a| a == "--deep").map(|i| {
+        rest.get(i + 1)
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    });
+    let _ = DEEP.set(deep);
     let root = std::path::PathBuf::from(root);
 
     let reports = addon_harness::survey(&root);
@@ -176,8 +399,27 @@ fn main() {
         .map(|r| r.name.as_str())
         .collect();
     if !silent.is_empty() {
+        // **This list is a QUESTION, not a defect list, and the header used to say otherwise.**
+        //
+        // It read "read this list first", which invites treating every row as a bug. Most are not.
+        // The survey seats a player and an empty world: no buffs, no target, no combat, no cursor
+        // over an item. An addon with nothing to draw in that world draws nothing CORRECTLY — and
+        // that is most of this list. Measured on the vanilla corpus rather than assumed: of 48 rows
+        // checked, 6 ship no XML at all (pure libraries — Ace, LibStub, Stubby, DevTools), and of
+        // the rest the buff bars (CT_BuffMod 29 frames, ElkBuffBar 3, neither hidden at birth) are
+        // waiting on buffs that a fresh login does not have either.
+        //
+        // What the row DOES mean is "nothing here can be ruled out by the other four columns" —
+        // which is worth printing, and is not the same as "broken".
+        //
+        // The instrument change that would sharpen it is a POPULATED session fixture (a buff, a
+        // target, a live cooldown) so that "nothing to draw" and "failed to draw" stop sharing a
+        // row. Named here rather than done, because seating content changes the fixture for all
+        // 218 addons and deserves its own controlled A/B.
         println!(
-            "\n  CLEAN ON EVERY OTHER COLUMN AND DREW NOTHING ({}) — read this list first:",
+            "\n  DREW NOTHING, and clean on every other column ({}) — a QUESTION, not a defect\n  \
+             list: the seated world has one buff, one target and one running cooldown, so an addon\n  \
+             waiting on combat, a cursor over an item or a slash command belongs here too:",
             silent.len()
         );
         for chunk in silent.chunks(4) {
@@ -303,9 +545,7 @@ fn main() {
     let templates = addon_harness::template_demand(&reports);
     if !templates.is_empty() {
         println!("\n  most-wanted missing TEMPLATES (addons naming each in CreateFrame):");
-        for (name, count) in templates.into_iter().take(12) {
-            println!("    {count:>4}  {name}");
-        }
+        ranked(templates, 12);
     }
 
     // The same question over the OTHER axis, and the one that actually moves the headline: a
@@ -317,9 +557,7 @@ fn main() {
     let inherits = addon_harness::inherits_demand(&reports);
     if !inherits.is_empty() {
         println!("\n  most-wanted missing TEMPLATES (addons naming each in an XML inherits=):");
-        for (name, count) in inherits.into_iter().take(12) {
-            println!("    {count:>4}  {name}");
-        }
+        ranked(inherits, 12);
     }
 
     // Frames and tables, ranked separately: a missing function is a Rust verb to write, a missing
@@ -328,9 +566,7 @@ fn main() {
     let tables = addon_harness::table_demand(&reports);
     if !tables.is_empty() {
         println!("\n  most-wanted missing FRAMES/TABLES (addons indexing each):");
-        for (name, count) in tables.into_iter().take(16) {
-            println!("    {count:>4}  {name}");
-        }
+        ranked(tables, 16);
     }
 
     // **Widget METHODS** — the third queue, and the one this report was blind to while the arc
@@ -346,10 +582,21 @@ fn main() {
     // `--why <name>` now reads any row back by name.
     let methods = addon_harness::method_demand(&reports);
     if !methods.is_empty() {
-        println!("\n  most-wanted missing METHODS (addons calling each as obj:Name(), no widget has it):");
-        for (name, count) in methods.into_iter().take(16) {
-            println!("    {count:>4}  {name}");
-        }
+        // The header states BOTH limits, because the list read as a build queue and is not one
+        // (decision 1240). It counts addons that NAME the verb, which is neither "addons blocked
+        // by it" nor "call sites": its top three were once RegisterTabCompletion/IsModule/
+        // IsModuleActive — AceConsole-2.0's and AceAddon-2.0's own methods on their own objects,
+        // one library file replicated into 56 and 38 addons — and its fourth, EnableKeyboard, was
+        // a real absent Frame verb that was blocking none of its 8, every one of which died
+        // earlier and elsewhere.
+        println!("\n  most-wanted missing METHODS — addons that NAME each as obj:Name(), and");
+        println!("  no widget answers. NOT a blocker list and NOT a build queue:");
+        println!("    · a big number is usually ONE library file replicated (1207/1210), and");
+        println!(
+            "    · a third-party library's own method on its own object is not ours to write."
+        );
+        println!("  Open the call site before ranking it (decision 1240).");
+        ranked(methods, 16);
     }
 
     // **Per KIND** — the question the table above structurally cannot ask. It resolves a name
@@ -365,9 +612,7 @@ fn main() {
             "\n  most-wanted missing METHODS BY KIND (receiver typed from the call site; \"on X\" \
              = the sibling that does answer it):"
         );
-        for (name, count) in by_kind.into_iter().take(16) {
-            println!("    {count:>4}  {name}");
-        }
+        ranked(by_kind, 16);
     }
 
     // ...and the residue: a receiver nothing could type, on a name whose answer DEPENDS on the
@@ -383,9 +628,7 @@ fn main() {
              is the AddMessage shape and one every kind but the two regions answers is not):",
             ambiguous.len()
         );
-        for (name, count) in ambiguous.into_iter().take(12) {
-            println!("    {count:>4}  {name}");
-        }
+        ranked(ambiguous, 12);
     }
 
     // The other half of the same scan, and never merged into it: methods addons call **behind a
@@ -396,15 +639,11 @@ fn main() {
     let optional = addon_harness::optional_method_demand(&reports);
     if !optional.is_empty() {
         println!("\n  ...and methods they FEATURE-TEST and work around (not blockers):");
-        for (name, count) in optional.into_iter().take(8) {
-            println!("    {count:>4}  {name}");
-        }
+        ranked(optional, 8);
     }
 
     println!("\n  most-wanted missing globals (addons wanting each):");
-    for (name, count) in addon_harness::demand(&reports).into_iter().take(30) {
-        println!("    {count:>4}  {name}");
-    }
+    ranked(addon_harness::demand(&reports), 30);
 
     if let Some(pattern) = &why {
         let hits = addon_harness::blocked_by(&reports, pattern);
@@ -451,6 +690,37 @@ fn main() {
         if rows.is_empty() {
             println!("    (none — no addon's method tables contain that text)");
         }
+        // ...and WHICH ADDONS each demand ranking counted. The rankings print a number per name and
+        // nothing could ask what it was made of, so a row could disagree with the corpus and no
+        // command would say so. It happened: `GetChannelList` ranked 4 while exactly ONE addon's
+        // source names it, and finding that took a hand-rolled grep across a symlinked corpus.
+        // A count you cannot open is a claim, not a measurement.
+        for (label, rows) in [
+            (
+                "globals",
+                addon_harness::wanters(&reports, pattern, |r| &r.missing_globals),
+            ),
+            (
+                "tables",
+                addon_harness::wanters(&reports, pattern, |r| &r.missing_tables),
+            ),
+            (
+                "methods",
+                addon_harness::wanters(&reports, pattern, |r| &r.missing_methods),
+            ),
+        ] {
+            if rows.is_empty() {
+                continue;
+            }
+            println!(
+                "\n  addons whose missing-{label} list matches {pattern:?} ({}) — this is what the \
+                 ranking counted:",
+                rows.len()
+            );
+            for (addon, name) in &rows {
+                println!("    {addon:<36} {name}");
+            }
+        }
     }
 
     if verbose {
@@ -494,7 +764,7 @@ fn main() {
                 if r.loaded { "loaded" } else { "ERRORS" },
                 r.missing_globals.len(),
                 session,
-                r.render.frames.join(","),
+                render_frames(&r.render.frames),
                 r.errors.first().map(String::as_str).unwrap_or("")
             );
         }

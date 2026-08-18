@@ -912,23 +912,23 @@ fn editbox_justify_v_echoes_but_multiline_alone_decides_the_pixels() {
     );
 }
 
-/// **`Texture:SetDesaturated(flag)` answers `shaderSupported`, and ours says nil.**
+/// **`Texture:SetDesaturated(flag)` answers `shaderSupported`, and since 1327 ours says yes.**
 ///
 /// `0x79c1e0` (wow-re ledger). The reference's own `ItemButtonTemplate.lua:69` is
 /// `local shaderSupported = icon:SetDesaturated(desaturated)`, and lines 70-78 fall back to a 0.5
 /// grey vertex tint when that answer is falsy — 1.12 shipped on cards without the shader, so the
 /// verb reporting "no" is a real machine's answer, not a stub.
 ///
-/// We have no desaturating shader, so nil is the honest reply: claiming support would suppress
-/// FrameXML's grey fallback and leave disabled icons at full colour, which looks *more* wrong.
-/// The test pins the return shape rather than the state, because the return is what callers branch
-/// on — and `nil`, not `false`, because the C answer is `1|nil` and the reference writes
-/// `not shaderSupported`.
+/// benilla answered nil for exactly as long as nothing greyed. Decision 1327 gave the renderer the
+/// luminance fold, so the honest answer flipped: a caller that asks for grey now gets grey, and
+/// keeps its own tint instead of having it overwritten by the 0.5 fallback. The test pins the
+/// return SHAPE, because the return is what callers branch on — `1`, not `true`, because the C
+/// answer is `1|nil` and every reference consumer writes `not shaderSupported`.
 ///
 /// 98 of the 109 draw-then-raise addons in the corpus die on this one verb, via
 /// `FuBar_Panel.lua:43` → Dewdrop `AddLine` → `button.arrow:SetDesaturated(true)`, unguarded.
 #[test]
-fn set_desaturated_reports_no_shader_support_and_does_not_raise() {
+fn set_desaturated_reports_shader_support_and_does_not_raise() {
     let s = crate::script::UiScript::new().unwrap();
     s.run(r#"f = CreateFrame("Frame", "DsF") tex = f:CreateTexture("DsTex", "ARTWORK")"#)
         .unwrap();
@@ -936,11 +936,11 @@ fn set_desaturated_reports_no_shader_support_and_does_not_raise() {
     // Dewdrop's exact call — the one 98 addons reach. It must not raise.
     s.run("DsTex:SetDesaturated(true)").unwrap();
 
-    // ...and it answers nil, so the reference's `not shaderSupported` branch is taken.
+    // ...and it answers truthy, so the reference's shader arm is taken.
     assert!(
-        s.eval::<bool>("return DsTex:SetDesaturated(true) == nil")
+        s.eval::<bool>("return DsTex:SetDesaturated(true) == 1")
             .unwrap(),
-        "shaderSupported must be nil (1|nil C shape), not false"
+        "shaderSupported must be 1 (1|nil C shape), not true"
     );
     assert_eq!(
         s.eval::<i64>("return select('#', DsTex:SetDesaturated(true))")
@@ -949,11 +949,13 @@ fn set_desaturated_reports_no_shader_support_and_does_not_raise() {
         "one return value"
     );
 
-    // The reference's own consumer, transcribed: a falsy answer greys via vertex colour.
+    // The reference's own consumer, transcribed: a truthy answer keeps the CALLER's tint, and the
+    // 0.5 fallback never fires. This is the half B162 turned on — the talent tree asks for
+    // `(1, 0.65, 0.65, 0.65)` and must get 0.65, greyscale, not a flat 0.5 colour multiply.
     s.run(
         r#"
         local shaderSupported = DsTex:SetDesaturated(true)
-        local r, g, b = 1, 1, 1
+        local r, g, b = 0.65, 0.65, 0.65
         if not shaderSupported then r, g, b = 0.5, 0.5, 0.5 end
         DsTex:SetVertexColor(r, g, b)
         "#,
@@ -962,9 +964,581 @@ fn set_desaturated_reports_no_shader_support_and_does_not_raise() {
     let (r, g, b) = s
         .eval::<(f32, f32, f32)>("return DsTex:GetVertexColor()")
         .unwrap();
-    assert_eq!((r, g, b), (0.5, 0.5, 0.5), "the no-shader fallback greys");
+    assert!(
+        (r - 0.65).abs() < 1e-6 && (g - 0.65).abs() < 1e-6 && (b - 0.65).abs() < 1e-6,
+        "the shader arm keeps the caller's tint, got {r},{g},{b}"
+    );
 
     // Both spellings of "off" are off — nil and false.
     s.run("DsTex:SetDesaturated(nil) DsTex:SetDesaturated(false)")
         .unwrap();
+}
+
+/// `UnitCreatureType(unit)` — `0x51a280`'s three-stage resolver, of which we model stages 2 and 3.
+///
+/// The load-bearing assertion is the **player** one. `0x605570` falls through the (never populated)
+/// creature record to a `ChrRaces.dbc` col-9 lookup that is **7 for all nine shipped races**, and
+/// `CreatureType[7]` is `"Humanoid"` — so a player answers a word, not nil. Reading only the
+/// creature record, which is what our data alone suggested, would have been wrong for every
+/// `UnitCreatureType("player")` call in the corpus.
+#[test]
+fn unit_creature_type_answers_the_record_then_falls_back_to_humanoid() {
+    let mut s = script();
+    s.set_unit(
+        "target",
+        Some(crate::script::UnitState {
+            exists: true,
+            creature_type_name: Some("Beast".into()),
+            ..Default::default()
+        }),
+    );
+    s.set_unit(
+        "player",
+        Some(crate::script::UnitState {
+            exists: true,
+            is_player: true,
+            ..Default::default()
+        }),
+    );
+
+    // Stage 2: a creature's cached record wins.
+    assert_eq!(
+        s.eval::<String>(r#"return UnitCreatureType("target")"#)
+            .unwrap(),
+        "Beast"
+    );
+    // Stage 3: a player has no record and falls through to race -> Humanoid.
+    assert_eq!(
+        s.eval::<String>(r#"return UnitCreatureType("player")"#)
+            .unwrap(),
+        "Humanoid"
+    );
+    // An unresolved TOKEN is nil — not a raise.
+    assert!(s
+        .eval::<bool>(r#"return UnitCreatureType("party4") == nil"#)
+        .unwrap());
+    // A non-string ARGUMENT is a raise, which is a different failure from the nil above:
+    // `lua_isstring` gates it and `luaL_error` longjmps, so a missing arg abandons the statement.
+    let err = s
+        .run("UnitCreatureType()")
+        .expect_err("a missing arg must raise");
+    assert!(
+        format!("{err}").contains("Usage: UnitCreatureType"),
+        "got {err}"
+    );
+}
+
+/// `GetInventorySlotInfo(slotName)` — `0x4c81b0`, three returns and a **case-insensitive**,
+/// full-string name match.
+///
+/// The case-insensitivity is the whole point: two 1.12-era corpus addons died at session start on
+/// case variants of real names — `FuBar_AmmoFu` passes `"ammoSlot"`, `FuBar_PoisonFu`
+/// `"MAINHANDSLOT"` — and both worked on the real client, because `0x4c8215` reaches the CRT
+/// `_strnicmp`, which folds both operands.
+///
+/// The other two assertions are things a plausible implementation gets wrong and nothing notices:
+/// the third return is the **number 1**, only for `RangedSlot`, never a boolean; and a miss
+/// **raises** with the reference's own message, which carries no `Usage:` prefix and does not
+/// interpolate the offending name.
+#[test]
+fn get_inventory_slot_info_folds_case_and_flags_only_the_ranged_slot() {
+    let s = script();
+
+    // The exact spelling, and the two case variants the corpus actually ships.
+    for name in ["AmmoSlot", "ammoSlot", "AMMOSLOT"] {
+        assert_eq!(
+            s.eval::<i64>(&format!("return GetInventorySlotInfo('{name}')"))
+                .unwrap(),
+            0,
+            "{name} must fold to AmmoSlot"
+        );
+    }
+    assert_eq!(
+        s.eval::<i64>("return GetInventorySlotInfo('MAINHANDSLOT')")
+            .unwrap(),
+        16
+    );
+
+    // Three values, and the second is the empty-slot background art the paper-doll buttons use.
+    assert_eq!(
+        s.eval::<i64>("return select('#', GetInventorySlotInfo('HeadSlot'))")
+            .unwrap(),
+        3
+    );
+    let (id, art) = s
+        .eval::<(i64, String)>("return GetInventorySlotInfo('HeadSlot')")
+        .unwrap();
+    assert_eq!(id, 1);
+    // The DBC string verbatim: LOWERCASE directory and the `.blp` extension. The binding pushes
+    // `[esi+4]` with no normalisation, so a caller that keys a table by this sees these bytes.
+    assert_eq!(art, "interface\\paperdoll\\UI-PaperDoll-Slot-Head.blp");
+
+    // checkRelic: the NUMBER 1 for the ranged slot alone, nil everywhere else — not `false`, which
+    // is falsey like nil but the wrong type for a caller that compares it against 1.
+    assert!(s
+        .eval::<bool>("local _,_,r = GetInventorySlotInfo('RangedSlot') return r == 1")
+        .unwrap());
+    assert!(s
+        .eval::<bool>("local _,_,r = GetInventorySlotInfo('HeadSlot') return r == nil")
+        .unwrap());
+
+    // The twelve rows this table was short of — `Bag1`..`Bag12` at SlotNumbers 64..75, of which
+    // 64..69 is the bank-bag band. They share ONE string offset with Bag0Slot..Bag3Slot, so all
+    // sixteen bag rows answer the same art.
+    assert_eq!(
+        s.eval::<i64>("return GetInventorySlotInfo('Bag1')")
+            .unwrap(),
+        64
+    );
+    assert_eq!(
+        s.eval::<i64>("return GetInventorySlotInfo('bag12')")
+            .unwrap(),
+        75,
+        "the new rows fold case like every other"
+    );
+    assert_eq!(
+        s.eval::<String>("local _,a = GetInventorySlotInfo('Bag6') return a")
+            .unwrap(),
+        s.eval::<String>("local _,a = GetInventorySlotInfo('Bag0Slot') return a")
+            .unwrap(),
+        "all sixteen bag rows share one string-block offset"
+    );
+    // ...and `Bag1` (64) is NOT `Bag1Slot` (21): different names, different ids, both real rows.
+    assert_eq!(
+        s.eval::<i64>("return GetInventorySlotInfo('Bag1Slot')")
+            .unwrap(),
+        21
+    );
+
+    // A miss raises — there is no nil path — with the reference's own string.
+    let err = s
+        .run("GetInventorySlotInfo('NoSuchSlot')")
+        .expect_err("an unknown slot name must raise");
+    let err = format!("{err}");
+    assert!(
+        err.contains("Invalid inventory slot in GetInventorySlotInfo"),
+        "got {err}"
+    );
+    assert!(
+        !err.contains("NoSuchSlot"),
+        "the reference does not interpolate the offending name: {err}"
+    );
+}
+
+/// **The whole Region method map, on both leaves that chain to it.**
+///
+/// `SetParent` above landed as one name because one addon line named it. That is how this table has
+/// always grown, and it is why `GetParent` — its own getter — was still absent while `SetParent`
+/// worked. wow-re carves the map as a SET, not as names: FontString's lookup `0x79ee20` chains its
+/// own map `0xcf5400` to the Region map `0xcf54b4`, whose 19 entries are
+///
+/// ```text
+/// GetObjectType IsObjectType GetName GetParent SetParent GetCenter GetLeft GetRight GetTop
+/// GetBottom GetWidth SetWidth GetHeight SetHeight GetNumPoints GetPoint SetPoint SetAllPoints
+/// ClearAllPoints
+/// ```
+///
+/// (`system/ui/scratch/font-object-lua-surface.md` — the same note whose point is that a `<Font>`
+/// object does NOT chain and so has none of these. Texture reaches the identical map through its
+/// own leaf lookup, which is why both are asserted here.)
+///
+/// So this asserts membership rather than behaviour: each name is *present and callable* on a
+/// Texture and on a FontString. Behaviour belongs in the focused tests around it — what is pinned
+/// here is that the set cannot quietly lose a member again, which is the failure `GetParent` was.
+#[test]
+fn every_region_map_method_is_callable_on_a_texture_and_a_fontstring() {
+    /// All 19. `GetObjectType`/`IsObjectType` were held out of this list when 1244 landed the other
+    /// four — dispatched rather than guessed — and joined it when wow-re answered
+    /// (`system/ui/scratch/widget-type-identity.md`). The list is the whole map again.
+    // The one list, shared with the title region's narrower table (`script::REGION_MAP_METHODS`)
+    // so the two can never disagree about what "the Region map" is.
+    const REGION_MAP: [&str; 19] = crate::script::REGION_MAP_METHODS;
+    let mut s = crate::script::UiScript::new().unwrap();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        RMOwner = CreateFrame("Frame", "RMOwner")
+        RMOwner:SetPoint("BOTTOMLEFT", 0, 0)  RMOwner:SetSize(100, 50)
+        RMTex = RMOwner:CreateTexture("RMTex", "ARTWORK")
+        RMStr = RMOwner:CreateFontString("RMStr", "ARTWORK")
+        "#,
+    )
+    .unwrap();
+
+    let mut absent: Vec<String> = Vec::new();
+    for kind in ["RMTex", "RMStr"] {
+        for name in REGION_MAP {
+            if !s
+                .eval::<bool>(&format!("return type({kind}.{name}) == 'function'"))
+                .unwrap_or(false)
+            {
+                absent.push(format!("{kind}:{name}"));
+            }
+        }
+    }
+    assert!(
+        absent.is_empty(),
+        "the Region map 0xcf54b4 is missing from our regions: {absent:?}"
+    );
+}
+
+/// **The four Region-map readers, on the cases a frame-shaped copy gets wrong.**
+///
+/// `TheoryCraftUI.lua:720` is the line that found them: `buttontext:GetParent():GetID()`, where
+/// `buttontext` is a FontString — a working line on the real client, and `attempt to call method
+/// 'GetParent' (a nil value)` here, every session.
+#[test]
+fn the_region_map_readers_answer_the_way_the_edges_do() {
+    let mut s = crate::script::UiScript::new().unwrap();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        RRFrame = CreateFrame("Frame", "RRFrame")
+        RRFrame:SetPoint("BOTTOMLEFT", 100, 200)  RRFrame:SetSize(200, 100)
+        RRPlate = RRFrame:CreateTexture("RRPlate", "ARTWORK")
+        RRPlate:SetPoint("TOPLEFT", 10, -10)  RRPlate:SetSize(50, 20)
+        -- the sibling-region anchor the real XML uses everywhere
+        RRLabel = RRFrame:CreateFontString("RRLabel", "OVERLAY")
+        RRLabel:SetPoint("LEFT", RRPlate, "RIGHT", 4, 0)
+        "#,
+    )
+    .unwrap();
+    s.resolve();
+
+    // GetParent is the OWNER frame — the identity TheoryCraft then calls :GetID() on.
+    assert!(
+        s.eval::<bool>("return RRPlate:GetParent() == RRFrame")
+            .unwrap(),
+        "a region's parent is the frame that created it"
+    );
+    assert!(
+        s.eval::<bool>("return RRLabel:GetParent():GetName() == 'RRFrame'")
+            .unwrap(),
+        "…and it is a real frame handle, not a bare id"
+    );
+
+    // GetCenter agrees with the edge readers BY CONSTRUCTION — the invariant that forbids scaling
+    // one and not the others.
+    let (cx, cy): (f64, f64) = s.eval("return RRPlate:GetCenter()").unwrap();
+    let (l, r, t, b): (f64, f64, f64, f64) = s
+        .eval("return RRPlate:GetLeft(), RRPlate:GetRight(), RRPlate:GetTop(), RRPlate:GetBottom()")
+        .unwrap();
+    assert_eq!((cx, cy), ((l + r) * 0.5, (t + b) * 0.5));
+
+    // GetNumPoints counts what SetPoint wrote, and ClearAllPoints takes it back to 0.
+    assert_eq!(s.eval::<i64>("return RRPlate:GetNumPoints()").unwrap(), 1);
+    assert_eq!(
+        s.eval::<i64>("return RRLabel:GetNumPoints()").unwrap(),
+        1,
+        "the sibling-anchored label carries its one point"
+    );
+
+    // GetPoint's relativeTo must come back as the SIBLING REGION, not a frame wrapper onto the same
+    // id — the one place regions genuinely differ from frames, since both share an id space.
+    let (p, rp, x, y): (String, String, f64, f64) = s
+        .eval("local p, _, rp, x, y = RRLabel:GetPoint(1) return p, rp, x, y")
+        .unwrap();
+    assert_eq!((p.as_str(), rp.as_str(), x, y), ("LEFT", "RIGHT", 4.0, 0.0));
+    assert!(
+        s.eval::<bool>("local _, rel = RRLabel:GetPoint(1) return rel == RRPlate")
+            .unwrap(),
+        "relativeTo is the sibling REGION handle itself"
+    );
+    // Out of range is five nils, like the frame twin.
+    assert_eq!(
+        s.eval::<i64>("return select('#', RRPlate:GetPoint(7))")
+            .unwrap(),
+        5,
+        "an out-of-range index still answers five values, all nil"
+    );
+    assert!(
+        s.eval::<bool>("return RRPlate:GetPoint(7) == nil").unwrap(),
+        "…and the first of them is nil"
+    );
+}
+
+/// **`GetObjectType`/`IsObjectType` — every detail wow-re had to answer, asserted.**
+///
+/// 1244 shipped four Region-map members and left these two out rather than guess them, because
+/// each of the four traps below is a coin-flip a reimplementation loses (1203/1205/1211 are three
+/// records of losing it). The carve is `system/ui/scratch/widget-type-identity.md`; this is that
+/// answer turned into a gate, so the next person to touch these has to disagree with the binary
+/// rather than with me.
+#[test]
+fn the_type_identity_verbs_answer_what_the_binary_answers() {
+    let s = crate::script::UiScript::new().unwrap();
+    s.run(
+        r#"
+        TIOwner = CreateFrame("Frame", "TIOwner")
+        TITex = TIOwner:CreateTexture("TITex", "ARTWORK")
+        TIStr = TIOwner:CreateFontString("TIStr", "ARTWORK")
+        TIAnon = TIOwner:CreateTexture(nil, "ARTWORK")
+        "#,
+    )
+    .unwrap();
+
+    // The leaf names, one value each (`lua_pushstring`, no arity check on extra args).
+    assert_eq!(
+        s.eval::<String>("return TITex:GetObjectType()").unwrap(),
+        "Texture"
+    );
+    assert_eq!(
+        s.eval::<String>("return TIStr:GetObjectType()").unwrap(),
+        "FontString"
+    );
+    assert_eq!(
+        s.eval::<i64>("return select('#', TITex:GetObjectType('ignored'))")
+            .unwrap(),
+        1,
+        "one value, and a stray argument is ignored rather than an arity error"
+    );
+
+    // The chain is TWO deep and stops there.
+    for (obj, leaf) in [("TITex", "Texture"), ("TIStr", "FontString")] {
+        assert_eq!(
+            s.eval::<i64>(&format!("return {obj}:IsObjectType('{leaf}')"))
+                .unwrap(),
+            1,
+            "{obj} is its own leaf type"
+        );
+        assert_eq!(
+            s.eval::<i64>(&format!("return {obj}:IsObjectType('Region')"))
+                .unwrap(),
+            1,
+            "{obj} is a Region"
+        );
+        // **The invented root.** 1.12.1 has no LayoutFrame/ScriptObject/Object type at all — those
+        // strings live only in __FILE__ paths and allocator tags. Knowing later clients is exactly
+        // what would put them here.
+        for absent in ["LayoutFrame", "ScriptObject", "Object", "Frame", "Font"] {
+            assert!(
+                s.eval::<Option<i64>>(&format!("return {obj}:IsObjectType('{absent}')"))
+                    .unwrap()
+                    .is_none(),
+                "{obj}:IsObjectType('{absent}') must be nil — 1.12 has no such type in the chain"
+            );
+        }
+    }
+    // …and the two leaves are not each other.
+    assert!(s
+        .eval::<Option<i64>>("return TITex:IsObjectType('FontString')")
+        .unwrap()
+        .is_none());
+
+    // Case-INSENSITIVE and WHOLE-string (SStrCmpI folds both operands; the compare stops at the
+    // first NUL, so no prefix or substring match either).
+    for spelling in ["texture", "TEXTURE", "TeXtUrE", "region", "REGION"] {
+        assert_eq!(
+            s.eval::<i64>(&format!("return TITex:IsObjectType('{spelling}')"))
+                .unwrap(),
+            1,
+            "'{spelling}' must match — the compare folds case"
+        );
+    }
+    for partial in ["Tex", "TextureX", "Regio", ""] {
+        assert!(
+            s.eval::<Option<i64>>(&format!("return TITex:IsObjectType('{partial}')"))
+                .unwrap()
+                .is_none(),
+            "'{partial}' must NOT match — whole-string, not a prefix"
+        );
+    }
+
+    // A hit is the NUMBER 1, never a boolean; a miss is nil. Both paths push exactly one value.
+    assert_eq!(
+        s.eval::<String>("return type(TITex:IsObjectType('Texture'))")
+            .unwrap(),
+        "number",
+        "the reference pushes tag 3 (number); tag 1 (boolean) is never written"
+    );
+    for arg in ["'Texture'", "'nope'"] {
+        assert_eq!(
+            s.eval::<i64>(&format!("return select('#', TITex:IsObjectType({arg}))"))
+                .unwrap(),
+            1,
+            "exactly one value on both the hit and the miss path"
+        );
+    }
+
+    // A NUMBER is accepted (lua_isstring takes tags 4 and 3) and stringified in place — it simply
+    // never matches, because no type name is numeric.
+    assert!(
+        s.eval::<Option<i64>>("return TITex:IsObjectType(5)")
+            .unwrap()
+            .is_none(),
+        "a number argument is accepted and quietly answers nil, NOT a raise"
+    );
+
+    // Everything else RAISES with the reference's own Usage text, naming the region — or
+    // `<unnamed>` for one declared anonymously.
+    for bad in ["", "nil", "true", "{}", "print"] {
+        let err = s
+            .run(&format!("TITex:IsObjectType({bad})"))
+            .expect_err(&format!("IsObjectType({bad}) must raise"))
+            .to_string();
+        assert!(
+            err.contains(r#"Usage: TITex:IsObjectType("TYPE")"#),
+            "the raise carries the reference's Usage text and the region's name: {err}"
+        );
+    }
+    let anon = s
+        .run("TIAnon:IsObjectType(nil)")
+        .expect_err("anonymous region raises too")
+        .to_string();
+    assert!(
+        anon.contains(r#"Usage: <unnamed>:IsObjectType("TYPE")"#),
+        "an anonymous region reports <unnamed>, as GetName()'s absence does: {anon}"
+    );
+}
+
+/// **The frame side of the type identity, and the three chains a guess gets wrong.**
+///
+/// `_Nameplates.lua` is why this half exists: it asks `Region:GetObjectType()` (the region twin)
+/// AND `Nameplate:GetObjectType() ~= "Button"` / `Frame:GetObjectType() == "StatusBar"` in the same
+/// file. The chains come from wow-re's 23-class roster, which is a hardcoded straight-line list per
+/// class in the binary rather than a runtime parent walk.
+#[test]
+fn a_frames_type_chain_matches_the_roster() {
+    let s = crate::script::UiScript::new().unwrap();
+    // (CreateFrame kind, GetObjectType string, full chain)
+    let cases: &[(&str, &str, &[&str])] = &[
+        ("Frame", "Frame", &["Frame", "Region"]),
+        ("Button", "Button", &["Button", "Frame", "Region"]),
+        // Depth 4 — the longest chain we can build.
+        (
+            "CheckButton",
+            "CheckButton",
+            &["CheckButton", "Button", "Frame", "Region"],
+        ),
+        ("EditBox", "EditBox", &["EditBox", "Frame", "Region"]),
+        ("StatusBar", "StatusBar", &["StatusBar", "Frame", "Region"]),
+        ("Slider", "Slider", &["Slider", "Frame", "Region"]),
+        (
+            "ScrollFrame",
+            "ScrollFrame",
+            &["ScrollFrame", "Frame", "Region"],
+        ),
+        (
+            "MessageFrame",
+            "MessageFrame",
+            &["MessageFrame", "Frame", "Region"],
+        ),
+        // **NOT via MessageFrame**, despite the name (roster `0x787940`).
+        (
+            "ScrollingMessageFrame",
+            "ScrollingMessageFrame",
+            &["ScrollingMessageFrame", "Frame", "Region"],
+        ),
+        // **Capital HTML** — the enum variant is `SimpleHtml`, and `GetObjectType` is compared with
+        // `==` by addons, so a variant-derived string would be silently wrong here.
+        (
+            "SimpleHTML",
+            "SimpleHTML",
+            &["SimpleHTML", "Frame", "Region"],
+        ),
+        (
+            "ColorSelect",
+            "ColorSelect",
+            &["ColorSelect", "Frame", "Region"],
+        ),
+        (
+            "GameTooltip",
+            "GameTooltip",
+            &["GameTooltip", "Frame", "Region"],
+        ),
+        ("Minimap", "Minimap", &["Minimap", "Frame", "Region"]),
+        // **Our Era-shaped divergence reports what 1.12's cooldown IS**: a Model. 1.12.1 has no
+        // `Cooldown` type name at all (the roster is 23 and none is that).
+        ("Cooldown", "Model", &["Model", "Frame", "Region"]),
+    ];
+    for (kind, leaf, chain) in cases {
+        s.run(&format!(r#"TC = CreateFrame("{kind}")"#))
+            .unwrap_or_else(|e| panic!("CreateFrame(\"{kind}\"): {e}"));
+        assert_eq!(
+            &s.eval::<String>("return TC:GetObjectType()").unwrap(),
+            leaf,
+            "{kind}:GetObjectType()"
+        );
+        for want in *chain {
+            assert_eq!(
+                s.eval::<i64>(&format!("return TC:IsObjectType('{want}')"))
+                    .unwrap(),
+                1,
+                "{kind} must be a {want}"
+            );
+        }
+        // Every OTHER leaf in the roster must be absent from this chain — the assertion that
+        // catches a chain built by "sounds related".
+        for (other, other_leaf, _) in cases {
+            if chain.contains(other_leaf) {
+                continue;
+            }
+            assert!(
+                s.eval::<Option<i64>>(&format!("return TC:IsObjectType('{other_leaf}')"))
+                    .unwrap()
+                    .is_none(),
+                "{kind}'s chain must NOT contain {other_leaf} (via {other})"
+            );
+        }
+    }
+
+    // The frame verbs share the region twin's contract: number 1 / nil, one value, and a raise
+    // naming the frame.
+    s.run(r#"TCNamed = CreateFrame("Button", "TCNamed")"#)
+        .unwrap();
+    assert_eq!(
+        s.eval::<String>("return type(TCNamed:IsObjectType('button'))")
+            .unwrap(),
+        "number",
+        "case-folded hit is the number 1"
+    );
+    let err = s
+        .run("TCNamed:IsObjectType({})")
+        .expect_err("a table argument raises")
+        .to_string();
+    assert!(
+        err.contains(r#"Usage: TCNamed:IsObjectType("TYPE")"#),
+        "the frame's Usage text names the frame: {err}"
+    );
+}
+
+/// **Every region method belongs to a leaf — no name may be installed and invisible to both.**
+///
+/// The split (`script::region`) copies names out of the full table into a Texture leaf and a
+/// FontString leaf. A name in neither list is still installed, still costs a closure, and is
+/// reachable from NOTHING — the silent half of a wrong partition.
+///
+/// This is not hypothetical: the partition was first built from a grep, and that grep missed
+/// `SetGradient`/`SetGradientAlpha` because they are installed from a LOOP rather than a literal
+/// `m.set("…")`. One test caught one of them; this gate catches the whole class, and it reads the
+/// table the VM actually holds rather than the source that builds it.
+#[test]
+fn every_installed_region_method_lands_in_a_leaf() {
+    use crate::script::{
+        FONTSTRING_ONLY_METHODS, REGION_LEAF_SHARED, REGION_MAP_METHODS, TEXTURE_ONLY_METHODS,
+    };
+    let s = crate::script::UiScript::new().unwrap();
+    let full: mlua::Table = s
+        .lua()
+        .named_registry_value(crate::script::REG_REGION_METHODS_FOR_TEST)
+        .expect("the full region method table");
+
+    let mut known: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    known.extend(REGION_MAP_METHODS);
+    known.extend(REGION_LEAF_SHARED);
+    known.extend(TEXTURE_ONLY_METHODS);
+    known.extend(FONTSTRING_ONLY_METHODS);
+
+    let mut orphans: Vec<String> = Vec::new();
+    for pair in full.pairs::<String, mlua::Value>() {
+        let (name, _) = pair.expect("region method entry");
+        if !known.contains(name.as_str()) {
+            orphans.push(name);
+        }
+    }
+    orphans.sort();
+    assert!(
+        orphans.is_empty(),
+        "installed on the region table but in NO leaf list, so no region can call them: {orphans:?}"
+    );
 }

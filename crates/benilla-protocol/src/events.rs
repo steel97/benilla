@@ -12,7 +12,8 @@
 use crate::messages::{
     ActionButton, AttackerState, ChannelNoticeTail, Character, CreateSpline, DamageShield,
     EnvironmentalDamageLog, ExplorationXp, FriendEntry, FriendStatusUpdate, GossipOption,
-    GroupLootInfo, GroupMemberEntry, ItemInfo, ItemPushResult, JumpInfo, LevelUpInfo,
+    GroupLootInfo, GroupMemberEntry, GuildCommandResult, GuildEventNotice, GuildInfo,
+    GuildQueryResponse, GuildRoster, ItemInfo, ItemPushResult, JumpInfo, LevelUpInfo,
     LootAllPassed, LootItem, LootRoll, LootRollWon, LootStartRoll, MailListEntry, MirrorTimerStart,
     MonsterMoveFacing, ObjectFields, PartyMemberStatsInfo, PeriodicAuraLog, PetMode, PetSpells,
     QuestComplete, QuestDetails, QuestGiverList, QuestOfferReward, QuestRequestItems,
@@ -82,6 +83,30 @@ pub enum LoginStage {
     Handshaking,
 }
 
+/// **How a world session ended** — the fact [`SessionEvent::Disconnected`] carries alongside its
+/// reason string, and the one the client's whole post-session behaviour hangs on (decision 1262).
+///
+/// The two are not shades of the same thing. A logout is a door the player walked through, and the
+/// roster on the other side of it is the character-select screen they asked for. A loss is a door
+/// that slammed: the reference's engine fires `DISCONNECTED_FROM_SERVER`, and its `GlueParent.lua`
+/// answers `SetGlueScreen("login")` + `GlueDialog_Show("DISCONNECTED")` — back to the account
+/// screen, one Okay button, no retry. Before this the app told them apart by comparing the reason
+/// *string* to `"logged out"`, which is how "the session died" and "the session ended" came to share
+/// one code path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// A clean, client-initiated logout the server confirmed (`SMSG_LOGOUT_COMPLETE`). The IO
+    /// thread cycles the connection and a fresh [`SessionEvent::CharacterList`] follows — the
+    /// teardown here is bookkeeping between two halves of one continuous session.
+    LoggedOut,
+    /// The stream died under us: a socket error, an EOF, or a post-roster handshake failure. A
+    /// **displacement kick is exactly this** and carries nothing else — vmangos's
+    /// `WorldSession::KickPlayer` is a bare `CloseSocket()`, no packet (verified in
+    /// `vmangos-core/src/game/Server/WorldSession.cpp`), so "another client took the account" and
+    /// "the server went away" are the same event on the wire and get the same answer.
+    Lost,
+}
+
 /// One decoded event from the world stream. Carries only primitives + the coarse [`EntityKind`]
 /// classification — no wire types leak to the app, and no running state lives here.
 #[derive(Debug, Clone)]
@@ -131,8 +156,8 @@ pub enum SessionEvent {
     LogoutResponse { reason: u32, instant: bool },
     /// The server dropped a pending logout at our `CMSG_LOGOUT_CANCEL` (`SMSG_LOGOUT_CANCEL_ACK`).
     LogoutCancelled,
-    /// The session ended (socket closed / handshake failure); carries a human-readable reason.
-    Disconnected { reason: String },
+    /// The session ended; carries a human-readable reason and **how** it ended ([`SessionEnd`]).
+    Disconnected { reason: String, end: SessionEnd },
     /// An object entered range / was created: a unit, player, or GameObject at a raw-WoW pose. Carries
     /// the interpreted spawn identity (`display_id`/`scale`, decoded per object type here so the app
     /// needn't know the wire layout) plus the full descriptor `fields` mask the ECS seeds its per-object
@@ -313,6 +338,13 @@ pub enum SessionEvent {
     /// The player's hearthstone bind point (`SMSG_BINDPOINTUPDATE`): the AreaTable id the
     /// `$z` token names ("Returns you to <area>.").
     BindPoint { area: u32 },
+    /// An innkeeper is asking whether to make this your home (`SMSG_BINDER_CONFIRM`) — the
+    /// question the `CONFIRM_BINDER` dialog puts on screen. `binder` is the innkeeper's guid, and
+    /// it must be echoed in `CMSG_BINDER_ACTIVATE` for the bind to happen at all (decision 1331).
+    BinderConfirm { binder: u64 },
+    /// The bind took (`SMSG_PLAYERBOUND`): `area` is the AreaTable id we are now bound in, the
+    /// same one [`Self::BindPoint`] carries in the packet beside it.
+    PlayerBound { binder: u64, area: u32 },
     /// The player's equip proficiencies for one item class (`SMSG_SET_PROFICIENCY`, at login +
     /// on train): the subclass bitmask the item tooltip's slot-line red compares against
     /// (the client's `0xc4d4a0[class]` store).
@@ -325,6 +357,10 @@ pub enum SessionEvent {
     /// Mid-session reputation deltas (`SMSG_SET_FACTION_STANDING`): `(reputationListId,
     /// standing)` per changed slot — same standing convention as [`Self::Reputations`].
     ReputationDelta { standings: Vec<(u32, i32)> },
+    /// One reputation-list slot just became visible in the pane (`SMSG_SET_FACTION_VISIBLE`) — the
+    /// server's "you have now met these people". Carries no standing; it only lifts the slot's
+    /// visible flag, which is what decides whether the pane lists the row at all.
+    ReputationVisible { list_id: u32 },
     /// A player character's identity (`SMSG_NAME_QUERY_RESPONSE`, answering our `CMSG_NAME_QUERY`).
     /// Unit names are **not** descriptor fields on the 1.12 wire — they arrive only through this
     /// query pair (players) and [`Self::CreatureName`] (creatures); the app caches them by guid/entry
@@ -386,6 +422,13 @@ pub enum SessionEvent {
     /// The load-bearing sender is the fishing bobber's bite (`anim_id 0`, the splash;
     /// decision 1086).
     GameObjectCustomAnim { guid: u64, anim_id: u32 },
+    /// An object plays its one-shot **Despawn** animation, then goes away
+    /// (`SMSG_GAMEOBJECT_DESPAWN_ANIM`): the client arms substate 12 — AnimationData **157
+    /// Despawn** — and holds the object alive across the `SMSG_DESTROY_OBJECT` that follows in
+    /// the same server tick, for the length of that play (decision 1404). UBRS's Rookery Eggs
+    /// hatch on this packet; a totem's death and a DynamicObject's expiry send it too, and those
+    /// carry nothing armable, so the consumer falls back to the ordinary instant destroy.
+    GameObjectDespawnAnim { guid: u64 },
     /// The fishing channel ended with nothing hooked (`SMSG_FISH_NOT_HOOKED`, empty body):
     /// the red `ERR_FISH_NOT_HOOKED` toast (decision 1086).
     FishNotHooked,
@@ -409,8 +452,13 @@ pub enum SessionEvent {
         instant: bool,
     },
     /// A nearby unit's chat emote (`SMSG_TEXT_EMOTE`): the `EmotesText.dbc` id; the guid names
-    /// the performer (voice race/sex resolve from its descriptor).
-    TextEmote { guid: u64, text_emote: u32 },
+    /// the performer (voice race/sex resolve from its descriptor). `target_name` is the wire's
+    /// target display name, empty when untargeted — the sentence-form selector, decision 1274.
+    TextEmote {
+        guid: u64,
+        text_emote: u32,
+        target_name: String,
+    },
     /// A unit's anim emote (`SMSG_EMOTE`): the `Emotes.dbc` id (drives the anim + its
     /// `EventSoundID`).
     Emote { guid: u64, emote_id: u32 },
@@ -434,11 +482,15 @@ pub enum SessionEvent {
         new_spell_id: u32,
     },
     /// The server's verdict on our cast (`SMSG_CAST_RESULT`): `reason` is the failure code when
-    /// `success` is false (the client's error-text table keys on it; surfaced raw for now).
+    /// `success` is false (the client's error-text table keys on it), and `arg` the reason-specific
+    /// argument word that fills that message's `%s` — a `SpellFocusObject.dbc` id for
+    /// `REQUIRES_SPELL_FOCUS`, an `AreaTable.dbc` id for `REQUIRES_AREA`
+    /// ([`crate::messages::CastOutcome::Failed`]).
     CastResult {
         spell_id: u32,
         success: bool,
         reason: Option<u8>,
+        arg: Option<u32>,
     },
     /// The pet action bar's whole state (`SMSG_PET_SPELLS`, decision 0982) — or its **teardown**,
     /// which is the same event carrying a zero `pet_guid`. Server-authoritative: this is not a
@@ -846,6 +898,16 @@ pub enum SessionEvent {
     /// per-player broadcaster does not) — so the app self-suppresses it on receive and plays
     /// its own flourish locally at send time.
     MountSpecial { guid: u64 },
+    /// The server handed us — or took from us — the reins of a unit (`SMSG_CLIENT_CONTROL_UPDATE`).
+    ///
+    /// `mover` is the unit being spoken about, **not** necessarily a new subject: when the server
+    /// takes control away it names *us*, with `allow_move = false`. So the two questions the app
+    /// asks of this are different — "is this about me?" (`mover == self guid`) and "may that unit
+    /// move?" — and conflating them gets the mind-controlled *victim*'s case backwards.
+    ///
+    /// Answering with `CMSG_SET_ACTIVE_MOVER` is not optional when control is granted: vmangos
+    /// discards every `MSG_MOVE_*` for a mover it has not confirmed.
+    ClientControl { mover: u64, allow_move: bool },
     /// A packet the codec dropped on the floor: `unparseable = false` means **no parse arm exists**
     /// for the opcode at all (it fell through to `ServerPacket::Other` — a wire-coverage gap);
     /// `true` means a parser exists but errored on this body (the reader skipped it to keep the
@@ -989,6 +1051,32 @@ pub enum SessionEvent {
     FriendStatus(FriendStatusUpdate),
     /// A `/who` answer (`SMSG_WHO`) — at most 49 rows, plus the true match total.
     WhoResults(WhoResults),
+    /// One guild's public identity (`SMSG_GUILD_QUERY_RESPONSE`) — name, its ten rank names,
+    /// tabard. The guild twin of the name query: an ask-once cache fill keyed by guild id, so a
+    /// consumer holds these by [`GuildQueryResponse::guild_id`] and a roster row or a chat line
+    /// can name its guild late rather than never.
+    GuildQueryResponse(GuildQueryResponse),
+    /// The whole guild (`SMSG_GUILD_ROSTER`) — MOTD, info text, per-rank rights, every member.
+    /// Always a complete snapshot, never a delta, so it *replaces* whatever is held; the server
+    /// re-sends it for anything worth showing (a note edit, a rank-rights change, a promotion).
+    GuildRoster(GuildRoster),
+    /// One thing that happened in the guild (`SMSG_GUILD_EVENT`) — a
+    /// [`guild_event`](crate::messages::guild_event) id plus its already-formatted arguments. The
+    /// arguments are the display text; the optional guid rides only on the sign-on/off pair.
+    GuildEvent(GuildEventNotice),
+    /// The server's verdict on a guild verb we sent (`SMSG_GUILD_COMMAND_RESULT`). Carry the
+    /// command tag through to the display: it is what tells the two meanings of result `0x08`
+    /// apart (see [`guild_command_error`](crate::messages::guild_command_error)).
+    GuildCommandResult(GuildCommandResult),
+    /// Somebody asked us into their guild (`SMSG_GUILD_INVITE`) — the popup. Answered with
+    /// `CMSG_GUILD_ACCEPT`/`_DECLINE`, neither of which says *which* invitation it means, so the
+    /// pending invitation is the consumer's own state.
+    GuildInvite { inviter: String, guild: String },
+    /// The player we invited turned it down (`SMSG_GUILD_DECLINE`) — delivered to the inviter only.
+    GuildDecline { name: String },
+    /// The guild's "founded on / N members / N accounts" summary (`SMSG_GUILD_INFO`) — a separate
+    /// ask from the roster, sharing no fields with it.
+    GuildInfo(GuildInfo),
     /// The taxi map (`SMSG_SHOWTAXINODES`, decision 0484): `flightmaster` is the NPC the menu
     /// opened on, `nearest_node` the node it sits at, `known_mask` the full known-node bitmask
     /// ([`TaxiMask::is_known`]). The wire's window-framing constant carries no state and is

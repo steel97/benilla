@@ -29,6 +29,11 @@ use benilla_world::world_census::WorldCensus;
 /// (scenario=`live`), and exits.
 pub(crate) struct LiveFpsPlugin;
 
+/// How long past `WOW_LIVE_FPS_AT` the probe waits for a world before declaring the run dead.
+/// Entry normally lands well inside `at` itself; 60 s of grace covers a cold-cache load without
+/// ever letting a stranded run ride out a harness timeout (see the `Waiting` arm).
+const BOOT_DEADLINE_SECS: f32 = 60.0;
+
 impl Plugin for LiveFpsPlugin {
     fn build(&self, app: &mut App) {
         let frames = std::env::var("WOW_LIVE_FPS")
@@ -146,6 +151,19 @@ fn drive_live_fps(
             // (The un-occludable window that keeps the SETTLE phase from streaming the world at
             // ~1 fps is [`ProbeFocusPlugin`]'s now — every probe needs it, not just this one.)
             if time.elapsed_secs() < probe.at || self_player.is_empty() {
+                // The boot deadline: entering the world takes seconds, and `at` already grants a
+                // settle window on top — a run still worldless this far past it is stranded on a
+                // glue screen (dead server, refused login the marker arms didn't catch) and every
+                // second more is the 1371 sitting's dead wall-clock again. `FATAL` is the marker
+                // leg.sh keys on.
+                if time.elapsed_secs() > probe.at + BOOT_DEADLINE_SECS {
+                    error!(
+                        "live-fps: FATAL — still not in world {:.0}s past the probe delay; a measurement run with no world is dead. exiting",
+                        BOOT_DEADLINE_SECS
+                    );
+                    exit.write(AppExit::error());
+                    probe.phase = LiveFpsPhase::Done;
+                }
                 return;
             }
             if let Ok(mut w) = windows.single_mut() {
@@ -253,10 +271,25 @@ fn drive_live_fps(
                 (Some(room), Some(w)) => format!(" room={room} windows={w}"),
                 _ => String::new(),
             };
+            // Beside `room=`, because the two answer the same question from opposite ends:
+            // `room=none` says the camera claims no interior, `sky=` says whether some building's
+            // PVS is painting its own backdrop over the world anyway.
+            let sky = seen
+                .sky
+                .as_deref()
+                .map(|s| format!(" sky={s}"))
+                .unwrap_or_default();
+            // The effect stream's other half. `emitters=`/`particles=` above count quad clouds
+            // only, so a screen full of ribbon trails reads as an empty scene without this.
+            let ribbons = seen
+                .ribbons
+                .map(|(n, d)| format!(" ribbons={n} ribbons_drawn={d}"))
+                .unwrap_or_default();
             let culled = match seen.cull.as_ref() {
                 Some(v) => format!(
-                    " cull_windows={} cull_frusta={} cull_tested={} cull_hidden={} cull_unbounded={}",
-                    v.windows, v.frusta, v.tested, v.hidden, v.unbounded
+                    " cull_windows={} cull_frusta={} cull_tested={} cull_hidden={} \
+                     cull_unbounded={} cull_bodies={} cull_bodies_hidden={}",
+                    v.windows, v.frusta, v.tested, v.hidden, v.unbounded, v.bodies, v.bodies_hidden
                 ),
                 None => String::new(),
             };
@@ -274,7 +307,7 @@ fn drive_live_fps(
                 seen.mats, seen.meshes, seen.images, seen.uv_anims, seen.tint_anims,
             );
             println!(
-                "FPS_PROBE scenario=live frames={} mean_ms={mean:.2} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2} fps={:.1} emitters={} active={} particles={} submeshes={} drawn={} streamed={} parked={} entities={}{rigs}{residency_line} px={}x{}{cpu}{sys}{present} occluded_frames={}{at_pin}{gate}{culled}",
+                "FPS_PROBE scenario=live frames={} mean_ms={mean:.2} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2} fps={:.1} emitters={} active={} particles={} submeshes={} drawn={} streamed={} parked={} entities={}{rigs}{residency_line} px={}x{}{cpu}{sys}{present} occluded_frames={}{at_pin}{gate}{sky}{ribbons}{culled}",
                 v.len(),
                 at(0.50),
                 at(0.95),

@@ -60,8 +60,8 @@ use benilla_world::lighting::{PropProbeSlot, PropProbes};
 use benilla_world::model_render::ShadeSel;
 use benilla_world::particles;
 use benilla_world::terrain_stream::{
-    build_collider_task, fold_interior_probe, m2_fade, placement_collider_data, point_light,
-    spawn_model_entities, PendingCollider, PropLobeLight,
+    build_collider_task, fold_interior_probe, m2_anim_bound, m2_fade, placement_collider_data,
+    point_light, spawn_model_entities, PendingCollider, PropLobeLight,
 };
 
 use super::{GameObjects, ModelHandle, VisualAttached};
@@ -188,6 +188,7 @@ pub(super) fn spawn_wmo_gameobject_props(
     mut mats: benilla_world::model_render::M2BatchMaterials,
     mut uv_reg: ResMut<benilla_world::doodad_anim::UvAnimMaterials>,
     mut tint_reg: ResMut<benilla_world::doodad_anim::TintAnimMaterials>,
+    mut anim_table: ResMut<benilla_world::mat_anim_table::MatAnimTable>,
     mut probes: ResMut<PropProbes>,
     time: Res<Time>,
     mut hosts: Query<(Entity, &GlobalTransform, &mut WmoProps)>,
@@ -228,6 +229,7 @@ pub(super) fn spawn_wmo_gameobject_props(
                 anchor
             });
             let (radius, center) = m2_fade(&m.bounds, prop.local.scale.x);
+            let anim_bound = m2_anim_bound(&m.bounds);
             // The interior lane (0474): fold the cabin prop's committed light ONCE, composed
             // through the host's current pose. Exact on a mover — see the module doc's
             // invariance argument.
@@ -273,9 +275,11 @@ pub(super) fn spawn_wmo_gameobject_props(
                 interior_slot,
                 radius,
                 center,
+                anim_bound,
                 Some((m, now)),
                 &mut uv_reg,
                 &mut tint_reg,
+                &mut anim_table,
                 card_owner,
             );
             commands.entity(entity).add_children(&ents);
@@ -308,15 +312,14 @@ pub(super) fn spawn_wmo_gameobject_props(
             if let Some(&root) = ents.first() {
                 let placement = host_world.mul_transform(prop.local);
                 for em in &m.emitters {
-                    // The emitter rides its host bone's joint when the prop animates (the same
-                    // ride as a terrain doodad — an unanimated chain reproduces the static path
-                    // exactly); a boneless prop follows its root. Either owner's propagated
+                    // The emitter rides its host bone's anchor when the prop animates (the
+                    // same ride as a terrain doodad — an unanimated chain reproduces the static
+                    // path exactly); a boneless prop follows its root. Either owner's propagated
                     // global composes the moving hull.
                     let owner = host
                         .as_ref()
-                        .map(|h| h.joints.as_slice())
-                        .and_then(|js| js.get(em.def.bone as usize))
-                        .map_or((root, [0.0; 3]), |&j| (j, em.bone_pivot));
+                        .and_then(|h| h.anchor(em.def.bone))
+                        .map_or((root, [0.0; 3]), |a| (a, em.bone_pivot));
                     if let Some(e) = particles::spawn_emitter(
                         &mut commands,
                         em,
@@ -356,9 +359,8 @@ pub(super) fn spawn_wmo_gameobject_props(
                 for rb in &m.ribbons {
                     let (owner, use_pivot) = host
                         .as_ref()
-                        .map(|h| h.joints.as_slice())
-                        .and_then(|js| js.get(rb.def.bone as usize))
-                        .map_or((root, false), |&j| (j, true));
+                        .and_then(|h| h.anchor(rb.def.bone))
+                        .map_or((root, false), |a| (a, true));
                     if benilla_world::ribbons::spawn_ribbon(
                         &mut commands,
                         rb,
@@ -367,6 +369,20 @@ pub(super) fn spawn_wmo_gameobject_props(
                         placement.scale.max_element(),
                         benilla_world::ribbons::RibbonSeq::Host(entity),
                         // No model-alpha source: a placed prop / effect instance is always drawn (0827).
+                        None,
+                        // No fade sphere: a GameObject's props ride the GameObject, not a
+                        // baked world placement — that gate's centre is a fixed world point and a
+                        // mover would drag away from it (the same reason the emitters beside them
+                        // take none, stated at the top of this file), and nothing floods this WMO
+                        // to give it rooms. The far-clip wall still applies: `simulate_ribbons`
+                        // bounds a fade-less trail at the wall exactly as `simulate_particles`
+                        // bounds a fade-less emitter, which is what a map-wide-streamed transport
+                        // five kilometres away needs (decision 0678).
+                        //
+                        // Still open, and named rather than guessed at: a `Visibility`-hidden
+                        // transport trails. The trail reads its owner's render alpha, not its
+                        // `Visibility`, and the off-map hide writes the latter. No 1.12 transport
+                        // prop authors a ribbon, so nothing renders it today.
                         None,
                     )
                     .is_some()

@@ -10,10 +10,11 @@
 //! pacing, the env fast path, auto-relogin on reconnect, the director's click) is app-side
 //! ([`crate::login`], [`crate::char_select`]); this thread is a pure sequencer — it never sleeps.
 //!
-//! On a stream failure it emits a [`SessionEvent::Disconnected`] and returns to the login park;
-//! the app's pending-credentials policy re-establishes the session (decision 0065's seamless
-//! reconnect, paced app-side). A clean in-game logout ([`SessionEvent::LoggedOut`]) does the same
-//! with no failure. A single long-lived sibling write thread drains
+//! On a stream failure it emits a [`SessionEvent::Disconnected`] carrying
+//! [`SessionEnd::Lost`] and returns to the login park; a clean in-game logout
+//! ([`SessionEvent::LoggedOut`]) does the same with [`SessionEnd::LoggedOut`]. What happens next is
+//! the app's, and the two answers differ (decision 1262): the logout relists, while a loss ends the
+//! session at the account screen unless nobody is there to type. A single long-lived sibling write thread drains
 //! [`ClientCommand`](super::ClientCommand)s down to the server; each successful connection hands it
 //! the fresh [`WorldWriter`] over a swap channel, so "exactly one writer" is structural, not
 //! signalled. The ECS half (draining the events into components each frame, and tearing the
@@ -27,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use benilla_protocol::{
-    host_port, messages, AuthReject, CharAction, LoginStage, Poll, SessionEvent, WardenRequired,
-    WorldSession, WorldWriter, WORLD_PORT,
+    host_port, messages, AuthReject, CharAction, LoginStage, Poll, SessionEnd, SessionEvent,
+    WardenRequired, WorldSession, WorldWriter, WORLD_PORT,
 };
 use crossbeam_channel::{Receiver, Sender};
 
@@ -190,6 +191,7 @@ pub(super) fn spawn_net(cfg: NetConfig, connect: bool) -> NetHandles {
                             if events_tx
                                 .send(SessionEvent::Disconnected {
                                     reason: "logged out".into(),
+                                    end: SessionEnd::LoggedOut,
                                 })
                                 .is_err()
                             {
@@ -197,11 +199,14 @@ pub(super) fn spawn_net(cfg: NetConfig, connect: bool) -> NetHandles {
                             }
                         }
                         Err(e) => {
-                            // A live-stream failure. No sleep — the app paces resubmits (0539 §3).
+                            // A live-stream failure — including a displacement kick, which reaches
+                            // us as a bare EOF and nothing else (decision 1262). No sleep: what
+                            // happens next is the app's policy, not this thread's (0539 §3).
                             bevy::log::error!("net: {e:#}");
                             if events_tx
                                 .send(SessionEvent::Disconnected {
                                     reason: format!("disconnected: {e:#}"),
+                                    end: SessionEnd::Lost,
                                 })
                                 .is_err()
                             {
@@ -617,6 +622,15 @@ fn writer_loop(
                         jump,
                         transport,
                     ),
+                    ClientCommand::SetActiveMover { guid } => w.set_active_mover(guid),
+                    ClientCommand::NotActiveMover {
+                        guid,
+                        flags,
+                        pos,
+                        orientation,
+                        fall_time,
+                    } => w.move_not_active_mover(guid, flags, pos, orientation, fall_time),
+                    ClientCommand::FarSight { engage } => w.far_sight(engage),
                     ClientCommand::TeleportAck { guid, counter } => w.teleport_ack(guid, counter),
                     ClientCommand::WorldportAck => w.worldport_ack(),
                     ClientCommand::SetSelection { guid } => w.set_selection(guid),
@@ -644,6 +658,12 @@ fn writer_loop(
                             w.send_channel(target.as_deref().unwrap_or_default(), &text)
                         }
                     },
+                    // The addon lane (decision 1235). The distribution arrived as an enum and the
+                    // map is TOTAL — no "unknown, guess SAY" arm exists, which is what the enum
+                    // seam is for — so the whole arm is one call.
+                    ClientCommand::AddonMessage { distribution, text } => {
+                        w.send_addon_message(super::addon_wire_chat_type(distribution), &text)
+                    }
                     ClientCommand::JoinChannel { name, password } => {
                         w.join_channel(&name, &password)
                     }
@@ -743,6 +763,7 @@ fn writer_loop(
                     ClientCommand::RepairItem { vendor, item_guid } => {
                         w.repair_item(vendor, item_guid)
                     }
+                    ClientCommand::BinderActivate { binder } => w.binder_activate(binder),
                     ClientCommand::BankerActivate { guid } => w.banker_activate(guid),
                     ClientCommand::BuyBankSlot { guid } => w.buy_bank_slot(guid),
                     ClientCommand::AutoBankItem { bag, slot } => w.autobank_item(bag, slot),
@@ -757,6 +778,17 @@ fn writer_loop(
                         w.learn_talent(talent_id, rank)
                     }
                     ClientCommand::UnlearnSkill { skill_id } => w.unlearn_skill(skill_id),
+                    ClientCommand::SetFactionAtWar {
+                        rep_list_id,
+                        at_war,
+                    } => w.set_faction_at_war(rep_list_id, at_war),
+                    ClientCommand::SetFactionInactive {
+                        rep_list_id,
+                        inactive,
+                    } => w.set_faction_inactive(rep_list_id, inactive),
+                    ClientCommand::SetWatchedFaction { rep_list_id } => {
+                        w.set_watched_faction(rep_list_id)
+                    }
                     ClientCommand::GameObjUse { guid } => w.gameobj_use(guid),
                     ClientCommand::AreaTrigger { trigger_id } => w.area_trigger(trigger_id),
                     ClientCommand::GameObjectQuery { entry, guid } => w.gameobject_query(entry, guid),
@@ -892,6 +924,34 @@ fn writer_loop(
                     ClientCommand::DelIgnore { guid } => w.del_ignore(guid),
                     ClientCommand::Who { request } => w.who(&request),
                     ClientCommand::ChatIgnored { guid } => w.chat_ignored(guid),
+                    ClientCommand::GuildQuery { guild_id } => w.guild_query(guild_id),
+                    ClientCommand::GuildCreate { name } => w.guild_create(&name),
+                    ClientCommand::GuildInvite { name } => w.guild_invite(&name),
+                    ClientCommand::GuildAccept => w.guild_accept(),
+                    ClientCommand::GuildDecline => w.guild_decline(),
+                    ClientCommand::GuildInfoRequest => w.guild_info(),
+                    ClientCommand::GuildRosterRequest => w.guild_roster(),
+                    ClientCommand::GuildPromote { name } => w.guild_promote(&name),
+                    ClientCommand::GuildDemote { name } => w.guild_demote(&name),
+                    ClientCommand::GuildLeave => w.guild_leave(),
+                    ClientCommand::GuildRemove { name } => w.guild_remove(&name),
+                    ClientCommand::GuildDisband => w.guild_disband(),
+                    ClientCommand::GuildLeader { name } => w.guild_leader(&name),
+                    ClientCommand::GuildMotd { motd } => w.guild_motd(&motd),
+                    ClientCommand::GuildRank {
+                        rank_id,
+                        rights,
+                        name,
+                    } => w.guild_rank(rank_id, rights, &name),
+                    ClientCommand::GuildAddRank { name } => w.guild_add_rank(&name),
+                    ClientCommand::GuildDelRank => w.guild_del_rank(),
+                    ClientCommand::GuildSetPublicNote { name, note } => {
+                        w.guild_set_public_note(&name, &note)
+                    }
+                    ClientCommand::GuildSetOfficerNote { name, note } => {
+                        w.guild_set_officer_note(&name, &note)
+                    }
+                    ClientCommand::GuildInfoText { text } => w.guild_info_text(&text),
                     ClientCommand::TaxiNodeStatusQuery { guid } => w.taxi_node_status_query(guid),
                     ClientCommand::TaxiQueryNodes { guid } => w.taxi_query_available_nodes(guid),
                     ClientCommand::ActivateTaxi {

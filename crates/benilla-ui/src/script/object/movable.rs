@@ -101,6 +101,28 @@ pub(crate) struct FrameMove {
     frame: FrameHandle,
     /// The cursor position at the last pump (`root+0xd08`/`+0xd0c`), UI px, y-up.
     sample: (f32, f32),
+    /// Whether releasing the mouse ends this move on its own.
+    ///
+    /// **The reference's drag MODE, reduced to the one bit that is observable from Lua.** The
+    /// mouse-up handler `0x766420` auto-cancels modes 1 (modifier-drag) and 2 (title region) and
+    /// leaves mode 3 (`StartMoving`) running until `StopMovingOrSizing`
+    /// (wow-re `widget-api-batch-benilla.md` Q6). So a title drag ends on release while a scripted
+    /// one outlives the button — which is exactly the distinction this module's own doc already
+    /// records for the drag/move split.
+    pub(crate) auto_stop: bool,
+}
+
+/// An in-flight `StartSizing` drag: which frame, which grip, and the cursor at the last pump.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FrameSizing {
+    frame: FrameHandle,
+    /// The grip the caller named — the EDGES this drag moves. `LEFT` moves the left edge and
+    /// leaves the right where it is, `BOTTOMRIGHT` moves both of those, and so on.
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+    sample: (f32, f32),
 }
 
 /// Populate `m`'s movable/resizable methods (see the module doc).
@@ -177,6 +199,57 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
             start_moving(&mut model, h)
         })?,
     )?;
+    // StartSizing(point) — begin a resize drag from a named grip (`0x776830`, verified in wow-re's
+    // ledger; the reference's own caller is `FloatingChatFrame.lua:600`,
+    // `this:GetParent():StartSizing(anchorPoint)`).
+    //
+    // **What is verified and what is read, kept apart on purpose.** Verified: the verb exists, it
+    // takes the grip name, it returns nothing, and `StopMovingOrSizing` ends it (the same slot
+    // clear as a move). NOT recorded anywhere in wow-re — the ledger has it as ORCHESTRATION with
+    // no inline math — is WHICH EDGES a given grip moves. Taken here as the plain meaning of an
+    // anchor point, which is how the reference's own caller uses it (its resize grips pass the
+    // corner they sit in): the named edges follow the cursor and the opposite ones stay put. If an
+    // RE pass ever contradicts that, this comment is where to correct it.
+    //
+    // Four corpus addons reach it through ONE line — `FuBar_Panel.lua:980`, replicated into
+    // FuBar_CorkFu, FuBar_FuXPFu, FuBar_SpellStatusFu and oRA2 — which is 1207's rule and why the
+    // count is not four independent votes.
+    m.set(
+        "StartSizing",
+        lua.create_function(|lua, (this, point): (Table, Option<String>)| {
+            let h = frame_handle_of(lua, &this)?;
+            let mut model = lua.app_data_mut::<Model>().expect("model");
+            if !model.arena.frame(h).is_some_and(|f| f.resizable) {
+                return Err(not_flagged(&model, h, "resizable"));
+            }
+            // Same "do not start a second one" guard `start_moving` carries.
+            if model.sizing.is_some() || model.moving.is_some() {
+                return Ok(());
+            }
+            let p = point.unwrap_or_default().to_ascii_uppercase();
+            let (left, right) = (p.contains("LEFT"), p.contains("RIGHT"));
+            let (top, bottom) = (p.contains("TOP"), p.contains("BOTTOM"));
+            // A grip naming no edge would resize nothing; the reference has no such call and we
+            // refuse rather than invent one.
+            if !(left || right || top || bottom) {
+                return Ok(());
+            }
+            super::toplevel::raise(&mut model, h);
+            if let Some(f) = model.arena.frame_mut(h) {
+                f.user_placed = true;
+            }
+            let sample = model.cursor_pos;
+            model.sizing = Some(FrameSizing {
+                frame: h,
+                left,
+                right,
+                top,
+                bottom,
+                sample,
+            });
+            Ok(())
+        })?,
+    )?;
     // StopMovingOrSizing() — leave the drag (`0x776990` → `0x765640`): a state clear, and only
     // when `self` IS the frame in the slot. Nothing is written back — the pump has been moving the
     // anchors all along, so the frame simply keeps the last position it was dragged to. Harmless
@@ -187,6 +260,9 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         lua.create_function(|lua, this: Table| {
             let h = frame_handle_of(lua, &this)?;
             let mut model = lua.app_data_mut::<Model>().expect("model");
+            if model.sizing.is_some_and(|sz| sz.frame == h) {
+                model.sizing = None;
+            }
             if model.moving.is_some_and(|mv| mv.frame == h) {
                 model.moving = None;
             }
@@ -270,8 +346,39 @@ fn start_moving(model: &mut Model, h: FrameHandle) -> mlua::Result<()> {
     model.moving = Some(FrameMove {
         frame: h,
         sample: model.cursor_pos,
+        // Lua `StartMoving` is mode 3: it survives the button and ends only at
+        // `StopMovingOrSizing`.
+        auto_stop: false,
     });
     Ok(())
+}
+
+/// Begin a **title-region** move — mode 2, the drag a mouse-down inside `frame:GetTitleRegion()`
+/// starts (wow-re Q6, `0x7662c0` → `0x765320(frame, mode=2, …)` → `0x7652b0`).
+///
+/// [`start_moving`]'s body **minus the movable gate**, and that omission is the carved part rather
+/// than a shortcut: the movable bit is `frame+0xb4 & 0x100`, tested by `StartMoving` (`0x77678b`,
+/// else `"Frame %s is not movable"`) and by the modifier-drag path — and **not read anywhere** on
+/// `0x7662c0`→`0x765320`→`0x7652b0`→`0x768430`. Q6 marks the no-gate reading VERIFIED and the
+/// observable claim INFERRED, because both FrameXML users happen to be `movable="true"`; a title
+/// region on a non-movable frame is the case that would tell them apart, and it drags here.
+///
+/// Returns whether a move actually started — `false` when one was already in flight, which is
+/// `0x7767e8`'s `root+0xcfc != 0` guard and the same refusal [`start_moving`] makes.
+pub(crate) fn start_title_move(model: &mut Model, h: FrameHandle) -> bool {
+    if model.moving.is_some() {
+        return false;
+    }
+    super::toplevel::raise(model, h);
+    if let Some(f) = model.arena.frame_mut(h) {
+        f.user_placed = true;
+    }
+    model.moving = Some(FrameMove {
+        frame: h,
+        sample: model.cursor_pos,
+        auto_stop: true,
+    });
+    true
 }
 
 /// Pump an in-flight move to the cursor at `pos` — the engine half of `0x7655b0`, run from
@@ -283,6 +390,76 @@ fn start_moving(model: &mut Model, h: FrameHandle) -> mlua::Result<()> {
 /// Applies `(pos − sample)` scaled into the frame's anchor offsets and re-centers the sample; a
 /// zero delta does nothing at all, and a frame that died mid-move ends the move rather than
 /// writing to a dead handle.
+/// Pump an in-flight `StartSizing`: move the gripped edges to the cursor, leave the others.
+///
+/// The mirror of [`advance_move`] — same sample-and-recentre, same dead-frame bail, same
+/// local-unit scaling (offsets are pre-scale, so a cursor delta divides by the frame's own scale on
+/// the way in). Where a move translates every anchor, a resize moves the gripped edges only: the
+/// width/height change, and the anchor offsets follow only for the edges that actually moved, which
+/// is what keeps the OPPOSITE edge planted.
+pub(crate) fn advance_size(model: &mut Model, pos: (f32, f32)) {
+    let Some(sz) = model.sizing else { return };
+    if model.arena.frame(sz.frame).is_none() {
+        model.sizing = None;
+        return;
+    }
+    let (dx, dy) = (pos.0 - sz.sample.0, pos.1 - sz.sample.1);
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    let inv = 1.0 / eff_scale(model, sz.frame);
+    let (dx, dy) = (dx * inv, dy * inv);
+    let Some(input) = model.layout_inputs.get_mut(&sz.frame) else {
+        return;
+    };
+    // Width grows when the RIGHT grip goes right, or the LEFT grip goes left. Height likewise with
+    // y-up: the TOP grip going up grows it, the BOTTOM grip going down grows it.
+    let dw = if sz.right {
+        dx
+    } else if sz.left {
+        -dx
+    } else {
+        0.0
+    };
+    let dh = if sz.top {
+        dy
+    } else if sz.bottom {
+        -dy
+    } else {
+        0.0
+    };
+    let (w0, h0) = (input.width, input.height);
+    input.width = (input.width + dw).max(1.0);
+    input.height = (input.height + dh).max(1.0);
+    let mut moved = input.width.to_bits() != w0.to_bits() || input.height.to_bits() != h0.to_bits();
+    // The planted edge: a frame anchored by its LEFT that is gripped on the LEFT has to move too,
+    // or the resize would push the right edge instead. Only the gripped axis shifts.
+    if !input.anchors.is_empty() && (sz.left || sz.bottom) {
+        for a in &mut input.anchors {
+            if sz.left {
+                a.x_off += dx;
+            }
+            if sz.bottom {
+                a.y_off += dy;
+            }
+        }
+        moved |= (sz.left && dx != 0.0) || (sz.bottom && dy != 0.0);
+    }
+    // The zero-delta return above is on the RAW cursor delta, which is not the same question: a
+    // single-axis grip dragged purely across its axis gives `dw == dh == 0`, and so does a grip
+    // held past `.max(1.0)` saturation. Both used to bump the epoch and then hash all ~10k
+    // anchored regions to conclude nothing had moved — the castbar's bug class in miniature, for
+    // every frame of such a drag (decision 1385).
+    if moved {
+        // Offsets only — a resize grip never repoints an anchor, so the frame names itself and the
+        // cached graph survives the drag (decision 1388). A drag is per-frame by nature: this is
+        // the difference between a smooth window resize and one that re-derives 13,656 nodes on
+        // every mouse-move.
+        model.touch_layout_frame(sz.frame);
+    }
+    model.sizing = Some(FrameSizing { sample: pos, ..sz });
+}
+
 pub(crate) fn advance_move(model: &mut Model, pos: (f32, f32)) {
     let Some(mv) = model.moving else { return };
     if model.arena.frame(mv.frame).is_none() {
@@ -308,8 +485,9 @@ pub(crate) fn advance_move(model: &mut Model, pos: (f32, f32)) {
             }
             // The one mutation path every layout setter shares — the tier-1 epoch, never the
             // solver's arrays (see [`super::layout_methods`]'s mutate-only-on-change law; a zero
-            // delta returned above, so this write always moved something).
-            model.touch_layout();
+            // delta returned above, so this write always moved something). Translating every
+            // anchor moves no TARGET, so the frame names itself (decision 1388).
+            model.touch_layout_frame(mv.frame);
         }
     }
     model.moving = Some(FrameMove { sample: pos, ..mv });

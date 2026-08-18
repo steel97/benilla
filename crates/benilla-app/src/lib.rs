@@ -37,6 +37,7 @@ mod area_trigger;
 #[cfg(feature = "dev")]
 mod asset_churn;
 mod aura_visual;
+mod autocast_shine;
 mod bindings;
 mod blob_shadow;
 mod bowstring;
@@ -96,6 +97,7 @@ mod transport;
 mod ui_action;
 mod ui_aura;
 mod ui_bank;
+mod ui_binder;
 mod ui_cast;
 mod ui_char;
 mod ui_chat;
@@ -105,6 +107,7 @@ mod ui_duel;
 mod ui_follow;
 mod ui_gamma;
 mod ui_gossip;
+mod ui_guild;
 mod ui_hide;
 mod ui_inspect;
 mod ui_item_text;
@@ -125,6 +128,7 @@ mod ui_pet_doll;
 mod ui_pet_stats;
 mod ui_quest;
 mod ui_quest_log;
+mod ui_reputation;
 mod ui_saved;
 mod ui_script;
 mod ui_session;
@@ -140,6 +144,7 @@ mod ui_tradeskill;
 mod ui_trainer;
 mod ui_unit;
 mod ui_world_map;
+mod video;
 mod vplates;
 mod world_state;
 
@@ -163,6 +168,7 @@ use transport::TransportPlugin;
 use ui_action::UiActionPlugin;
 use ui_aura::UiAuraPlugin;
 use ui_bank::UiBankPlugin;
+use ui_binder::UiBinderPlugin;
 use ui_cast::UiCastPlugin;
 use ui_char::UiCharPlugin;
 use ui_chat::UiChatPlugin;
@@ -170,6 +176,7 @@ use ui_craft::UiCraftPlugin;
 use ui_duel::UiDuelPlugin;
 use ui_follow::UiFollowPlugin;
 use ui_gossip::UiGossipPlugin;
+use ui_guild::UiGuildPlugin;
 use ui_item_text::UiItemTextPlugin;
 use ui_items::UiItemsPlugin;
 use ui_logout::UiLogoutPlugin;
@@ -230,6 +237,37 @@ pub fn run(build: BuildId) -> AppExit {
     let mut app = App::new();
     // The stamp is plain data from here on — the panel footer and preflight banner read it back.
     app.insert_resource(build);
+    // Pin Bevy's static-scene transform tracking ON (decision 1356). At the default threshold
+    // `mark_dirty_trees` re-decides per frame by counting every changed-Transform row and every
+    // tree row — two full scans of the very population the tracking exists to skip. This scene
+    // is provably static-heavy (terrain/WMO batches and parked units barely move), so the
+    // auto-tuner can only ever confirm what this line states. The guard it removes bites only
+    // when MOST rows move in one frame (a load burst into a near-empty world), where
+    // dirty-marking briefly costs more than it saves — a loading-band term, accepted knowingly.
+    app.insert_resource(bevy::transform::systems::StaticTransformOptimizations::enabled());
+    // The Update schedule runs on the SINGLE-THREADED executor (decision 1366). Not a tuning
+    // whim: ~60% of our per-frame Update systems are non-Send (mlua's UiScript, kira's audio
+    // handles) and serialize through the multi-threaded executor's one `local_thread_running`
+    // flag anyway, so the cross-thread dispatch machinery was pure overhead — measured
+    // −1.30 cpu_ms at the LBRS pin under 5-round grading with the wall tail (p95/p99/max)
+    // flat-to-better (the 1364 "fatter tail" reading did not reproduce; 1366 has the tables,
+    // both pins). PostUpdate stays multi-threaded — its wide parallel bands
+    // (propagation, visibility) are real parallelism; re-grading it is a named open probe.
+    // `WOW_MT_UPDATE=1` is the A/B lever back to the multi-threaded executor.
+    if std::env::var_os("WOW_MT_UPDATE").is_none() {
+        app.edit_schedule(Update, |s| {
+            s.set_executor_kind(bevy::ecs::schedule::ExecutorKind::SingleThreaded);
+        });
+    }
+    // `WOW_ST_POSTUPDATE=1` — 1366's named open probe: PostUpdate on the single-threaded
+    // executor, an EXPERIMENT lever only. The expectation is a REGRESSION (propagation and
+    // visibility are real parallel bands there, not flag-serialized non-Send work); the lever
+    // exists so the expectation gets measured instead of assumed.
+    if std::env::var_os("WOW_ST_POSTUPDATE").is_some() {
+        app.edit_schedule(PostUpdate, |s| {
+            s.set_executor_kind(bevy::ecs::schedule::ExecutorKind::SingleThreaded);
+        });
+    }
     // …and one startup line says which build produced this log. Registered HERE, beside the stamp
     // it prints, rather than in `preflight` where it sat until decision 1179: **which build is
     // this** is the first thing a bug report from someone else's machine has to establish, and a
@@ -356,15 +394,12 @@ pub fn run(build: BuildId) -> AppExit {
                 })
                 .into()
         },
-        // `$WOW_NOVSYNC=1`: uncap presentation so a headless FPS-journal run measures true frame
-        // cost, not the vsync ceiling — the same uncap the capture probe flips mid-run, available
-        // from boot for non-capture probes (perf triage at the glue screens, where no capture
-        // scenario runs).
-        present_mode: if std::env::var("WOW_NOVSYNC").as_deref() == Ok("1") {
-            bevy::window::PresentMode::AutoNoVsync
-        } else {
-            bevy::window::PresentMode::default()
-        },
+        // The boot present mode. `$WOW_NOVSYNC=1` uncaps presentation so a headless FPS-journal
+        // run measures true frame cost, not the vsync ceiling — the same uncap the capture probe
+        // flips mid-run, available from boot for non-capture probes (perf triage at the glue
+        // screens, where no capture scenario runs). Absent it, we boot synced and the player's
+        // `gxVSync` setting takes over from `Startup` on ([`crate::video`]).
+        present_mode: video::present_mode(!video::novsync_env()),
         // An instrumented run must never fight the director's screen (decision 0703).
         // Focused, it steals the keyboard — on 2026-07-19 a login-shot run swallowed
         // their keystrokes out of another app and typed them into the account box,
@@ -470,6 +505,9 @@ pub fn run(build: BuildId) -> AppExit {
     // The HUD minimap (decision 0203 phase 1): fills the `<Minimap>` widget's extracted hole with
     // the streamed tile window + mask + player arrow, and feeds the zone text.
     .add_plugins(minimap::MinimapPlugin)
+    // The pet-bar / spellbook autocast shine, drawn on the append lane from the conversion's
+    // parked sites — zero per-frame script-layout traffic (decision 1383, B282).
+    .add_plugins(autocast_shine::AutocastShinePlugin)
     // The shared AreaTable catalog + the ZONE_CHANGED event family / zone-text host globals
     // behind GetZoneText & co. (the zone-entry splash arc, decision 0287).
     .add_plugins(area::AreaPlugin)
@@ -485,6 +523,9 @@ pub fn run(build: BuildId) -> AppExit {
     // `SetPortraitTexture`-bound region (the modern high-res 2D model bake).
     .add_plugins(PortraitPlugin)
     .add_plugins((TextInputPlugin, UiScriptPlugin))
+    // The video knobs the CVar host writes into (today: `gxVSync`). Before CvarPlugin so the
+    // resource exists when `load_config` applies the saved value at Startup.
+    .add_plugins(video::VideoPlugin)
     // The CVar host (decision 0954): registration, knob sync, config.toml persistence. After
     // UiScriptPlugin only for reading order — its systems gate on the VM existing anyway.
     .add_plugins(cvars::CvarPlugin)
@@ -498,6 +539,10 @@ pub fn run(build: BuildId) -> AppExit {
     // Duels (decision 0633): the wire session, the client-side countdown tick, the four Era
     // events, and the accept/cancel/challenge intents.
     .add_plugins(UiDuelPlugin)
+    // Setting your hearthstone (decision 1331): the innkeeper's SMSG_BINDER_CONFIRM question, the
+    // CONFIRM_BINDER dialog it raises, and the CMSG_BINDER_ACTIVATE its Accept sends — the only
+    // packet in the flow that actually binds anything.
+    .add_plugins(UiBinderPlugin)
     // Auto-follow's UI seam: the popup's Follow row + `FollowUnit`/`FollowByName` inbound, and
     // the AUTOFOLLOW_BEGIN/END pair that drives the centre-screen status line outbound.
     .add_plugins(UiFollowPlugin)
@@ -505,10 +550,18 @@ pub fn run(build: BuildId) -> AppExit {
     // 20-second answer narrated as the CAMP/QUIT countdown, and the process exit.
     .add_plugins(UiLogoutPlugin)
     .add_plugins(UiSocialPlugin)
+    // Guilds (decision 1257): the identity/roster mirror behind the four guild windows, the
+    // membership verbs, and the `ERR_GUILD_*` lines. Right after the social session, whose
+    // FriendsFrame it shares a window with and whose ignore list its sign-on lines consult.
+    .add_plugins(UiGuildPlugin)
     .add_plugins(UiTooltipPlugin)
     // The character-window feed (decision 0208): the combat-stats/inventory snapshots + events
     // the paper doll reads, and the paper-doll booth's yaw mirror.
     .add_plugins(UiCharPlugin)
+    // The reputation-pane feed: the player's wire faction slots resolved against Faction.dbc into
+    // the pane's snapshot, plus the pane's three outbound verbs. Beside the character feed because
+    // it is the same window's other tab.
+    .add_plugins(ui_reputation::UiReputationPlugin)
     // The inspect feed (decision 0631): another player's equipment off their PUBLIC visible-item
     // entries, plus the "inspect" booth's unit + yaw. Right after the character feed it mirrors.
     .add_plugins(ui_inspect::InspectUiPlugin)

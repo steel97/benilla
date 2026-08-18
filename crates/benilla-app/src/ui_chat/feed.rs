@@ -10,8 +10,11 @@ use benilla_protocol::messages::{
     channel_notice, ChannelNoticeTail, ChatMessage, LevelUpInfo, XpGain, MACRO_EXPANDED_TYPES,
 };
 
+use benilla_assets::{LockRecover, WorldAssets};
+use benilla_formats::{EmoteLine, EmoteTextCatalog};
+
 use crate::names::NameCache;
-use crate::net::{GuidIndex, NetCommands, ObjectStore};
+use crate::net::{GuidIndex, NetCommands, ObjectStore, SelfGuid};
 
 use super::edit::ChannelState;
 use super::event::{flag_of_tag, kind_of_wire, language_name, ChatEvent, ChatEventKind};
@@ -21,6 +24,32 @@ use super::frames::{route, ChatWindows};
 /// genuinely-unknown guid never resolves; ~2s at 60fps is well past a normal name-query
 /// round-trip). The line renders with a placeholder rather than being lost.
 const NAME_MAX_TRIES: u16 = 120;
+
+/// The text-emote sentence tables (decision 1274), read once off the patch chain.
+#[derive(Resource)]
+pub(crate) struct EmoteTexts(pub(crate) EmoteTextCatalog);
+
+/// **The locale column is 0.** `[0xc0e080]` is the client's locale slot; only enUS is populated in
+/// this install, and every other DBC catalog in the tree reads column 0 for the same reason.
+const LOCALE: usize = 0;
+
+/// Load `EmotesText.dbc` × `EmotesTextData.dbc`. `.after(benilla_assets::AssetSet::Open)` at the
+/// call site is load-bearing for the reason [`super::channels::load_chat_channels`] records:
+/// without it the patch chain does not exist yet and this silently loads nothing.
+pub(super) fn load_emote_texts(mut commands: Commands, assets: Option<Res<WorldAssets>>) {
+    let Some(assets) = assets else { return };
+    let loaded = {
+        let mut chain = assets.chain.lock_recover();
+        benilla_formats::load_emote_text_catalog(&mut chain)
+    };
+    match loaded {
+        Ok(cat) => {
+            info!("chat: {} emote sentence tables", cat.len());
+            commands.insert_resource(EmoteTexts(cat));
+        }
+        Err(e) => warn!("chat: emote text catalog failed to load: {e:#}"),
+    }
+}
 
 /// One queued item awaiting its turn through [`feed_chat`].
 enum Pending {
@@ -33,6 +62,17 @@ enum Pending {
         channel: String,
         a_guid: u64,
         b_guid: u64,
+        tries: u16,
+    },
+    /// An inbound addon line awaiting its SENDER's name — `CHAT_MSG_ADDON` (event 227, fired at
+    /// `0x49a95f`). Parked here rather than fired at decode for the reason wow-re records: the
+    /// reference fires it *downstream* of the name resolve, from the `CMSG_NAME_QUERY` callback
+    /// (`0x49ccc0`), so `sender` is a NAME and never a guid.
+    Addon {
+        prefix: String,
+        message: String,
+        distribution: String,
+        guid: u64,
         tries: u16,
     },
     /// A `/random` broadcast awaiting the roller's name.
@@ -51,11 +91,79 @@ enum Pending {
         bonus: u32,
         tries: u16,
     },
+    /// A text emote (`SMSG_TEXT_EMOTE`) awaiting the PERFORMER's name — decision 1274.
+    ///
+    /// Parked here for the reference's own reason, not merely for convenience: `0x49dbe0` composes
+    /// the sentence immediately when the `NameCache` already holds the performer, and otherwise
+    /// queues a `PENDINGTEXTEMOTE` node (`0x49cc00`) that the name-query callback (`0x49d0d0`)
+    /// drains into the same composer. This queue *is* that node, and the bounded `tries` is its
+    /// give-up edge.
+    ///
+    /// `target` is the raw wire name (empty = untargeted), never re-resolved — the reference
+    /// passes the server's string straight into the format.
+    TextEmote {
+        performer: u64,
+        text_id: u32,
+        target: String,
+        tries: u16,
+    },
     /// An area discovery (`SMSG_EXPLORATION_EXPERIENCE`): the toast + conditional chat line pair
     /// (the drain fires them — the toast needs the script, which only [`feed_chat`] holds).
     Discovery { area: String, xp: u32 },
     /// A ready event (client-composed lines; name-carrying notices).
     Event(ChatEvent),
+}
+
+/// Fire `CHAT_MSG_ADDON` with the reference's four arguments, in the reference's order.
+///
+/// Split out of the drain so the shape that reaches Lua is testable without standing up
+/// `feed_chat`'s dozen resources — the scaffolding is not what can be wrong here; the argument
+/// ORDER is. wow-re carves it as `SignalEvent2(227, "%s%s%s%s", prefix, message, distribution,
+/// sender)` (`0x49a95f`), and `BigWigs` independently self-delivers
+/// `self:CHAT_MSG_ADDON("BigWigs", msg, "RAID", playerName)` — a 2006 addon author and the binary
+/// agreeing.
+///
+/// Fired DIRECTLY rather than through [`route`]: `CHAT_MSG_ADDON` is not a `ChatTypeInfo` key and
+/// carries four arguments against the chat family's ten, so the chat pipeline would mis-shape it
+/// and `every_fired_event_name_is_a_chat_type_info_key` would rightly reject it.
+pub(super) fn fire_addon_message(
+    script: &mut benilla_ui::script::UiScript,
+    prefix: String,
+    message: String,
+    distribution: String,
+    sender: String,
+) {
+    use benilla_ui::script::ScriptValue::Str;
+    script.fire_event(
+        "CHAT_MSG_ADDON",
+        vec![Str(prefix), Str(message), Str(distribution), Str(sender)],
+    );
+}
+
+/// One text emote's chat event — the sentence plus the performer name — or `None` when the
+/// sentence table has nothing to say (the reference's `0x49b4bd` tail: SIT/STAND/TRAIN ship blank
+/// in every locale, so a vanilla `/sit` prints no line at all).
+///
+/// Split out of the drain for [`fire_addon_message`]'s reason: the scaffolding around it is not
+/// what can be wrong, the **shape** is — which sentence form the facts select, and which slot the
+/// performer's name lands in.
+///
+/// **`sender` is the PERFORMER**, and it never reaches the rendered line: TEXT_EMOTE is one of the
+/// verbatim families in `ChatFrame_OnEvent`, so the sentence *is* the line and this slot only ever
+/// reaches addons as arg2. VERIFIED at the bytes: the last push before the event fire at
+/// `0x49b495` is `[ebp-0x4]`, the `NameCache` record resolved for the performer at `0x49b289`
+/// (`record+0` is the name string).
+pub(super) fn text_emote_event(
+    cat: &EmoteTextCatalog,
+    text_id: u32,
+    line: &EmoteLine,
+) -> Option<ChatEvent> {
+    Some(ChatEvent {
+        kind: Some(ChatEventKind::TextEmote),
+        text: cat.compose(text_id, line, LOCALE)?,
+        sender: line.performer.to_string(),
+        ..Default::default()
+    })
 }
 
 /// The pending chat items the net/loot/quest feeds fill and [`feed_chat`] drains. Cleared on
@@ -112,6 +220,52 @@ impl ChatLog {
         }
     }
 
+    /// Queue an inbound addon line (`SMSG_MESSAGECHAT` carrying `LANG_ADDON`) for the sender-name
+    /// resolve, then `CHAT_MSG_ADDON`.
+    ///
+    /// **The split is the counter-intuitive part and it is the reference's** (`0x49a8d0`): the text
+    /// divides on its **FIRST** tab, and with **no tab at all the whole text is the PREFIX** and
+    /// the message is empty — not the other way round, which is what a reimplementation guesses.
+    ///
+    /// `distribution` is the remap at `0x49aff4`: only PARTY / RAID / GUILD / BATTLEGROUND have
+    /// names, and every other type byte reports `"UNKNOWN"` rather than being dropped — the
+    /// reference hands the addon a string it can branch on either way.
+    pub(crate) fn push_addon(&mut self, text: &str, chat_type: u8, guid: u64) {
+        let (prefix, message) = match text.find('\t') {
+            Some(i) => (text[..i].to_string(), text[i + 1..].to_string()),
+            None => (text.to_string(), String::new()),
+        };
+        // **The protocol constants, not hand-copied bytes.** Three of the four literals here were
+        // WRONG: RAID is `0x2` and this said `0x03`, GUILD is `0x3` and this said `0x04`, and
+        // BATTLEGROUND is `0x5C` and this said `0x18`. The visible effect was not a dropped
+        // message but a MISLABELLED one — a real guild addon message arrived at
+        // `CHAT_MSG_ADDON` as `"RAID"`, while real raid and battleground traffic fell to
+        // `"UNKNOWN"` — so an addon branching on the distribution acted on the wrong lane.
+        //
+        // The outbound half (`net::addon_wire_chat_type`) always used the named constants and its
+        // own doc calls itself "the one place a distribution becomes a wire byte". It was not: this
+        // was the other one, and it disagreed. Both ends now read the same symbols, so they cannot
+        // drift apart again.
+        let distribution = {
+            use benilla_protocol::messages as m;
+            match u32::from(chat_type) {
+                m::CHAT_TYPE_PARTY => "PARTY",
+                m::CHAT_TYPE_RAID => "RAID",
+                m::CHAT_TYPE_GUILD => "GUILD",
+                m::CHAT_TYPE_BATTLEGROUND => "BATTLEGROUND",
+                _ => "UNKNOWN",
+            }
+        }
+        .to_string();
+        self.pending.push(Pending::Addon {
+            prefix,
+            message,
+            distribution,
+            guid,
+            tries: 0,
+        });
+    }
+
     /// Queue a `/random` broadcast (`MSG_RANDOM_ROLL`) for the roller-name resolve.
     pub(crate) fn push_roll(&mut self, min: u32, max: u32, roll: u32, guid: u64) {
         self.pending.push(Pending::Roll {
@@ -140,6 +294,17 @@ impl ChatLog {
                 xp_gain_line(None, x.total, 0),
             )));
         }
+    }
+
+    /// Queue a text emote's chat line (`SMSG_TEXT_EMOTE` → CHAT_MSG_TEXT_EMOTE; decision 1274) for
+    /// the performer-name resolve, then the `EmotesText`/`EmotesTextData` composition.
+    pub(crate) fn push_text_emote(&mut self, performer: u64, text_id: u32, target: String) {
+        self.pending.push(Pending::TextEmote {
+            performer,
+            text_id,
+            target,
+            tries: 0,
+        });
     }
 
     /// Queue an area discovery's announcement (`SMSG_EXPLORATION_EXPERIENCE`; decision 0828,
@@ -171,11 +336,36 @@ impl ChatLog {
         self.pending.clear();
     }
 
-    /// How many items are queued — the gates upstream of this log ([`crate::net::apply`]'s addon
-    /// and ignore gates) are "the line never got here at all", so their tests read this.
+    /// The parked addon lines as `(prefix, message, distribution)` — test-only, so the split and
+    /// the remap can be asserted without standing up a name cache and a VM.
+    #[cfg(test)]
+    pub(crate) fn pending_addons(&self) -> Vec<(String, String, String)> {
+        self.pending
+            .iter()
+            .filter_map(|p| match p {
+                Pending::Addon {
+                    prefix,
+                    message,
+                    distribution,
+                    ..
+                } => Some((prefix.clone(), message.clone(), distribution.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many parked items are headed for a CHAT WINDOW.
+    ///
+    /// Addon lines are excluded on purpose. They park in the same queue for the same ask-once name
+    /// resolve, but they are not speech and never render — so counting them here would make
+    /// `addon_chat_never_reaches_the_chat_window` fail the moment the receive half opened, which is
+    /// exactly what it did. "Pending" stopped meaning "will render" when `Pending::Addon` arrived.
     #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
-        self.pending.len()
+        self.pending
+            .iter()
+            .filter(|p| !matches!(p, Pending::Addon { .. }))
+            .count()
     }
 }
 
@@ -267,6 +457,75 @@ fn notice_event(
     }
 }
 
+/// Deliver one built event: the joined-list upkeep on **both sides** of the render, with the
+/// channel stamp and [`route`] between them — the client's own split, and the reason a leave line
+/// still knows its number.
+///
+/// **YOU_JOINED lands before, YOU_LEFT lands after.** The notice's arg4/arg7/arg8/arg9 are read off
+/// the client's channel record ([`ChannelState::stamp_channel`] is our leg of that), so a record
+/// torn down before the line is composed costs it the slot number — and, since the color resolves
+/// through `ChatTypeInfo["CHANNEL"..arg8]` ([`super::event::resolved_color`]), its color with it.
+/// The reference's YOU_LEFT arm only *flags* the teardown (`0x49c115 mov dword [ebp-0xc],1`); the
+/// event fires first (`0x49c5b0 call 0x49a870`) and only then does `0x49c5b5 test` /
+/// `0x49c5c2 call 0x49bbd0` destroy the record — VERIFIED by disassembly at those addresses (1275).
+/// We removed first and printed "Left Channel: [General]" where the client prints "Left Channel:
+/// [2. General - Elwynn Forest]"; an addon reading `GetChannelName` from its own handler also saw
+/// the channel already gone, which the reference never shows it either.
+///
+/// **Unmodeled, and visible right there in that arm:** the teardown flag is the *YOU_LEFT* leg's
+/// alone. Notice `0x03` splits on `rec+0x9c == 3` — the SUSPENDED leg (`0x49c0e9`) takes a
+/// different token AND jumps past `0x49c115`, so a suspended channel keeps its record and its
+/// number. We do not model that state field (it is the same one that makes `0x02` "YOU_CHANGED"),
+/// so every `0x03` here is a genuine leave.
+///
+/// The two arms log, because this edge is where "we asked to join" becomes "the server says we are
+/// in": [`super::channels`]'s walk only ever proves the request went out, and the round trip is
+/// what actually arms an addon (it is the `CHAT_MSG_CHANNEL_NOTICE` Ace2's whole init gate waits
+/// on). A join the server refuses is otherwise completely silent on this side. Each arm also
+/// mirrors the list into the VM, where `GetChannelName` reads it (17 corpus sites across 6 addons):
+/// these two are the only places it ever changes.
+pub(super) fn deliver(
+    script: &mut benilla_ui::script::UiScript,
+    windows: &mut ChatWindows,
+    channels: &mut ChannelState,
+    event: &mut ChatEvent,
+) {
+    let notice = event
+        .notice_byte()
+        .filter(|_| event.kind == Some(ChatEventKind::ChannelNotice));
+    if notice == Some(channel_notice::YOU_JOINED) && channels.number_of(&event.channel).is_none() {
+        match channels.claim_slot(&event.channel) {
+            Some(slot) => {
+                debug!(
+                    "chat: server confirms channel {:?} joined (slot {slot})",
+                    event.channel
+                );
+                script.set_joined_channels(channels.joined.clone());
+            }
+            // The reference's own ceiling, reached: ten slots, all taken. It answers with a chat
+            // error and no record, so the channel stays unnumbered here too.
+            None => warn!(
+                "chat: server confirms channel {:?} joined but all {} slots are taken — it has no \
+                 number, so /N cannot reach it",
+                event.channel,
+                super::edit::MAX_CHANNELS
+            ),
+        }
+    }
+    // The wire name, kept before `stamp_channel` decorates arg4 with the slot number.
+    let leaving = (notice == Some(channel_notice::YOU_LEFT)).then(|| event.channel.clone());
+    // A member-line / notice channel renders numbered when we know its slot.
+    channels.stamp_channel(event);
+    route(script, windows, event);
+    if let Some(name) = leaving {
+        // Cleared in place, never compacted: slot 2 going empty must not make slot 3 into 2
+        // ([`ChannelState`], 1286).
+        let freed = channels.free_slot(&name);
+        debug!("chat: server confirms channel {name:?} left (slot {freed:?} now free)");
+        script.set_joined_channels(channels.joined.clone());
+    }
+}
+
 /// Drain [`ChatLog`]: resolve names (ask-once, bounded), build events, [`route`] them. Also ticks
 /// the whisper-chime throttle.
 #[allow(clippy::too_many_arguments)] // a Bevy system's param list IS its dependency set
@@ -281,6 +540,10 @@ pub(super) fn feed_chat(
     bubble_cfg: Res<crate::chat_bubble::BubbleConfig>,
     commands: Res<NetCommands>,
     time: Res<Time>,
+    // The text-emote sentence seam (decision 1274): the tables, plus the guid the composer's
+    // "are you the performer?" test compares against.
+    emote_texts: Option<Res<EmoteTexts>>,
+    self_guid: Res<SelfGuid>,
     // The `$`-macro subject seam: monster/BG lines expand against the guid the line is ADDRESSED to,
     // which needs the object index + the streamed unit's descriptors. See [`macro_subject`].
     guids: Res<GuidIndex>,
@@ -299,42 +562,7 @@ pub(super) fn feed_chat(
     for item in pending {
         match item {
             Pending::Event(mut event) => {
-                // The joined-list upkeep (the client-side number law): YOU_JOINED appends,
-                // YOU_LEFT (and the suspend form) removes.
-                //
-                // Logged, because this edge is where "we asked to join" becomes "the server says
-                // we are in": [`super::channels`]'s walk only ever proves the request went out, and
-                // the round trip is what actually arms an addon (it is the `CHAT_MSG_CHANNEL_NOTICE`
-                // Ace2's whole init gate waits on). A join the server refuses is otherwise
-                // completely silent on this side.
-                if event.kind == Some(ChatEventKind::ChannelNotice) {
-                    match event.notice.as_str() {
-                        "2" if channels.number_of(&event.channel).is_none() => {
-                            channels.joined.push(event.channel.clone());
-                            debug!(
-                                "chat: server confirms channel {:?} joined (slot {})",
-                                event.channel,
-                                channels.joined.len()
-                            );
-                        }
-                        "3" => {
-                            debug!("chat: server confirms channel {:?} left", event.channel);
-                            channels
-                                .joined
-                                .retain(|c| !c.eq_ignore_ascii_case(&event.channel));
-                        }
-                        _ => {}
-                    }
-                    // Mirror the confirmed list into the VM, where `GetChannelName` reads it
-                    // (17 corpus sites across 6 addons). Here rather than beside either arm
-                    // because this is the ONLY place the list changes, so one push cannot drift
-                    // from it — and unconditional within the notice branch so a notice that
-                    // changed nothing still costs one clone rather than risking a missed edge.
-                    script.set_joined_channels(channels.joined.clone());
-                }
-                // A member-line / notice channel renders numbered when we know its slot.
-                channels.stamp_channel(&mut event);
-                route(&mut script, &mut windows, &event);
+                deliver(&mut script, &mut windows, &mut channels, &mut event);
             }
             Pending::Wire { msg, tries } => {
                 let kind = kind_of_wire(msg.chat_type);
@@ -498,6 +726,32 @@ pub(super) fn feed_chat(
                 );
                 route(&mut script, &mut windows, &event);
             }
+            Pending::Addon {
+                prefix,
+                message,
+                distribution,
+                guid,
+                tries,
+            } => {
+                let name = names.resolve(guid, &commands).map(str::to_string);
+                if name.is_none() && tries < NAME_MAX_TRIES {
+                    still.push(Pending::Addon {
+                        prefix,
+                        message,
+                        distribution,
+                        guid,
+                        tries: tries + 1,
+                    });
+                    continue;
+                }
+                fire_addon_message(
+                    &mut script,
+                    prefix,
+                    message,
+                    distribution,
+                    name.unwrap_or_else(|| "Unknown".into()),
+                );
+            }
             Pending::Roll {
                 min,
                 max,
@@ -553,6 +807,57 @@ pub(super) fn feed_chat(
                     ),
                 );
             }
+            Pending::TextEmote {
+                performer,
+                text_id,
+                target,
+                tries,
+            } => {
+                // Both names resolve ask-once: the performer's is the sentence's `%s`, and our own
+                // is what the "is the target me?" compare needs (`GetOwnName` in the reference,
+                // which never has to wait for it — we can, so we park like every other line).
+                let performer_name = names.resolve(performer, &commands).map(str::to_string);
+                let your_name = self_guid
+                    .0
+                    .and_then(|g| names.resolve(g, &commands).map(str::to_string));
+                if (performer_name.is_none() || your_name.is_none()) && tries < NAME_MAX_TRIES {
+                    still.push(Pending::TextEmote {
+                        performer,
+                        text_id,
+                        target,
+                        tries: tries + 1,
+                    });
+                    continue;
+                }
+                // No name for the performer ⇒ **no line**, not an "Unknown" one: the reference
+                // bails outright when `NameCache::GetRecord` misses (`0x49b28c`), and that cache
+                // is player-only. The emote is still an animation and a voice — those rode the
+                // `EmoteMessage` path at decode and do not depend on this.
+                let (Some(performer_name), Some(cat)) = (performer_name, emote_texts.as_deref())
+                else {
+                    debug!("chat: text emote {text_id} from {performer:#x} has no sentence source");
+                    continue;
+                };
+                let event = text_emote_event(
+                    &cat.0,
+                    text_id,
+                    &EmoteLine {
+                        performer: &performer_name,
+                        performer_is_you: self_guid.0 == Some(performer),
+                        // Sex 1 = Female, from the same `SMSG_NAME_QUERY_RESPONSE` the name came
+                        // from — exactly where the reference reads it (`record+0x13c`).
+                        performer_female: names
+                            .player_traits(performer)
+                            .is_some_and(|(_, _, sex)| sex == 1),
+                        target: &target,
+                        your_name: your_name.as_deref().unwrap_or_default(),
+                    },
+                );
+                // A dry ladder is a real outcome, not a failure: SIT/STAND/TRAIN ship blank in
+                // every locale, so a vanilla `/sit` prints nothing.
+                let Some(event) = event else { continue };
+                route(&mut script, &mut windows, &event);
+            }
             Pending::Discovery { area, xp } => {
                 // The toast fires every time; the chat line only rides XP (decisions 0828/0829).
                 script.fire_event(
@@ -599,4 +904,41 @@ fn needs_name(chat_type: u8) -> bool {
             | m::CHAT_MSG_BATTLEGROUND
             | m::CHAT_MSG_BATTLEGROUND_LEADER
     )
+}
+
+/// **`RequestTimePlayed()` out, `TIME_PLAYED_MSG` back** — the two halves of `/played` for an addon.
+///
+/// The request is a count-drain ([`benilla_ui::script::UiScript::take_played_time_asks`], the pvp
+/// queue's shape): the packet is empty, so two asks are two sends. The answer is a one-slot mailbox
+/// the net apply pass fills, and it is delivered as the event rather than a return value, because
+/// that is how the API answers — `RequestTimePlayed()` itself returns nothing.
+///
+/// **This does NOT replace the chat breakdown beside it.** `net::apply::chat::played_time` prints
+/// the TIME_PLAYED_TOTAL/LEVEL lines because we do not ship `ChatFrame_DisplayTimePlayed`, which is
+/// what the reference's own `TIME_PLAYED_MSG` handler does. The two are the reference's two
+/// consumers of one packet, not a doubling: an addon that registers the event does its own thing
+/// with the numbers, and the player still sees `/played` answer in chat.
+pub(crate) fn played_time_bridge(
+    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    commands: Res<NetCommands>,
+    answer: Option<ResMut<crate::net::PlayedTimeAnswer>>,
+) {
+    let Some(mut script) = script else {
+        return;
+    };
+    for _ in 0..script.take_played_time_asks() {
+        let _ = commands.0.send(crate::net::ClientCommand::PlayedTime);
+    }
+    let Some(mut answer) = answer else {
+        return;
+    };
+    if let Some((total, level)) = answer.0.take() {
+        script.fire_event(
+            "TIME_PLAYED_MSG",
+            vec![
+                benilla_ui::script::ScriptValue::Int(i64::from(total)),
+                benilla_ui::script::ScriptValue::Int(i64::from(level)),
+            ],
+        );
+    }
 }

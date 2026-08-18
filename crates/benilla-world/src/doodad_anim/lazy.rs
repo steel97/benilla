@@ -52,8 +52,10 @@ const REAP_MIN_PARKED_SECS: f32 = 2.0;
 /// drawn. Present ⇔ the placement has skinned parts worth a slot.
 #[derive(Component)]
 pub(crate) struct LazyRig {
-    /// The host's joint entities, bone-indexed — [`RigSkin`]'s joint list at promote.
-    pub(crate) joints: Vec<Entity>,
+    /// The skeleton's bone count — the allocation size. No joint list since decision 1365: the
+    /// pose lives in the host's [`crate::rig_anim::RigPose`] buffer and the world pass writes
+    /// the rows.
+    pub(crate) bones: u32,
     pub(crate) ibp: Handle<SkinnedMeshInverseBindposes>,
     /// The [`SkinnedTwin`]-carrying part entities the promote/demote swaps.
     pub(crate) parts: Vec<Entity>,
@@ -80,11 +82,13 @@ pub(super) type TwinParts<'w, 's> = Query<
     ),
 >;
 
-/// The wake edge: allocate the slot, seed its rows from the joints' CURRENT worlds, and swap the
-/// parts. Returns whether the host now has a rig (so the gate can keep retrying a denial while
-/// the host stays drawn). Rows are seeded before the meshes swap: the first skinned frame shows
-/// the parked pose the static mesh was already showing, and the palette sweep takes over the
-/// same frame (the wake re-arms the player, whose targets mark the joints changed).
+/// The wake edge: allocate the slot, seed its rows from the pose buffer's CURRENT composed
+/// affines, and swap the parts. Returns whether the host now has a rig (so the gate can keep
+/// retrying a denial while the host stays drawn). Rows are seeded before the meshes swap: the
+/// first skinned frame shows the parked pose the static mesh was already showing, and the world
+/// pass takes over the same frame (the wake re-arms the player, whose evaluation re-raises
+/// `pose_dirty`).
+#[allow(clippy::too_many_arguments)] // the gate's full promote handoff
 pub(super) fn promote_lazy_rig(
     commands: &mut Commands,
     palettes: &mut RigPalettes,
@@ -92,31 +96,18 @@ pub(super) fn promote_lazy_rig(
     worlds: &Query<&GlobalTransform>,
     root: Entity,
     lazy: &LazyRig,
+    pose: Option<&crate::rig_anim::RigPose>,
     parts: &mut TwinParts,
 ) -> bool {
-    let Some(rig) = RigSkin::allocate(palettes, lazy.joints.clone(), lazy.ibp.clone()) else {
+    let Some(rig) = RigSkin::allocate_bones(palettes, lazy.bones, lazy.ibp.clone()) else {
         return false; // table full — the warn fired; the gate retries while drawn
     };
     let slot = rig.slot;
-    if let Some(ibp) = ibps.get(&lazy.ibp) {
-        // Rig-relative like every other seed (decision 0974) — these joint worlds came off Bevy
-        // propagation, so the rebase only carries the convention here; it cannot un-spend the
-        // precision propagation already spent. The sweep rewrites the rows the same frame anyway.
-        let origin = crate::rig_palette::rebase_origin(
-            worlds
-                .get(root)
-                .map(|g| g.translation())
-                .unwrap_or_default(),
-        );
-        let joint_worlds: Vec<GlobalTransform> = lazy
-            .joints
-            .iter()
-            .map(|&j| {
-                let g = worlds.get(j).copied().unwrap_or_default();
-                crate::rig_palette::rebase_global(g, origin)
-            })
-            .collect();
-        palettes.write_rig_worlds(&rig, &joint_worlds, ibp, origin);
+    if let (Some(ibp), Some(pose)) = (ibps.get(&lazy.ibp), pose) {
+        // Rig-relative like every other seed (decision 0974): the same compose the world pass
+        // runs, from the root's propagated world.
+        let root_g = worlds.get(root).copied().unwrap_or_default();
+        crate::rig_anim::seed_rig_rows(pose, root_g, &rig, ibp, palettes);
     }
     // Queued, liveness-checked at APPLY time: the slot's only free path is the component's
     // `on_replace` hook, so a plain `insert` racing this frame's tile-unload despawn would drop
@@ -225,8 +216,9 @@ mod tests {
     }
 
     /// One host: a hidden-by-default part carrying a [`SkinnedTwin`] of two distinct weak mesh
-    /// handles, a one-joint [`LazyRig`], and the mesh-backed draw-gate shape. Returns
-    /// `(host, part, mesh_vis_entity)` — the part IS the visibility carrier, like assemble's.
+    /// handles, a one-bone [`LazyRig`] + [`crate::rig_anim::RigPose`] (the collapsed shape,
+    /// decision 1365), and the mesh-backed draw-gate shape. Returns `(host, part)` — the part IS
+    /// the visibility carrier, like assemble's.
     fn lazy_host(app: &mut App, visible: bool) -> (Entity, Entity) {
         let stat = Handle::<Mesh>::default();
         let skinned = app
@@ -249,10 +241,6 @@ mod tests {
                 },
             ))
             .id();
-        let joint = app
-            .world_mut()
-            .spawn((Transform::default(), GlobalTransform::default()))
-            .id();
         let ibp = app
             .world_mut()
             .resource_mut::<Assets<SkinnedMeshInverseBindposes>>()
@@ -271,12 +259,24 @@ mod tests {
                     parked_at: 0.0,
                 },
                 LazyRig {
-                    joints: vec![joint],
+                    bones: 1,
                     ibp,
                     parts: vec![part],
                 },
             ))
             .id();
+        let skeleton = benilla_assets::ModelSkeleton {
+            joints: vec![benilla_assets::ModelJoint {
+                parent: -1,
+                local_translation: Vec3::ZERO,
+                billboard: None,
+                parent_arm: None,
+            }],
+            spine_bone: None,
+            head_bone: None,
+        };
+        let pose = crate::rig_anim::RigPose::new(host, &skeleton);
+        app.world_mut().entity_mut(host).insert(pose);
         (host, part)
     }
 
@@ -295,8 +295,8 @@ mod tests {
     /// The lazy law end to end: born hidden, a host holds NO slot; a wake allocates on its
     /// SECOND consecutive drawn frame (the first is the spawn-default-visibility lie — see the
     /// gate's promote comment), swaps the part to the skinned twin, writes its tag's rig field,
-    /// and seeds the palette rows (the joint's identity world × identity bindpose = a non-zero
-    /// row — the swapped-in mesh never renders zeroed rows).
+    /// and seeds the palette rows (the pose buffer's identity bind affine × identity bindpose =
+    /// a non-zero row — the swapped-in mesh never renders zeroed rows).
     #[test]
     fn a_host_rigs_at_first_wake_not_at_spawn() {
         let mut app = app();
@@ -445,5 +445,90 @@ mod tests {
         app.update();
         assert_eq!(rig_slot(&app, host), None);
         assert_eq!(app.world().resource::<RigPalettes>().occupancy().0, 0);
+    }
+}
+
+/// The Bevy contract this lane's `Aabb` depends on (decision 1261), pinned against the real
+/// `calculate_bounds` system rather than a reading of it.
+///
+/// `promote_lazy_rig`/`demote_lazy_rig` write `Mesh3d`. Bevy's `calculate_bounds` runs two
+/// queries — an inserting one filtered `Without<Aabb>`, and an **updating** one filtered
+/// `Or<(AssetChanged<Mesh3d>, Changed<Mesh3d>)>` that overwrites a bound the app authored. So the
+/// authored all-animation bound decision 1259 puts on an animated placement survives exactly as
+/// long as nothing swaps that placement's mesh — i.e. until its first draw-gate wake, at which
+/// point it was silently recomputed from the skinned twin's bind-pose geometry and the birds
+/// resumed blinking. `NoAutoAabb` (which both queries exclude) is the fix; this is the guard that
+/// a Bevy upgrade cannot quietly take it back.
+#[cfg(test)]
+mod bound_survives_the_twin_swap {
+    use super::*;
+    use bevy::camera::primitives::Aabb;
+    use bevy::camera::visibility::NoAutoAabb;
+
+    /// A 1 yd cube — what the skinned twin's bind-pose geometry computes to.
+    fn tiny_mesh() -> Mesh {
+        Mesh::from(bevy::math::primitives::Cuboid::new(1.0, 1.0, 1.0))
+    }
+
+    /// The authored all-animation bound: a bird's 67 yd circuit around that 1 yd body.
+    fn authored() -> Aabb {
+        Aabb::from_min_max(Vec3::new(-4.2, 8.8, -30.5), Vec3::new(13.6, 16.0, 36.6))
+    }
+
+    /// `(app, entity)` with Bevy's own bounds system on the schedule and the authored bound in
+    /// place, mid-swap: `Mesh3d` has just been rewritten the way `promote_lazy_rig` rewrites it.
+    fn swapped(guard: bool) -> (App, Entity) {
+        let mut app = App::new();
+        app.add_plugins((bevy::MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<Mesh>();
+        app.add_systems(Update, bevy::camera::visibility::calculate_bounds);
+        let stat = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(tiny_mesh());
+        let skinned = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(tiny_mesh());
+        let e = app.world_mut().spawn((Mesh3d(stat), authored())).id();
+        if guard {
+            app.world_mut().entity_mut(e).insert(NoAutoAabb);
+        }
+        app.update();
+        // The swap the lazy rig performs at the placement's first wake.
+        app.world_mut().entity_mut(e).get_mut::<Mesh3d>().unwrap().0 = skinned;
+        app.update();
+        (app, e)
+    }
+
+    fn bound(app: &App, e: Entity) -> Aabb {
+        *app.world().entity(e).get::<Aabb>().expect("a bound")
+    }
+
+    /// The bug: unguarded, the twin swap hands the authored bound back to `compute_aabb`.
+    #[test]
+    fn an_unguarded_bound_is_clobbered_by_the_mesh_swap() {
+        let (app, e) = swapped(false);
+        let b = bound(&app, e);
+        assert!(
+            b.half_extents.max_element() < 1.0,
+            "expected the 1 yd cube's own bound, got half-extents {:?} — if this now keeps the \
+             authored box, Bevy changed `calculate_bounds` and `NoAutoAabb` may be unnecessary",
+            b.half_extents
+        );
+    }
+
+    /// The fix: guarded, the authored bound is still the authored bound after the swap.
+    #[test]
+    fn a_guarded_bound_survives_the_mesh_swap() {
+        let (app, e) = swapped(true);
+        let b = bound(&app, e);
+        assert!(
+            (Vec3::from(b.min()) - Vec3::from(authored().min())).length() < 1e-3
+                && (Vec3::from(b.max()) - Vec3::from(authored().max())).length() < 1e-3,
+            "the authored all-animation bound must survive the promote, got {:?}..{:?}",
+            b.min(),
+            b.max()
+        );
     }
 }

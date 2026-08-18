@@ -135,9 +135,10 @@ pub(super) fn logged_out(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn disconnected(
     reason: String,
+    end: benilla_protocol::SessionEnd,
     commands: &mut Commands,
     index: &mut GuidIndex,
-    self_guid: &SelfGuid,
+    self_guid: &mut SelfGuid,
     status: &mut NetStatus,
     names: &mut NameCache,
     items: &mut Items,
@@ -159,14 +160,17 @@ pub(super) fn disconnected(
     bank: &mut crate::ui_bank::BankOpen,
     duel: &mut crate::ui_duel::DuelState,
     social: &mut crate::ui_social::SocialState,
+    guild: &mut crate::ui_guild::GuildState,
     pending_transfer: &mut PendingTransfer,
     disconnects: &mut MessageWriter<DisconnectedMessage>,
 ) {
     // The reconnect-policy feed first (decision 0539): [`crate::login`] reads it as "the IO thread
     // is back at its pre-logon park".
-    disconnects.write(DisconnectedMessage {
-        reason: reason.clone(),
-    });
+    // Is the session over, or is this the pause inside one? Settled once, here, and carried on the
+    // message to every other reader (decision 1262).
+    let msg = DisconnectedMessage::new(reason.clone(), end);
+    let over = msg.session_over;
+    disconnects.write(msg);
     warn!("net: {reason} — tearing down the streamed world");
     // An announced-but-unfinished far teleport died with the socket.
     pending_transfer.0 = None;
@@ -181,7 +185,16 @@ pub(super) fn disconnected(
     // connection loss is not a world event, and index-less fading entities would race
     // the reconnect's re-creates. Entities already mid-fade left the index earlier and
     // finish fading on their own.
-    let keep = self_guid.0;
+    //
+    // **Unless the session is over** (decision 1262), and then the avatar goes too, exactly as
+    // [`logged_out`] takes it: 0065 spares it *for the reconnect*, and with no reconnect coming
+    // that spared body is a puppet with no server behind it. Keeping it was the free camera —
+    // `SelfGuid` set, no entity, an entry that never finished — so the fact that decides whether
+    // anything reconnects has to be the same fact that decides whether the body stays.
+    let keep = if over { None } else { self_guid.0 };
+    if over {
+        self_guid.0 = None;
+    }
     index.0.retain(|guid, e| {
         if Some(*guid) == keep {
             return true;
@@ -220,6 +233,13 @@ pub(super) fn disconnected(
     // server re-pushes both lists at the next login, and a stale ignore list would silence the
     // wrong guids after a reconnect renumbers nothing but re-streams everything.
     *social = crate::ui_social::SocialState::default();
+    // The guild session is login-scoped the same way (decision 1257) — and more strictly, because
+    // the next login may be a *different character*, whose guild id, rank, rights and roster share
+    // nothing with this one's. The identity cache goes too: it is keyed by guild id, so it would
+    // survive correctly, but the reference's own is backed by `guildcache.wdb` and re-primed
+    // lazily, and keeping a cache alive across a socket only to save one query is not worth the
+    // one wrong name a renamed guild would show.
+    *guild = crate::ui_guild::GuildState::default();
     // The death stores are session-scoped too: a reclaim expiry, resurrect offer, or corpse
     // marker must not survive the socket (the reconnect re-sends the reclaim delay when dead).
     *death_net = crate::death::DeathNet::default();
@@ -363,23 +383,49 @@ pub(super) fn reputations(standings: Vec<(u8, i32)>, reputations: &mut Reputatio
 }
 
 /// A mid-session standing delta (`SMSG_SET_FACTION_STANDING`): overwrite the changed slots,
-/// growing the store for a list id past the login snapshot (flags default 0 — the wire's
-/// delta carries none).
+/// growing the store for a list id past the login snapshot (flags default 0 — the delta carries
+/// none), and **auto-reveal** each one.
+///
+/// The auto-reveal is the client's own (wow-5875-re `reputation-panel-law.md`, the `0x124` handler):
+/// gaining reputation with a faction makes it visible, unless the slot carries `HIDDEN` — which is
+/// exactly what that bit is for, and is why it is not a list gate. The server pushes an
+/// `SMSG_SET_FACTION_VISIBLE` for the same slot in most cases (vmangos `SetOneFactionReputation`
+/// calls `SetVisible`), so this is usually belt to that braces; it matters when the reveal and the
+/// standing arrive in the other order, and it is what the client does regardless.
 pub(super) fn reputation_delta(
     standings: Vec<(u32, i32)>,
     reputations: &mut Reputations,
     quest: &mut QuestGiver,
 ) {
+    use benilla_formats::faction_flags as flag;
     for (list_id, standing) in standings {
         let i = list_id as usize;
         if reputations.0.len() <= i {
             reputations.0.resize(i + 1, (0, 0));
         }
         reputations.0[i].1 = standing;
+        if reputations.0[i].0 & flag::HIDDEN == 0 {
+            reputations.0[i].0 |= flag::VISIBLE;
+        }
     }
     // A standing change is a questgiver-status input (`SatisfyQuestReputation`, and the reaction
     // gate): the reference sweeps from this handler too (0654).
     quest.bump_reask();
+}
+
+/// A faction became visible (`SMSG_SET_FACTION_VISIBLE`): lift `FACTION_FLAG_VISIBLE` on that slot
+/// and nothing else.
+///
+/// The server pushes this the first time the player meets a faction, and it carries **no
+/// standing** — the slot's standing was already correct and stays untouched. Dropping it is the
+/// silent failure it exists to prevent: the pane keys row membership off this bit, so a faction met
+/// mid-session would keep accruing reputation the player could never see.
+pub(super) fn reputation_visible(list_id: u32, reputations: &mut Reputations) {
+    let i = list_id as usize;
+    if reputations.0.len() <= i {
+        reputations.0.resize(i + 1, (0, 0));
+    }
+    reputations.0[i].0 |= benilla_formats::faction_flags::VISIBLE;
 }
 
 /// The keepalive echo (`SMSG_PONG`): match it against the shared ping clock to measure the

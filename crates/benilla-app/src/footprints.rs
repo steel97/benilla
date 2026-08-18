@@ -49,7 +49,7 @@ use bevy::prelude::*;
 
 use crate::creature_anim::{footfall_side, move_flags, AnimSoundEvent, MovementState};
 use crate::entities::{BoneAttach, Creatures};
-use crate::net::{NetEntity, ObjectStore, SelfPlayer};
+use crate::net::{Embodied, NetEntity, ObjectStore};
 use crate::sound::footsteps::Footsteps;
 use benilla_assets::{AssetSet, LockRecover, WorldAssets};
 use benilla_world::decal::{DecalFrame, WorldDecal};
@@ -149,7 +149,7 @@ fn load_ink(
 
 /// The spawner's ROOT-unit reads (see [`spawn_footprints`]'s `roots` param).
 type RootState = (
-    Has<SelfPlayer>,
+    Has<Embodied>,
     Option<&'static NetEntity>,
     Option<&'static ObjectStore>,
     Option<&'static MovementState>,
@@ -164,12 +164,17 @@ fn spawn_footprints(
     time: Res<Time>,
     // GlobalTransform for the same reason as the footstep sounds (0441): a mounted unit's steps
     // are the MOUNT child's tags, whose local Transform is the seat-relative ~origin.
-    units: Query<(&NetEntity, &GlobalTransform, Option<&BoneAttach>)>,
+    units: Query<(
+        &NetEntity,
+        &GlobalTransform,
+        Option<&BoneAttach>,
+        Option<&benilla_world::rig_anim::RigPose>,
+    )>,
     // The spawner's ROOT (the rider for a mount child): the pool select, the print scale (the
     // rider's SCALE_X — RE-corrected), and the state gates all read the root.
     parents: Query<&ChildOf>,
     roots: Query<RootState>,
-    self_pos: Query<&Transform, With<SelfPlayer>>,
+    self_pos: Query<&Transform, With<Embodied>>,
     joints: Query<&GlobalTransform>,
     footsteps: Option<Res<Footsteps>>,
     creatures: Option<Res<Creatures>>,
@@ -192,7 +197,7 @@ fn spawn_footprints(
         let Some(side) = footfall_side(&ev.ident) else {
             continue;
         };
-        let Ok((net, transform, attach)) = units.get(ev.entity) else {
+        let Ok((net, transform, attach, pose)) = units.get(ev.entity) else {
             continue;
         };
         // The ink + dims come from the EVENT's model (the mount for a mounted composite); the
@@ -223,10 +228,10 @@ fn spawn_footprints(
         // The planted foot: the event's own marker (bone + offset) through the live joint —
         // exactly the shape the missile launch points use. No marker/joint = the unit origin.
         let foot = attach
-            .and_then(|a| {
+            .zip(pose)
+            .and_then(|(a, p)| {
                 let (bone, offset) = a.markers.get(&ev.ident).copied()?;
-                let joint = a.anchor(bone)?;
-                Some(joints.get(joint).ok()?.transform_point(offset))
+                p.posed_point(joints.get(p.joints_root).ok()?, bone, offset)
             })
             .unwrap_or_else(|| transform.translation());
         // The reference's 50-yd radius about the local player (2500 yd², self always passes).

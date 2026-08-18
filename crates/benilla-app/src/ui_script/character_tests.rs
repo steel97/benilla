@@ -939,17 +939,21 @@ fn a_keybind_page_switch_moves_the_tab_row_with_it() {
     load_xml(&s, "UIParent.xml");
     load_xml(&s, "GameTooltip.xml");
     load_xml(&s, "ScrollTemplates.xml");
+    load_xml(&s, "UIPanelTemplates.xml");
+    load_xml(&s, "OptionsFrameTemplates.xml");
     load_xml(&s, "CharacterFrame.xml");
     load_xml(&s, "PetPaperDollFrame.xml");
+    load_xml(&s, "ReputationFrame.xml");
     load_xml(&s, "SkillFrame.xml");
     s.set_unit("player", Some(player_unit()));
 
     // THE INVARIANT the fix rests on: a page's `id=` is its slot in this window's own tab row, and
-    // `BENILLA_CHARACTERFRAME_SUBFRAMES` is the same 1:1 mapping written the other way round. The
-    // reference's numbers are NOT ours — its Skills page is id 4 behind a Reputation tab we have
-    // not built — so this is the check that makes the divergence loud the day Reputation lands
-    // between them, instead of silently selecting the wrong tab.
-    for i in 1..=3 {
+    // `BENILLA_CHARACTERFRAME_SUBFRAMES` is the same 1:1 mapping written the other way round. It
+    // did its job: this loop is what made the Reputation page's arrival LOUD, since Skills had to
+    // move from 3 to 4 in the same breath. The four slots are the reference's own now
+    // (Character/Pet/Reputation/Skills, ref `CharacterFrame.xml:79-168`); only Honor, its tab 5, is
+    // still out, and it sits past the end where its absence shifts nothing.
+    for i in 1..=4 {
         let id: i64 = s
             .eval(&format!(
                 "return getglobal(BENILLA_CHARACTERFRAME_SUBFRAMES[{i}]):GetID()"
@@ -983,8 +987,8 @@ fn a_keybind_page_switch_moves_the_tab_row_with_it() {
     assert_eq!(selected(&mut s), 1);
     s.run(r#"ToggleCharacter("SkillFrame")"#).unwrap();
     assert!(shown(&mut s, "SkillFrame"));
-    assert_eq!(selected(&mut s), 3, "the row follows a keybind to Skills");
-    assert!(wearing_active_art(&mut s, 3));
+    assert_eq!(selected(&mut s), 4, "the row follows a keybind to Skills");
+    assert!(wearing_active_art(&mut s, 4));
     assert!(!wearing_active_art(&mut s, 1));
 
     // THE REPORT: `C` from the Skills page. The page goes back to Character — and so must the row.
@@ -997,7 +1001,7 @@ fn a_keybind_page_switch_moves_the_tab_row_with_it() {
         "the tab row followed the keybind back to Character"
     );
     assert!(wearing_active_art(&mut s, 1));
-    assert!(!wearing_active_art(&mut s, 3));
+    assert!(!wearing_active_art(&mut s, 4));
 
     // …and the second half of the report — *"then if I click on char tab, it closes the whole
     // window"* — falls out of the same fix rather than needing its own. `PanelTemplates_SelectTab`
@@ -1011,5 +1015,70 @@ fn a_keybind_page_switch_moves_the_tab_row_with_it() {
         "the selected tab is disabled — clicking it cannot close the window"
     );
     assert!(shown(&mut s, "PaperDollFrame"), "…or change the page");
+    assert!(s.errors().is_empty(), "no handler errors: {:?}", s.errors());
+}
+
+/// **The tab kit's XML-facing entry point, driven the way an addon drives it.**
+///
+/// Four corpus addons (Enchantrix, Outfitter, SimpleActionSets, TheoryCraft) put
+/// `PanelTemplates_Tab_OnClick(<frame>)` straight into a tab's `<OnClick>` and let the kit do the
+/// rest; this client had every other member of the kit and not that one, because our own windows
+/// wire their tabs to their own handlers and never reached for the generic entry point.
+///
+/// **It is built on a row of this test's own, and that is the finding, not a convenience.** The
+/// reference's tab buttons carry `id="1".."4"` (ref `CharacterFrame.xml:79-133`) and ours carry
+/// none: our row is id-based through `BenillaCharacterFrameTab_OnClick(id)`, which closes over the
+/// number instead of reading it off the widget. So `CharacterFrameTab2:GetID()` is **0** here, and
+/// driving OUR row through the generic entry point would select tab 0 — correct code meeting a
+/// window that does not obey the contract it reads. An addon's own tabs do carry ids, which is why
+/// the four callers above work; this builds a row that obeys the reference's contract and drives
+/// that.
+///
+/// The `this`/frame split is the whole reason the function exists: `this` is the clicked TAB and
+/// the owning FRAME is a separate argument, which is the shape `SimpleActionSets.xml:342` relies on
+/// when it passes `this:GetParent()`.
+#[test]
+fn an_addons_tab_click_selects_through_the_generic_entry_point() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_xml(&s, "Fonts.xml");
+    load_xml(&s, "UiPanels.xml");
+    load_xml(&s, "UIParent.xml");
+
+    // A conforming row: tabs named `<frame>Tab1..N` (what `PanelTemplates_UpdateTabs` getglobals)
+    // and each carrying its own id, exactly as an addon's XML declares them.
+    s.run(
+        r#"
+        TabKitFrame = CreateFrame("Frame", "TabKitFrame", UIParent)
+        PanelTemplates_SetNumTabs(TabKitFrame, 2)
+        for i = 1, 2 do
+            local t = CreateFrame("Button", "TabKitFrameTab" .. i, TabKitFrame,
+                                  "CharacterFrameTabButtonTemplate")
+            t:SetID(i)
+        end
+        PanelTemplates_SetTab(TabKitFrame, 1)
+        "#,
+    )
+    .unwrap();
+    let selected = |s: &mut UiScript| {
+        s.eval::<i64>("return PanelTemplates_GetSelectedTab(TabKitFrame)")
+            .unwrap()
+    };
+    assert_eq!(selected(&mut s), 1);
+
+    // The addon idiom, verbatim: `this` is the tab, the frame is the argument.
+    s.run("this = TabKitFrameTab2; PanelTemplates_Tab_OnClick(TabKitFrame); this = nil")
+        .unwrap();
+    assert_eq!(
+        selected(&mut s),
+        2,
+        "the kit takes the tab's OWN id from `this`, not from the frame it was handed"
+    );
+    // The row repainted, not just the number — the same visible half the keybind test asserts.
+    assert!(
+        s.eval::<bool>("return TabKitFrameTab2MiddleDisabled:IsVisible()")
+            .unwrap(),
+        "the newly selected tab wears the Active art"
+    );
     assert!(s.errors().is_empty(), "no handler errors: {:?}", s.errors());
 }

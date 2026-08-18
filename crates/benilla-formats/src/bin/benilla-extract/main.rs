@@ -212,6 +212,31 @@ enum Command {
         /// Internal-path prefix filter (e.g. `spells`), case-insensitive; all models if omitted.
         prefix: Option<String>,
     },
+    /// Sweep every `.m2` (optionally under a path prefix) and census the batches carrying
+    /// **degenerate authored vertex normals** — `(0,0,0)`, which the shipped corpus really does
+    /// author (the AQ40 Qiraji Brainwasher's sleeves, Uldaman Ironaya's skirt). The reference
+    /// consumes such a normal as the zero vector and its order-2 SH collapses to the flat DC term,
+    /// so the surface draws lit; a renderer that `normalize()`s it gets NaN, `clamp(NaN)` floors
+    /// the whole lighting factor to 0, and the batch renders PURE BLACK over its correct texture.
+    /// The population instrument for that class (decision 1268, bug B134) — `ALL` marks a batch
+    /// where every vertex is degenerate, and the tail names the worst-hit models.
+    Normalscan {
+        /// Internal-path prefix filter (e.g. `creature`), case-insensitive; all models if omitted.
+        prefix: Option<String>,
+    },
+    /// Sweep every `.m2` (optionally under a path prefix) and measure how far its authored header
+    /// bounding box — the model's **all-animation** vertex extent, and the box the reference
+    /// derives its doodad cull sphere from (`rec+0x5c`/`rec+0x68`) — reaches past its **bind-pose**
+    /// vertex extent. The population instrument for decision 1259: an animated placement's submesh
+    /// keeps its transform at the placement origin while the joint palette moves its vertices, so a
+    /// bind-pose bound culls an object whose geometry is still on screen. The ambient critters are
+    /// the extreme — `World\critter\birds\Bird01.m2` authors a 67 yd box around a 1.2 yd body,
+    /// because its root bone flies it 64 yd along a circuit. Also reports the reverse (`SHORT`:
+    /// bind-pose geometry OUTSIDE the authored box), which is why the fix unions the two boxes.
+    Animboundscan {
+        /// Internal-path prefix filter (e.g. `world\critter`), case-insensitive; all if omitted.
+        prefix: Option<String>,
+    },
     /// Sweep every `.m2` (optionally under a path prefix) and census the geometry a
     /// **non-character** spawn draws that the reference may not: MULTI-GEOSET models (more than
     /// one `skinSectionId` — only the character compositor selects among them, so every other
@@ -283,6 +308,41 @@ enum Command {
     /// ticks. The population instrument for that silent class (decision 0760; found on
     /// `BlastedLandsLightningbolt01.m2`, the Blasted Lands strike that never fires).
     Partslotscan {
+        /// Internal-path prefix filter (e.g. `world`), case-insensitive; all models if omitted.
+        prefix: Option<String>,
+    },
+    /// Sweep every `.m2` (optionally under a path prefix) and census the batches the bake routes
+    /// to a **per-placement material** — the ones whose UV loop or M2Color RGB tint loop is not the
+    /// same in every FILE sequence slot, so no material shared by every instance can be right for
+    /// them (decision 1408). The texture-transform twin of `partslotscan`.
+    ///
+    /// It asks the **bake**, not a copy of it: `RenderSubmesh::uv_seq` / `rgb_seq` are `Some`
+    /// exactly when `SeqLoops::uniform()` refused the shared lane, so the census and the runtime
+    /// cannot disagree by construction. It used to transcribe the sampler instead — it was written
+    /// to SIZE this fix, before the fix existed — and once the fix landed the twin drifted from it:
+    /// the transcription compared periods and value EXTENTS at 1e-3, which calls
+    /// `Spells\AdrenalineRush_Cast_Base` the same loop in both slots, where the bake's own tail key
+    /// differs by a full 1.0 (slot 0 ends blue, slot 1 returns to red).
+    ///
+    /// Per (batch, channel): **SHARED** — the set is `None`, the slots agree, nothing changes for
+    /// it (with the sub-count that actually animates on that lane) — and **PER-PLACEMENT**, the set
+    /// is `Some`. The latter splits by WHY the slots disagree, which is the question of whether
+    /// `uniform()`'s exact float equality is *earning* the routing it does: **DEAD-0** (slot 0
+    /// bakes nothing while a later slot animates — the B98 shape, `BlackrockStatueLavaBubble.m2`
+    /// keying its whole UV flipbook inside file slot 1, a 50/50 variation of animation id 0, so the
+    /// slot-0 bake returns `None` and every placement is frozen for ever), **WRAP-ONLY** and
+    /// **KEYS-EPSILON** — the over-application buckets, where the slots hold the same authored loop
+    /// and are split only by the wrap flag or by sub-epsilon noise in a rebased key — and
+    /// **REAL-DIFFERS** (genuinely different loops, or slot 0 alive against a dead later slot).
+    /// Over the shipped corpus both over-application buckets are **empty**, so nothing is on the
+    /// per-placement lane that a coarser comparison would have left off it.
+    ///
+    /// Each bucket closes with its content family and a named worst-hit tail (batches, file
+    /// sequence slots). `World\` is the only family the per-placement lane reaches at all — a
+    /// placed doodad or WMO prop; `Creature\`/`Spells\` and the `World\Goober\` GameObject
+    /// displays resolve their own sequence through the entity lane — so a bucket living outside it
+    /// costs nothing whatever it says.
+    Uvslotscan {
         /// Internal-path prefix filter (e.g. `world`), case-insensitive; all models if omitted.
         prefix: Option<String>,
     },
@@ -658,6 +718,8 @@ fn main() -> Result<()> {
         Command::Bbscan { prefix } => scan::bbscan(&mut chain, prefix.as_deref())?,
         Command::Bbfacescan { prefix } => scan::bbfacescan(&mut chain, prefix.as_deref())?,
         Command::Groundscan { prefix } => scan::groundscan(&mut chain, prefix.as_deref())?,
+        Command::Normalscan { prefix } => scan::normalscan(&mut chain, prefix.as_deref())?,
+        Command::Animboundscan { prefix } => scan::animboundscan(&mut chain, prefix.as_deref())?,
         Command::Geosetscan { prefix } => scan::geosetscan(&mut chain, prefix.as_deref())?,
         Command::Alphascan { prefix } => scan::alphascan(&mut chain, prefix.as_deref())?,
         Command::Fxlifescan { prefix } => scan::fxlifescan(&mut chain, prefix.as_deref())?,
@@ -665,6 +727,7 @@ fn main() -> Result<()> {
         Command::Bonescan { prefix } => scan::bonescan(&mut chain, prefix.as_deref())?,
         Command::Partcensus { prefix } => scan::partcensus(&mut chain, prefix.as_deref())?,
         Command::Partslotscan { prefix } => scan::partslotscan(&mut chain, prefix.as_deref())?,
+        Command::Uvslotscan { prefix } => scan::uvslotscan(&mut chain, prefix.as_deref())?,
         Command::Seqclockscan { prefix } => scan::seqclockscan(&mut chain, prefix.as_deref())?,
         Command::Uvwrapscan { prefix } => scan::uvwrapscan(&mut chain, prefix.as_deref())?,
         Command::Envmapscan { prefix } => scan::envmapscan(&mut chain, prefix.as_deref())?,

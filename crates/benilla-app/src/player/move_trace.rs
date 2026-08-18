@@ -9,6 +9,8 @@
 //!   jitters at the surface") is a question about the depth signal frame by frame, and no other
 //!   tag carries it: `move` is emitted by the walk arm only, so the swim frames of a flapping
 //!   latch are exactly the ones it drops (decision 0644).
+//! - **`mvr`** — one line per mover-claim packet ([`mover_claim`]): who we told the server we are
+//!   driving, which is what decides whether anything under `snd` is accepted.
 //! - **`snd`** — one line per outbound `MSG_MOVE_*` ([`sent`]), the send-side twin of `net::motion`'s
 //!   `rly`: it makes **our own wire cadence measurable** (decision 0617), which is the only way to
 //!   compare it against the reference's — the 1.12.1 sniff's client stream is a list of exactly these
@@ -64,6 +66,19 @@ pub(super) fn sent(kind: crate::net::MoveKind, flags: u32, facing: f32, pos: [f3
     );
 }
 
+/// One `mvr` line per **mover-claim** packet — `CMSG_SET_ACTIVE_MOVER` and
+/// `CMSG_MOVE_NOT_ACTIVE_MOVER`. Neither is a `MSG_MOVE_*`, so neither appears under `snd`, and yet
+/// the pair decides whether every packet that *does* is accepted at all: vmangos matches each
+/// against the session's confirmed mover and answers a mismatch with a server-side error log the
+/// client never sees. A possession that goes wrong is unreadable from `snd` alone — the stream looks
+/// perfect and lands nowhere (decision 1281; the gap cost a live probe round to notice).
+pub(super) fn mover_claim(what: &str, guid: u64) {
+    if !trace::enabled() {
+        return;
+    }
+    trace::line("mvr", &format!("{what} guid={guid:#x}"));
+}
+
 /// One `swim` line per frame the avatar is over liquid: the waterline, the feet, the submersion
 /// depth and the two latch thresholds it is being compared against, plus the regime that ran. The
 /// `<` / `>` markers flag the frames where the depth crossed a threshold, so a latch that is
@@ -103,17 +118,19 @@ pub(super) fn swim(feet_y: f32, surface_y: f32, swimming: bool, h: f32) {
 ///
 /// `resident` means the destination's world arrived (scene spawned + collider queue quiet —
 /// decision 0737's release) and the hold released onto it; `!resident` is the
-/// [`super::SETTLE_TIMEOUT`] backstop firing, which switches gravity on with the world never
-/// having become resident. The distinction is invisible from inside the game (both look like "the
-/// loading screen went away") and it is the difference between a world that streamed in time and
-/// one that did not, so the timeout end is also a `warn!` on the ordinary log — a reporter's paste
-/// can then name it without owning a trace.
+/// [`super::SETTLE_TIMEOUT`] backstop firing, which since decision 1303 (B263) means the stream
+/// made **no progress at all** for the whole budget — a genuinely dead stream, never a slow one —
+/// and gravity comes on with the world never having become resident. `waited` is measured from
+/// the snap either way. The distinction is invisible from inside the game (both look like "the
+/// loading screen went away") and it is the difference between a world that arrived and one that
+/// died, so the timeout end is also a `warn!` on the ordinary log — a reporter's paste can then
+/// name it without owning a trace.
 pub(super) fn settle(resident: bool, waited: f32, pos: bevy::prelude::Vec3) {
     if !resident {
         bevy::log::warn!(
-            "settle: TIMED OUT after {waited:.2}s with the world never resident at \
-             ({:.1},{:.1},{:.1}) — releasing anyway. If a building stands here, its collider \
-             had not finished streaming and the body is about to fall through it.",
+            "settle: TIMED OUT {waited:.2}s after the snap with the stream stalled and the world \
+             never resident at ({:.1},{:.1},{:.1}) — releasing anyway. If a building stands \
+             here, its collider never streamed and the body is about to fall through it.",
             pos.x,
             pos.y,
             pos.z,

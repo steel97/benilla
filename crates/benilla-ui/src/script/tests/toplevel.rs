@@ -91,10 +91,13 @@ fn the_flag_round_trips_and_defaults_off() {
 /// this law existed, which left every window authored toplevel (thirteen of our own frames, 82
 /// corpus addons) unable to come to the front while `SetToplevel` did not exist at all.
 ///
-/// `enableKeyboard` is deliberately still warned: implementing one clause is not a licence to go
-/// quiet about the other.
+/// `enableKeyboard` used to be warned here on the same principle — implementing one clause is not
+/// a licence to go quiet about the other. It now lands on a real `EnableKeyboard`, so the warning
+/// is gone and this asserts the flag instead. What is still NOT built is key *delivery*, which the
+/// method's own doc states; the flag and the delivery are separable in the reference too
+/// (`frame-key-script-delivery.md` §3.2).
 #[test]
-fn the_xml_toplevel_attribute_reaches_the_method_and_enable_keyboard_still_warns() {
+fn the_xml_toplevel_and_enable_keyboard_attributes_both_reach_their_methods() {
     let s = script();
     let doc = crate::framexml::parse(
         r#"<Ui>
@@ -114,11 +117,23 @@ fn the_xml_toplevel_attribute_reaches_the_method_and_enable_keyboard_still_warns
         report.warnings
     );
     assert!(
-        report.warnings.iter().any(|w| w.contains("EnableKeyboard")),
-        "the clause we did NOT build stays loud: {:?}",
+        !report.warnings.iter().any(|w| w.contains("EnableKeyboard")),
+        "enableKeyboard is built now, not warned: {:?}",
         report.warnings
     );
     assert!(s.eval::<bool>("return XmlTop:IsToplevel()").unwrap());
+    assert!(
+        s.eval::<bool>("return XmlTop:IsKeyboardEnabled()").unwrap(),
+        "the XML attribute must reach the flag"
+    );
+    // Default false, and the setter round-trips both ways — a frame that never asked is not in the
+    // bucket (`0x76af00` is reached from the attribute or an explicit call, never a ctor).
+    s.run("Plain = CreateFrame('Frame', 'PlainKbd')").unwrap();
+    assert!(!s.eval::<bool>("return Plain:IsKeyboardEnabled()").unwrap());
+    s.run("Plain:EnableKeyboard(true)").unwrap();
+    assert!(s.eval::<bool>("return Plain:IsKeyboardEnabled()").unwrap());
+    s.run("Plain:EnableKeyboard(false)").unwrap();
+    assert!(!s.eval::<bool>("return Plain:IsKeyboardEnabled()").unwrap());
 }
 
 // ── The raise on Show ───────────────────────────────────────────────────────────────────────────
@@ -195,18 +210,21 @@ fn the_trigger_is_the_effective_visibility_transition_not_the_show_call() {
     .unwrap();
     assert_eq!(
         level(&mut s, "Dialog"),
-        0,
-        "a Show that moves no effective visibility raises nothing"
+        1,
+        "a Show that moves no effective visibility raises nothing — the 1 is not a raise, it is \
+         SetParent's own level := Holder(0)+1 (decision 1323's re-level law)"
     );
     assert_eq!(level(&mut s, "Board"), 5, "and compacts nothing");
 
     s.run("Holder:Show()").unwrap();
+    // Occupied visible MEDIUM levels at the raise: Holder 0, Dialog 1, Board 5 → compaction
+    // renumbers to {0, 1, 2} (Board → 2), count 3, and the raise writes Dialog := 3.
     assert_eq!(
         level(&mut s, "Dialog"),
-        2,
+        3,
         "Dialog became effective-visible through its parent's Show and raised itself"
     );
-    assert_eq!(level(&mut s, "Board"), 1, "the compaction ran with it");
+    assert_eq!(level(&mut s, "Board"), 2, "the compaction ran with it");
 }
 
 // ── The gate ────────────────────────────────────────────────────────────────────────────────────

@@ -73,7 +73,8 @@ fn bag_bar_icons_draw_above_the_action_bar_art() {
 /// The backpack open/close kits (ContainerFrame.lua ContainerFrame_OnShow/OnHide, l.140 / l.120):
 /// showing the window queues igBackPackOpen, hiding it queues igBackPackClose — and nothing queues
 /// at load (the frame is authored hidden="true", so it never transitions on startup). Driven through
-/// `BenillaBagToggle_OnClick`, the exact path both the bag button and the 'B' binding use.
+/// `BenillaBagToggle_OnClick` — the toggle body the bag button's click wrapper calls (the 'B'
+/// binding runs the bare `ToggleBackpack()`, the same one hop deeper).
 #[test]
 fn backpack_toggle_plays_open_and_close_kits() {
     let mut s = UiScript::new().unwrap();
@@ -1002,6 +1003,185 @@ fn shift_click_on_a_stack_opens_the_split_frame() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
+/// B180 — the split dialog's parchment plate fills the whole 172×96 frame. The reference authors
+/// the plate 256×32 with NO anchors, a vestigial size the real client never renders (the TexCoords
+/// crop exactly 172×96 out of the 256×128 art — the frame's own size, a complete panel drawn 1:1
+/// over it). 1308 first dodged this by dropping the size; 1310 then landed the byte-verified law
+/// (an anchor-less region gets an implicit SetAllPoints at creation, size unread under the two
+/// corners) and restored the ref's own text — this pins the render through the real mechanism.
+#[test]
+fn the_split_frame_plate_fills_the_dialog() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    let (x, y) = open_backpack_with_a_five_stack(&mut s);
+
+    s.set_modifiers(true, false, false);
+    s.mouse_button(x, y, "LeftButton", true);
+    s.mouse_button(x, y, "LeftButton", false);
+    s.set_modifiers(false, false, false);
+    s.resolve();
+
+    let (left, right, top, bottom) = s
+        .eval::<(f64, f64, f64, f64)>(
+            "return StackSplitFrame:GetLeft(), StackSplitFrame:GetRight(), \
+                    StackSplitFrame:GetTop(), StackSplitFrame:GetBottom()",
+        )
+        .unwrap();
+    assert!(
+        (right - left - 172.0).abs() < 0.5 && (top - bottom - 96.0).abs() < 0.5,
+        "the dialog frame is 172×96, got {}×{}",
+        right - left,
+        top - bottom
+    );
+    let plate = s
+        .extract()
+        .into_iter()
+        .find(|q| {
+            matches!(&q.content, QuadContent::Texture { path: Some(p), .. }
+                    if p.contains("UI-MoneyFrame"))
+        })
+        .expect("the plate is on screen");
+    let r = plate.rect.expect("the plate has a rect");
+    for (edge, got, want) in [
+        ("left", r.left, left as f32),
+        ("right", r.right, right as f32),
+        ("top", r.top, top as f32),
+        ("bottom", r.bottom, bottom as f32),
+    ] {
+        assert!(
+            (got - want).abs() < 0.5,
+            "plate {edge} = {got}, frame {edge} = {want} — the plate must fill the dialog"
+        );
+    }
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// B180's Bagnon follow-on (director, 08-14): the dialog opened UNDER an addon bag window —
+/// Bagnon's windows are `frameStrata="HIGH"`, the dialog's own stratum, and our re-expression had
+/// dropped the reference's `toplevel="true"`, so the dialog's Show raised nothing and lost the
+/// level tie to the later-shown window (its child buttons at level+1 poked through; the plate did
+/// not). With the ref's attrs restored, Show runs the verified raise (toplevel.rs: compact, then
+/// top-occupied-plus-one) and the whole dialog lands above. The synthetic window stands in for
+/// Bagnon: same stratum, shown after load, overlapping the dialog.
+#[test]
+fn the_split_frame_raises_over_a_same_stratum_window() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    let (x, y) = open_backpack_with_a_five_stack(&mut s);
+
+    s.run(
+        r#"
+        local w = CreateFrame("Frame", "FakeBagnon", UIParent)
+        w:SetFrameStrata("HIGH")
+        w:SetPoint("BOTTOMLEFT", 0, 0)
+        w:SetSize(1024, 768)
+        local bg = w:CreateTexture(nil, "BACKGROUND")
+        bg:SetTexture("Interface\\FakeBagnonBG")
+        bg:SetAllPoints()
+        w:Show()
+    "#,
+    )
+    .unwrap();
+    s.resolve();
+
+    s.set_modifiers(true, false, false);
+    s.mouse_button(x, y, "LeftButton", true);
+    s.mouse_button(x, y, "LeftButton", false);
+    s.set_modifiers(false, false, false);
+    s.resolve();
+
+    assert!(
+        s.eval::<bool>("return StackSplitFrame:IsShown()").unwrap(),
+        "the spinner opened"
+    );
+    let (dialog, bagnon) = s
+        .eval::<(i64, i64)>("return StackSplitFrame:GetFrameLevel(), FakeBagnon:GetFrameLevel()")
+        .unwrap();
+    assert!(
+        dialog > bagnon,
+        "Show must raise the toplevel dialog over the same-stratum window \
+         (dialog level {dialog}, window level {bagnon})"
+    );
+    // The symptom itself: the plate paints AFTER the window's background in draw order.
+    let order: Vec<String> = s
+        .extract()
+        .iter()
+        .filter_map(|q| match &q.content {
+            QuadContent::Texture { path: Some(p), .. }
+                if p.contains("FakeBagnonBG") || p.contains("UI-MoneyFrame") =>
+            {
+                Some(p.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order.len(), 2, "both textures on screen: {order:?}");
+    assert!(
+        order[0].contains("FakeBagnonBG"),
+        "the plate must draw over the window, not under it: {order:?}"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// Typed-digit entry in the split spinner (decision 1319) — the director's ask, and the deferral
+/// this file's header carried since 0216. Pins the whole chain in one go: the dialog is in the
+/// keyboard walk (`enableKeyboard`), a digit reaches its `OnChar`, the first digit REPLACES the
+/// seeded 1 while later digits append, an over-max entry clamps instead of being rejected,
+/// BACKSPACE drops a digit, and ENTER commits exactly as Okay does.
+#[test]
+fn typing_a_number_into_the_split_spinner_sets_the_count() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    let (x, y) = open_backpack_with_a_five_stack(&mut s);
+
+    s.set_modifiers(true, false, false);
+    s.mouse_button(x, y, "LeftButton", true);
+    s.mouse_button(x, y, "LeftButton", false);
+    s.set_modifiers(false, false, false);
+    s.resolve();
+    assert_eq!(
+        s.eval::<i64>("return StackSplitFrame.split").unwrap(),
+        1,
+        "opens seeded at 1"
+    );
+
+    // A digit is consumed by the dialog — which is also what stops it firing action button 3.
+    assert!(s.char_input("3"), "the spinner consumed the digit");
+    assert_eq!(
+        s.eval::<i64>("return StackSplitFrame.split").unwrap(),
+        3,
+        "the first digit REPLACES the seed rather than appending to it"
+    );
+    assert_eq!(
+        s.eval::<String>("return StackSplitText:GetText()").unwrap(),
+        "3",
+        "and the label follows"
+    );
+
+    // A second digit appends, then clamps to the 5-stack rather than being thrown away.
+    assert!(s.char_input("7"));
+    assert_eq!(
+        s.eval::<i64>("return StackSplitFrame.split").unwrap(),
+        5,
+        "37 against a 5-stack clamps to 5"
+    );
+    // BACKSPACE drops a digit off the clamped value.
+    assert!(s.frame_key_input("BACKSPACE"), "the dialog took BACKSPACE");
+    assert_eq!(s.eval::<i64>("return StackSplitFrame.split").unwrap(), 1);
+
+    // Type a real value and commit with ENTER — the Okay path, so the carry is picked up.
+    assert!(s.char_input("4"));
+    assert_eq!(s.eval::<i64>("return StackSplitFrame.split").unwrap(), 4);
+    assert!(s.key_input("ENTER"), "ENTER is consumed by the dialog");
+    assert!(
+        !s.eval::<bool>("return StackSplitFrame:IsShown()").unwrap(),
+        "ENTER commits and closes, like Okay"
+    );
+    let held = s.cursor_item().expect("ENTER committed the split");
+    assert_eq!(held.count, Some(4), "the typed count is what got picked up");
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
 /// Okay in the split spinner only picks the split carry up (ref/cursor.rs `SplitContainerItem` —
 /// a pickup, not a self-contained move); a SUBSEQUENT placement is what actually queues the
 /// `ContainerMove` with `count: Some(n)`, drained the same way any other container move is.
@@ -1620,10 +1800,15 @@ fn an_item_push_drops_its_icon_into_the_bag_that_took_it() {
 
     // t=0: invisible, full size, held a whole fall above the button (and a drift to its left) —
     // the .m2's alpha key (0.000, 0.0), scale key (0.000, 1.0), translation (0.000, (0,0)).
+    //
+    // The pixel figures below are the model's own ratios at the <Model> widget's REAL projection
+    // (1280 px per model unit at this template's modelScale of 1 — BagFrame.xml's header carries
+    // the derivation and why the 1200 that produced 36/48/12 was a back-fit). Same animation,
+    // 6.7% larger: a 38.4 px card, a 51.2 px fall, a 12.8 px drift.
     let (dx, dy) = offset(&s, "CharacterBag1Slot");
     assert!(
-        (dy - 48.0).abs() < 0.5 && (dx + 12.0).abs() < 0.5,
-        "starts one fall (48px) above and one drift (12px) left of the button: got ({dx}, {dy})"
+        (dy - 51.2).abs() < 0.5 && (dx + 12.8).abs() < 0.5,
+        "starts one fall (51.2px) above and one drift (12.8px) left: got ({dx}, {dy})"
     );
     assert!(
         alpha(&s, "CharacterBag1Slot") < 0.01,
@@ -1638,19 +1823,19 @@ fn an_item_push_drops_its_icon_into_the_bag_that_took_it() {
         "opaque by the alpha track's second key"
     );
     assert!(
-        (size(&s, "CharacterBag1Slot") - 36.0 * 1.2).abs() < 0.5,
-        "swollen to 1.2x the 36px icon at the scale track's peak"
+        (size(&s, "CharacterBag1Slot") - 38.4 * 1.2).abs() < 0.5,
+        "swollen to 1.2x the 38.4px card at the scale track's peak"
     );
 
     // t=0.267: back to the icon's own size, still opaque, still parked.
     s.tick(0.134);
     s.resolve();
     assert!(
-        (size(&s, "CharacterBag1Slot") - 36.0).abs() < 0.5,
-        "settled back to the 36px icon at the scale track's third key"
+        (size(&s, "CharacterBag1Slot") - 38.4).abs() < 0.5,
+        "settled back to the 38.4px card at the scale track's third key"
     );
     let (_, dy) = offset(&s, "CharacterBag1Slot");
-    assert!((dy - 48.0).abs() < 0.5, "has not started falling: got {dy}");
+    assert!((dy - 51.2).abs() < 0.5, "has not started falling: got {dy}");
 
     // t=0.5: STILL PARKED — the translation track's second key is (0,0), so the whole first half
     // second is a hang above the bar. The other two tracks are already running down, though: the
@@ -1660,11 +1845,11 @@ fn an_item_push_drops_its_icon_into_the_bag_that_took_it() {
     s.resolve();
     let (_, dy) = offset(&s, "CharacterBag1Slot");
     assert!(
-        (dy - 48.0).abs() < 0.5,
+        (dy - 51.2).abs() < 0.5,
         "has not moved yet at the half second: got {dy}"
     );
     assert!(
-        (size(&s, "CharacterBag1Slot") - 36.0 * 0.686).abs() < 0.5,
+        (size(&s, "CharacterBag1Slot") - 38.4 * 0.686).abs() < 0.5,
         "but is already dwindling: got {}",
         size(&s, "CharacterBag1Slot")
     );
@@ -1679,7 +1864,7 @@ fn an_item_push_drops_its_icon_into_the_bag_that_took_it() {
     s.resolve();
     let (_, dy) = offset(&s, "CharacterBag1Slot");
     assert!(
-        (dy - 24.0).abs() < 0.5,
+        (dy - 25.6).abs() < 0.5,
         "half the fall travelled by t=0.75: got {dy}"
     );
 
@@ -1833,4 +2018,74 @@ fn the_bag_slots_carry_the_references_names_and_icon_names() {
             .unwrap(),
         "Bagnon captures this OnClick to replace the bag behaviour"
     );
+}
+
+/// The backpack button's checked law after the stated divergence (BenillaBagToggle_OnClick's
+/// comment): checked belongs to the WINDOWS' OnShow/OnHide writes, and the button's XML click
+/// wrapper only undoes the CheckButton widget's pre-handler flip. The killer case is the click
+/// that never touches the backpack window — backpack shut, another bag's window open →
+/// ToggleBackpack sees an open window and CLOSES ALL; the backpack never transitions, nothing
+/// writes its button, and only the wrapper's undo keeps the widget flip from leaving it
+/// lit-while-shut (the job the ref's native-window scan tail used to do).
+#[test]
+fn a_close_others_click_leaves_the_backpack_button_dark() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    for file in [
+        "Fonts.xml",
+        "UiPanels.xml",
+        "MerchantFrame.xml",
+        "Cooldown.xml",
+        "ActionBar.xml",
+        "BagFrame.xml",
+    ] {
+        load_xml(&s, file);
+    }
+    s.set_money(0);
+    s.set_container(
+        1,
+        Some(benilla_ui::script::ContainerState {
+            name: Some("Pouch".into()),
+            num_slots: 6,
+            slots: std::collections::HashMap::new(),
+        }),
+    );
+    let checked = |s: &mut UiScript| {
+        s.eval::<bool>("return MainMenuBarBackpackButton:GetChecked() and true or false")
+            .unwrap()
+    };
+    // Bag 1's window alone is open; the backpack window and its button are dark.
+    s.run("ToggleBag(1)").unwrap();
+    assert!(!s.eval::<bool>("return BenillaBagFrame:IsShown()").unwrap());
+    assert!(!checked(&mut s));
+
+    // A REAL click on the backpack button (the widget flip fires only on real input): close-all.
+    s.resolve();
+    let r: Vec<f32> = s
+        .eval(
+            "local f = MainMenuBarBackpackButton \
+             return { f:GetLeft() + f:GetWidth() / 2, f:GetBottom() + f:GetHeight() / 2 }",
+        )
+        .unwrap();
+    s.mouse_move(r[0], r[1]);
+    s.mouse_button(r[0], r[1], "LeftButton", true);
+    s.mouse_button(r[0], r[1], "LeftButton", false);
+    assert!(
+        !s.eval::<bool>("return BenillaBagFrame1:IsShown()").unwrap(),
+        "the click closes the other bag's window (ToggleBackpack's close-all arm)"
+    );
+    assert!(
+        !checked(&mut s),
+        "no backpack transition happened, so the button must stay dark — the widget flip undone"
+    );
+
+    // The second real click opens the backpack (plus the equipped bag): its OnShow writes the light.
+    s.mouse_button(r[0], r[1], "LeftButton", true);
+    s.mouse_button(r[0], r[1], "LeftButton", false);
+    assert!(s.eval::<bool>("return BenillaBagFrame:IsShown()").unwrap());
+    assert!(
+        checked(&mut s),
+        "open ⇒ lit, written by the window's OnShow"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }

@@ -182,6 +182,16 @@ impl ObjectFields {
     pub fn player_money(&self) -> Option<u32> {
         self.get_u32(FIELD_PLAYER_FIELD_COINAGE)
     }
+    /// `PLAYER_FARSIGHT` — the object our view is anchored to while a far-sight effect runs (Mind
+    /// Vision, Sentry Totem, the Ornate Spyglass), or `None` when the view is our own body.
+    ///
+    /// PRIVATE, so like [`Self::player_xp`] it only ever streams for our own avatar — which is the
+    /// whole consumer: this answers "what does the camera orbit", never anything about another
+    /// player. `0` is the cleared state and reads as `None`, following the house convention for
+    /// guid fields ([`Self::unit_charmed_by`] and friends): a zero guid is absence, not an object.
+    pub fn player_farsight(&self) -> Option<u64> {
+        self.get_guid(FIELD_PLAYER_FARSIGHT).filter(|&g| g != 0)
+    }
     /// `PLAYER_XP` — our current experience within the level (`UnitXP("player")`). `None` for a
     /// non-player unit (no PLAYER block) or before the field has streamed; a PRIVATE field, so it
     /// only ever arrives for our own avatar's descriptor.
@@ -192,6 +202,16 @@ impl ObjectFields {
     /// Same PRIVATE/own-player caveat as [`Self::player_xp`].
     pub fn player_next_level_xp(&self) -> Option<u32> {
         self.get_u32(FIELD_PLAYER_NEXT_LEVEL_XP)
+    }
+    /// `PLAYER_FIELD_WATCHED_FACTION_INDEX` — the reputation-list slot whose bar rides the main
+    /// menu bar (`GetWatchedFactionInfo`), or `-1` for none. Same PRIVATE/own-player caveat as
+    /// [`Self::player_xp`].
+    ///
+    /// **Signed, and `0` is not "none".** Slot 0 is the Bloodsail Buccaneers, so the only
+    /// no-faction value is `-1` — reading this field as unsigned would silently watch them.
+    pub fn player_watched_faction(&self) -> Option<i32> {
+        self.get_u32(FIELD_PLAYER_WATCHED_FACTION_INDEX)
+            .map(|v| v as i32)
     }
     /// `PLAYER_CHARACTER_POINTS1` — unspent talent points (`UnitCharacterPoints("player")`'s
     /// first return; the talent frame's "N talent points" line, decision 0304). Same
@@ -277,27 +297,30 @@ impl ObjectFields {
     pub fn player_crit_percentage(&self) -> Option<f32> {
         self.get_f32(FIELD_PLAYER_CRIT_PERCENTAGE)
     }
-    /// `PLAYER_FIELD_POSSTAT0 + i` — stat `i`'s **positive** buff delta (float despite the header's
-    /// "Type: INT" tag; see the field's doc comment). `i >= 5` reads `None`.
-    pub fn player_posstat(&self, i: u8) -> Option<f32> {
-        (i < 5).then(|| self.get_f32(FIELD_PLAYER_POSSTAT0 + u16::from(i)))?
+    /// `PLAYER_FIELD_POSSTAT0 + i` — stat `i`'s **positive** buff delta: the sum of every gear,
+    /// enchant and aura contribution the server split out of `UNIT_FIELD_STAT0 + i`. **INT on the
+    /// wire**, whatever the server keeps internally — see the field's doc comment. `i >= 5` reads
+    /// `None`.
+    pub fn player_posstat(&self, i: u8) -> Option<i32> {
+        (i < 5).then(|| self.get_i32(FIELD_PLAYER_POSSTAT0 + u16::from(i)))?
     }
-    /// `PLAYER_FIELD_NEGSTAT0 + i` — stat `i`'s **negative** buff delta; negative-or-zero (see the
-    /// field's doc comment for the verified sign). `i >= 5` reads `None`.
-    pub fn player_negstat(&self, i: u8) -> Option<f32> {
-        (i < 5).then(|| self.get_f32(FIELD_PLAYER_NEGSTAT0 + u16::from(i)))?
+    /// `PLAYER_FIELD_NEGSTAT0 + i` — stat `i`'s **negative** buff delta; negative-or-zero, read
+    /// signed because only one of the two server host architectures can carry the sign at all (the
+    /// field's doc comment). `i >= 5` reads `None`.
+    pub fn player_negstat(&self, i: u8) -> Option<i32> {
+        (i < 5).then(|| self.get_i32(FIELD_PLAYER_NEGSTAT0 + u16::from(i)))?
     }
     /// `PLAYER_FIELD_RESISTANCEBUFFMODSPOSITIVE + school` — the positive resistance buff for
-    /// `school` (0..6). `school >= 7` reads `None`.
-    pub fn player_resistance_buff_pos(&self, school: u8) -> Option<f32> {
+    /// `school` (0..6), INT on the wire. `school >= 7` reads `None`.
+    pub fn player_resistance_buff_pos(&self, school: u8) -> Option<i32> {
         (school < 7)
-            .then(|| self.get_f32(FIELD_PLAYER_RESISTANCEBUFFMODSPOSITIVE + u16::from(school)))?
+            .then(|| self.get_i32(FIELD_PLAYER_RESISTANCEBUFFMODSPOSITIVE + u16::from(school)))?
     }
     /// `PLAYER_FIELD_RESISTANCEBUFFMODSNEGATIVE + school` — negative-or-zero (see the field's doc
     /// comment). `school >= 7` reads `None`.
-    pub fn player_resistance_buff_neg(&self, school: u8) -> Option<f32> {
+    pub fn player_resistance_buff_neg(&self, school: u8) -> Option<i32> {
         (school < 7)
-            .then(|| self.get_f32(FIELD_PLAYER_RESISTANCEBUFFMODSNEGATIVE + u16::from(school)))?
+            .then(|| self.get_i32(FIELD_PLAYER_RESISTANCEBUFFMODSNEGATIVE + u16::from(school)))?
     }
     /// `PLAYER_FIELD_MOD_DAMAGE_DONE_POS + school` — positive damage-done bonus (`[0]` = physical).
     /// `school >= 7` reads `None`.
@@ -358,7 +381,19 @@ impl ObjectFields {
     /// (id, name, multiplier) triple: `1` = rested, `2` = normal (vmangos `REST_STATE_*`,
     /// `Player.h:673`). The server writes it with hysteresis off the rest pool — rested when the
     /// pool exceeds 10, normal when it falls to ≤1 (`SetRestBonus`) — so the byte, not the pool,
-    /// is the state authority. `None` when never sent; a fresh descriptor reads absent as normal.
+    /// is the state authority.
+    ///
+    /// **Absent reads `0`, not "normal"** — the struct's own absent-field law, and it is the
+    /// truth: vmangos always writes this word (`Player::Create` and `LoadFromDB` seed byte 3 with
+    /// `REST_STATE_NORMAL` and byte 1 with `0xEE`, so the field is never zero and never masked out
+    /// of a create block), so on a created store this IS the wire's byte. `0` is what the client's
+    /// own zero-initialized descriptor holds *before* the create lands, and it is a state
+    /// `Exhaustion.dbc` cannot map — `GetRestState()` answers the binary's `(nil, nil, nil)` fail
+    /// path for it, which the reference's own unguarded `exhaustionStateID >= 3` cannot survive.
+    /// The reference never meets that because FrameXML is up and the descriptor has landed before
+    /// any handler runs; we hold the same guarantee at the feed's own gate
+    /// (`ui_script::ingame_ui_pending`, 1348). Do not fabricate a `2` here — that hides an
+    /// ordering bug behind a value.
     pub fn player_rest_state(&self) -> Option<u8> {
         self.player_bytes_2().map(|b| (b >> 24) as u8)
     }
@@ -412,6 +447,28 @@ impl ObjectFields {
     /// the challenge, so hostility keys off the pair, never the arbiter alone (0633).
     pub fn player_duel_team(&self) -> u32 {
         self.get_u32(FIELD_PLAYER_DUEL_TEAM).unwrap_or(0)
+    }
+    /// `PLAYER_GUILDID` (field 191) — the id of the guild this player belongs to, `0` for a
+    /// guildless one (and for the absent field, which is the same thing: the descriptor skips
+    /// zeroes). **PUBLIC**, so it arrives for every visible player, not only for us.
+    ///
+    /// It names a guild but does not describe one: the name and the rank names come only from
+    /// `SMSG_GUILD_QUERY_RESPONSE`, keyed by this id (decision 1257). The real client's own
+    /// `GetGuildInfo 0x4c9330` reads exactly this field and answers nil on both the `0` and the
+    /// cache-miss legs (`0x4c93a9`, `0x4c93d7`).
+    pub fn player_guild_id(&self) -> u32 {
+        self.get_u32(FIELD_PLAYER_GUILDID).unwrap_or(0)
+    }
+    /// `PLAYER_GUILDRANK` (field 192) — this player's rank within [`Self::player_guild_id`]'s
+    /// guild, **0-based with `0` = guild master** (vmangos promotes with `rank--`). Meaningless
+    /// while the guild id is `0`. Indexes both [`crate::messages::GuildQueryResponse::rank_names`]
+    /// and [`crate::messages::GuildRoster::rank_rights`].
+    ///
+    /// The reference indexes its cached rank-name array with this **unbounded**
+    /// (`0x4c93e4 mov edx,[ecx+0x10]` / `shl edx,0x6`); a consumer of ours must bound it against
+    /// the ten slots that array really has.
+    pub fn player_guild_rank(&self) -> u32 {
+        self.get_u32(FIELD_PLAYER_GUILDRANK).unwrap_or(0)
     }
     /// `PLAYER_FIELD_BYTES` byte 0 bit `0x08` — `PLAYER_FIELD_BYTE_RELEASE_TIMER`, "Display time
     /// till auto release spirit" (the header's own comment): set at death iff the map is

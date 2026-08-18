@@ -95,7 +95,12 @@ fn region_fontstring_unpinned_edge_collapses_until_measured() {
 }
 
 #[test]
-fn region_sized_no_anchor_centers_on_owner() {
+fn templateless_lua_region_without_anchors_never_draws() {
+    // Decision 1310 (wow-re `region-implicit-anchor.md`, VERIFIED): the creation-path implicit
+    // anchor fires from Lua CreateTexture only on a template-registry hit — a templateless region
+    // gets NOTHING, stays rect-less (the resolver has no zero-anchor fallback), and never renders,
+    // its explicit size notwithstanding. This replaced the old draws-centered-at-its-size
+    // fallback, which was refuted at the bytes (it was B180's squashed stack-split dialog).
     let mut s = script();
     s.set_screen_size(800.0, 600.0);
     s.run(
@@ -105,16 +110,18 @@ fn region_sized_no_anchor_centers_on_owner() {
         f:SetSize(100, 50)
         local t = f:CreateTexture("Tex", "ARTWORK")
         t:SetTexture("Interface\\Ring")
-        t:SetSize(24, 24)                -- no anchors ⇒ centered on the owner
+        t:SetSize(24, 24)                -- no anchors, and no template ⇒ no rect, no draw
+        assert(t:GetLeft() == nil, "a rect-less region reads nil edges")
     "#,
     )
     .unwrap();
     s.resolve();
-    // center (50, 25), 24×24 → [bottom 13, left 38, top 37, right 62].
-    assert_eq!(
-        region_tex_rect(&s, "Interface\\Ring"),
-        Rect::new(13.0, 38.0, 37.0, 62.0)
-    );
+    let drawn = s.extract().iter().any(|q| {
+        matches!(&q.content,
+            QuadContent::Texture { path: Some(p), .. } if p.contains("Interface\\Ring"))
+            && q.rect.is_some()
+    });
+    assert!(!drawn, "a templateless anchor-less region must not draw");
 }
 
 #[test]
@@ -527,6 +534,155 @@ fn a_solid_colour_texel_multiplies_with_the_vertex_colour() {
     );
 }
 
+/// **`SetDesaturated` rides the extract, and only against real ART** (decision 1327).
+///
+/// The state was stored from the day the verb landed and read by nobody, which is why every
+/// greyed-out affordance in the UI was a brightness tint (B162's talent tree). The flag now travels
+/// on the quad, so this pins the two ends of that wire — set/clear — plus the one carve-out: a
+/// PATHLESS solid has its colour folded into the quad's tint and draws against a 1x1 white texel,
+/// so a shader that greys the texel would grey white and change nothing. Carrying the flag there
+/// would read as honoured while doing nothing at all, so extract drops it.
+#[test]
+fn desaturation_rides_the_extract_for_art_and_never_for_a_solid() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        local f = CreateFrame("Frame", "DsOwner")
+        f:SetPoint("BOTTOMLEFT", 0, 0)
+        f:SetWidth(100) f:SetHeight(50)
+        art = f:CreateTexture("DsArt", "ARTWORK")
+        art:SetTexture("Interface\\Icons\\Spell_Nature_Sleep")
+        art:SetAllPoints()
+        solid = f:CreateTexture("DsSolid", "OVERLAY")
+        solid:SetTexture(1, 0, 0)
+        solid:SetAllPoints()
+    "#,
+    )
+    .unwrap();
+    s.resolve();
+    let grey = |s: &UiScript, want_path: bool| {
+        s.extract()
+            .iter()
+            .find_map(|q| match &q.content {
+                QuadContent::Texture {
+                    path, desaturated, ..
+                } if path.is_some() == want_path => Some(*desaturated),
+                _ => None,
+            })
+            .expect("the quad")
+    };
+    assert!(!grey(&s, true), "art starts full colour");
+
+    s.run("art:SetDesaturated(1) solid:SetDesaturated(1)")
+        .unwrap();
+    assert!(grey(&s, true), "the flag reaches the art quad");
+    assert!(
+        !grey(&s, false),
+        "a pathless solid never carries it — greying a white texel is a no-op dressed as a feature"
+    );
+
+    // And it clears — the reference's own `SetItemButtonDesaturated(button, nil)` restore.
+    s.run("art:SetDesaturated(nil)").unwrap();
+    assert!(!grey(&s, true), "clearing the flag restores full colour");
+}
+
+/// Read a Texture region's desaturation state straight off the model, by name.
+///
+/// It has no getter in Lua on purpose — `IsDesaturated` (`0x79c2c0`) is in wow-re's ledger but its
+/// return shape is not carved, and inventing one to make a test convenient is how an unverified API
+/// gets shipped (decision 1327's own residual). The extract quad is the other way to see it, but a
+/// cleared texture emits no quad at all, which is exactly the case these tests need to observe.
+fn desaturated(s: &UiScript, name: &str) -> bool {
+    let lua = s.lua();
+    let model = lua.app_data_ref::<crate::script::Model>().expect("model");
+    let id = *model.region_names.get(name).expect("region name");
+    let h = *model.id_to_region.get(&id).expect("region handle");
+    model.region_data.get(&h).is_some_and(|d| d.desaturated)
+}
+
+/// **`SetTexture` clears the desaturation — except when the path does not actually change**
+/// (wow-re `texture-desaturate-law.md` §2.3, VERIFIED; decision 1330).
+///
+/// `+0x128` is a `CGxShader*`, and `CSimpleTexture::SetTexture` writes it from a shader index the
+/// Lua binding always passes as slot 0 (permanently NULL). Storing a desaturate boolean *beside*
+/// the texture handle — which is what benilla did on 1327 — diverges on the single most common
+/// FrameXML shape there is: a repaint that re-sets the icon and expects the grey to follow the art.
+/// The same-path early-out (`0x770225`) is what makes the *idempotent* repaint keep its grey, and
+/// it is the half a plausible implementation drops.
+#[test]
+fn set_texture_clears_desaturation_unless_the_path_is_unchanged() {
+    let s = script();
+    s.run(
+        r#"
+        local f = CreateFrame("Frame", "ClrOwner")
+        icon = f:CreateTexture("ClrIcon", "ARTWORK")
+        icon:SetTexture("Interface\\Icons\\Spell_Nature_Sleep")
+        icon:SetDesaturated(1)
+    "#,
+    )
+    .unwrap();
+    let grey = |s: &UiScript| desaturated(s, "ClrIcon");
+
+    // The idempotent repaint: same file, so the client returns before it can clear anything.
+    s.run(r#"icon:SetTexture("Interface\\Icons\\Spell_Nature_Sleep")"#)
+        .unwrap();
+    assert!(grey(&s), "re-setting the SAME art keeps the grey");
+
+    // A different file reaches the write and zeroes the slot.
+    s.run(r#"icon:SetTexture("Interface\\Icons\\Spell_Fire_Fireball")"#)
+        .unwrap();
+    assert!(!grey(&s), "a texture CHANGE clears the desaturation");
+
+    // The clear forms take the same leg (`test esi,esi` falls through to the write).
+    s.run("icon:SetDesaturated(1) icon:SetTexture(nil)")
+        .unwrap();
+    assert!(!grey(&s), "SetTexture(nil) clears it too");
+
+    // The COLOUR form is a different function (`0x770360`) and is not one of the field's writers.
+    s.run(r#"icon:SetTexture("Interface\\Icons\\Spell_Nature_Sleep") icon:SetDesaturated(1)"#)
+        .unwrap();
+    s.run("icon:SetTexture(1, 0, 0)").unwrap();
+    assert!(grey(&s), "the colour form does not touch the shader slot");
+}
+
+/// **`SetDesaturated`'s argument truth table has two arms that read backwards** (wow-re
+/// `texture-desaturate-law.md` §1.1, VERIFIED at `0x6f1c10`'s jump table; decision 1330).
+///
+/// `0x6f1c10(L, 2, default=1)` takes its DEFAULT on `LUA_TNONE`, so a bare `SetDesaturated()` greys
+/// — the opposite of the `if flag then` an implementation writes without looking. And a number is
+/// truncated to an int, so `SetDesaturated(0)` clears where truthiness would have greyed.
+#[test]
+fn set_desaturated_takes_the_clients_argument_truth_table() {
+    let s = script();
+    s.run(r#"f = CreateFrame("Frame", "ArgOwner") tex = f:CreateTexture("ArgTex", "ARTWORK")"#)
+        .unwrap();
+    let grey = |s: &UiScript| desaturated(s, "ArgTex");
+
+    // NO ARGUMENT is ON — the LUA_TNONE default arm, not the nil arm.
+    s.run("ArgTex:SetDesaturated()").unwrap();
+    assert!(
+        grey(&s),
+        "a bare SetDesaturated() greys (LUA_TNONE default)"
+    );
+
+    s.run("ArgTex:SetDesaturated(nil)").unwrap();
+    assert!(!grey(&s), "nil clears");
+
+    // A number truncating to zero clears; a non-zero one greys.
+    s.run("ArgTex:SetDesaturated(1) ArgTex:SetDesaturated(0)")
+        .unwrap();
+    assert!(!grey(&s), "0 clears — the number arm truncates to int");
+    s.run("ArgTex:SetDesaturated(0.5)").unwrap();
+    assert!(!grey(&s), "0.5 truncates to 0 and clears");
+
+    // Both booleans, and Dewdrop's `true` (the call 98 corpus addons reach).
+    s.run("ArgTex:SetDesaturated(true)").unwrap();
+    assert!(grey(&s), "true greys");
+    s.run("ArgTex:SetDesaturated(false)").unwrap();
+    assert!(!grey(&s), "false clears");
+}
+
 /// The draw gate is the TEXTURE slot, never the colour (`texture-color-composition.md` §4,
 /// VERIFIED): `0x7706e0` tests `+0xcc` and emits NOTHING when it is empty, whatever the vertex
 /// colour holds. Since the tint deliberately survives `SetTexture(nil)` ("a tint outlives the art
@@ -661,4 +817,131 @@ fn a_gradient_is_stored_whole_and_painted_as_its_midpoint() {
         Some([0.5, 0.0, 0.5, 1.0]),
         "SetGradient's stops are opaque, so the midpoint alpha is 1"
     );
+}
+
+/// **The split itself: a Texture answers texture verbs and NOT text ones, and vice versa.**
+///
+/// Until this landed, one shared table meant a Texture answered `SetText` and a FontString answered
+/// `SetTexture` — a superset in both directions (wow-re
+/// `system/ui/scratch/texture-fontstring-method-split.md`: Texture's map `0x87c128` is 22 entries,
+/// FontString's `0xcf5400` is 32, both tail-calling the Region map and stopping there).
+#[test]
+fn the_two_region_leaves_answer_their_own_maps() {
+    let s = crate::script::UiScript::new().unwrap();
+    s.run(
+        r#"
+        LeafOwner = CreateFrame("Frame", "LeafOwner")
+        Tex = LeafOwner:CreateTexture("Tex", "ARTWORK")
+        Str = LeafOwner:CreateFontString("Str", "ARTWORK")
+        "#,
+    )
+    .unwrap();
+    let has = |s: &crate::script::UiScript, obj: &str, m: &str| {
+        s.eval::<String>(&format!("return type({obj}.{m})"))
+            .unwrap()
+            == "function"
+    };
+
+    // Texture-only, and the asymmetry the carve calls out: `SetVertexColor` is on BOTH leaves while
+    // `GetVertexColor` is Texture-only. No reasonable partition invents that.
+    for m in [
+        "SetTexture",
+        "GetTexture",
+        "SetTexCoord",
+        "SetBlendMode",
+        "GetVertexColor",
+    ] {
+        assert!(has(&s, "Tex", m), "a Texture answers {m}");
+        assert!(!has(&s, "Str", m), "a FontString must NOT answer {m}");
+    }
+    // FontString-only.
+    for m in [
+        "SetText",
+        "GetText",
+        "GetStringWidth",
+        "SetJustifyH",
+        "SetAlphaGradient",
+    ] {
+        assert!(has(&s, "Str", m), "a FontString answers {m}");
+        assert!(!has(&s, "Tex", m), "a Texture must NOT answer {m}");
+    }
+    // On BOTH — and each leaf registers its own copy in the client, so these are NOT on the Region
+    // map and must not be hoisted into it.
+    for m in [
+        "SetVertexColor",
+        "SetAlpha",
+        "Show",
+        "Hide",
+        "IsShown",
+        "SetDrawLayer",
+    ] {
+        assert!(
+            has(&s, "Tex", m) && has(&s, "Str", m),
+            "{m} is on both leaves"
+        );
+    }
+    // The Region map reaches both, through each leaf's own fallback.
+    for m in crate::script::REGION_MAP_METHODS {
+        assert!(
+            has(&s, "Tex", m) && has(&s, "Str", m),
+            "{m} is the Region map"
+        );
+    }
+    // **`GetStringHeight` is GONE and must stay gone.** 1.12 has no such method on any table (0
+    // hits in every encoding; the control `GetStringWidth` has 1), Blizzard's own FrameXML calls it
+    // 0 times, and ours was a byte-identical duplicate of `GetHeight` — which is the method the
+    // reference itself uses for this, falling through to the same cached measurement
+    // `GetStringWidth` reads. Keeping the width and dropping the height is not an oversight: the
+    // client really is asymmetric here.
+    assert!(
+        !has(&s, "Str", "GetStringHeight"),
+        "1.12 has no GetStringHeight"
+    );
+    assert!(
+        has(&s, "Str", "GetStringWidth"),
+        "…but it does have GetStringWidth"
+    );
+    assert!(
+        has(&s, "Str", "GetHeight"),
+        "GetHeight is the replacement, via the Region map"
+    );
+
+    // The near-miss pair: Texture has SetGradientAlpha, FontString has SetAlphaGradient.
+    assert!(has(&s, "Tex", "SetGradientAlpha") && !has(&s, "Str", "SetGradientAlpha"));
+    assert!(has(&s, "Str", "SetAlphaGradient") && !has(&s, "Tex", "SetAlphaGradient"));
+}
+
+/// **`SetPortraitToTexture` is a GLOBAL in 1.12, not a Texture method.**
+///
+/// `reference/1.12-globals.tsv` marks it `engine`, and both of the reference's own call sites pass a
+/// texture NAME: `ContainerFrame.lua:419` and `MailFrame.lua:174`. The first is the one that binds
+/// us — we SOURCE `ContainerFrame.lua` off the patch chain, so the client's own file calls this
+/// global inside our VM.
+#[test]
+fn set_portrait_to_texture_is_a_global_taking_a_name() {
+    let s = crate::script::UiScript::new().unwrap();
+    s.run(
+        r#"
+        PortHost = CreateFrame("Frame", "PortHost")
+        Port = PortHost:CreateTexture("PortHostPortrait", "ARTWORK")
+        SetPortraitToTexture("PortHostPortrait", "Interface\\ContainerFrame\\KeyRing-Bag-Icon")
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        s.eval::<String>("return Port:GetTexture()").unwrap(),
+        "Interface\\ContainerFrame\\KeyRing-Bag-Icon"
+    );
+    // The Texture METHOD is gone — 1.12's Texture map has no such entry.
+    assert_eq!(
+        s.eval::<String>("return type(Port.SetPortraitToTexture)")
+            .unwrap(),
+        "nil",
+        "1.12 has no Texture:SetPortraitToTexture — it is a global"
+    );
+    // An unknown name is not an error: the reference's callers compose names that may not exist
+    // yet, and nothing here may raise on the sourced file's behalf.
+    s.run(r#"SetPortraitToTexture("NoSuchPortrait", "Interface\\X")"#)
+        .unwrap();
+    assert!(s.errors().is_empty());
 }

@@ -61,6 +61,31 @@ pub struct WorldUnit {
     /// component defaulted it to zero and the water-foam fixture caught it: 91 k pixels of wrong
     /// ripple, in a lane none of the six scenery captures covers.
     pub height: f32,
+    /// The box the world may **cull this body by**, in model space — or `None` for a body the world
+    /// must not decide.
+    ///
+    /// The third of this component's size facts, beside [`scale`](Self::scale) and
+    /// [`height`](Self::height), and here for the same reason they are: one place answers "how big
+    /// is this body", and a second component for the culling half is the drift that ends with two
+    /// extents disagreeing.
+    ///
+    /// It exists because standing in a sealed WMO room the reference never *submits* an outdoor
+    /// object at all (`crate::exterior_cull`, decision 1270) — so the cull needs one whole-object
+    /// AABB per body, on its root, which is the reference's own granularity. The game supplies the
+    /// loader-armed idle's authored CAaBox (decision 0637 — a skinned body's bind-pose box is not
+    /// where it draws), unscaled: the root transform already carries the display scale.
+    ///
+    /// **`None` means one thing only: not the world's to decide.** In 1.12 content that is the
+    /// transport, whose root `Visibility` its own tick writes every frame — a second writer there
+    /// is the fight decision 0025 forbids.
+    ///
+    /// A body whose model has **not resolved yet** is elected all the same, with a degenerate box
+    /// at its own origin. That is not a fallback, it is the honest bound: the origin is the
+    /// server's position and is known exactly from the body's first frame, while the model's extent
+    /// crosses two reconcilers before it arrives. Admitting the body meanwhile was a real defect,
+    /// not a conservative default — every streamed mob drew for one full frame through a sealed
+    /// room's ceiling, and at a cavern's frame rate one frame is most of a second (1270 §5).
+    pub bound: Option<bevy::camera::primitives::Aabb>,
 }
 
 /// …and this one is the **viewer's own** body. A marker rather than a bool on [`WorldUnit`]

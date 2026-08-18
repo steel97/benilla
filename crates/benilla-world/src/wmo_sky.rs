@@ -19,19 +19,41 @@
 //! without a MOSB, 0 counter-examples (`benilla-extract skyboxscan`) — was true and still is; it just
 //! never established *which* group the renderer tests, and it was over-read as if it had.
 //!
-//! Five roots exercise both halves: the four Caverns of Time shells (unreleased in 1.12) and
-//! **`Stratholme_B`**, the burning city. Four more name a skybox no group ever asks for (DireMaul's
+//! Five roots exercise both halves: **`Stratholme_B`**, the burning city, and the four Caverns of
+//! Time shells — which are *not* out of reach in 1.12, whatever the instance portals do.
+//! `CavernsofTime.wmo` is placed in the live world at Kalimdor tile (39, 47), MODF `uniqueId`
+//! 398759, and standing in the crater at `.go xyz -8437.16 -4222.44 -211.58 1` the cull's down-ray
+//! seeds group 29 (`flags 0x42805` — `SHOW_SKYBOX` set) and this resolve fires. An earlier note here
+//! read "unreleased" as "unreachable" and concluded this branch never actually picks; the director
+//! walked into it.
+//!
+//! Four more roots name a skybox no group ever asks for (DireMaul's
 //! instance shell, `Stratholme_A`, and the two Sunken Temple roots — whose MOSB isn't even a model
 //! path, it's the string "the temple of atal'hakkar"), so keying off the chunk alone would still
 //! paint skies the reference never shows. This is why Stratholme's sky is red where the zone light
 //! says otherwise: map 329's only reachable `Light.dbc` atmosphere (global row 341 → `LightParams`
 //! 336) is a khaki-brown gradient with a near-black apex, and it is not what draws in there.
 //!
-//! What we draw is the model as authored: `StratholmeSkybox.m2` is a static, emissive, two-sided cube
-//! (three batches × 8 verts, one texture pair per axis), anchored at the camera with identity rotation
-//! — the same treatment [`crate::sky`] gives its dome. Occlusion is **not** the box's radius: like
-//! every sky element it forces the far depth (`wmo_skybox.wgsl`; the law is in [`crate::sky_order`]),
-//! so the world paints over it and the 26-yard shell is free to sit inside the room's own geometry.
+//! **A skybox is an ordinary M2, and is drawn as one** (decision 1264). This lane used to have a
+//! private mesh builder and a private material — positions, UVs, one texture, everything opaque —
+//! which is a faithful drawing of `StratholmeSkybox.m2` (three opaque batches × 8 verts, one texture
+//! pair per axis, no animation) and of nothing else. `CavernsOfTimeSky.m2` is the counter-example the
+//! chain also ships: **21 batches across four blend modes** — a painted cube, six ADDITIVE star
+//! sheets on the cube's own faces, five alpha-blended planet cards, three alpha-tested asteroid belts
+//! on rotating bones. Drawn opaque, the star sheet — whose RGB is near-white and whose stars live in
+//! its ALPHA channel — paints a flat white sheet over the painted sky, and the planets and belts
+//! become dark cards. That is the director's *"the whole ceiling is white … some of the cool effects
+//! seem missing"* in Caverns of Time.
+//!
+//! So the batches go through [`crate::model_render`]'s material lane like every other model
+//! ([`M2BatchMaterials::skybox`]), which is where the blend law, the 224/255 alpha-key reference, the
+//! additive gamma premultiply and the authored batch order already live, byte-verified. Three things
+//! are the *sky's* and are set here, not read off the batch: the forced far depth, depth-write off,
+//! and depth-test on — the rationale is on `skybox()`.
+//!
+//! Occlusion is **not** the box's radius: like every sky element it forces the far depth (the law is
+//! in [`crate::sky_order`]), so the world paints over it and the shell is free to sit inside the
+//! room's own geometry.
 //!
 //! **Scope — the skybox replaces the WHOLE celestial pass, not just the backdrop.** `CSky::Render`
 //! carries one shared boolean (`0x6d49cd` sets it, `0x6d49fb`/`0x6d4a2e` clear it once any slot's
@@ -48,17 +70,10 @@
 use std::collections::HashSet;
 
 use bevy::asset::RenderAssetUsages;
-use bevy::mesh::{Indices, MeshVertexBufferLayoutRef, PrimitiveTopology};
-use bevy::pbr::{
-    ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
-    MaterialPlugin,
-};
+use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use bevy::render::render_resource::{
-    AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
-};
-use bevy::shader::ShaderRef;
 
+use crate::model_render::M2BatchMaterials;
 use crate::view::WorldCamera;
 use benilla_assets::coords::wow_to_bevy;
 use benilla_assets::WmoModel;
@@ -68,36 +83,6 @@ use benilla_assets::{LockRecover, WorldAssets};
 /// module doc for how the bit was identified). Mirrored between the root's MOGI table and each group
 /// file's MOGP header; we read the MOGP copy the loader already keeps in `WmoGroupNav::flags`.
 const SHOW_SKYBOX: u32 = 0x40000;
-
-/// Unlit textured backdrop over a `StandardMaterial` shell — the shell supplies `unlit` +
-/// `cull_mode: None` (the box is viewed from inside) and the texture; the extension's fragment shader
-/// emits the texel raw and forces the sky pass's far depth.
-pub type WmoSkyboxMaterial = ExtendedMaterial<StandardMaterial, WmoSkyboxExt>;
-
-/// No per-material uniforms — the fragment reads the base-colour texture and nothing else.
-#[derive(Asset, AsBindGroup, Clone, TypePath, Default)]
-pub struct WmoSkyboxExt {}
-
-impl MaterialExtension for WmoSkyboxExt {
-    fn fragment_shader() -> ShaderRef {
-        "embedded://benilla_world/shaders/wmo_skybox.wgsl".into()
-    }
-
-    /// Depth-write OFF, exactly as [`crate::sky::SkyExt`] does it: the backdrop must leave the
-    /// z-buffer at its clear value over sky pixels so the forced-far glare quads stay occluded by
-    /// *world* geometry alone.
-    fn specialize(
-        _pipeline: &MaterialExtensionPipeline,
-        descriptor: &mut RenderPipelineDescriptor,
-        _layout: &MeshVertexBufferLayoutRef,
-        _key: MaterialExtensionKey<Self>,
-    ) -> Result<(), SpecializedMeshPipelineError> {
-        if let Some(depth) = descriptor.depth_stencil.as_mut() {
-            depth.depth_write_enabled = false;
-        }
-        Ok(())
-    }
-}
 
 /// The skybox model the camera's room asks for this frame — `None` (the overwhelming default) means
 /// the [`crate::sky`] gradient dome is the backdrop. Resolved from [`CameraInteriorClaim`]: the same
@@ -109,6 +94,29 @@ pub struct CameraWmoSkybox(pub Option<String>);
 /// walk through more than one skybox building, and the built entities are cached, not rebuilt).
 #[derive(Component)]
 struct WmoSkyboxPart(String);
+
+/// This batch **spins**: every one of its vertices is wholly weighted to one parentless
+/// rotation-only bone, so the authored motion is a rigid transform about that bone's pivot and needs
+/// no skinning palette at all ([`benilla_formats::BoneSpin`]).
+///
+/// That is the whole reason the belts can turn here rather than on the `M2Model` asset lane, which
+/// is what decision 1264 assumed this would cost. A rig would want joint entities under the anchor,
+/// and the anchor is written *post-propagation* ([`follow_camera`], decision 0504's same-frame
+/// camera pose) — so its children's globals would be a frame stale, and fixing that means either
+/// giving up the same-frame pose or hand-writing joint globals. A rigid batch sidesteps the whole
+/// question: there are no children.
+///
+/// **Population, measured** (`benilla-extract m2batch`/`m2bones`): `CavernsOfTimeSky.m2`'s four
+/// asteroid-belt batches, `[1@1.00]×38`, `[2@1.00]×38`, `[3@1.00]×38` and `[3@1.00]×28`, on three
+/// parentless bones keying rotation alone over one 66.667 s loop. The other 17 batches ride bone 0,
+/// which has no track, and `StratholmeSkybox.m2` has no animation at all — so this is the entire
+/// animated content of every skybox the chain ships.
+#[derive(Component)]
+struct SkyboxSpin {
+    /// The bone's pivot, in the same (Bevy) space the batch's vertices were baked into.
+    pivot: Vec3,
+    spin: benilla_formats::BoneSpin,
+}
 
 /// Which skybox paths have been built already — a build is a chain read + BLP decodes, so it happens
 /// once per path per session and the entities are then just shown/hidden. A path that FAILED to load
@@ -129,8 +137,9 @@ pub(crate) struct WmoSkyPlugin;
 
 impl Plugin for WmoSkyPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(MaterialPlugin::<WmoSkyboxMaterial>::default())
-            .init_resource::<CameraWmoSkybox>()
+        // No `MaterialPlugin` of its own any more: a skybox batch is a `WowModelMaterial` like every
+        // other model batch, and that plugin is already loaded.
+        app.init_resource::<CameraWmoSkybox>()
             .init_resource::<BuiltSkyboxes>()
             .add_systems(
                 Update,
@@ -170,8 +179,11 @@ fn resolve_camera_skybox(
     mut want: ResMut<CameraWmoSkybox>,
 ) {
     // `min()` rather than "first match": `Query` iteration order is not stable across frames, and a
-    // tie would otherwise alternate two backdrops frame to frame. Only one 1.12 root can qualify
-    // (Stratholme_B — the four Caverns of Time shells are unreleased), so this never actually picks.
+    // tie would otherwise alternate two backdrops frame to frame. Five roots qualify — Stratholme_B
+    // and the four Caverns of Time shells — and the tie-break is live code, not a formality: the
+    // note that used to sit here read "unreleased" as "unreachable" and concluded this can never
+    // pick twice. `CavernsofTime.wmo` is placed in the live world (decision 1264, and the module
+    // header above); two of its shells overlapping the camera is exactly the case `min()` settles.
     let resolved = instances
         .iter()
         .filter_map(|inst| {
@@ -197,9 +209,10 @@ fn resolve_camera_skybox(
     }
 }
 
-/// Build the wanted skybox's entities the first time it is asked for. The model is tiny (three static
-/// batches) and there are five in the whole game, so a built one is kept for the session rather than
-/// torn down on leaving the room — walking in and out of Stratholme's gate must not re-decode art.
+/// Build the wanted skybox's entities the first time it is asked for. The models are small (3 batches
+/// for Stratholme, 21 for Caverns of Time) and there are five in the whole game, so a built one is
+/// kept for the session rather than torn down on leaving the room — walking in and out of
+/// Stratholme's gate must not re-decode art.
 fn build_skybox(
     mut commands: Commands,
     want: Res<CameraWmoSkybox>,
@@ -207,7 +220,7 @@ fn build_skybox(
     world_assets: Option<ResMut<WorldAssets>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<WmoSkyboxMaterial>>,
+    mut mats: M2BatchMaterials,
 ) {
     let Some(path) = want.0.as_deref() else {
         return;
@@ -215,8 +228,23 @@ fn build_skybox(
     if built.0.contains(path) {
         return;
     }
+    // The shared light buffer is created in the render world's shadow at startup; a build that ran
+    // before it would bake materials against nothing. Retry — and do NOT latch `built` here, or the
+    // first frame in the room would permanently give up on the sky.
+    if !mats.ready() {
+        return;
+    }
     let Some(mut world_assets) = world_assets else {
         return; // assetless dev run — the gradient dome stays the backdrop
+    };
+    // The model's rigid spins, keyed by bone — empty for `StratholmeSkybox` and for a capture
+    // (`deterministic_run`), which keeps every animated lane on its bind pose so world baselines stay
+    // comparable across runs and branches, exactly as the doodad host's own arm does.
+    let spins = if crate::dev_state::deterministic_run() {
+        Default::default()
+    } else {
+        benilla_formats::load_m2_bone_spins(&mut world_assets.chain.lock_recover(), path)
+            .unwrap_or_default()
     };
     let subs = benilla_formats::load_m2_mesh(&mut world_assets.chain.lock_recover(), path);
     let subs = match subs {
@@ -232,7 +260,7 @@ fn build_skybox(
             return;
         }
     };
-    for sub in &subs {
+    for (i, sub) in subs.iter().enumerate() {
         let mut mesh = Mesh::new(
             PrimitiveTopology::TriangleList,
             RenderAssetUsages::default(),
@@ -243,32 +271,68 @@ fn build_skybox(
             .map(|p| wow_to_bevy(*p).to_array())
             .collect();
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+        // The model lane's vertex stage declares `world_normal` unconditionally and fills it under
+        // `VERTEX_NORMALS`; the sky is unlit and never reads it, but the attribute has to be there
+        // for the layout the shared shader was compiled against.
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_NORMAL,
+            sub.normals
+                .iter()
+                .map(|n| wow_to_bevy(*n).to_array())
+                .collect::<Vec<_>>(),
+        );
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, sub.uvs.clone());
         mesh.insert_indices(Indices::U32(sub.indices.clone()));
-        // The batch's own authored address mode (decision 0763) — a skybox's UVs sit inside 0..1, but
-        // reading the flags costs nothing and keeps this lane off a private convention.
+        // The batch's own authored address mode (decision 0763) — a skybox's UVs sit inside 0..1 for
+        // the cube faces, but Caverns of Time's asteroid belts tile theirs over ±21 wraps.
         let texture = sub
             .texture
             .as_deref()
             .and_then(|t| world_assets.texture(t, (sub.wrap_x, sub.wrap_y), &mut images));
-        let material = materials.add(WmoSkyboxMaterial {
-            base: StandardMaterial {
-                base_color_texture: texture,
-                unlit: true,
-                cull_mode: None, // authored two-sided, and we view the box from inside
-                ..default()
-            },
-            extension: WmoSkyboxExt {},
-        });
-        commands.spawn((
-            Mesh3d(meshes.add(mesh)),
-            MeshMaterial3d(material),
-            Transform::default(),
-            Visibility::Hidden, // `apply_skybox_visibility` turns on exactly the wanted one
-            WmoSkyboxPart(path.to_string()),
-        ));
+        // `i + 1` is the authored-batch-order convention (`0` = unordered): the transparent half of
+        // a skybox is camera-anchored, so every one of its batches shares a sort distance and the
+        // order is the only thing keeping the layers from re-flipping every frame.
+        let Some(material) = mats.skybox(sub, texture, u16::try_from(i + 1).unwrap_or(0)) else {
+            return; // light buffer vanished mid-build; `built` is unlatched, so we retry
+        };
+        let part = commands
+            .spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(material),
+                Transform::default(),
+                Visibility::Hidden, // `apply_skybox_visibility` turns on exactly the wanted one
+                WmoSkyboxPart(path.to_string()),
+            ))
+            .id();
+        if let Some(spin) = sole_bone(sub).and_then(|b| spins.get(&b)) {
+            commands.entity(part).insert(SkyboxSpin {
+                pivot: wow_to_bevy(spin.pivot),
+                spin: spin.clone(),
+            });
+        }
     }
     built.0.insert(path.to_string());
+}
+
+/// The bone this batch is **wholly** weighted to, if any — the caller's half of
+/// [`benilla_formats::BoneSpin`]'s rigid-body condition, and the one half the bone table cannot
+/// answer: a vertex split between this bone and another is half a rigid body's worth of motion,
+/// which no single transform can produce.
+///
+/// `None` for a batch with no skin binding at all (every WMO batch, and any loader that didn't fill
+/// it) — the conservative answer, since an unweighted batch has nothing to spin about.
+fn sole_bone(sub: &benilla_formats::RenderSubmesh) -> Option<u16> {
+    let bone = sub.joints.first()?[0];
+    (sub.weights.len() == sub.joints.len()
+        && sub
+            .joints
+            .iter()
+            .zip(&sub.weights)
+            // `> 0.999` rather than `== 1.0`: the weights are the file's 0..255 bytes normalised by
+            // their sum, so a wholly-bound vertex is exactly 1.0 today — but an equality test on a
+            // divided float is the kind of thing that silently stops matching.
+            .all(|(j, w)| j[0] == bone && w[0] > 0.999))
+    .then_some(bone)
 }
 
 /// Show the wanted skybox's batches and hide every other built one. This is the sole `Visibility`
@@ -312,22 +376,88 @@ fn apply_skybox_visibility(
 /// not incidental — the near-black ±Z pair covers only a **34.7°** cone about the zenith rather than
 /// a symmetric 45°, and the side pairs' painted horizon lands three-quarters down their gradient
 /// (v ≈ 0.72). Re-centring the box on the eye would be a visible change and a wrong one.
+/// A spinning batch ([`SkyboxSpin`]) composes its bone's rotation about the bone's own pivot INSIDE
+/// the anchor: `T(eye) · T(pivot) · R(t) · T(−pivot)`, which closes to the rotation itself plus the
+/// translation below. The pivot conjugation is not decoration — Caverns of Time's belt bones pivot
+/// ~3 yd off the model origin, and the eye sits AT that origin ~20 yd from the belt, so dropping it
+/// swings the whole ring through several degrees instead of turning it in place.
+///
+/// The clock is the scene's own elapsed time, wrapped by the sequence. **The phase origin is not
+/// byte-pinned** — the reference arms the model at load and samples a shared clock, so its phase is
+/// whatever the room's load moment was — and for a 66.7 s loop of an asteroid ring with no start
+/// event, phase is unobservable. Captures never reach here at all (the spin component is not
+/// attached under a deterministic run), so no golden frame depends on it.
 #[allow(clippy::type_complexity)]
 fn follow_camera(
+    time: Res<Time>,
     cam: Query<&GlobalTransform, With<WorldCamera>>,
     mut parts: Query<
-        (&mut Transform, &mut GlobalTransform),
+        (&mut Transform, &mut GlobalTransform, Option<&SkyboxSpin>),
         (With<WmoSkyboxPart>, Without<WorldCamera>),
     >,
 ) {
     let Some(cam_gt) = cam.iter().next() else {
         return;
     };
-    for (mut tf, mut gt) in &mut parts {
-        tf.translation = cam_gt.translation();
-        tf.rotation = Quat::IDENTITY;
+    let now = time.elapsed_secs();
+    for (mut tf, mut gt, spin) in &mut parts {
+        let (rot, pivot) = match spin {
+            Some(s) => (
+                benilla_assets::coords::wow_rotation_to_bevy(s.spin.sample(now)),
+                s.pivot,
+            ),
+            None => (Quat::IDENTITY, Vec3::ZERO),
+        };
+        tf.translation = cam_gt.translation() + pivot - rot * pivot;
+        tf.rotation = rot;
         tf.scale = Vec3::ONE;
         // Propagation already ran this frame — the direct global write is what renders.
         *gt = GlobalTransform::from(*tf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The renderer's half of the rigid-spin predicate, on the real art: exactly the four
+    /// asteroid-belt batches resolve to a bone the collector spins, and the other seventeen resolve
+    /// to bone 0 — which is *weighted* wholly, and simply has no track.
+    ///
+    /// The distinction matters and is why this asserts both columns. `sole_bone` returning `Some(0)`
+    /// for the painted cube is correct and harmless; it is the SPIN lookup that must come back empty
+    /// for it. A test that only checked "four parts spin" would pass just as well if the predicate
+    /// were selecting the wrong four.
+    #[test]
+    fn only_the_belt_batches_of_the_caverns_sky_resolve_to_a_spinning_bone() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::Chain::open(&data).expect("open vanilla patch chain");
+        const SKY: &str = "Environments\\Stars\\CavernsOfTimeSky.m2";
+        let subs = benilla_formats::load_m2_mesh(&mut chain, SKY).expect("load the sky");
+        let spins = benilla_formats::load_m2_bone_spins(&mut chain, SKY).expect("its spins");
+
+        let bones: Vec<Option<u16>> = subs.iter().map(sole_bone).collect();
+        assert_eq!(bones.len(), 21, "21 authored batches");
+        // Batches 5..=8 are the belts (`m2batch`: `[1@1.00]×38`, `[2@1.00]×38`, `[3@1.00]×38`,
+        // `[3@1.00]×28`); every other batch rides bone 0.
+        assert_eq!(
+            &bones[5..=8],
+            &[Some(1), Some(2), Some(3), Some(3)],
+            "the belt batches and the bones they ride"
+        );
+        assert!(
+            bones
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !(5..=8).contains(i))
+                .all(|(_, b)| *b == Some(0)),
+            "every non-belt batch is wholly on bone 0: {bones:?}"
+        );
+
+        let spinning = bones
+            .iter()
+            .filter(|b| b.and_then(|b| spins.get(&b)).is_some())
+            .count();
+        assert_eq!(spinning, 4, "exactly the four belt batches turn");
     }
 }

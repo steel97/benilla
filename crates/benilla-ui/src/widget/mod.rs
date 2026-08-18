@@ -173,11 +173,12 @@ impl<T> Arena<T> {
 
 mod kinds;
 pub use kinds::{
-    ButtonFont, ButtonState, ColorSelectState, CooldownState, EditAction, EditBoxState,
-    EditOutcome, EditUnit, FrameKind, InsertMode, KindState, MessageFrameState, MessageLine,
-    MinimapState, RegionKind, ScrollFrameState, ScrollingMessageState, SliderState, StatusBarState,
-    TooltipState, COOLDOWN_FLASH_SECS, MINIMAP_DEFAULT_ZOOM, MINIMAP_ZOOM_LEVELS,
-    TOOLTIP_DOUBLE_GAP, TOOLTIP_FADE_SECS, TOOLTIP_LINE_GAP, TOOLTIP_PAD, TOOLTIP_WRAP_WIDTH,
+    slider_fraction, slider_grab, ButtonFont, ButtonState, ColorSelectState, CooldownState,
+    EditAction, EditBoxState, EditOutcome, EditUnit, FrameKind, InsertMode, KindState,
+    MessageFrameState, MessageLine, MinimapState, RegionKind, ScrollFrameState,
+    ScrollingMessageState, SliderState, StatusBarState, TooltipState, COOLDOWN_FLASH_SECS,
+    MINIMAP_DEFAULT_ZOOM, MINIMAP_ZOOM_LEVELS, TOOLTIP_DOUBLE_GAP, TOOLTIP_FADE_SECS,
+    TOOLTIP_LINE_GAP, TOOLTIP_PAD, TOOLTIP_WRAP_WIDTH,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -208,6 +209,13 @@ pub struct Frame {
     /// `SetParent(nil)` stays in this list so [`WidgetArena::destroy`] still frees it — see
     /// [`Region::detached`], which is what actually takes it out of the draw.
     pub regions: Vec<RegionHandle>,
+    /// This frame's **title region** — the drag handle at `CSimpleFrame+0xA8`, or `None`.
+    ///
+    /// **One per frame**, which is what makes `CreateTitleRegion` idempotent: a second call returns
+    /// the SAME object after clearing its anchors, so calling it on an XML-declared title region
+    /// silently wipes them (wow-re `widget-api-batch-benilla.md` Q6). It is also in
+    /// [`Frame::regions`], so the arena still frees it.
+    pub title_region: Option<RegionHandle>,
     /// The draw stratum (`frameStrata +0xc0`, default MEDIUM).
     pub strata: Strata,
     /// The level within the stratum (`frameLevel +0xc4`, default 0).
@@ -236,6 +244,20 @@ pub struct Frame {
     /// window behind it while keeping its handler installed — a frame with a handler it has not
     /// enabled is deliberately transparent to the wheel.
     pub mouse_wheel_enabled: bool,
+    /// Whether the frame is **keyboard-enabled** (`EnableKeyboard` `0x776f90` / XML
+    /// `enableKeyboard`) — the kind-0/kind-1 bucket membership `0x76af00` writes as
+    /// `[frame+0xcc] |= 1<<kind`.
+    ///
+    /// Default **false**, the client's own default. **The flag round-trips; key DELIVERY is not
+    /// gated on it yet** — the same shape [`Self::mouse_wheel_enabled`] shipped in (1198), and for
+    /// the same reason: the machinery it gates (the strata 8→0 walk, the kind buckets, the
+    /// `OnKeyDown`/`OnKeyUp`/`OnChar` script kinds) does not exist here, so gating on the flag
+    /// would change nothing while pretending otherwise. wow-re's
+    /// `scratch/frame-key-script-delivery.md` §3.2 is explicit that the two are separable:
+    /// `EnableKeyboard(true)` on a script-less frame "puts it in the walk where it is called and
+    /// declines — transparent to everything downstream", so **being enabled is not being a
+    /// handler**, and storing the flag alone is the faithful half rather than a stub of the whole.
+    pub keyboard_enabled: bool,
     /// Clamp-to-screen (`SetClampedToScreen` / XML `clampedToScreen` — the client's geometry
     /// flags **bit4**, applied inside rect assembly `0x767a20`, wow-re `layout.md`): the layout
     /// resolve shifts this frame's assembled rect back inside the screen, size preserved.
@@ -351,6 +373,10 @@ pub struct WidgetArena {
     regions: Arena<Region>,
     names: HashMap<String, FrameHandle>,
     next_insertion: u32,
+    /// Monotonic count of Minimap-kind frames ever created — an O(1) "a new Minimap widget
+    /// exists" signal, so the per-frame state feed (`set_minimap_inside`'s caller) re-pushes
+    /// exactly when one appears instead of walking every frame to find out.
+    minimap_created: u64,
 }
 
 impl Default for WidgetArena {
@@ -367,7 +393,13 @@ impl WidgetArena {
             regions: Arena::new(),
             names: HashMap::new(),
             next_insertion: 0,
+            minimap_created: 0,
         }
+    }
+
+    /// Monotonic count of Minimap widgets ever created (see the field note).
+    pub fn minimap_created(&self) -> u64 {
+        self.minimap_created
     }
 
     // ── Read access ────────────────────────────────────────────────────────────────────────────
@@ -482,6 +514,7 @@ impl WidgetArena {
             parent,
             children: Vec::new(),
             regions: Vec::new(),
+            title_region: None,
             strata: Strata::default(),
             level: 0,
             alpha,
@@ -517,6 +550,9 @@ impl WidgetArena {
                 kind,
                 FrameKind::ScrollingMessageFrame | FrameKind::ScrollFrame
             ),
+            // Nothing is keyboard-enabled by construction: `0x76af00` is only ever reached from the
+            // XML attribute or an explicit call, never a ctor (`scripts-auto-enable.md` §1-2).
+            keyboard_enabled: false,
             // A tooltip clamps to the screen by construction (its XML never sets the attribute,
             // yet the reference plate observably never leaves the window — the class supplies
             // geometry flags bit4; decision 0352's law: no tooltip off-screen, ever).
@@ -559,6 +595,9 @@ impl WidgetArena {
             next_decl: 0,
         };
 
+        if matches!(kind, FrameKind::Minimap) {
+            self.minimap_created += 1;
+        }
         let (index, generation) = self.frames.insert(frame);
         let handle = FrameHandle { index, generation };
 
@@ -633,6 +672,37 @@ impl WidgetArena {
             .regions
             .push(handle);
         Some(handle)
+    }
+
+    /// **Free one region leaf** — unlink it from its owner's region list and release the slab slot,
+    /// so the handle stops resolving and the region stops drawing. Returns whether it was live.
+    ///
+    /// There is no `Region:Destroy` in the widget API and none is wanted: this exists for the one
+    /// engine-owned lifetime in the client, `CSimpleHTML::SetText`, which pool-frees the blocks of
+    /// the previous parse before building the new ones (`simplehtml-markup-engine.md` §10 step 1 —
+    /// the pool allocate at `0x78adc6` has a matching free, and the CONTENTNODE list at `+0x340` is
+    /// what names the objects to free). Without it a second `SetText` leaves the first parse's
+    /// FontStrings on screen, stacked behind the new ones.
+    ///
+    /// **The caller owns the rest of the region's identity.** The arena holds only structure;
+    /// paint (`RegionData`), the stable id maps, the resolved-rect cache and any name publish live
+    /// on the script model, and a caller that frees a region without dropping those leaves a
+    /// resolvable id pointing at a dead handle. [`crate::script`]'s SimpleHTML block teardown is
+    /// the one caller and does the whole set. For the same reason this must never be pointed at a
+    /// region some *state* still holds by handle (a button's texture slot, a tooltip line, an
+    /// EditBox's text region): freeing those would leave that state dangling.
+    pub fn destroy_region(&mut self, h: RegionHandle) -> bool {
+        let Some(region) = self.region(h) else {
+            return false;
+        };
+        let owner = region.owner;
+        if let Some(f) = self.frame_mut(owner) {
+            f.regions.retain(|&r| r != h);
+            if f.title_region == Some(h) {
+                f.title_region = None;
+            }
+        }
+        self.regions.remove(h.index, h.generation).is_some()
     }
 }
 

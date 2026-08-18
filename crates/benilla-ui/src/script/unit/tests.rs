@@ -551,9 +551,11 @@ fn faction_group_pair_and_the_pvp_toggle() {
     assert!(s
         .eval::<bool>(r#"local a, b = UnitFactionGroup("target") return a == nil and b == nil"#)
         .unwrap());
-    // An absent unit answers the same way.
+    // An absent unit answers the same way. (This read `"focus"` until the unrecognised-token raise
+    // landed — a token 1.12 does not have at all, so it now raises rather than being "absent". The
+    // question the line means to ask needs a RECOGNISED token that names nothing.)
     assert!(s
-        .eval::<bool>(r#"local a = UnitFactionGroup("focus") return a == nil"#)
+        .eval::<bool>(r#"local a = UnitFactionGroup("party4") return a == nil"#)
         .unwrap());
 
     assert_eq!(s.take_pvp_toggles(), 0, "nothing queued yet");
@@ -640,11 +642,16 @@ fn unit_affecting_combat_is_one_or_nil_and_hides_the_missing_unit() {
             .unwrap(),
         "an unresolvable token is the SAME nil a peaceful unit gives"
     );
-    // A number is accepted and stringified (`0x6f3510` is number-OR-string): it resolves the
-    // token "5", finds nothing, and answers nil — it does not raise.
-    assert!(s
-        .eval::<bool>("return UnitAffectingCombat(5) == nil")
-        .unwrap());
+    // **A number is accepted and stringified — and that is exactly why it RAISES.** The gate
+    // `0x6f3510` is number-OR-string, so `5` is coerced via `%.14g` to the token `"5"`; `"5"` then
+    // matches none of the resolver's nine prefixes and falls into
+    // `luaL_error("Unknown unit name: %s")`. This assertion read `== nil` and "it does not raise"
+    // until wow-re's own §5 cross-check refuted the no-error-path claim it rested on
+    // (`raid-roster-bindings.md` §1) — the acceptance was right, the conclusion was not.
+    assert!(
+        s.run("UnitAffectingCombat(5)").is_err(),
+        "a number is coerced to a token that matches nothing, so it raises"
+    );
 }
 
 /// A missing or wrong-typed argument **raises** — `0x6f4940` is `luaL_error` and does not return,
@@ -692,5 +699,262 @@ fn target_by_name_queues_the_name_and_the_exact_flag() {
     assert!(
         format!("{err}").contains(r#"Usage: TargetByName("name")"#),
         "got {err}"
+    );
+}
+
+/// **`UnitIsCharmed` — the number `1`, the nil, and the asymmetry.**
+///
+/// `KLHThreatMeter\Code\KTM_My.lua:533` is the corpus line blocked on it; seven other addons name
+/// it. The binding (`0x516cf0`) reads `UNIT_FIELD_CHARMEDBY != 0` — a 64-bit non-zero test on
+/// fields 10/11, **not** a `UNIT_FIELD_FLAGS` bit, which is what a boolean-shaped unit question
+/// invites you to assume.
+#[test]
+fn unit_is_charmed_answers_one_or_nil_and_only_for_the_charmed_side() {
+    let mut s = UiScript::new().unwrap();
+    s.set_unit("player", Some(player()));
+    let mut mc = player();
+    mc.charmed = true;
+    s.set_unit("target", Some(mc));
+
+    // A hit is the NUMBER 1 — `lua_pushnumber` writes tag 3; tag 1 (boolean) is never written on
+    // either arm, so `== true` in an addon must NOT match.
+    assert_eq!(
+        s.eval::<i64>(r#"return UnitIsCharmed("target")"#).unwrap(),
+        1
+    );
+    assert_eq!(
+        s.eval::<String>(r#"return type(UnitIsCharmed("target"))"#)
+            .unwrap(),
+        "number",
+        "the reference pushes a number, not a boolean"
+    );
+    assert_eq!(
+        s.eval::<i64>(r#"return select('#', UnitIsCharmed("target"))"#)
+            .unwrap(),
+        1,
+        "exactly one value on the hit path"
+    );
+
+    // An uncharmed unit and an absent one both answer nil — and nil, not `false` and not `0`.
+    for token in ["player", "party1"] {
+        assert!(
+            s.eval::<Option<i64>>(&format!(r#"return UnitIsCharmed("{token}")"#))
+                .unwrap()
+                .is_none(),
+            "{token} is not charmed, so the answer is nil"
+        );
+        assert_eq!(
+            s.eval::<String>(&format!(r#"return type(UnitIsCharmed("{token}"))"#))
+                .unwrap(),
+            "nil",
+            "…nil rather than false or 0"
+        );
+    }
+
+    // **The asymmetry.** The field is "who charms me", never "whom I charm", so the charmer reads
+    // nil while its victim reads 1 — here the player is doing the charming and is not charmed.
+    assert!(
+        s.eval::<Option<i64>>(r#"return UnitIsCharmed("player")"#)
+            .unwrap()
+            .is_none(),
+        "a charmER is not charmed; UNIT_FIELD_CHARM is never read by this binding"
+    );
+}
+
+/// **Unit tokens fold case, because the client's resolver does.**
+///
+/// `0x515970` compares every one of its literals with `SStrCmpI` → `_strnicmp`, whose fold is
+/// `'A'..'Z' += 0x20`; not one of its ten compares reaches the case-sensitive sibling (wow-re
+/// `system/ui/scratch/unit-token-grammar.md`, §5 trio). So this is a NARROWING fix — the real
+/// client resolves these and we did not — rather than the superset 1189 had to take back out.
+///
+/// `Accountant.lua:107` is the corpus line that paid for it: `UnitFactionGroup("Player")`, capital
+/// P, whose nil made `Accountant_SaveData[realm][faction]` a nil table index at l.192 and ended the
+/// addon's session. Roughly ten addons pass `Player`, `PLAYER`, `Target`, `Pet`, `PARTY`, `NPC`,
+/// `Mouseover` or `"Raid"..i`.
+#[test]
+fn a_unit_token_resolves_whatever_its_case() {
+    let mut s = UiScript::new().unwrap();
+    s.set_unit("player", Some(player()));
+    let mut tgt = player();
+    tgt.name = Some("Hogger".into());
+    s.set_unit("target", Some(tgt));
+
+    // Every spelling names the same unit — the getter, the number and the predicate alike.
+    for spelling in ["player", "Player", "PLAYER", "PlAyEr"] {
+        assert_eq!(
+            s.eval::<String>(&format!(r#"return UnitName("{spelling}")"#))
+                .unwrap(),
+            "Benilla",
+            "UnitName(\"{spelling}\") must resolve"
+        );
+        assert_eq!(
+            s.eval::<i64>(&format!(r#"return UnitLevel("{spelling}")"#))
+                .unwrap(),
+            12
+        );
+        assert!(s
+            .eval::<bool>(&format!(r#"return UnitExists("{spelling}")"#))
+            .unwrap());
+    }
+    for spelling in ["target", "Target", "TARGET"] {
+        assert_eq!(
+            s.eval::<String>(&format!(r#"return UnitName("{spelling}")"#))
+                .unwrap(),
+            "Hogger"
+        );
+    }
+
+    // **The two-unit call, which the map's fold does not cover on its own.**
+    // `pick_unit_token` chooses "whichever arg is not the player"; with a case-sensitive test,
+    // `("Player", "target")` reads as a non-player FIRST arg and the call answers about the wrong
+    // unit — a wrong answer rather than a missing one.
+    assert!(
+        s.eval::<bool>(
+            r#"return UnitIsEnemy("Player", "target") == UnitIsEnemy("player", "target")"#
+        )
+        .unwrap(),
+        "the directional pick folds case too"
+    );
+
+    // An unseated but RECOGNISED token is still absent whatever its case — folding must not invent
+    // units. (`bogus` moved out of this list when the unrecognised-token raise landed: it is not
+    // "absent", it is not a unit token at all, and the client says so.)
+    for spelling in ["Party1", "PARTY1", "raid9", "MouseOver"] {
+        assert!(
+            !s.eval::<bool>(&format!(r#"return UnitExists("{spelling}")"#))
+                .unwrap(),
+            "{spelling} was never seated"
+        );
+    }
+}
+
+/// The fold is on the way **IN** as well as out: a feed that pushes `"Target"` must not create a
+/// second entry shadowing `"target"`, which is what a lookup-only fold would allow.
+#[test]
+fn seating_a_token_folds_its_key_too() {
+    let mut s = UiScript::new().unwrap();
+    let mut a = player();
+    a.name = Some("First".into());
+    s.set_unit("Target", Some(a));
+    assert_eq!(
+        s.eval::<String>(r#"return UnitName("target")"#).unwrap(),
+        "First",
+        "a token seated as \"Target\" is readable as \"target\""
+    );
+
+    // …and clearing it through the other spelling really clears it, rather than leaving a shadow.
+    s.set_unit("TARGET", None);
+    assert!(
+        !s.eval::<bool>(r#"return UnitExists("target")"#).unwrap(),
+        "removal folds too — no shadowed entry survives"
+    );
+}
+
+/// **An unrecognised token RAISES; a recognised one that names nothing is a quiet nil.**
+///
+/// `0x515970` falls off the end of its nine compares into `luaL_error(L, "Unknown unit name: %s")`,
+/// which longjmps and never returns (wow-re `system/ui/scratch/unit-token-grammar.md`). Ours
+/// answered nil for everything unknown — 1203's shape pointed the other way, a failure the client
+/// reports and we swallowed.
+///
+/// The split is THREE-way, and the two quiet legs are the ones a "raise on nil" implementation gets
+/// wrong.
+#[test]
+fn an_unrecognised_unit_token_raises_and_a_recognised_empty_one_does_not() {
+    let mut s = UiScript::new().unwrap();
+    s.set_unit("player", Some(player()));
+
+    // RAISE: nothing the resolver's compares match.
+    for bogus in ["bogus", "focus", "boss1", "arena1"] {
+        let err = s
+            .run(&format!(r#"UnitName("{bogus}")"#))
+            .expect_err(&format!("{bogus} must raise"))
+            .to_string();
+        assert!(
+            err.contains(&format!("Unknown unit name: {bogus}")),
+            "the raise carries the client's own text and the offending token: {err}"
+        );
+    }
+    // `npc` is the SOLE full-string compare, so a suffix on it matches nothing at all.
+    assert!(s.run(r#"UnitName("npctarget")"#).is_err());
+    // …while `npc` itself is recognised, folded like everything else.
+    assert!(s.run(r#"UnitName("NPC")"#).is_ok());
+
+    // QUIET NIL, leg 1: a recognised token naming nothing here.
+    for absent in [
+        "party5",
+        "raid17",
+        "pet",
+        "mouseover",
+        "partypet2",
+        "raidpet3",
+    ] {
+        assert!(
+            s.eval::<Option<String>>(&format!(r#"return UnitName("{absent}")"#))
+                .unwrap()
+                .is_none(),
+            "{absent} is recognised and absent — nil, not a raise"
+        );
+    }
+    // QUIET NIL, leg 2: a recognised PREFIX with a junk suffix. The compares are prefix tests that
+    // stop at either NUL, so `playerfoo` matches `player` and never reaches the raise.
+    for junk in ["playerfoo", "raidx", "petx", "targetish"] {
+        assert!(
+            s.eval::<Option<String>>(&format!(r#"return UnitName("{junk}")"#))
+                .unwrap()
+                .is_none(),
+            "{junk} matches a PREFIX, so it is a quiet nil — not a raise. This is the leg an \
+             implementation that raises on \"did not resolve\" gets wrong."
+        );
+    }
+    // QUIET NIL, leg 3: the empty string and an absent argument. The per-binding argument gates are
+    // NOT uniform in the client and only two poles are verified, so this asserts the resolver's
+    // behaviour and does not invent a gate.
+    assert!(s.run(r#"UnitName("")"#).is_ok());
+    assert!(s.run("UnitName()").is_ok());
+
+    // A two-unit call gates BOTH arguments.
+    assert!(s.run(r#"UnitIsUnit("player", "bogus")"#).is_err());
+    assert!(s.run(r#"UnitIsUnit("bogus", "player")"#).is_err());
+    assert!(s.run(r#"UnitIsUnit("player", "party3")"#).is_ok());
+}
+
+/// **A multibyte unit token must not take the client down.**
+///
+/// The prefix test used to slice the token as a `&str` — `token[..p.len()]` — which PANICS when the
+/// token is multibyte UTF-8 and the prefix length lands mid-character ("byte index N is not a char
+/// boundary"). Any addon passing a non-ASCII token would have crashed the process rather than
+/// getting the `Unknown unit name` raise the client gives.
+///
+/// The client compares with `_strnicmp` over BYTES and folds ASCII only, so byte comparison is both
+/// the safe form and the faithful one — a token whose bytes differ above 0x7F is simply not one of
+/// the nine prefixes.
+#[test]
+fn a_multibyte_unit_token_raises_rather_than_panicking() {
+    let mut s = UiScript::new().unwrap();
+    s.set_unit("player", Some(player()));
+
+    // Each of these has a multibyte character positioned so that a byte-index slice at one of the
+    // prefix lengths (3 for `pet`, 4 for `raid`, 5 for `party`, 6 for `player`/`target`) would land
+    // inside it.
+    for token in ["pé", "раid", "playér", "targét", "мышь", "日本語のトークン"] {
+        let err = s
+            .run(&format!(r#"UnitName("{token}")"#))
+            .expect_err("a non-ASCII token matches no prefix, so it raises")
+            .to_string();
+        assert!(
+            err.contains("Unknown unit name"),
+            "it must RAISE, not panic and not answer: {err}"
+        );
+    }
+    // …and an ASCII token that merely shares a prefix's leading bytes still behaves.
+    assert!(s
+        .eval::<Option<String>>(r#"return UnitName("playerfoo")"#)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        s.eval::<String>(r#"return UnitName("player")"#).unwrap(),
+        "Benilla"
     );
 }

@@ -142,10 +142,11 @@ impl Plugin for ProbeKeyPlugin {
                 }
             })
             .collect();
-        app.insert_resource(ProbeKeys { taps }).add_systems(
-            bevy::app::PreUpdate,
-            fire_probe_key.after(bevy::input::InputSystems),
-        );
+        app.insert_resource(ProbeKeys { taps, armed: false })
+            .add_systems(
+                bevy::app::PreUpdate,
+                fire_probe_key.after(bevy::input::InputSystems),
+            );
     }
 }
 
@@ -166,6 +167,14 @@ fn probe_key_by_name(name: &str) -> Option<KeyCode> {
         "X" => KeyCode::KeyX,
         "Z" => KeyCode::KeyZ,
         "Tab" => KeyCode::Tab,
+        // TOGGLEAUTORUN's 1.12 default. The moving-axis protocol (task: grade streaming while
+        // running) engages autorun with one tap and steers with `WOW_PROBE_LOOK` — the whole
+        // scripted drive out of two instruments that already existed.
+        "NumLock" => KeyCode::NumLock,
+        // The nameplate toggles (`vplates`): bare `V` is enemy plates, `Shift`-held `V` is
+        // friendly. A probe that wants plates over a town's *friendly* NPCs — the only way to
+        // measure plate behaviour without standing in aggro range of something — presses this.
+        "V" => KeyCode::KeyV,
         // The detached free-fly toggle (`player.rs`) and its Ctrl speed boost (`camera.rs`, ×5).
         // Added because the harness could not reach the leg that broke decision 0793: the director's
         // first real run was a boosted free-fly, whose camera crosses the art radius in ~5 s, and
@@ -188,14 +197,27 @@ fn probe_key_by_name(name: &str) -> Option<KeyCode> {
         "Right" => KeyCode::ArrowRight,
         "Home" => KeyCode::Home,
         "End" => KeyCode::End,
+        // Enter at the character-select screen IS "enter world" (`char_select::input`), which makes
+        // the **second** login of a run reachable headlessly: `/logout` then `Enter` reproduces a
+        // character switch in one process. Session-scoped state that survives that boundary is a
+        // whole bug class, and until this key existed no probe could reach it — 1284's stale channel
+        // membership had to be found by the director, twice. `WOW_CHAR` is a deliberate one-shot
+        // (`run_mode`), so synthesizing the keypress is the only way back into the world in-process.
+        "Enter" => KeyCode::Enter,
         _ => return None,
     })
 }
 
-/// [`ProbeKeyPlugin`] state: one entry per scheduled tap.
+/// [`ProbeKeyPlugin`] state: one entry per scheduled tap, plus the once-armed latch.
 #[derive(Resource)]
 struct ProbeKeys {
     taps: Vec<ProbeKeyTap>,
+    /// **A self player has existed at some point this run.** The gate used to be "a self player
+    /// exists *right now*", which is what keeps a tap from firing into the loading screen — but it
+    /// also made every glue screen unreachable, and the second half of a `/logout` + `Enter`
+    /// character-switch probe happens at exactly one of those (1284). Latching it keeps the "not
+    /// before the world" intent and drops the "only while in it" accident.
+    armed: bool,
 }
 
 struct ProbeKeyTap {
@@ -220,8 +242,10 @@ fn fire_probe_key(
     self_player: Query<(), With<crate::net::SelfPlayer>>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut events: MessageWriter<bevy::input::keyboard::KeyboardInput>,
+    mut hold: ResMut<benilla_world::modkeys::SyntheticHold>,
 ) {
-    if probe.taps.is_empty() || self_player.is_empty() {
+    probe.armed |= !self_player.is_empty();
+    if probe.taps.is_empty() || !probe.armed {
         return;
     }
     let now = time.elapsed_secs();
@@ -251,6 +275,21 @@ fn fire_probe_key(
             synth(tap.key, bevy::input::ButtonState::Released);
             tap.released = true;
         }
+    }
+    // Publish what we are holding, so the macOS stuck-modifier reconciler
+    // ([`benilla_world::modkeys`]) doesn't undo it: it polls the *hardware* flags, which read
+    // "up" for a key no hand is on, so before this every synthesized chord — `SHIFT-V`,
+    // `Ctrl`+`Shift`+`F` — was released the frame after it was pressed, and the release was
+    // logged as a stuck-key correction. Rewritten only when the held set changes (a plain
+    // `ResMut` write every frame would mark the resource changed forever).
+    let held: Vec<KeyCode> = probe
+        .taps
+        .iter()
+        .filter(|t| t.pressed && !t.released)
+        .map(|t| t.key)
+        .collect();
+    if hold.0 != held {
+        hold.0 = held;
     }
 }
 

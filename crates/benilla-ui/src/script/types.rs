@@ -123,6 +123,11 @@ pub enum QuadContent {
         /// player arrow spins by it, standing in for the reference's engine arrow model; 0203
         /// flags the stand-in). `0.0` for the overwhelmingly common unrotated case.
         rotation: f32,
+        /// `Texture:SetDesaturated(1)` — draw the sampled texel as its **luminance** instead of
+        /// its colour (decision 1327). The renderer greys the texel and *then* modulates by
+        /// `color`, because the reference's own consumers pass a dim tint alongside the flag
+        /// (`SetItemButtonDesaturated(button, 1, 0.65, 0.65, 0.65)`) and expect both to land.
+        desaturated: bool,
     },
     /// One frame `Backdrop` piece (the tiled bg, or one of the 8 border pieces) — emitted at the
     /// owning frame's own draw slot, behind its regions ([`UiScript::extract`](super::UiScript::extract)). A textured quad
@@ -431,19 +436,25 @@ pub(crate) struct RegionData {
     /// WoW `ADD` blend (`SetBlendMode("ADD")` / XML `alphaMode` — the shared enum `0x811aa8`).
     /// Highlight state textures default to it (the client's `SetHighlightTexture` contract).
     pub(crate) additive: bool,
-    /// Explicit region size (`SetWidth`/`SetHeight`/XML `<Size>`); `None` = derive. When the region
-    /// carries [`RegionData::anchors`], size fills the axis the anchors don't pin (the client's "0 =
-    /// derive"); with **no** anchors, a sized region draws *centered* on its owner (the common
-    /// state-texture overhang, e.g. the 64×64 quickslot ring on a 36×36 button).
+    /// Explicit region size (`SetWidth`/`SetHeight`/XML `<Size>`); `None` = derive. Size fills the
+    /// axis the anchors don't pin (the client's "0 = derive") — so under a texture's implicit
+    /// SetAllPoints (two corners pin everything) an authored size is structurally unread, which is
+    /// how the reference stack-split plate authors 256×32 and renders 172×96 (decision 1310, B180).
     pub(crate) size: Option<(f32, f32)>,
     /// Region anchors (`SetPoint`/XML `<Anchors>` on a Texture/FontString). An anchor's
     /// `relative_to` defaults to the owner frame and may name a frame or a **sibling region**
     /// (resolved via [`Model::region_names`]; the fixpoint in [`UiScript::resolve`] orders the
-    /// sibling chain). Empty ⇒ the size/centered/fill fallback in [`UiScript::extract`];
-    /// non-empty ⇒ resolved in [`UiScript::resolve`], any edge the anchors leave unset inherited
-    /// from the owner frame's rect.
+    /// sibling chain). Every drawable region carries at least one — authored, or the
+    /// creation-path implicit anchor ([`super::region::implicit_creation_anchor`], decision
+    /// 1310); empty means a templateless Lua region nobody anchored, which never resolves and
+    /// never draws. Non-empty ⇒ resolved in [`UiScript::resolve`], any edge the anchors leave
+    /// unset inherited from the owner frame's rect.
     pub(crate) anchors: Vec<Anchor>,
-    /// FontString horizontal justification (`SetJustifyH`/XML `justifyH`); default CENTER.
+    /// `Texture:SetDesaturated(flag)` — the shader desaturation state (`0x79c1e0`, verified in
+    /// wow-re's ledger). Rides the extract as [`QuadContent::Texture::desaturated`] and the
+    /// renderer greys the texel by it (decision 1327), so the binding answers "shader supported"
+    /// — see `region/paint.rs`'s `SetDesaturated`.
+    pub(crate) desaturated: bool,
     /// `SetNonSpaceWrap` / `CanNonSpaceWrap` — FontString only (`0x79e9f0`/`0x79ead0`, wow-re's
     /// widget-method batch). **State only here.** The real client's gx flag `0x40` feeds a
     /// mid-word wrap carry and the fit-count terminator whose one consumer is the ellipsis
@@ -452,14 +463,13 @@ pub(crate) struct RegionData {
     /// which is the honest position and is stated rather than left to be discovered.
     ///
     /// Default is ON (a no-arg `SetNonSpaceWrap()` also enables), so `None` reads as enabled.
-    /// `Texture:SetDesaturated(flag)` — the shader desaturation state (`0x79c1e0`, verified in
-    /// wow-re's ledger). **Stored; the renderer does not yet honour it**, which is exactly why the
-    /// binding answers "shader unsupported" — see `region.rs`'s `SetDesaturated`.
-    pub(crate) desaturated: bool,
     pub(crate) non_space_wrap: Option<bool>,
-    pub(crate) justify_h: JustifyH,
-    /// FontString vertical justification (`SetJustifyV`/XML `justifyV`); default MIDDLE.
-    pub(crate) justify_v: JustifyV,
+    /// FontString justification, as the client's own **dword** rather than a pair of resolved
+    /// enums — `CSimpleFontString+0x120`, bits 0–2 horizontal and 3–5 vertical, defaulting to the
+    /// ctor's `0x212` (CENTER|MIDDLE). See [`crate::justify::Justify`]: an axis can be *cleared*,
+    /// which no resolved enum can hold, and the Lua getter and the draw path then answer that
+    /// state differently (`"UNKNOWN"` vs centred) — both faithfully.
+    pub(crate) justify: crate::justify::Justify,
     /// The `<TexCoords>`/`SetTexCoord` UV mapping ([`TexCoords`]: the 4-edge crop, or the 8-arg
     /// affine quad). `None` = the full texture. Slices the quadrant/atlas art (decision 0084).
     pub(crate) tex_coords: Option<TexCoords>,
@@ -555,6 +565,30 @@ pub(crate) struct MeasuredText {
     pub(crate) key: u64,
 }
 
+impl MeasuredText {
+    /// Did the part of this measurement the **layout** reads move? (decision 1385)
+    ///
+    /// Only `w`/`h` are layout inputs — they are the auto-size axes, and the only fields
+    /// `InputFingerprint` feeds (`script::layout`'s region walk hashes `m.w`/`m.h`, nothing else).
+    /// `key` is the measure CACHE's business and `natural_w` is `GetStringWidth`'s; neither can
+    /// move a rect.
+    ///
+    /// The distinction is load-bearing, not tidiness. A measure request is only ever *issued* when
+    /// the stored key mismatches, and `MeasuredText`'s derived `PartialEq` includes `key` — so
+    /// `d.measured != Some(new)` is **structurally always true** at both write sites, and touching
+    /// the epoch on it meant every answered measure opened tier 1. A FontString whose text changes
+    /// to something the same size does that on a cadence: a buff countdown ticking `"58s" → "57s"`,
+    /// a colour-code swap, any same-width digit. Tier 1 then went dirty and tier 2 hashed all
+    /// ~10k anchored regions to conclude nothing had moved — ~1 ms, `solves=0`, per tick, times
+    /// the number of unsynchronised timers on screen. The same shape 0740's own doc records the
+    /// bag-hover loop paying, and a sibling of the castbar's (1385).
+    pub(crate) fn layout_moved(before: Option<Self>, after: Self) -> bool {
+        before.is_none_or(|b| {
+            b.w.to_bits() != after.w.to_bits() || b.h.to_bits() != after.h.to_bits()
+        })
+    }
+}
+
 impl RegionData {
     /// The measure-cache key for the region's CURRENT text/font/wrap/outline — the one recipe both
     /// sides of the measure round-trip share. [`super::UiScript::fontstrings_needing_measure`]
@@ -572,7 +606,10 @@ impl RegionData {
     pub(crate) fn measure_key(&self, scale: f32) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.text.clone().unwrap_or_default().hash(&mut hasher);
+        // By reference: `String` hashes exactly as `str` does, and this runs for every
+        // FontString on every frame's staleness sweep — a clone here was ~1.5k heap allocs a
+        // frame at a city pin, all discarded at the key compare.
+        self.text.as_deref().unwrap_or("").hash(&mut hasher);
         self.font_path.hash(&mut hasher);
         self.font_height.map(f32::to_bits).hash(&mut hasher);
         self.text_height.map(f32::to_bits).hash(&mut hasher);

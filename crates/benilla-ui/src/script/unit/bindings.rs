@@ -6,7 +6,8 @@ use mlua::{Lua, Value};
 
 use super::super::Model;
 use super::{
-    classification_word, grey_band, level_reads_unknown, pick_unit_token, power_token, with_unit,
+    check_unit_token, classification_word, grey_band, level_reads_unknown, pick_unit_token,
+    power_token, with_unit,
 };
 
 /// The two class ids `GetComboPoints 0x51a190` accepts — the literals `4` and `0xb` it compares
@@ -27,14 +28,14 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitExists",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(with_unit(lua, &token, false, |u| u.exists))
+            with_unit(lua, &token, false, |u| u.exists)
         })?,
     )?;
 
     g.set(
         "UnitName",
         lua.create_function(|lua, token: Option<String>| {
-            let name = with_unit(lua, &token, None, |u| u.name.clone());
+            let name = with_unit(lua, &token, None, |u| u.name.clone())?;
             match name {
                 Some(n) => Ok(Value::String(lua.create_string(&n)?)),
                 None => Ok(Value::Nil),
@@ -45,14 +46,14 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitHealth",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(with_unit(lua, &token, 0i64, |u| i64::from(u.health)))
+            with_unit(lua, &token, 0i64, |u| i64::from(u.health))
         })?,
     )?;
 
     g.set(
         "UnitHealthMax",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(with_unit(lua, &token, 0i64, |u| i64::from(u.max_health)))
+            with_unit(lua, &token, 0i64, |u| i64::from(u.max_health))
         })?,
     )?;
 
@@ -66,8 +67,9 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitLevel",
         lua.create_function(|lua, token: Option<String>| {
+            check_unit_token(&token)?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let Some(u) = token.as_ref().and_then(|t| model.units.get(t)) else {
+            let Some(u) = token.as_ref().and_then(|t| model.unit(t)) else {
                 return Ok(0i64);
             };
             Ok(if u.level == 0 {
@@ -89,7 +91,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsCorpse",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.corpse_object) {
+            Ok(if with_unit(lua, &token, false, |u| u.corpse_object)? {
                 Value::Integer(1)
             } else {
                 Value::Nil
@@ -106,7 +108,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         "UnitCanAttack",
         lua.create_function(|lua, (a, b): (Option<String>, Option<String>)| {
             let token = pick_unit_token(&a, &b);
-            Ok(if with_unit(lua, &token, false, |u| u.can_attack) {
+            Ok(if with_unit(lua, &token, false, |u| u.can_attack)? {
                 Value::Integer(1)
             } else {
                 Value::Nil
@@ -129,7 +131,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsDead",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(with_unit(lua, &token, false, |u| u.dead))
+            with_unit(lua, &token, false, |u| u.dead)
         })?,
     )?;
 
@@ -138,13 +140,13 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsGhost",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(with_unit(lua, &token, false, |u| u.ghost))
+            with_unit(lua, &token, false, |u| u.ghost)
         })?,
     )?;
     g.set(
         "UnitIsDeadOrGhost",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(with_unit(lua, &token, false, |u| u.dead || u.ghost))
+            with_unit(lua, &token, false, |u| u.dead || u.ghost)
         })?,
     )?;
 
@@ -156,7 +158,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitReaction",
         lua.create_function(|lua, (token, _other): (Option<String>, Option<String>)| {
-            let r = with_unit(lua, &token, 0u8, |u| u.reaction);
+            let r = with_unit(lua, &token, 0u8, |u| u.reaction)?;
             Ok(if r == 0 {
                 Value::Nil
             } else {
@@ -177,7 +179,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         "UnitIsEnemy",
         lua.create_function(|lua, (a, b): (Option<String>, Option<String>)| {
             let token = pick_unit_token(&a, &b);
-            let r = with_unit(lua, &token, 0u8, |u| u.reaction);
+            let r = with_unit(lua, &token, 0u8, |u| u.reaction)?;
             Ok(if (1..=2).contains(&r) {
                 Value::Integer(1)
             } else {
@@ -189,7 +191,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         "UnitIsFriend",
         lua.create_function(|lua, (a, b): (Option<String>, Option<String>)| {
             let token = pick_unit_token(&a, &b);
-            let r = with_unit(lua, &token, 0u8, |u| u.reaction);
+            let r = with_unit(lua, &token, 0u8, |u| u.reaction)?;
             Ok(if r >= 5 {
                 Value::Integer(1)
             } else {
@@ -207,7 +209,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsPlayer",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.is_player) {
+            Ok(if with_unit(lua, &token, false, |u| u.is_player)? {
                 Value::Integer(1)
             } else {
                 Value::Nil
@@ -220,11 +222,14 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsUnit",
         lua.create_function(|lua, (a, b): (Option<String>, Option<String>)| {
+            // BOTH arguments go through the resolver, so either being unrecognised raises.
+            check_unit_token(&a)?;
+            check_unit_token(&b)?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let (Some(a), Some(b)) = (a, b) else {
                 return Ok(Value::Nil);
             };
-            let (Some(ua), Some(ub)) = (model.units.get(&a), model.units.get(&b)) else {
+            let (Some(ua), Some(ub)) = (model.unit(&a), model.unit(&b)) else {
                 return Ok(Value::Nil);
             };
             if !ua.exists || !ub.exists {
@@ -257,7 +262,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 "Usage: UnitAffectingCombat(\"unit\")",
             )?;
-            let hot = with_unit(lua, &Some(token), false, |u| u.exists && u.in_combat);
+            let hot = with_unit(lua, &Some(token), false, |u| u.exists && u.in_combat)?;
             Ok(if hot { Value::Integer(1) } else { Value::Nil })
         })?,
     )?;
@@ -283,10 +288,11 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitInRaid",
         lua.create_function(|lua, token: Option<String>| {
+            check_unit_token(&token)?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let hit = token
                 .as_ref()
-                .and_then(|t| model.units.get(t))
+                .and_then(|t| model.unit(t))
                 .filter(|u| u.exists && u.guid != 0)
                 .is_some_and(|u| {
                     model
@@ -304,11 +310,12 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitInParty",
         lua.create_function(|lua, token: Option<String>| {
+            check_unit_token(&token)?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let Some(t) = token else {
                 return Ok(Value::Nil);
             };
-            let Some(u) = model.units.get(&t) else {
+            let Some(u) = model.unit(&t) else {
                 return Ok(Value::Nil);
             };
             let grouped = !model.party.members.is_empty();
@@ -316,9 +323,9 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 return Ok(Value::Nil);
             }
             let hit = (t.starts_with("party") && !t.starts_with("partypet"))
-                || t == "player"
+                || t.eq_ignore_ascii_case("player")
                 || (u.guid != 0
-                    && (model.units.get("player").is_some_and(|p| p.guid == u.guid)
+                    && (model.unit("player").is_some_and(|p| p.guid == u.guid)
                         || model
                             .party
                             .members
@@ -338,7 +345,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             let token = pick_unit_token(&a, &b);
             let ok = with_unit(lua, &token, false, |u| {
                 u.exists && u.is_player && u.reaction >= 5
-            });
+            })?;
             Ok(if ok { Value::Integer(1) } else { Value::Nil })
         })?,
     )?;
@@ -348,7 +355,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "GetRaidTargetIndex",
         lua.create_function(|lua, token: Option<String>| {
-            let idx = with_unit(lua, &token, 0u8, |u| u.raid_target);
+            let idx = with_unit(lua, &token, 0u8, |u| u.raid_target)?;
             Ok(if idx > 0 {
                 Value::Integer(i64::from(idx))
             } else {
@@ -363,7 +370,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsConnected",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.is_connected) {
+            Ok(if with_unit(lua, &token, false, |u| u.is_connected)? {
                 Value::Integer(1)
             } else {
                 Value::Nil
@@ -373,7 +380,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsAFK",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.is_afk) {
+            Ok(if with_unit(lua, &token, false, |u| u.is_afk)? {
                 Value::Integer(1)
             } else {
                 Value::Nil
@@ -383,7 +390,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsDND",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.is_dnd) {
+            Ok(if with_unit(lua, &token, false, |u| u.is_dnd)? {
                 Value::Integer(1)
             } else {
                 Value::Nil
@@ -395,7 +402,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsPVP",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.pvp) {
+            Ok(if with_unit(lua, &token, false, |u| u.pvp)? {
                 Value::Integer(1)
             } else {
                 Value::Nil
@@ -405,7 +412,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsPVPFreeForAll",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.is_pvp_ffa) {
+            Ok(if with_unit(lua, &token, false, |u| u.is_pvp_ffa)? {
                 Value::Integer(1)
             } else {
                 Value::Nil
@@ -419,7 +426,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitFactionGroup",
         lua.create_function(|lua, token: Option<String>| {
-            match with_unit(lua, &token, None, |u| u.faction_group.clone()) {
+            match with_unit(lua, &token, None, |u| u.faction_group.clone())? {
                 Some(group) => {
                     let s = Value::String(lua.create_string(&group)?);
                     Ok((s.clone(), s))
@@ -438,7 +445,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, token: Option<String>| {
             let pair = with_unit(lua, &token, None, |u| {
                 u.race.clone().zip(u.race_file.clone())
-            });
+            })?;
             match pair {
                 Some((loc, file)) => Ok((
                     Value::String(lua.create_string(&loc)?),
@@ -453,7 +460,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, token: Option<String>| {
             let pair = with_unit(lua, &token, None, |u| {
                 u.class.clone().zip(u.class_file.clone())
-            });
+            })?;
             match pair {
                 Some((loc, file)) => Ok((
                     Value::String(lua.create_string(&loc)?),
@@ -468,12 +475,71 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitSex",
         lua.create_function(|lua, token: Option<String>| {
-            let sex = with_unit(lua, &token, 0u8, |u| u.sex);
+            let sex = with_unit(lua, &token, 0u8, |u| u.sex)?;
             Ok(if sex == 0 {
                 Value::Nil
             } else {
                 Value::Integer(i64::from(sex))
             })
+        })?,
+    )?;
+
+    // UnitCreatureType(unit) → **1 string, or nil** (`0x51a280`), the sibling of
+    // `UnitCreatureFamily 0x51a310`. Adjacent addresses and the same shape — but a DIFFERENT
+    // column: this reads `CreatureType.dbc` col `1 + locale`, the family reads col `8 + locale`.
+    // "Adjacent so probably identical" was right about the shape and wrong about the map.
+    //
+    // **A three-stage resolver** (`0x605570`), with no class or typemask gate anywhere — its only
+    // three tests are bounds checks:
+    //   1. **shapeshift override** — `SpellShapeshiftForm.dbc` col 12, keyed by field 138
+    //      `UNIT_FIELD_BYTES_1` byte 2, taken only if signed `> 0` (`0x60559a jg`), so `0` **and
+    //      the `-1` sentinel** fall through;
+    //   2. **the cached creature record** `[unit+0xb30]+0x18`, returned **unvalidated** — this is
+    //      what [`UnitState::creature_type_name`] carries;
+    //   3. **race fallback** — `ChrRaces.dbc` col 9, keyed by field 36 `UNIT_FIELD_BYTES_0` byte 0.
+    //
+    // Stage 3 is why **a PLAYER answers `"Humanoid"`, not nil**: `ChrRaces` col 9 is **7 for all
+    // nine shipped race rows** and `CreatureType[7]` is `"Humanoid"`, while `[player+0xb30]` is
+    // never populated (§5-verified by a 4-hit writer census — the ctor zeroes it, two writers
+    // early-out on `key==0`, and the third is hard-gated on `OBJECT_FIELD_TYPE == 0x9`, an
+    // equality a player's `0x19` fails structurally). A creature-record-only reading answers nil
+    // there, which would have been wrong for every `UnitCreatureType("player")` and every
+    // `("target")` aimed at a player.
+    //
+    // **Stage 1 is NOT modelled, and it is the one divergence to know about.** A druid in Cat,
+    // Bear, Dire Bear, Travel or Aquatic form — and a shaman in Ghost Wolf — answers `"Beast"` on
+    // the reference and `"Humanoid"` here. Tree Form, Moonkin, Battle Stance, Shadowform and
+    // Spirit of Redemption carry col 12 = `-1` and fall through to race anyway, so those already
+    // agree. We hold the active form's spell id and name ([`super::super::ShapeshiftFormView`])
+    // but **not the form INDEX the DBC is keyed by**, and matching on a localised form name would
+    // be inventing a mechanism the client does not use.
+    //
+    // The argument gate is real, and differs from the two boolean siblings: arg1 goes through
+    // `lua_isstring` (`0x6f3510`) and a miss calls `luaL_error 0x6f4940`, which **longjmps** — so a
+    // non-string, including a MISSING argument, abandons the caller's statement. An unresolved
+    // *token* is a different thing entirely and answers nil (`0x51a2b8`).
+    //
+    // Demand: 6 distinct corpus addons over 11 files.
+    g.set(
+        "UnitCreatureType",
+        lua.create_function(|lua, token: Value| {
+            let token = match &token {
+                Value::String(s) => Some(s.to_str()?.to_string()),
+                // `lua_isstring` coerces a number, so a numeric token is accepted and simply
+                // resolves to nothing.
+                Value::Number(_) | Value::Integer(_) => Some(String::new()),
+                _ => return Err(mlua::Error::runtime("Usage: UnitCreatureType(\"unit\")")),
+            };
+            let word = with_unit(lua, &token, None, |u| {
+                u.creature_type_name
+                    .clone()
+                    // Stage 3, collapsed: every player race maps to CreatureType 7.
+                    .or_else(|| u.is_player.then(|| "Humanoid".to_string()))
+            })?;
+            match word {
+                Some(w) => Ok(Value::String(lua.create_string(&w)?)),
+                None => Ok(Value::Nil),
+            }
         })?,
     )?;
 
@@ -485,7 +551,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitClassification",
         lua.create_function(|lua, token: Option<String>| {
-            let rank = with_unit(lua, &token, 0u32, |u| u.rank);
+            let rank = with_unit(lua, &token, 0u32, |u| u.rank)?;
             Ok(classification_word(rank).to_string())
         })?,
     )?;
@@ -495,7 +561,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitPowerType",
         lua.create_function(|lua, token: Option<String>| {
-            let ty = with_unit(lua, &token, 0u8, |u| u.power_type);
+            let ty = with_unit(lua, &token, 0u8, |u| u.power_type)?;
             Ok((i64::from(ty), power_token(ty).to_string()))
         })?,
     )?;
@@ -514,13 +580,13 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitMana",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(with_unit(lua, &token, 0i64, |u| i64::from(u.power)))
+            with_unit(lua, &token, 0i64, |u| i64::from(u.power))
         })?,
     )?;
     g.set(
         "UnitManaMax",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(with_unit(lua, &token, 0i64, |u| i64::from(u.max_power)))
+            with_unit(lua, &token, 0i64, |u| i64::from(u.max_power))
         })?,
     )?;
 
@@ -548,6 +614,32 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 i64::from(model.player_next_level_xp)
             } else {
                 0
+            })
+        })?,
+    )?;
+
+    // UnitIsCharmed(unit) → 1 while somebody is charming this unit, else nil (`0x516cf0`).
+    //
+    // Three details, all byte-verified, none of them what a reimplementation reaches for:
+    //  · the predicate is `UNIT_FIELD_CHARMEDBY != 0` — a plain 64-bit non-zero test on fields
+    //    10/11 — **not** a `UNIT_FIELD_FLAGS` bit, which is the obvious guess for a boolean-shaped
+    //    unit question;
+    //  · a hit is the NUMBER 1 (`lua_pushnumber`, tag 3) and a miss is `nil` (tag 0) — never
+    //    `true`/`false`, and never `0`. Exactly one value on both arms;
+    //  · it is ASYMMETRIC. The field is "who charms me", so the CHARMER reads nil and the charmed
+    //    unit reads 1. `UnitIsPossessed` does not exist in 5875 at all — this is the only
+    //    charm verb in the API.
+    //
+    // KLHThreatMeter is the corpus addon blocked on it (`KTM_My.lua:533`); seven others name it.
+    g.set(
+        "UnitIsCharmed",
+        lua.create_function(|lua, token: Option<String>| {
+            with_unit(lua, &token, Value::Nil, |u| {
+                if u.charmed {
+                    Value::Number(1.0)
+                } else {
+                    Value::Nil
+                }
             })
         })?,
     )?;
@@ -593,7 +685,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             if class != CLASS_ROGUE && class != CLASS_DRUID {
                 return Ok(0_i64);
             }
-            let target = model.units.get("target").map_or(0, |u| u.guid);
+            let target = model.unit("target").map_or(0, |u| u.guid);
             if model.combo_target != target {
                 return Ok(0_i64);
             }
@@ -780,7 +872,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         "ClearTarget",
         lua.create_function(|lua, ()| {
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            if model.units.get("target").is_some_and(|u| u.exists) {
+            if model.unit("target").is_some_and(|u| u.exists) {
                 model.target_clear = true;
                 Ok(Value::Integer(1))
             } else {

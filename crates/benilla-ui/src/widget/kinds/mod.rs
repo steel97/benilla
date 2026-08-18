@@ -70,6 +70,14 @@ pub enum RegionKind {
     Texture,
     /// A `FontString` (text run).
     FontString,
+    /// A frame's **title region** — the drag handle `Frame:CreateTitleRegion()` makes.
+    ///
+    /// A third leaf rather than a texture that happens to draw nothing, because the difference is
+    /// OBSERVABLE: wow-re carves the object as a plain Region (`widget-api-batch-benilla.md` Q6,
+    /// `0x773910`) whose `GetObjectType()` answers `"Region"` and which exposes exactly the 19
+    /// Region methods — **no Show/Hide, no scripts, no textures**. A `Texture` in disguise would
+    /// answer `"Texture"` to any addon that asked, and would emit a quad.
+    Title,
 }
 
 /// Per-kind widget state — the "later layer" over the kind tag, for the kinds whose behavior is
@@ -592,6 +600,64 @@ impl Default for SliderState {
             thumb: None,
         }
     }
+}
+
+/// **The slider drag law — the one owner, for every lane.**
+///
+/// Two pure functions, stated on a single axis in *distance from the track's leading edge* (the
+/// end the thumb sits at when the value is `min`). That framing is what makes them lane-neutral:
+/// the Lua widget arena measures y **up** and the Bevy-UI glue screens measure y **down**, and
+/// both reduce to "how far along the track is this", so neither has to restate the arithmetic.
+///
+/// Restating it is exactly what went wrong. The AddOns glue scrollbar shipped with a *decorative*
+/// knob and no drag at all (1297 named the gap; B273's reporter hit it), the char-create glue
+/// scrollbar grew its own accumulated-delta drag that drifts off the cursor, and the engine slider
+/// held the real formula — three surfaces, one widget, no shared line of code. These two functions
+/// are that shared line.
+///
+/// **The law is benilla's, and it diverges from 1.12 deliberately in one place.** wow-re's
+/// `system/ui/scratch/slider-mouse-law.md` (a §5 1v1, VERIFIED off the bytes of `0x789ba0` /
+/// `0x789ca0`) settled `CSimpleSlider`: there is **no thumb hit-test in the class at all** — every
+/// press, track or thumb, warps the value to seat the thumb's CENTER under the cursor and begins
+/// one continuous drag capture, button-agnostic, clamped by SetValue. We take all of that except
+/// the thumb press: ours grabs **offset-preserving**, so the point you grabbed stays under the
+/// finger instead of jumping to the thumb's middle (decision 0992 §6 — kept as the less surprising
+/// feel, and invisible on a reference-sized thumb either way). If that ever flips to byte-faithful,
+/// it flips here, once, for every surface at the same time.
+///
+/// [`slider_grab`] runs on the press, [`slider_fraction`] on the press and on every move after it.
+///
+/// Where a press grabs the thumb: the offset from the thumb's leading edge that stays under the
+/// cursor for the rest of the drag.
+///
+/// `cursor` and `thumb_lead` are distances from the track's leading edge; `thumb_extent` is the
+/// thumb's length along the axis. A press **on** the thumb keeps its grabbed point (0992 §6); a
+/// press **off** it — anywhere on the track — grabs the thumb by its center, which is what makes
+/// the value warp under the cursor and the drag continue as one gesture (1.12's whole law, and
+/// 0989's directed requirement, which converged with it).
+pub fn slider_grab(cursor: f32, thumb_lead: f32, thumb_extent: f32) -> f32 {
+    if cursor >= thumb_lead && cursor <= thumb_lead + thumb_extent {
+        cursor - thumb_lead
+    } else {
+        thumb_extent * 0.5
+    }
+}
+
+/// Cursor → fraction of travel, absolute and drift-free: the thumb's leading edge goes to
+/// `cursor − grab`, and that lands at `fraction × (track_extent − thumb_extent)`.
+///
+/// `None` when the travel is zero or negative — a thumb as long as its track has nowhere to go, so
+/// there is no value to compute and the caller must leave the slider alone rather than divide by
+/// zero. Otherwise clamped to `[0, 1]`: dragging past either end pins there, exactly as the
+/// client's own out-of-span presses pin through SetValue's clamp.
+pub fn slider_fraction(
+    cursor: f32,
+    grab: f32,
+    track_extent: f32,
+    thumb_extent: f32,
+) -> Option<f32> {
+    let travel = track_extent - thumb_extent;
+    (travel > 0.0).then(|| ((cursor - grab) / travel).clamp(0.0, 1.0))
 }
 
 impl SliderState {

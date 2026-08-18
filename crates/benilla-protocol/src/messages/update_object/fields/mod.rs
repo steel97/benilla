@@ -324,6 +324,14 @@ const FIELD_PLAYER_VENDORBUYBACK_SLOT_1: u16 = 624; // 12 slots × 2 (item guids
                                                     // PLAYER_FIELD_KEYRING_SLOT_1 — the next link of the same chain the buyback comment walks
                                                     // (624 + 12×2 = 648; +32×2 = 712 = FARSIGHT ✓, which the chain's far end already pins).
 const FIELD_PLAYER_KEYRING_SLOT_1: u16 = 648; // 32 slots × 2 (item guids), wire slots 81–112
+                                              // PLAYER_FARSIGHT — the object our view is anchored to (Mind Vision, Sentry Totem, the Ornate
+                                              // Spyglass), or 0 for "my own body". A 2-field guid, PRIVATE, so it only ever arrives on our own
+                                              // descriptor — exactly the consumer. Its index needs no fresh derivation: it is the next link of
+                                              // the same chain the two comments above walk, and both ends of that chain are tested anchors
+                                              // (648 + 32×2 = 712; +2 combo 714, +2 = XP 716 ✓). vmangos's hex comment reads 0x2C2 = 706 — the
+                                              // same 6-low drift as COINAGE/XP, and not what the server compiles: its enum arithmetic says
+                                              // UNIT_END(0xBC = 188) + 0x20C(524) = 712.
+const FIELD_PLAYER_FARSIGHT: u16 = 712;
 const FIELD_PLAYER_BUYBACK_PRICE_1: u16 = 1226; // 12 × u32 copper, indexed slot−69
 const FIELD_PLAYER_BUYBACK_TIMESTAMP_1: u16 = 1238; // 12 × u32 — the client's sort key only
                                                     // PLAYER_FIELD_COINAGE, our purse in copper (INT, PRIVATE — sent only for our own player, the exact
@@ -341,6 +349,14 @@ const FIELD_PLAYER_FIELD_COINAGE: u16 = 1176;
 // UNIT_END + 0x210 / 0x211; its stale hex comments read 0x2C6/0x2C7, the same 6-low drift as COINAGE.)
 const FIELD_PLAYER_XP: u16 = 716;
 const FIELD_PLAYER_NEXT_LEVEL_XP: u16 = 717;
+// PLAYER_FIELD_WATCHED_FACTION_INDEX (INT, PRIVATE — self only): the reputation-list slot whose bar
+// rides the main menu bar, or -1 for none. SIGNED, and that matters — slot 0 is a real faction (the
+// Bloodsail Buccaneers), so -1 is the only "watch nothing" (vmangos writes it with `SetInt32Value`
+// in `HandleSetWatchedFactionOpcode`). Derived by the same server enum arithmetic as COINAGE above:
+// UNIT_END(0xBC = 188) + 0x431(1073) = 1261. Cross-checked against the tested COINAGE anchor:
+// 1176 + (0x431 − 0x3DC = 85) = 1261 ✓. (vmangos UpdateFields_1_12_1.h's stale hex comment reads
+// 0x4E7 = 1255, the usual 6-low drift.)
+const FIELD_PLAYER_WATCHED_FACTION_INDEX: u16 = 1261;
 // PLAYER_REST_STATE_EXPERIENCE (INT, PRIVATE — self only): the rested-XP pool, in BASE kill-XP
 // units — the server drains it 1:1 against a kill's base XP while granting +100%
 // (vmangos `Player::GetXPRestBonus`), and caps it at NEXT_LEVEL_XP × 1.5 / 2 (`SetRestBonus`), so
@@ -368,18 +384,27 @@ pub const PLAYER_EXPLORED_ZONES_SLOTS: u16 = 64;
 // `UNIT_END`(188) + vmangos's own symbolic offset, in **decimal** (never the hex `//` comments, stale
 // from the CONTAINER block on) — chain-verified against the already-tested COINAGE(1176) and
 // BUYBACK_PRICE_1(1226) anchors (see the tests).
-const FIELD_PLAYER_POSSTAT0: u16 = 1177; // UNIT_END+0x3DD ×5; FLOAT despite the header's "Type: INT"
-                                         // tag (VERIFIED vmangos `Player.h:1505,1511`
-                                         // `ApplyStatBuffMod`/`GetPosStat` route through
-                                         // `ApplyModSignedFloatValue`/`GetFloatValue`).
-const FIELD_PLAYER_NEGSTAT0: u16 = 1182; // ×5, FLOAT, same header-tag mismatch; **negative-or-zero**
-                                         // (VERIFIED `Player.h:1505`: a stat *debuff* routes its
-                                         // already-negative `val` into this array through the same
-                                         // signed accumulator).
-const FIELD_PLAYER_RESISTANCEBUFFMODSPOSITIVE: u16 = 1187; // ×7, FLOAT (`Player.h:1513-1514`)
-const FIELD_PLAYER_RESISTANCEBUFFMODSNEGATIVE: u16 = 1194; // ×7, FLOAT; negative-or-zero (VERIFIED
-                                                           // `SpellAuras.cpp:4496-4499`: `change` is the signed
-                                                           // resistance delta, routed here unchanged).
+// **These four families are INT on the wire, and the server's own storage type is not the wire
+// type** (decision 1397). The header's "Type: INT" tag is right and the earlier "FLOAT" reading
+// here was wrong: it was taken from vmangos's *internal* accessors (`Player.h:1505,1511-1514`
+// really do route through `ApplyModSignedFloatValue`/`GetFloatValue`), which is one layer below
+// the question. `Object::BuildValuesUpdate` (`Objects/Object.cpp`) carries an explicit special
+// case — comment *"there are some float values which may be negative or can't get negative due to
+// other checks"* — that sends exactly `NEGSTAT0..4`, `POSSTAT0..4`,
+// `RESISTANCEBUFFMODSPOSITIVE+0..6` and `…NEGATIVE+0..6` as `*data << uint32(m_floatValues[index])`,
+// the same float→int narrowing it already applies to `UNIT_FIELD_BASEATTACKTIME`. Live-confirmed on
+// a level-60 warrior in preraid-BiS gear: fields 1177..1181 arrive as `105, 76, 68, 4, 4` (the
+// gear's own +105 str / +76 agi / …), and 1215 `MOD_DAMAGE_DONE_PCT` in the same packet arrives as
+// `0x3F800000` — genuine f32 — so the two encodings sit side by side in one block.
+//
+// Read **signed**: the server's cast of a negative float to `uint32` is UB, and the two
+// architectures disagree. On x86 it wraps to the two's-complement word; on aarch64 `fcvtzu`
+// saturates and a stat *debuff* arrives as a flat `0` (measured on this deploy's arm64 container:
+// a −5 agility debuff moved `UNIT_FIELD_STAT1` but sent `NEGSTAT1 = 0`). `i32` is right for both.
+const FIELD_PLAYER_POSSTAT0: u16 = 1177; // UNIT_END+0x3DD ×5, INT
+const FIELD_PLAYER_NEGSTAT0: u16 = 1182; // ×5, INT; negative-or-zero where the wire can carry it
+const FIELD_PLAYER_RESISTANCEBUFFMODSPOSITIVE: u16 = 1187; // ×7, INT
+const FIELD_PLAYER_RESISTANCEBUFFMODSNEGATIVE: u16 = 1194; // ×7, INT; negative-or-zero
 const FIELD_PLAYER_MOD_DAMAGE_DONE_POS: u16 = 1201; // ×7 schools ([0]=physical), INT (VERIFIED
                                                     // `StatSystem.cpp:87` `SetStatInt32Value` for the magic
                                                     // schools, `SpellAuras.cpp:5208-5210`
@@ -426,6 +451,19 @@ const FIELD_PLAYER_FLAGS: u16 = 190;
 // three reads `UnitReaction 0x6061e0`'s duel leg makes (decision 0633).
 const FIELD_PLAYER_DUEL_ARBITER: u16 = 188;
 const FIELD_PLAYER_DUEL_TEAM: u16 = 196;
+// PLAYER_GUILDID = UNIT_END(188) + 0x3, PLAYER_GUILDRANK = UNIT_END + 0x4 — both INT and both
+// **PUBLIC** (VERIFIED vmangos `UpdateFields_1_12_1.h:120-121`), the same arithmetic that pins
+// PLAYER_FLAGS = 190 at +0x2 above. Independently VERIFIED in the binary off the very player-block
+// base the duel pair is read through: `GetGuildInfo 0x4c9330` takes the guild id at `[+0xe68]+0xc`
+// (`0x4c93a9`, whose `test ecx,ecx` IS the guildless→nil path) and the rank at `+0x10` (`0x4c93e4`,
+// `shl edx,0x6` — the 0x40-byte rank-name slot in the cached guild record). 0xc/4 + 188 = 191 and
+// 0x10/4 + 188 = 192, with `+0x8` = PLAYER_FLAGS(190) as the third point on the same line.
+//
+// PUBLIC is the load-bearing half: these stream for *every visible player*, not just for us, which
+// is what makes `GetGuildInfo(unit)` answerable for an arbitrary unit — and why the guild query
+// response carries a fixed ten rank names to decode another player's rank against (decision 1257).
+const FIELD_PLAYER_GUILDID: u16 = 191;
+const FIELD_PLAYER_GUILDRANK: u16 = 192;
 // PLAYER_FIELD_COMBO_TARGET = UNIT_END(188) + 0x20E (GUID, PRIVATE) — VERIFIED vmangos
 // `UpdateFields_1_12_1.h:251`, and independently by the binary: `GetComboPoints 0x51a190` reads the
 // pair at `[player+0xe68]+0x838/+0x83c`, and 0x838/4 + 188 = 714 (decision 0875). The same player-

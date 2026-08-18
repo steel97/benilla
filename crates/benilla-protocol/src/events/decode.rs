@@ -45,8 +45,16 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             sound_id,
             instant,
         }],
-        ServerPacket::TextEmote { guid, text_emote } => {
-            vec![SessionEvent::TextEmote { guid, text_emote }]
+        ServerPacket::TextEmote {
+            guid,
+            text_emote,
+            target_name,
+        } => {
+            vec![SessionEvent::TextEmote {
+                guid,
+                text_emote,
+                target_name,
+            }]
         }
         ServerPacket::Emote { guid, emote_id } => vec![SessionEvent::Emote { guid, emote_id }],
         ServerPacket::InitialSpells {
@@ -72,7 +80,11 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             success: outcome == CastOutcome::Ok,
             reason: match outcome {
                 CastOutcome::Ok => None,
-                CastOutcome::Failed { reason } => Some(reason),
+                CastOutcome::Failed { reason, .. } => Some(reason),
+            },
+            arg: match outcome {
+                CastOutcome::Ok => None,
+                CastOutcome::Failed { arg, .. } => arg,
             },
         }],
         ServerPacket::PetSpells(spells) => vec![SessionEvent::PetSpells(Box::new(spells))],
@@ -84,7 +96,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             spell_id,
             reason: match outcome {
                 CastOutcome::Ok => None,
-                CastOutcome::Failed { reason } => Some(reason),
+                CastOutcome::Failed { reason, .. } => Some(reason),
             },
         }],
         ServerPacket::ItemQueryResponse { entry, info } => {
@@ -482,6 +494,17 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::IgnoreList { guids } => vec![SessionEvent::IgnoreList { guids }],
         ServerPacket::FriendStatus(status) => vec![SessionEvent::FriendStatus(status)],
         ServerPacket::WhoResults(results) => vec![SessionEvent::WhoResults(results)],
+        ServerPacket::GuildQueryResponse(response) => {
+            vec![SessionEvent::GuildQueryResponse(response)]
+        }
+        ServerPacket::GuildRoster(roster) => vec![SessionEvent::GuildRoster(roster)],
+        ServerPacket::GuildEvent(notice) => vec![SessionEvent::GuildEvent(notice)],
+        ServerPacket::GuildCommandResult(result) => vec![SessionEvent::GuildCommandResult(result)],
+        ServerPacket::GuildInvite { inviter, guild } => {
+            vec![SessionEvent::GuildInvite { inviter, guild }]
+        }
+        ServerPacket::GuildDecline { name } => vec![SessionEvent::GuildDecline { name }],
+        ServerPacket::GuildInfo(info) => vec![SessionEvent::GuildInfo(info)],
         ServerPacket::DestroyObject { guid } => vec![SessionEvent::ObjectDestroyed(guid)],
         ServerPacket::TriggerCinematic { cinematic_id } => {
             vec![SessionEvent::CinematicTriggered { cinematic_id }]
@@ -581,6 +604,10 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             vec![SessionEvent::ServerUnixTime { unix_time }]
         }
         ServerPacket::BindPoint { area, .. } => vec![SessionEvent::BindPoint { area }],
+        ServerPacket::BinderConfirm { binder } => vec![SessionEvent::BinderConfirm { binder }],
+        ServerPacket::PlayerBound { binder, area } => {
+            vec![SessionEvent::PlayerBound { binder, area }]
+        }
         ServerPacket::SetProficiency {
             item_class,
             subclass_mask,
@@ -593,6 +620,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         }
         ServerPacket::SetFactionStanding { standings } => {
             vec![SessionEvent::ReputationDelta { standings }]
+        }
+        ServerPacket::SetFactionVisible { list_id } => {
+            vec![SessionEvent::ReputationVisible { list_id }]
         }
         ServerPacket::NameQueryResponse {
             guid,
@@ -684,6 +714,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::GameObjectCustomAnim { guid, anim_id } => {
             vec![SessionEvent::GameObjectCustomAnim { guid, anim_id }]
         }
+        ServerPacket::GameObjectDespawnAnim { guid } => {
+            vec![SessionEvent::GameObjectDespawnAnim { guid }]
+        }
         ServerPacket::FishNotHooked => vec![SessionEvent::FishNotHooked],
         ServerPacket::FishEscaped => vec![SessionEvent::FishEscaped],
         // The keepalive echo: the io layer matches the sequence against its ping clock to compute
@@ -738,6 +771,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         }
         ServerPacket::MountSpecialAnim { guid } => {
             vec![SessionEvent::MountSpecial { guid }]
+        }
+        ServerPacket::ClientControlUpdate { mover, allow_move } => {
+            vec![SessionEvent::ClientControl { mover, allow_move }]
         }
         ServerPacket::ShowTaxiNodes {
             window,

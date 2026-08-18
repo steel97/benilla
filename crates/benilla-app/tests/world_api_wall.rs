@@ -208,7 +208,46 @@ fn is_instrument_consumer(rel: &str) -> bool {
 /// it stopped two engine facts hiding inside instrument modules this test deliberately does not
 /// count. The items were always crossing; the measurement improved. That is the only kind of raise
 /// that is not a retreat — a raise for a NEW leak is the failure this number exists to catch.
-const CEILING: usize = 154;
+///
+/// And 157 → 158: `collision::ColliderEpoch`, a PUBLISH by 1164's test (decision 1384). It is the
+/// stamp on the world's collider set — "the geometry you last asked has changed" — and the whole
+/// point of it is that a *cached* collision answer must not outlive the world it described. The
+/// engine owns the fact (the streamer's attach queue is what changes the set), the game owns two of
+/// the three parties: the creature ground clamp reads it, and the GameObject hull lane
+/// (`entities::attach`) is the one collider insert outside the streamer's queue, so it must be able
+/// to stamp. Keeping it engine-private would mean either a game-side collider that no cache can see
+/// arrive — which is B197's bug with a different collider class — or an engine system reaching into
+/// game components to invalidate them, which crosses this line the other way and worse.
+///
+/// And 156 → 157: `mat_anim_table::MatAnimTable`, a PUBLISH by 1164's test (decision 1381). The
+/// mat-anim delta table replaced per-frame material mutation, and registration must happen where
+/// materials are BUILT — which for WMO GameObject props (transport interiors) is a game-side
+/// spawner (`entities::wmo_props`) that already threads the two registries this table serves
+/// (`UvAnimMaterials`/`TintAnimMaterials`, published members of the same family). The resource
+/// that allocates the slots is the smallest honest addition beside them; hiding it would mean
+/// a game-side material registering without a slot and silently freezing at its seed.
+///
+/// And 155 → 156: `doodad_anim::DoodadAnimHost`, a PUBLISH by 1164's test (decision 1365). The
+/// doodad joint collapse put placed doodads on the collapsed-rig lane (`RigPose`), which made
+/// them visible to the game's animation-LOD gate — whose park marker the engine's own doodad
+/// draw gate already owns, on a different law (the composed draw verdict + fade sphere, not the
+/// unit frustum test). Two writers to one marker silently un-park hidden hosts, so the game's
+/// gate must be able to say "this population is not mine" — and the engine component that IS
+/// that population's name is the smallest honest way to say it. The instruments already named
+/// it; this makes the one gameplay filter explicit rather than inventing a second marker to
+/// carry the same fact.
+///
+/// And 154 → 155: `modkeys::SyntheticHold`, a PUBLISH by 1164's test rather than a leak. The
+/// engine owns the macOS stuck-modifier reconciler, and that reconciler decides by polling the
+/// **hardware** flag state — which by construction reads "up" for a key no hand is on. So a
+/// synthesized press (the probe harness's `WOW_PROBE_KEY`) was released the frame after it was
+/// made, and logged as a stuck-key correction: every chord binding was silently unreachable
+/// headlessly on the platform we develop on. "Something is deliberately holding this key" has
+/// exactly one reader — the reconciler, engine-side — and its writers are whoever synthesizes
+/// input, which is game-side; a one-field resource is the smallest honest expression of that. The
+/// alternative was ordering a game system against an engine system, which crosses this same line
+/// *and* publishes a schedule point to do it.
+const CEILING: usize = 158;
 
 /// How far under [`CEILING`] the real count may sit before this test asks for the ceiling to be
 /// lowered. Slack, not tolerance: it keeps a single closure from failing the gate, while making it

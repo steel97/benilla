@@ -96,6 +96,10 @@ impl PluginGroup for WorldPlugins {
             // The per-instance body tint (decision 0812), on the same slot index as that palette:
             // the aura state kit's CharProc-1 colour, in its own region of the shared light buffer.
             .add(crate::instance_tint::plugin)
+            // The mat-anim delta table (decision 1381), one region over: the per-frame samples of
+            // every UV/tint-animated batch material, so animating a waterfall never mutates its
+            // material asset again.
+            .add(crate::mat_anim_table::plugin)
             // The M2 render lane's three own plugins (decision 1163, stage zero). All three used to
             // be registered by `EntitiesPlugin` — the entity streamer — which is why booting the
             // engine without the game left the model-`Visibility` authority reading a
@@ -203,6 +207,71 @@ impl Plugin for WorldFoundation {
             // The dev state (decision 0026): the always-present config layer eight subsystems
             // read, whose defaults ARE the player behaviour. The debug panel is only its editor
             // and may not be installed at all.
-            .init_resource::<crate::dev_state::DebugState>();
+            .init_resource::<crate::dev_state::DebugState>()
+            // The collider-set stamp every cached collision answer is dated against
+            // (`collision::ColliderEpoch`). Tracked in `First` so a removal is stamped before any
+            // consumer runs; the attach half is stamped by the streamer's own attach loop.
+            .init_resource::<crate::collision::ColliderEpoch>()
+            .add_systems(First, crate::collision::track_collider_removals);
+        // Avian's pre-step copy of Bevy's transform propagation is OFF by default (the 1370
+        // bracket surfaced the lane; the 3-round SW split then measured the skip at −0.40
+        // cpu_ms, negative in every round): `PhysicsTransformPlugin` re-registers
+        // `mark_dirty_trees`/`propagate_parent_transforms`/`sync_simple_transforms` to run
+        // before each physics step — a second whole-world transform sweep on top of
+        // PostUpdate's own. Our world is static geometry plus kinematic movers
+        // (`transport::tick_transports`) that mirror `Position`/`Rotation` directly — built
+        // that way precisely because the sync's own timing already lagged — so the pre-step
+        // sweep buys nothing. The one Transform-moved collider class left is an opening door
+        // (a GameObject's model-local hull riding its pose): it reaches physics one frame late
+        // via PostUpdate's own propagation — transient, bounded, imperceptible.
+        // `WOW_PHYS_PREPROP=1` restores avian's upstream default (the A/B lever back).
+        if std::env::var_os("WOW_PHYS_PREPROP").is_none() {
+            app.insert_resource(avian3d::physics_transform::PhysicsTransformConfig {
+                propagate_before_physics: false,
+                ..Default::default()
+            });
+        }
+        // `WOW_PHYS_HZ=<hz>` — run the fixed loop at a different rate. An EXPERIMENT lever
+        // (1370 item 10): avian's per-tick stack is the fixed loop's ONLY occupant (nothing
+        // first-party lives in any fixed schedule — zero-hit grep, re-verified at flip time),
+        // so 8 vs the default 64 prices the whole-avian bracket in one leg. A measurement
+        // lever, never a setting: at 8 Hz the spatial trees ingest streamed colliders up to
+        // 125 ms late, which the player's shape-cast controller would feel at a tile seam.
+        if let Some(hz) = std::env::var("WOW_PHYS_HZ")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            app.insert_resource(bevy::time::Time::<bevy::time::Fixed>::from_hz(hz));
+        }
+        // Direct draws on EVERY camera — the default, not a knob (1374/1376). Bevy's indirect
+        // lane is a per-draw indirect encode loop on Metal (no MULTI_DRAW_INDIRECT) plus the GPU
+        // preprocessing dispatches, and the 1374 bracket priced it ~4.3 cpu_ms at LBRS on 0.18 —
+        // shipped unclaimed for the campaign's whole run because 1364's knob under-measured it
+        // (the UI Camera2d leak, 1370). `WOW_INDIRECT=1` restores the upstream default for
+        // re-pricing. 1370's note that the lever must cover every camera, not just the world's,
+        // is why this is a sweep.
+        if std::env::var_os("WOW_INDIRECT").is_none() {
+            app.add_systems(bevy::app::Update, force_direct_draws);
+        }
+    }
+}
+
+/// Insert [`NoIndirectDrawing`] on any camera that lacks it — see the note at the registration
+/// site. Runs every frame so late-spawned cameras (portrait booths, the glue booth) are covered;
+/// the query is empty in steady state.
+fn force_direct_draws(
+    mut commands: Commands,
+    cams: Query<
+        Entity,
+        (
+            With<bevy::camera::Camera>,
+            Without<bevy::render::view::NoIndirectDrawing>,
+        ),
+    >,
+) {
+    for e in &cams {
+        commands
+            .entity(e)
+            .insert(bevy::render::view::NoIndirectDrawing);
     }
 }

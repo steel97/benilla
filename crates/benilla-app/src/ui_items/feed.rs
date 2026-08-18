@@ -24,7 +24,7 @@ use super::{
 /// The feed's memory of what it last pushed, for per-bag change events. No cooldown-churn gate:
 /// the pushed triple carries the ABSOLUTE start, which is frame-stable for a running cooldown.
 #[derive(Default)]
-pub(super) struct FeedMemory {
+pub(crate) struct FeedMemory {
     pushed: HashMap<i64, ContainerState>,
     /// The last `HasKey()` pushed — kept only so the transition can be logged once instead of
     /// every frame. It is the gate the entire keyring UI hangs off, and "the keyring never
@@ -216,11 +216,14 @@ pub(super) fn feed_item_sets(
     commands: Res<NetCommands>,
     spells: Option<Res<crate::ui_action::Spells>>,
     skill_lines: Option<Res<crate::ui_spellbook::SkillLines>>,
-    mut pending: Local<std::collections::HashMap<u32, benilla_ui::script::ItemSetView>>,
+    mut pending: Local<
+        crate::ui_script::VmMemo<std::collections::HashMap<u32, benilla_ui::script::ItemSetView>>,
+    >,
 ) {
     let Some(mut script) = script else {
         return;
     };
+    let pending = pending.get(&script);
     for id in script.take_item_set_asks() {
         pending.entry(id).or_default();
     }
@@ -304,12 +307,29 @@ pub(super) fn feed_item_stats(
     // ItemDisplayInfo icons the bag slots already resolve through.
     classes: Option<Res<super::ItemClasses>>,
     icons: Option<Res<ItemDisplays>>,
-    mut pending: Local<std::collections::HashSet<u32>>,
-    mut last_home: Local<Option<String>>,
+    mut pending: Local<crate::ui_script::VmMemo<std::collections::HashSet<u32>>>,
+    mut last_home: Local<crate::ui_script::VmMemo<Option<String>>>,
 ) {
     let Some(mut script) = script else {
         return;
     };
+    let pending = pending.get(&script);
+    let last_home = last_home.get(&script);
+    // **`GetBindLocation()`'s push, and it happens BEFORE the early return below.**
+    //
+    // The name resolution lives here because this system already owns it for the hearthstone's
+    // `$z` token, and a second AreaTable lookup elsewhere is the two-parallel-paths drift that has
+    // cost this codebase real bugs — the binding and the token must never disagree about where the
+    // player is bound. But the item feed idles whenever nothing is pending, and the bind point
+    // arrives long after world entry (`SMSG_BINDPOINTUPDATE` at login and on every re-bind), so the
+    // push cannot sit behind that gate.
+    let home_area: Option<String> = home_bind
+        .as_deref()
+        .and_then(|b| b.0)
+        .and_then(|id| area_names.as_deref()?.0.resolve(id as i32))
+        .map(str::to_string);
+    script.set_bind_location(home_area.as_deref().unwrap_or_default());
+
     pending.extend(items.take_fresh());
     pending.extend(script.take_item_stat_asks());
     if pending.is_empty() {
@@ -317,11 +337,6 @@ pub(super) fn feed_item_stats(
     }
     let spell_res = spells.as_deref();
     let skill_catalog = skill_lines.as_deref().map(|s| &s.catalog);
-    let home_area: Option<String> = home_bind
-        .as_deref()
-        .and_then(|b| b.0)
-        .and_then(|id| area_names.as_deref()?.0.resolve(id as i32))
-        .map(str::to_string);
     // A bind-point change re-substitutes every held view: templates pushed before the login's
     // SMSG_BINDPOINTUPDATE landed carry a raw $z otherwise (the hearthstone's login race).
     if *last_home != home_area {
@@ -365,11 +380,12 @@ pub(super) fn feed_player_req(
     factions: Option<Res<crate::target::Factions>>,
     actions: Res<crate::ui_action::PlayerActions>,
     spells: Option<Res<crate::ui_action::Spells>>,
-    mut last: Local<Option<benilla_ui::script::PlayerReqState>>,
+    mut last: Local<crate::ui_script::VmMemo<Option<benilla_ui::script::PlayerReqState>>>,
 ) {
     let Some(mut script) = script else {
         return;
     };
+    let last = last.get(&script);
     let Some(store) = self_q.iter().next() else {
         return;
     };
@@ -586,7 +602,7 @@ fn bag_family_name(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn feed_containers(
+pub(crate) fn feed_containers(
     script: Option<NonSendMut<UiScript>>,
     mut items: ResMut<Items>,
     icons: Option<Res<ItemDisplays>>,
@@ -604,11 +620,18 @@ pub(super) fn feed_containers(
     mut lock_cleared: ResMut<LockClearedByFailure>,
     mut names: ResMut<crate::names::NameCache>,
     clock: Res<crate::ui_script::UiClock>,
-    mut memory: Local<FeedMemory>,
+    mut memory: Local<crate::ui_script::VmMemo<FeedMemory>>,
 ) {
     let Some(mut script) = script else {
         return;
     };
+    let memory = memory.get(&script);
+    // `WOW_FEED_COST=1` — the premise counter for gating this feed (the 2026-08-15 ledger's #8):
+    // the whole snapshot+diff below runs per frame; before an epoch gate is built, this says what
+    // that actually costs on a real bag population. Printed once a second.
+    let cost_t0 = std::env::var_os("WOW_FEED_COST")
+        .is_some()
+        .then(std::time::Instant::now);
     // The frame's atomic clock pair (`crate::ui_script::UiClock`): the slot resolves read the
     // cooldown store and convert triples through ONE coherent instant, so a running cooldown's
     // pushed start is frame-stable (the resource's own doc).
@@ -905,10 +928,76 @@ pub(super) fn feed_containers(
         script.set_has_key(key);
     }
 
+    if let Some(t0) = cost_t0 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SUM_NS: AtomicU64 = AtomicU64::new(0);
+        static N: AtomicU64 = AtomicU64::new(0);
+        let sum = SUM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(60) {
+            let slots: usize = fresh.values().map(|c| c.slots.len()).sum();
+            eprintln!(
+                "[feed-cost] ms={:.3} slots={slots} containers={}",
+                sum as f64 / n as f64 / 1e6,
+                fresh.len(),
+            );
+        }
+    }
+    apply_container_source(
+        &mut script,
+        memory,
+        player.is_some().then_some(fresh),
+        transitioned,
+    );
+}
+
+/// The feed's outward half: diff `source` against what was last pushed, push each changed bag into
+/// the VM and fire the reference's events — `BAG_UPDATE(bagID)` (`PLAYERBANKSLOTS_CHANGED(slot)`
+/// for the vault), one `BAG_UPDATE_DELAYED` per batch, then the lock transitions.
+///
+/// **`source: None` means the self player STORE is absent this frame — "no data source", never
+/// "the player has no items."** The two absent windows are pre-arrival at login (the fresh VM's
+/// containers are already empty; nothing to say) and the logout despawn frames:
+/// `SMSG_LOGOUT_COMPLETE` despawns the self entity (`net/apply/session.rs::logged_out`) at least
+/// one full Update before the `OnExit(InWorld)` shutdown, so this runs against a still-live VM.
+/// Diffing the absence as an all-empty snapshot fired a full `BAG_UPDATE` burst whose every bag
+/// read `GetContainerNumSlots() == 0` — and an addon that mirrors bags into its saved variables
+/// deletes a bag's record on size 0 (Bagnon_Forever's `SaveBagData`), so the burst erased the
+/// whole record moments before [`crate::ui_script::shutdown_ui_state`] wrote the file. That was
+/// the director's offline-bags report: every recently-logged-out character money-only, the view
+/// stale. The reference never delivers such a burst — its UI shutdown (`0x490bd0`) runs with the
+/// inventory intact — so here the VM simply keeps its last-pushed state and the shutdown writes
+/// the bags the player actually had. Lock-clear events still flush either way: they are
+/// packet-driven and must not sit around to fire into a later VM.
+pub(crate) fn apply_container_source(
+    script: &mut UiScript,
+    memory: &mut FeedMemory,
+    source: Option<HashMap<i64, ContainerState>>,
+    transitioned: Vec<(i64, u32)>,
+) {
     // Diff whole bags; push + fire BAG_UPDATE per transition, one BAG_UPDATE_DELAYED per batch. A
     // pending-lock transition always flips a slot's `.locked` (part of `ContainerSlot`'s equality),
     // so it always shows up here too — but `transitioned`'s ITEM_LOCK_CHANGED fires unconditionally
     // below rather than leaning on that invariant.
+    if let Some(fresh) = source {
+        diff_and_push(script, memory, fresh);
+    }
+    // The lock-transition event (decision 0218: the bag windows' own repaint trigger) — after the
+    // container push above, so a listener's repaint reads the corrected `.locked` state.
+    for (bag, slot) in transitioned {
+        script.fire_event(
+            "ITEM_LOCK_CHANGED",
+            vec![ScriptValue::Int(bag), ScriptValue::Int(i64::from(slot))],
+        );
+    }
+}
+
+/// The present-source half of [`apply_container_source`]: push every changed bag, announce each.
+fn diff_and_push(
+    script: &mut UiScript,
+    memory: &mut FeedMemory,
+    fresh: HashMap<i64, ContainerState>,
+) {
     let changed: Vec<i64> = fresh
         .keys()
         .chain(memory.pushed.keys())
@@ -956,20 +1045,68 @@ pub(super) fn feed_containers(
         memory.pushed = fresh;
         script.fire_event("BAG_UPDATE_DELAYED", vec![]);
     }
-    // The lock-transition event (decision 0218: the bag windows' own repaint trigger) — after the
-    // container push above, so a listener's repaint reads the corrected `.locked` state.
-    for (bag, slot) in transitioned {
-        script.fire_event(
-            "ITEM_LOCK_CHANGED",
-            vec![ScriptValue::Int(bag), ScriptValue::Int(i64::from(slot))],
-        );
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::charges_count;
+    use super::{apply_container_source, charges_count, FeedMemory};
     use benilla_protocol::messages::ItemSpellEntry;
+    use benilla_ui::script::{ContainerState, UiScript};
+    use std::collections::HashMap;
+
+    /// The logout-wipe law (the director's stale-offline-bags report): an **absent** self player
+    /// store is "no data source", never "the player has no items". `SMSG_LOGOUT_COMPLETE` despawns
+    /// the self entity a full Update before `OnExit(InWorld)` shuts the VM down, and the feed used
+    /// to diff that absence as an all-empty snapshot — a `BAG_UPDATE` burst whose every bag read
+    /// `GetContainerNumSlots() == 0`, which made Bagnon_Forever erase its records right before the
+    /// saved-variables write. A *present* source that lost a bag is a real transition and must
+    /// still announce — the law gates on the source's existence, not on its emptiness.
+    #[test]
+    fn an_absent_self_player_is_no_source_never_an_empty_bag_burst() {
+        let mut s = UiScript::new().unwrap();
+        s.run(
+            "BAG_EVENTS = 0 \
+             local f = CreateFrame('Frame') \
+             f:RegisterEvent('BAG_UPDATE') \
+             f:SetScript('OnEvent', function() BAG_EVENTS = BAG_EVENTS + 1 end)",
+        )
+        .unwrap();
+        let bag0 = ContainerState {
+            name: Some("Backpack".into()),
+            num_slots: 16,
+            slots: HashMap::new(),
+        };
+        let mut memory = FeedMemory::default();
+
+        // The in-session push: source present, bag new → pushed + announced.
+        apply_container_source(
+            &mut s,
+            &mut memory,
+            Some(HashMap::from([(0, bag0)])),
+            Vec::new(),
+        );
+        assert_eq!(s.eval::<i64>("return GetContainerNumSlots(0)").unwrap(), 16);
+        assert_eq!(s.eval::<i64>("return BAG_EVENTS").unwrap(), 1);
+
+        // The logout despawn frame: no store. The VM keeps its last-pushed bags and no event
+        // fires — an addon reading its bags out of the PLAYER_LOGOUT edge sees them intact.
+        apply_container_source(&mut s, &mut memory, None, Vec::new());
+        assert_eq!(
+            s.eval::<i64>("return GetContainerNumSlots(0)").unwrap(),
+            16,
+            "an absent source must not empty the VM's containers"
+        );
+        assert_eq!(
+            s.eval::<i64>("return BAG_EVENTS").unwrap(),
+            1,
+            "an absent source must not fire a BAG_UPDATE burst"
+        );
+
+        // A PRESENT source without the bag is a genuine transition: push + announce.
+        apply_container_source(&mut s, &mut memory, Some(HashMap::new()), Vec::new());
+        assert_eq!(s.eval::<i64>("return GetContainerNumSlots(0)").unwrap(), 0);
+        assert_eq!(s.eval::<i64>("return BAG_EVENTS").unwrap(), 2);
+    }
 
     fn slot(spell_id: u32, charges: i32) -> ItemSpellEntry {
         ItemSpellEntry {

@@ -7,14 +7,14 @@
 use mlua::{Lua, Table, Value};
 
 use super::object::{
-    anchor_bits_eq, as_f32, decode_id, draw_layer_from_str, id_to_lud, point_from_str,
+    anchor_bits_eq, anchor_retarget_is_structural, as_f32, decode_id, id_to_lud, point_from_str,
 };
 use super::{
-    JustifyH, JustifyV, Model, Outline, TexCoords, REG_REGION_META, REG_REGION_METHODS,
-    REG_WRAPPERS, SCREEN,
+    Model, REG_FONTSTRING_META, REG_FONTSTRING_METHODS, REG_REGION_META, REG_REGION_METHODS,
+    REG_TEXTURE_META, REG_TEXTURE_METHODS, REG_TITLE_META, REG_TITLE_METHODS, REG_WRAPPERS, SCREEN,
 };
-use crate::layout::{Anchor, Point};
-use crate::widget::RegionHandle;
+use crate::layout::Anchor;
+use crate::widget::{RegionHandle, RegionKind};
 
 /// Resolve `self` (a region wrapper) to its live [`RegionHandle`].
 pub(super) fn region_handle_of(lua: &Lua, this: &Table) -> mlua::Result<RegionHandle> {
@@ -27,6 +27,46 @@ pub(super) fn region_handle_of(lua: &Lua, this: &Table) -> mlua::Result<RegionHa
         .ok_or_else(|| mlua::Error::runtime("stale or invalid region handle"))
 }
 
+/// Apply the font parts an **XML element** supplies — `font=`, `<FontHeight>`, `outline=` — any
+/// subset of which may be absent.
+///
+/// **This is deliberately not the `SetFont` binding, and that separation is the point.** The
+/// reference applies XML font attributes in C++ (`LoadXML`), never through the Lua method, and its
+/// `SetFont` therefore *requires* both a path and a height, raising
+/// `Usage: %s:SetFont("font", fontHeight [, flags])` (`0x87c69c`) without them. Our loader used to
+/// call the binding with three `Option`s — `SetFont(nil, nil, "OUTLINE")` for an outline-only
+/// `<FontString>` — which is why that binding could not be made faithful: one name was doing two
+/// jobs, and the more lenient job won. Splitting them lets `SetFont` be the reference's `SetFont`
+/// and lets the loader keep the partial application XML actually needs.
+///
+/// Each part supplied is an **explicit** set (`FontExplicit`), so it survives a later mutation of
+/// the font object this region inherits. An empty `font=` is treated as absent — it keeps the
+/// inherited face, rather than being the binding's load-failure edge.
+pub(crate) fn apply_font_parts(
+    lua: &Lua,
+    this: &Table,
+    path: Option<String>,
+    height: Option<f32>,
+    flags: Option<String>,
+) -> mlua::Result<()> {
+    let rh = region_handle_of(lua, this)?;
+    let mut model = lua.app_data_mut::<Model>().expect("model");
+    let d = model.region_data.entry(rh).or_default();
+    if let Some(p) = path.filter(|p| !p.is_empty()) {
+        d.font_path = Some(p);
+        d.font_explicit.face = true;
+    }
+    if let Some(h) = height {
+        d.font_height = Some(h);
+        d.font_explicit.height = true;
+    }
+    if let Some(f) = flags {
+        d.outline = super::Outline::flags(&f);
+        d.font_explicit.outline = true;
+    }
+    Ok(())
+}
+
 /// Get-or-create the wrapper table for a region id (distinct metatable — the region "tag").
 pub(super) fn region_wrapper(lua: &Lua, id: u32) -> mlua::Result<Table> {
     let wrappers: Table = lua.named_registry_value(REG_WRAPPERS)?;
@@ -35,7 +75,28 @@ pub(super) fn region_wrapper(lua: &Lua, id: u32) -> mlua::Result<Table> {
     }
     let t = lua.create_table()?;
     t.raw_set(0, Value::LightUserData(id_to_lud(id)))?;
-    let meta: Table = lua.named_registry_value(REG_REGION_META)?;
+    // **A title region gets a NARROWER metatable, chosen here rather than per lookup.** wow-re Q6
+    // carves the object as answering *exactly* the 19 Region methods — no Show/Hide, no textures,
+    // no text — and this cache is created once per region, so picking the table at construction
+    // costs nothing on the call path (dispatching inside `__index` would put a model borrow and a
+    // kind lookup in front of EVERY region method call in the UI).
+    let kind = {
+        let model = lua.app_data_ref::<Model>().expect("model");
+        model
+            .id_to_region
+            .get(&id)
+            .and_then(|rh| model.arena.region(*rh))
+            .map(|r| r.kind)
+    };
+    let meta: Table = lua.named_registry_value(match kind {
+        Some(RegionKind::Texture) => REG_TEXTURE_META,
+        Some(RegionKind::FontString) => REG_FONTSTRING_META,
+        Some(RegionKind::Title) => REG_TITLE_META,
+        // A wrapper for an id with no live region: the full table, which is what this cache did for
+        // every region before the leaves were split. Nothing can call through it — every method
+        // resolves the handle first and raises on a dead one.
+        None => REG_REGION_META,
+    })?;
     t.set_metatable(Some(meta))?;
     wrappers.set(id, t.clone())?;
     Ok(t)
@@ -63,6 +124,43 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             data.texture = None;
             data.fill = None;
             data.circular = true;
+            Ok(())
+        })?,
+    )?;
+
+    // SetPortraitToTexture(textureName, path) — the ENGINE GLOBAL, which is what 1.12 has.
+    //
+    // `reference/1.12-globals.tsv` marks it `engine`, and the reference's own two call sites both
+    // pass a texture NAME: `ContainerFrame.lua:419` writes
+    // `SetPortraitToTexture(frame:GetName().."Portrait", "…KeyRing-Bag-Icon")` and
+    // `MailFrame.lua:174` writes `SetPortraitToTexture("OpenMailFrameIcon", stationeryIcon)`.
+    // **That first one matters here: we SOURCE `ContainerFrame.lua` off the patch chain, so the
+    // client's own file calls this global inside our VM.**
+    //
+    // A NAME, not a region handle — strictly what the reference's callers are attested to pass.
+    // Whether the real binding also accepts a texture object is not carved, so it is not accepted
+    // here: inventing the wider signature is how a superset starts (1189), and nothing needs it —
+    // both of our own callers already hold the name.
+    //
+    // The behaviour is the crop it was always: set the texture AND mark the region a portrait, so
+    // it draws masked to its inscribed circle. The client's portraits are circular and the frame
+    // ring is a thin band whose transparent corners would otherwise show the square texture's
+    // edges. Distinct from `SetPortraitTexture(region, unit)`'s live model bake, so it drops any
+    // live-unit binding; a later `SetTexture` clears the flag again.
+    lua.globals().set(
+        "SetPortraitToTexture",
+        lua.create_function(|lua, (name, path): (String, String)| {
+            let mut model = lua.app_data_mut::<Model>().expect("model");
+            let Some(id) = model.region_names.get(&name).copied() else {
+                return Ok(());
+            };
+            let Some(rh) = model.id_to_region.get(&id).copied() else {
+                return Ok(());
+            };
+            let data = model.region_data.entry(rh).or_default();
+            data.texture = Some(path);
+            data.circular = true;
+            data.portrait_unit = None;
             Ok(())
         })?,
     )?;
@@ -97,6 +195,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+mod layout;
+mod paint;
+mod text;
+
 fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
     let m = lua.create_table()?;
 
@@ -106,24 +208,80 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
     // to a fade `finishedFunc` and `getglobal`s it back ("hack since a frame can't have a
     // reference to itself in it" — its own comment).
     //
-    // Resolved by scanning the region-name registry rather than storing the name a second time on
-    // the region: that registry is the single authority for region names (the widget arena
-    // deliberately holds none), and a mirrored copy is one more thing to drift. The scan is linear
-    // in NAMED regions, and this is a human-rate call.
+    // Resolution is [`region_name_of`], shared with `IsObjectType`'s `Usage:` text so the two can
+    // never disagree about what this region is called.
     m.set(
         "GetName",
         lua.create_function(|lua, this: Table| {
             let id = decode_id(&this)?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let name = model
-                .region_names
-                .iter()
-                .find(|&(_, &v)| v == id)
-                .map(|(k, _)| k.clone());
-            match name {
+            match region_name_of(&model, id) {
                 Some(n) => Ok(Value::String(lua.create_string(&n)?)),
                 None => Ok(Value::Nil),
             }
+        })?,
+    )?;
+
+    // ── GetObjectType / IsObjectType: the last two of the Region map (1244 §4 closed) ───────────
+    //
+    // 1244 shipped four of the six missing Region-map members and deliberately left these two
+    // DISPATCHED rather than guessed, because every interesting detail is one a plausible
+    // implementation gets wrong. wow-re answered (§5 trio + byte cross-check,
+    // `system/ui/scratch/widget-type-identity.md`), and every one of those details is below.
+    //
+    // `GetObjectType` is a per-class `.data` `const char*` read through `vtable[+0x1c]` — Texture
+    // `0x773480` → `"Texture"`, FontString `0x7735d0` → `"FontString"` — pushed with
+    // `lua_pushstring`, exactly one value, extra arguments ignored with no arity check.
+    m.set(
+        "GetObjectType",
+        lua.create_function(|lua, this: Table| {
+            let rh = region_handle_of(lua, &this)?;
+            let model = lua.app_data_ref::<Model>().expect("model");
+            Ok(region_type_name(&model, rh))
+        })?,
+    )?;
+
+    // `IsObjectType(name)` — binding `0x7a1290`. Four traps, all verified, all here:
+    //
+    //  · **Case-INSENSITIVE, whole-string.** `vtable[+0x18]` → `SStrCmpI 0x64a4c0` → `_strnicmp`,
+    //    which folds both operands before comparing and breaks at the first NUL on either side —
+    //    so no prefix or substring match either. (The *method-name* lookup `0x702000` uses the
+    //    case-SENSITIVE sibling; the two are easy to conflate and behave differently.)
+    //  · **A short, hardcoded chain — and there is no root type.** Texture answers `"Texture"` and
+    //    `"Region"`; FontString answers `"FontString"` and `"Region"`. **1.12.1 has no
+    //    `"LayoutFrame"`, `"ScriptObject"` or `"Object"` type at all** — those strings exist only
+    //    inside `__FILE__` paths and allocator tags — so `tex:IsObjectType("LayoutFrame")` is nil.
+    //    That is the single most likely thing to invent from knowing later clients.
+    //  · **A hit is the NUMBER 1 and a miss is nil — never a boolean**, read off the pushed tags
+    //    (`lua_pushnumber` tag 3 vs `lua_pushnil` tag 0; tag 1 is never written), and exactly one
+    //    value on both paths.
+    //  · **A bad argument RAISES.** The gate is `lua_isstring`, which accepts strings and NUMBERS
+    //    only; anything else (missing, nil, boolean, table, function, userdata) hits
+    //    `luaL_error(L, "Usage: %s:IsObjectType(\"TYPE\")")` with `%s` the region's name or
+    //    `<unnamed>`, and that longjmps rather than returning. A number is ACCEPTED and stringified
+    //    in place, so `tex:IsObjectType(5)` compares against `"5"` and quietly answers nil — we
+    //    format it and compare for real rather than short-circuiting, though no type name is
+    //    numeric so the answer is nil either way.
+    m.set(
+        "IsObjectType",
+        lua.create_function(|lua, (this, want): (Table, Value)| {
+            let rh = region_handle_of(lua, &this)?;
+            let model = lua.app_data_ref::<Model>().expect("model");
+            let want = match &want {
+                Value::String(s) => s.to_str()?.to_string(),
+                Value::Number(n) => n.to_string(),
+                Value::Integer(i) => i.to_string(),
+                _ => {
+                    let who = region_name_of(&model, decode_id(&this)?)
+                        .unwrap_or_else(|| "<unnamed>".to_string());
+                    return Err(mlua::Error::runtime(format!(
+                        "Usage: {who}:IsObjectType(\"TYPE\")"
+                    )));
+                }
+            };
+            let leaf = region_type_name(&model, rh);
+            let hit = want.eq_ignore_ascii_case(leaf) || want.eq_ignore_ascii_case("Region");
+            Ok(if hit { Value::Number(1.0) } else { Value::Nil })
         })?,
     )?;
 
@@ -213,6 +371,7 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
             Ok(())
         })?,
     )?;
+
     m.set(
         "Hide",
         lua.create_function(|lua, this: Table| {
@@ -222,6 +381,7 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
             Ok(())
         })?,
     )?;
+
     m.set(
         "IsShown",
         lua.create_function(|lua, this: Table| {
@@ -231,6 +391,7 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
             Ok(if shown { Value::Integer(1) } else { Value::Nil })
         })?,
     )?;
+
     m.set(
         "IsVisible",
         lua.create_function(|lua, this: Table| {
@@ -250,919 +411,86 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // SetAlpha/GetAlpha — the region's own alpha, distinct from the owner frame's. The ref kit reads
-    // it back to ramp a texture (CastingBarFrame's completion flash does
-    // `CastingBarFlash:SetAlpha(GetAlpha() + CASTING_BAR_FLASH_STEP)`), so the getter must return the
-    // region's value, never the frame's. Draw law + the open question: [`RegionData::alpha`].
-    m.set(
-        "SetAlpha",
-        lua.create_function(|lua, (this, alpha): (Table, f32)| {
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            model.region_data.entry(rh).or_default().alpha = Some(alpha.clamp(0.0, 1.0));
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "GetAlpha",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let model = lua.app_data_ref::<Model>().expect("model");
-            Ok(model
-                .region_data
-                .get(&rh)
-                .and_then(|d| d.alpha)
-                .unwrap_or(1.0))
-        })?,
-    )?;
+    // The three clusters this file was split into (0716's budget). Order is immaterial —
+    // every one of them only writes into the same method table.
+    paint::install(lua, &m)?;
+    text::install(lua, &m)?;
+    layout::install(lua, &m)?;
 
-    m.set(
-        "SetVertexColor",
-        lua.create_function(
-            |lua, (this, r, g, b, a): (Table, f32, f32, f32, Option<f32>)| {
-                let rh = region_handle_of(lua, &this)?;
-                let mut model = lua.app_data_mut::<Model>().expect("model");
-                let d = model.region_data.entry(rh).or_default();
-                d.vertex_color = Some([r, g, b, a.unwrap_or(1.0)]);
-                // The same slot `SetTextColor` writes on a FontString, so it is the same explicit
-                // colour set as far as font-object inheritance is concerned.
-                d.font_explicit.color = true;
-                Ok(())
-            },
-        )?,
-    )?;
-    // GetVertexColor — the setter's own pair, a real 5875 binding (`0x79aa50`, wow-re
-    // `system/ui/ledger.tsv`; it sits directly above `SetVertexColor 0x79abd0` in the same region
-    // method family). Never set = the untinted white every region draws at by default.
-    m.set(
-        "GetVertexColor",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let model = lua.app_data_ref::<Model>().expect("model");
-            let c = model
-                .region_data
-                .get(&rh)
-                .and_then(|d| d.vertex_color)
-                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            Ok((c[0], c[1], c[2], c[3]))
-        })?,
-    )?;
-    // SetGradientAlpha(orientation, r1,g1,b1,a1, r2,g2,b2,a2) and its alpha-less twin
-    // SetGradient(orientation, r1,g1,b1, r2,g2,b2) — the two-stop linear gradient the client
-    // generates into the same `+0xcc` texture slot the colour form of SetTexture fills.
+    // ── The title region's own, narrower table ──────────────────────────────────────────────────
     //
-    // These were missing, and they were the single wall in front of the corpus's largest family:
-    // `FuBar\FuBar_Panel.lua:144` calls SetGradientAlpha while building the bar, so all 20 FuBar
-    // plugins died there — after the debugstack/chunk-name fix got them that far.
+    // 1250 §5 recorded this as a named divergence: our region metatable was shared, so a title
+    // region answered `SetTexture`/`Show`/`Hide` where the reference raises `attempt to call
+    // method`. Inert — the kind never draws — but a **superset in PRESENCE**, and 1189 is the
+    // record of what a superset costs when an addon feature-detects.
     //
-    // The orientation token is matched case-insensitively and anything that is not "VERTICAL" is
-    // horizontal, which is the client's own leniency and matters because addons spell it both ways.
-    // The gradient is stored WHOLE (see `RegionData::gradient`); the paint folds it to its midpoint
-    // because a quad carries one tint today. That approximation is visible and is recorded at the
-    // field, not hidden here.
-    for (name, with_alpha) in [("SetGradientAlpha", true), ("SetGradient", false)] {
-        m.set(
-            name,
-            lua.create_function(move |lua, args: mlua::MultiValue| {
-                let mut it = args.into_iter();
-                let this: Table = match it.next() {
-                    Some(Value::Table(t)) => t,
-                    _ => return Err(mlua::Error::runtime("expected a region")),
-                };
-                let orientation = match it.next() {
-                    Some(Value::String(s)) => s.to_str()?.to_string(),
-                    // A missing/!string orientation is horizontal, like any non-"VERTICAL" token.
-                    _ => String::new(),
-                };
-                let n = if with_alpha { 8 } else { 6 };
-                let mut c = [0.0f32; 8];
-                for slot in c.iter_mut().take(n) {
-                    *slot = it.next().as_ref().map(as_f32).unwrap_or(0.0);
-                }
-                let (start, end) = if with_alpha {
-                    ([c[0], c[1], c[2], c[3]], [c[4], c[5], c[6], c[7]])
-                } else {
-                    // SetGradient has no alpha stops: both ends are opaque.
-                    ([c[0], c[1], c[2], 1.0], [c[3], c[4], c[5], 1.0])
-                };
-                let rh = region_handle_of(lua, &this)?;
-                let mut model = lua.app_data_mut::<Model>().expect("model");
-                let d = model.region_data.entry(rh).or_default();
-                d.gradient = Some(super::Gradient {
-                    vertical: orientation.eq_ignore_ascii_case("VERTICAL"),
-                    start,
-                    end,
-                });
-                Ok(())
-            })?,
-        )?;
+    // Closed by copying exactly the Region map (the 19 names 1244/1245 landed and assert as a set)
+    // out of the full table. It is a copy rather than a second install because the two must never
+    // disagree about what, say, `GetPoint` does — one implementation, two visibilities.
+    //
+    // **The Texture/FontString superset is NOT closed here, deliberately.** They still share one
+    // table, so a Texture answers `SetText` and a FontString answers `SetTexture`. Splitting those
+    // needs the per-table membership facts, and the naive partition is WRONG: `paint.rs` installs
+    // `SetDrawLayer`/`SetVertexColor`/`SetAlpha`/`SetAlphaGradient`, all of which the font carve
+    // says a FontString legitimately has. A wrong split REMOVES verbs addons use, which is worse
+    // than the superset it fixes — so that half waits for the membership read (1238's shape).
+    let title = lua.create_table()?;
+    for name in super::REGION_MAP_METHODS {
+        let f: Value = m.get(name)?;
+        title.set(name, f)?;
     }
-    m.set(
-        "SetTexture",
-        // The trailing three are `Value`, not `Option<f32>`, and that is a fidelity fix rather than
-        // laxity. The path form reads ONE argument (`0x770200`); only the colour form
-        // (`0x770360`) reads up to four. A C function takes what it wants off the Lua stack and
-        // ignores the rest, so `SetTexture(path, true)` is fine on the real client — and typing
-        // these as `Option<f32>` made us raise on it, `bad argument #3: error converting Lua
-        // boolean to f32`, in a call the client accepts silently.
-        //
-        // Found by `_LazyPig/LazyPigMenu.lua:182`
-        // (`texture_title:SetTexture("Interface\DialogFrame\UI-DialogBox-Header", true)`), which
-        // reached us only once the survey started seating the addon registry — the whole point of
-        // that instrument fix. The stray `true` is meaningless in 1.12 and the addon author
-        // presumably meant a later client's second parameter; either way the client shrugs.
-        lua.create_function(
-            |lua, (this, arg, g, b, a): (Table, Value, Value, Value, Value)| {
-                let rh = region_handle_of(lua, &this)?;
-                let mut model = lua.app_data_mut::<Model>().expect("model");
-                let data = model.region_data.entry(rh).or_default();
-                // A plain SetTexture makes the region ordinary again — drop any portrait circular mask
-                // and any live-unit-portrait binding.
-                data.circular = false;
-                data.portrait_unit = None;
-                // Both forms write the SAME `+0xcc` texture slot — the path form loads a file
-                // there (`0x770200`), the colour form generates an 8×8 solid into it
-                // (`0x770360`) — so each clears the other. NEITHER touches the vertex colour at
-                // `+0xb8`: a tint outlives the art it was tinting.
-                match &arg {
-                    // SetTexture("") clears, same as SetTexture(nil) — the ref lua blanks state
-                    // art with the empty string (QuestLogFrame.lua:165-166).
-                    Value::String(s) if s.to_str()?.is_empty() => {
-                        data.texture = None;
-                        data.fill = None;
-                    }
-                    Value::String(s) => {
-                        data.texture = Some(s.to_str()?.to_string());
-                        data.fill = None;
-                    }
-                    // The colour form, and the ONLY branch that looks at the trailing three. A
-                    // non-numeric there takes the same default a missing one does, which is what
-                    // reading off a C stack does: `lua_tonumber` on a non-number yields 0.
-                    Value::Number(_) | Value::Integer(_) => {
-                        let chan = |v: &Value, dflt: f32| match v {
-                            Value::Number(_) | Value::Integer(_) => as_f32(v),
-                            Value::String(s) => s
-                                .to_str()
-                                .ok()
-                                .and_then(|s| s.parse::<f32>().ok())
-                                .unwrap_or(dflt),
-                            _ => dflt,
-                        };
-                        data.fill =
-                            Some([as_f32(&arg), chan(&g, 0.0), chan(&b, 0.0), chan(&a, 1.0)]);
-                        data.texture = None;
-                    }
-                    // SetTexture(nil) clears (the live API's blank-the-region form); a cleared
-                    // texture region draws nothing.
-                    Value::Nil => {
-                        data.texture = None;
-                        data.fill = None;
-                    }
-                    _ => {}
-                }
-                Ok(())
-            },
-        )?,
-    )?;
-    // SetDesaturated(flag) -> shaderSupported — Texture only (`0x79c1e0`, wow-re ledger; the
-    // reference's own `ItemButtonTemplate.lua:69` is `local shaderSupported =
-    // icon:SetDesaturated(desaturated)`).
+    // ── The two LEAF tables (wow-re `texture-fontstring-method-split.md`) ───────────────────────
     //
-    // **The RETURN is the whole design, and it is the half a plausible implementation drops.**
-    // 1.12 ran on cards that could not do the shader, so the verb reports whether it took effect
-    // and FrameXML falls back by hand:
+    // Texture's map is `0x87c128` (22 entries, lookup `0x79c620`), FontString's is `0xcf5400` (32,
+    // lookup `0x79ee20`); both tail-call the Region map and stop there — no third table. Until now
+    // ours was ONE table for both, so a Texture answered `SetText` and a FontString answered
+    // `SetTexture`: a superset in both directions.
     //
-    //     if ( not desaturated ) then r,g,b = 1,1,1
-    //     elseif ( not r or not shaderSupported ) then r,g,b = 0.5,0.5,0.5 end
-    //     icon:SetVertexColor(r, g, b)
+    // **Partitioned, not pruned.** Every name we install keeps a home; what changes is which leaf
+    // can see it. Removing the five names that are in NEITHER client map (`SetPortraitToTexture`,
+    // `SetRotation`, `SetSize`, `SetFormattedText`, `GetStringHeight`) is a separate question per
+    // name — and getting a split wrong REMOVES verbs addons use, which is worse than the superset
+    // it fixes.
     //
-    // We have no desaturation in the renderer, so we answer **nil — unsupported**, which is a real
-    // 1.12 machine's answer and not a lie. Claiming support would suppress that grey fallback and
-    // leave disabled icons drawn at full colour: strictly worse-looking than saying no. When a
-    // desaturating shader lands, flip the return and this comment with it.
-    //
-    // Why it matters far past one verb: **98 of the 109 addons that draw and then raise on being
-    // used, raise here** — `FuBar_Panel.lua:43`'s right-click reaches Dewdrop's `AddLine`
-    // (`Dewdrop-2.0.lua:2172`), which calls `button.arrow:SetDesaturated(true)` unguarded. A
-    // static scan costed this at 61 addons and it was declined; the use-probe costed it at 98 the
-    // moment anyone right-clicks.
-    m.set(
-        "SetDesaturated",
-        lua.create_function(|lua, (this, flag): (Table, Value)| {
-            let on = !matches!(flag, Value::Nil | Value::Boolean(false));
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            model.region_data.entry(rh).or_default().desaturated = on;
-            // nil, not false: the reference's `shaderSupported` is a 1|nil C answer and callers
-            // write `not shaderSupported`.
-            Ok(Value::Nil)
-        })?,
-    )?;
-    // GetTexture() — Texture only (`0x79ba70`), verified in wow-re's widget-method batch
-    // (`system/ui/scratch/widget-api-batch-benilla.md`). Three contract details are each the kind a
-    // plausible implementation gets silently wrong, so each is spelled out:
-    //
-    //  · **Exactly ONE return value**, never a multi-return.
-    //  · **The colour form returns the literal string `"Solid Texture"`** (`0x835708`), NOT nil.
-    //    `SetTexture(r,g,b)` synthesizes an 8x8 solid, and the getter reports that name — so an
-    //    addon's `if not tex then` passes straight through on a colour-filled region. Returning nil
-    //    here would look tidier and would be wrong in the one direction callers test for.
-    //  · **The path is stripped at the LAST `.`** (`0x79baf0`): the loader appends `.blp`/`.tga` to
-    //    what was set and the getter strips an extension back off. Taken verbatim rather than
-    //    "strip only a real extension" — a directory containing a dot is mangled by the real client
-    //    too, and this surface is a transcription, not an improvement.
-    //
-    // Four corpus addons: `AtlasQuest.lua:228` (`AQATLASMAP = AtlasMap:GetTexture()`) and
-    // `FuBarPlugin-2.0.lua:343` (`return self.iconFrame:GetTexture()`), each reached by two addons.
-    m.set(
-        "GetTexture",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let model = lua.app_data_mut::<Model>().expect("model");
-            let Some(data) = model.region_data.get(&rh) else {
-                return Ok(None);
-            };
-            if data.fill.is_some() {
-                return Ok(Some("Solid Texture".to_string()));
-            }
-            Ok(data.texture.as_ref().map(|t| match t.rfind('.') {
-                Some(i) => t[..i].to_string(),
-                None => t.clone(),
-            }))
-        })?,
-    )?;
-    // SetPortraitToTexture(path) — set the texture AND mark the region a portrait (drawn masked to
-    // its inscribed circle). The client's portraits are circular (model or icon fallback); the frame
-    // ring is a thin band whose transparent corners would otherwise show the square texture's edges.
-    // The live API's `SetPortraitToTexture(texture, path)` is a global crop helper; ours is the
-    // region-method face of the same intent. This is the *icon/path* portrait — distinct from the
-    // `SetPortraitTexture(region, unit)` live model bake, so it drops any live-unit binding.
-    // `SetTexture` on the same region clears the flag (a plain texture again).
-    m.set(
-        "SetPortraitToTexture",
-        lua.create_function(|lua, (this, path): (Table, String)| {
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let data = model.region_data.entry(rh).or_default();
-            data.texture = Some(path);
-            data.circular = true;
-            data.portrait_unit = None;
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "SetText",
-        lua.create_function(|lua, (this, text): (Table, Option<String>)| {
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let data = model.region_data.entry(rh).or_default();
-            data.text = text;
-            // Fresh text draws whole — an armed write-on gradient belongs to the old string.
-            data.alpha_gradient = None;
-            Ok(())
-        })?,
-    )?;
-    // SetAlphaGradient(start, length) — the per-character write-on reveal (CSimpleFontString;
-    // the quest-description machinery, ref QuestFrame.lua:548/558). Returns whether `start` is
-    // still inside the text (chars) — the ref's OnUpdate loop advances until this goes false.
-    m.set(
-        "SetAlphaGradient",
-        lua.create_function(|lua, (this, start, length): (Table, f32, f32)| {
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let data = model.region_data.entry(rh).or_default();
-            data.alpha_gradient = Some((start, length));
-            let chars = data.text.as_deref().map_or(0, |t| t.chars().count());
-            Ok(start < chars as f32)
-        })?,
-    )?;
-    // SetFormattedText(fmt, ...) = SetText(format(fmt, ...)) — routed through the stdlib's
-    // positional-aware `format` so `%N$s` specs behave (a consensus call across the 0068 targets).
-    m.set(
-        "SetFormattedText",
-        lua.create_function(|lua, (this, args): (Table, mlua::MultiValue)| {
-            let format: mlua::Function = lua
-                .globals()
-                .get::<Table>("string")?
-                .get::<mlua::Function>("format")?;
-            let text: String = format.call(args)?;
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let data = model.region_data.entry(rh).or_default();
-            data.text = Some(text);
-            data.alpha_gradient = None;
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "GetText",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let text = {
-                let model = lua.app_data_ref::<Model>().expect("model");
-                model.region_data.get(&rh).and_then(|d| d.text.clone())
-            };
-            match text {
-                Some(t) => Ok(Value::String(lua.create_string(&t)?)),
-                None => Ok(Value::Nil),
-            }
-        })?,
-    )?;
-    // SetBlendMode("BLEND"|"ADD"|…) — the shared alphaMode enum (0x811aa8); only ADD changes
-    // draw behavior in v1 (DISABLE/ALPHAKEY/MOD are accepted as straight alpha, a stated gap).
-    m.set(
-        "SetBlendMode",
-        lua.create_function(|lua, (this, mode): (Table, String)| {
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            model.region_data.entry(rh).or_default().additive = mode.eq_ignore_ascii_case("ADD");
-            Ok(())
-        })?,
-    )?;
-    // Region explicit size (drawn centered on the owner; region anchors come later).
-    m.set(
-        "SetWidth",
-        lua.create_function(|lua, (this, w): (Table, f32)| {
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let d = model.region_data.entry(rh).or_default();
-            let new = Some((w, d.size.map_or(0.0, |s| s.1)));
-            let changed = !size_bits_eq(d.size, new);
-            d.size = new;
-            if changed {
-                model.touch_layout();
-            }
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "SetHeight",
-        lua.create_function(|lua, (this, h): (Table, f32)| {
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let d = model.region_data.entry(rh).or_default();
-            let new = Some((d.size.map_or(0.0, |s| s.0), h));
-            let changed = !size_bits_eq(d.size, new);
-            d.size = new;
-            if changed {
-                model.touch_layout();
-            }
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "SetSize",
-        lua.create_function(|lua, (this, w, h): (Table, f32, f32)| {
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let d = model.region_data.entry(rh).or_default();
-            let new = Some((w, h));
-            let changed = !size_bits_eq(d.size, new);
-            d.size = new;
-            if changed {
-                model.touch_layout();
-            }
-            Ok(())
-        })?,
-    )?;
-    // GetStringWidth/GetStringHeight (FontString): the host-measured text extent from the measure
-    // round-trip ([`super::UiScript::set_measured_text`]) — the client asks its font engine for the
-    // laid-out string's metrics exactly here (`fontstring.md`), and the tooltip's auto-size sums
-    // these to fit its lines. `0` until the string has been measured (a frame's latency; converges).
-    // The stored measure only counts while its key matches the CURRENT text/font/wrap
-    // ([`RegionData::measure_key`]): after a SetText the old string's width is not this string's
-    // metric — serving it is how the whisper header's `GetWidth()` latched the edit-box insets on
-    // the previous header's width. A poll-until-nonzero caller (the chat header machine) now
-    // converges on the RIGHT measure instead of settling on a stale one.
-    // `GetWidth`/`GetHeight` prefer the measured extent, falling back to an explicit `SetSize` — the
-    // real client's `SmallTextTooltipText:GetWidth()` idiom (ref-GameTooltip.xml l.63).
-    fn measured_wh(lua: &Lua, this: &Table) -> mlua::Result<(f32, f32)> {
-        let rh = region_handle_of(lua, this)?;
-        let model = lua.app_data_ref::<Model>().expect("model");
-        let d = model.region_data.get(&rh);
-        // The key carries the owner's effective_scale ([`RegionData::measure_key`]) — the same
-        // recipe the request loop stamps, or every read under a SetScale'd owner reports stale.
-        let scale = model
-            .arena
-            .region(rh)
-            .and_then(|r| model.arena.frame(r.owner))
-            .map(|f| f.effective_scale)
-            .unwrap_or(1.0);
-        let m = d.and_then(|d| d.measured.filter(|m| m.key == d.measure_key(scale)));
-        let size = d.and_then(|d| d.size);
-        let w = m.map(|m| m.w).or(size.map(|s| s.0)).unwrap_or(0.0);
-        let h = m.map(|m| m.h).or(size.map(|s| s.1)).unwrap_or(0.0);
-        Ok((w, h))
-    }
-    // GetStringWidth is the **natural, unwrapped** extent — never the declared box, and never the
-    // wrapped one (wow-re `fontstring-overflow.md`, "The measurement echo": the reference's getter
-    // re-measures the raw text with NO wrap constraint). Unlike `GetWidth` below it deliberately
-    // does NOT fall back to an explicit `SetSize`: the declared width is the very thing a caller
-    // asks this to be independent of. A kit that sizes a box from this number and then sets a width
-    // on the string — which is what the reference's own `PanelTemplates_TabResize` does — would
-    // otherwise read its own output back as its next input and never settle (decision 0997, the
-    // macro window's character tab changing width every frame). `0` until measured, as ever.
-    fn natural_w(lua: &Lua, this: &Table) -> mlua::Result<f32> {
-        let rh = region_handle_of(lua, this)?;
-        let model = lua.app_data_ref::<Model>().expect("model");
-        let Some(d) = model.region_data.get(&rh) else {
-            return Ok(0.0);
-        };
-        let scale = model
-            .arena
-            .region(rh)
-            .and_then(|r| model.arena.frame(r.owner))
-            .map(|f| f.effective_scale)
-            .unwrap_or(1.0);
-        Ok(d.measured
-            .filter(|m| m.key == d.measure_key(scale))
-            .map(|m| m.natural_w)
-            .unwrap_or(0.0))
-    }
-    m.set(
-        "GetStringWidth",
-        lua.create_function(|lua, this: Table| natural_w(lua, &this))?,
-    )?;
-    m.set(
-        "GetStringHeight",
-        lua.create_function(|lua, this: Table| Ok(measured_wh(lua, &this)?.1))?,
-    )?;
-    m.set(
-        "GetWidth",
-        lua.create_function(|lua, this: Table| Ok(measured_wh(lua, &this)?.0))?,
-    )?;
-    m.set(
-        "GetHeight",
-        lua.create_function(|lua, this: Table| Ok(measured_wh(lua, &this)?.1))?,
-    )?;
-
-    // GetLeft/GetRight/GetTop/GetBottom — the region's RESOLVED edges (y-up UI units; frame twin
-    // in object.rs). An anchored region reads its own resolved rect; an unanchored one has no
-    // rect of its own (it draws relative to its owner at extract) → nil, same as pre-resolve.
-    for (name, pick) in [
-        ("GetLeft", 0u8),
-        ("GetRight", 1u8),
-        ("GetTop", 2u8),
-        ("GetBottom", 3u8),
+    // Copied out of the full table rather than installed twice, so one implementation stands behind
+    // both visibilities — and note the carve's warning that the shared names use the IDENTICAL
+    // `const char*` in the client's two tables, so de-duplicating by name would drop one side.
+    for (key, extra) in [
+        (REG_TEXTURE_METHODS, &super::TEXTURE_ONLY_METHODS[..]),
+        (REG_FONTSTRING_METHODS, &super::FONTSTRING_ONLY_METHODS[..]),
     ] {
-        m.set(
-            name,
-            lua.create_function(move |lua, this: Table| {
-                let rh = region_handle_of(lua, &this)?;
-                let model = lua.app_data_ref::<Model>().expect("model");
-                Ok(model.region_resolved.get(&rh).map(|r| match pick {
-                    0 => r.left,
-                    1 => r.right,
-                    2 => r.top,
-                    _ => r.bottom,
-                }))
-            })?,
-        )?;
+        let leaf = lua.create_table()?;
+        for name in super::REGION_MAP_METHODS
+            .iter()
+            .chain(super::REGION_LEAF_SHARED.iter())
+            .chain(extra.iter())
+        {
+            let f: Value = m.get(*name)?;
+            leaf.set(*name, f)?;
+        }
+        lua.set_named_registry_value(key, leaf)?;
     }
-    m.set(
-        "SetDrawLayer",
-        lua.create_function(|lua, (this, layer, sub): (Table, String, Option<i64>)| {
-            let rh = region_handle_of(lua, &this)?;
-            let dl = draw_layer_from_str(&layer)
-                .ok_or_else(|| mlua::Error::runtime(format!("unknown draw layer '{layer}'")))?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            if let Some(region) = model.arena.region_mut(rh) {
-                region.draw_layer = dl;
-                if let Some(s) = sub {
-                    region.sub_level = s.clamp(i64::from(i8::MIN), i64::from(i8::MAX)) as i8;
-                }
-            }
-            Ok(())
-        })?,
-    )?;
+    for (meta_key, methods_key) in [
+        (REG_TEXTURE_META, REG_TEXTURE_METHODS),
+        (REG_FONTSTRING_META, REG_FONTSTRING_METHODS),
+    ] {
+        let meta = lua.create_table()?;
+        let index = lua.create_function(move |lua, (_this, key): (Table, Value)| {
+            let methods: Table = lua.named_registry_value(methods_key)?;
+            methods.get::<Value>(key)
+        })?;
+        meta.set("__index", index)?;
+        lua.set_named_registry_value(meta_key, meta)?;
+    }
 
-    // Region anchors: SetPoint/ClearAllPoints/SetAllPoints mirror the frame versions
-    // ([`super::object`]) but write [`super::RegionData::anchors`]. An unspecified `relativeTo`
-    // defaults to the **owner frame**; a named one may be a frame or a sibling region (the real
-    // XML anchors regions to sibling regions everywhere — merchant label plate → `$parentSlot`).
-    m.set(
-        "SetPoint",
-        lua.create_function(
-            |lua, (this, p, a2, a3, a4, a5): (Table, String, Value, Value, Value, Value)| {
-                region_set_point(lua, &this, &p, [a2, a3, a4, a5])
-            },
-        )?,
-    )?;
-    m.set(
-        "ClearAllPoints",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let d = model.region_data.entry(rh).or_default();
-            let changed = !d.anchors.is_empty();
-            d.anchors.clear();
-            if changed {
-                model.touch_layout();
-            }
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "SetAllPoints",
-        lua.create_function(|lua, (this, target): (Table, Value)| {
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let owner = region_owner_id(&mut model, rh);
-            let rel_id = resolve_target(&mut model, &target, owner);
-            let pair = [
-                Anchor::new(Point::TopLeft, rel_id, Point::TopLeft, 0.0, 0.0),
-                Anchor::new(Point::BottomRight, rel_id, Point::BottomRight, 0.0, 0.0),
-            ];
-            let data = model.region_data.entry(rh).or_default();
-            let same = data.anchors.len() == 2
-                && data
-                    .anchors
-                    .iter()
-                    .zip(&pair)
-                    .all(|(a, b)| anchor_bits_eq(a, b));
-            if !same {
-                data.anchors.clear();
-                data.anchors.extend_from_slice(&pair);
-                model.touch_layout();
-            }
-            Ok(())
-        })?,
-    )?;
-    // SetJustifyH("LEFT"|"CENTER"|"RIGHT") — a FontString's horizontal justification (XML `justifyH`).
-    m.set(
-        "SetJustifyH",
-        lua.create_function(|lua, (this, j): (Table, String)| {
-            let rh = region_handle_of(lua, &this)?;
-            let jh = match j.to_ascii_uppercase().as_str() {
-                "LEFT" => JustifyH::Left,
-                "RIGHT" => JustifyH::Right,
-                _ => JustifyH::Center,
-            };
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let d = model.region_data.entry(rh).or_default();
-            d.justify_h = jh;
-            d.font_explicit.justify_h = true;
-            Ok(())
-        })?,
-    )?;
-
-    // SetJustifyV("TOP"|"MIDDLE"|"BOTTOM") — a FontString's vertical justification (XML `justifyV`).
-    m.set(
-        "SetJustifyV",
-        lua.create_function(|lua, (this, j): (Table, String)| {
-            let rh = region_handle_of(lua, &this)?;
-            let jv = match j.to_ascii_uppercase().as_str() {
-                "TOP" => JustifyV::Top,
-                "BOTTOM" => JustifyV::Bottom,
-                _ => JustifyV::Middle,
-            };
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let d = model.region_data.entry(rh).or_default();
-            d.justify_v = jv;
-            d.font_explicit.justify_v = true;
-            Ok(())
-        })?,
-    )?;
-
-    // SetRotation(radians) — spin the texture about its center, counterclockwise-positive (the
-    // later-era Texture API, shipped early: the world-map player arrow's stand-in rotation —
-    // see `QuadContent::Texture::rotation`). No-arg/nil resets to 0.
-    m.set(
-        "SetRotation",
-        lua.create_function(|lua, (this, radians): (Table, Option<f32>)| {
-            let rh = region_handle_of(lua, &this)?;
-            lua.app_data_mut::<Model>()
-                .expect("model")
-                .region_data
-                .entry(rh)
-                .or_default()
-                .rotation = radians.unwrap_or(0.0);
-            Ok(())
-        })?,
-    )?;
-
-    // SetTexCoord(left, right, top, bottom) — the 4-edge form (XML `<TexCoords>`): a UV sub-rect in
-    // 0..1 texture space (top-left origin) the Texture region samples, slicing quadrant/atlas art
-    // (decision 0084). SetTexCoord(ULx,ULy, LLx,LLy, URx,URy, LRx,LRy) — the 8-arg affine form: an
-    // arbitrary UV quad (rotation/shear — the reference's `DrawRouteLine` route lines), stored per
-    // corner in the renderer's screen winding.
-    m.set(
-        "SetTexCoord",
-        lua.create_function(|lua, (this, rest): (Table, mlua::Variadic<f32>)| {
-            let rh = region_handle_of(lua, &this)?;
-            let coords = match rest.len() {
-                4 => Some(TexCoords::Rect([rest[0], rest[1], rest[2], rest[3]])),
-                // The live arg order is UL, LL, UR, LR (corner pairs); [`TexCoords::Corners`]
-                // stores screen order [TL, TR, BR, BL].
-                8 => Some(TexCoords::Corners([
-                    [rest[0], rest[1]], // UL → TL
-                    [rest[4], rest[5]], // UR → TR
-                    [rest[6], rest[7]], // LR → BR
-                    [rest[2], rest[3]], // LL → BL
-                ])),
-                // No args resets to the full texture (the live API's clear form).
-                0 => None,
-                n => {
-                    return Err(mlua::Error::runtime(format!(
-                        "SetTexCoord: expected 4 (edges) or 8 (corner pairs) args, got {n}"
-                    )))
-                }
-            };
-            lua.app_data_mut::<Model>()
-                .expect("model")
-                .region_data
-                .entry(rh)
-                .or_default()
-                .tex_coords = coords;
-            Ok(())
-        })?,
-    )?;
-    // GetTexCoord() → left, right, top, bottom (the 4-edge form; full texture if never set; an
-    // affine mapping reports its bounding edges).
-    m.set(
-        "GetTexCoord",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let model = lua.app_data_ref::<Model>().expect("model");
-            let [l, r, t, b] = model
-                .region_data
-                .get(&rh)
-                .and_then(|d| d.tex_coords)
-                .map(|tc| tc.edges())
-                .unwrap_or([0.0, 1.0, 0.0, 1.0]);
-            Ok((l, r, t, b))
-        })?,
-    )?;
-    // SetFontObject(GameFontNormal) — re-point this FontString at a Font object: its resolved paint
-    // (face/height/color/outline/shadow) becomes the region's, and the link is kept live, so a later
-    // `GameFontNormal:SetFont(…)` re-paints this region too ([`super::font`]'s module doc).
-    //
-    // All three argument forms the reference's own usage string names (`.rdata 0x87c5cc`:
-    // `SetFontObject(font or "font" or nil)`) — the **object**, which is what 3,180 of the corpus's
-    // 3,186 call sites pass (`Gratuity-2.0.lua:57`, every FuBar/Ace label); a **name string**, for
-    // our own shipped XML and the 6 sites that use it; and **nil**, which severs the link. A frame,
-    // a number, or an unknown name is an error — never a silent no-op (1203/1205/1211's class).
-    m.set(
-        "SetFontObject",
-        lua.create_function(|lua, (this, font): (Table, Value)| {
-            let name = super::font::resolve("SetFontObject", &font)?;
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            // The nil form: unlink, and leave the paint standing (the reference stores a null
-            // parent; nothing re-reads and nothing is cleared).
-            let Some(name) = name else {
-                model.region_data.entry(rh).or_default().font_object = None;
-                return Ok(());
-            };
-            let Some(fo) = model.font_objects.get(&name).cloned() else {
-                return Err(mlua::Error::runtime(format!(
-                    "SetFontObject: no font object named '{name}' is registered"
-                )));
-            };
-            let d = model.region_data.entry(rh).or_default();
-            d.font_object = Some(name);
-            // The severance mask is deliberately NOT reset here. §5-verified: the real "stop
-            // inheriting this property" signal is a CLEARED bit in the inheritMask at
-            // `FONTINSTANCE+0x2c` (FontString `+0xd4`, per-axis justify at `+0x124`), cleared by
-            // each local setter and never restored — "a FontString that set its own colour stays
-            // severed even across a later SetFontObject" (wow-re
-            // `system/ui/scratch/font-object-lua-surface.md`). This corrects our first cut, which
-            // reset it.
-            super::font::repaint(d, &fo);
-            Ok(())
-        })?,
-    )?;
-    // GetFontObject() → the font OBJECT this FontString last resolved (or nil).
-    //
-    // The object, not its name: `Dewdrop-2.0.lua:2181` is
-    // `button.text:SetTextColor(button.text:GetFontObject():GetTextColor())` — 65 sites across 62
-    // corpus addons that index the result immediately. A name string there raises.
-    m.set(
-        "GetFontObject",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let name = {
-                let model = lua.app_data_ref::<Model>().expect("model");
-                model
-                    .region_data
-                    .get(&rh)
-                    .and_then(|d| d.font_object.clone())
-                    .filter(|n| model.font_objects.contains_key(n))
-            };
-            match name {
-                Some(n) => Ok(Value::Table(super::font::wrapper(lua, &n)?)),
-                None => Ok(Value::Nil),
-            }
-        })?,
-    )?;
-    // SetNonSpaceWrap(enable) / CanNonSpaceWrap() — FontString only (`0x79e9f0` / `0x79ead0`).
-    //
-    // Two contract details from wow-re's batch, both easy to get wrong:
-    //  · the getter is **`CanNonSpaceWrap`**, not `GetNonSpaceWrap`, and it answers **`1` or nil**,
-    //    not a boolean — 1.12 predates that convention and an addon may compare against 1.
-    //  · a **no-argument call ENABLES** it (the default is on), rather than being a query.
-    //
-    // `oRA2/Leader/Item.lua:561` is `f.textname:SetNonSpaceWrap(false)`, reached by two addons.
-    m.set(
-        "SetNonSpaceWrap",
-        lua.create_function(|lua, (this, enable): (Table, Value)| {
-            let on = match &enable {
-                Value::Nil => true,
-                Value::Boolean(b) => *b,
-                _ => true,
-            };
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            model.region_data.entry(rh).or_default().non_space_wrap = Some(on);
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "CanNonSpaceWrap",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let model = lua.app_data_mut::<Model>().expect("model");
-            let on = model
-                .region_data
-                .get(&rh)
-                .and_then(|d| d.non_space_wrap)
-                .unwrap_or(true);
-            Ok(if on { Some(1i64) } else { None })
-        })?,
-    )?;
-    // ── shadow, on the REGION ────────────────────────────────────────────────────────────────
-    // These already existed on the font-object table; a FontString made by `CreateFontString` had
-    // none of them, and that is where the corpus calls them:
-    // `FuBar_NavigatorFu/NavigatorFu.lua:31` does
-    // `coordText:SetShadowColor(GameFontNormal:GetShadowColor())` — the GETTER on a font object,
-    // the SETTER on a fresh region — and `KLHThreatMeter/.../KTM_Gui.lua:404` is
-    // `fontstring:SetShadowColor(0,0,0,0.3)`.
-    //
-    // **`GetShadowColor` returns FOUR values, not three** (`0x79dd2f`, `mov eax,0x4` — wow-re's
-    // widget-method batch). Three is the plausible wrong answer and it silently drops the alpha
-    // that NavigatorFu is round-tripping. `GetShadowOffset` returns two, in UI units.
-    //
-    // Either half may be set before the other, so each starts from whatever is there — the same
-    // rule the font-object versions already follow.
-    m.set(
-        "SetShadowColor",
-        lua.create_function(
-            |lua, (this, r, g, b, a): (Table, f32, f32, f32, Option<f32>)| {
-                let rh = region_handle_of(lua, &this)?;
-                let mut model = lua.app_data_mut::<Model>().expect("model");
-                let d = model.region_data.entry(rh).or_default();
-                let offset = d.font_shadow.map_or([0.0, 0.0], |s| s.offset);
-                d.font_shadow = Some(crate::script::FontShadow {
-                    offset,
-                    color: [r, g, b, a.unwrap_or(1.0)],
-                });
-                d.font_explicit.shadow = true;
-                Ok(())
-            },
-        )?,
-    )?;
-    m.set(
-        "GetShadowColor",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let model = lua.app_data_mut::<Model>().expect("model");
-            let c = model
-                .region_data
-                .get(&rh)
-                .and_then(|d| d.font_shadow)
-                .map_or([0.0, 0.0, 0.0, 1.0], |s| s.color);
-            Ok((c[0], c[1], c[2], c[3]))
-        })?,
-    )?;
-    m.set(
-        "SetShadowOffset",
-        lua.create_function(|lua, (this, x, y): (Table, f32, f32)| {
-            let rh = region_handle_of(lua, &this)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model");
-            let d = model.region_data.entry(rh).or_default();
-            let color = d.font_shadow.map_or([0.0, 0.0, 0.0, 1.0], |s| s.color);
-            d.font_shadow = Some(crate::script::FontShadow {
-                offset: [x, y],
-                color,
-            });
-            d.font_explicit.shadow = true;
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "GetShadowOffset",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let model = lua.app_data_mut::<Model>().expect("model");
-            let o = model
-                .region_data
-                .get(&rh)
-                .and_then(|d| d.font_shadow)
-                .map_or([0.0, 0.0], |s| s.offset);
-            Ok((o[0], o[1]))
-        })?,
-    )?;
-
-    // SetFont(path, height [, flags]) — the direct face/size/outline setter (the real region API and
-    // the XML `font=`/`<FontHeight>`/`outline=` join). `flags` is an OUTLINETYPE-ish string
-    // ("OUTLINE"/"THICKOUTLINE"/…"); anything else clears the outline. A nil/empty `path` keeps the
-    // current face (so a FontString with only `<FontHeight>` retains its inherited object's font).
-    // Returns true (the live API returns whether the font loaded; we always accept — face
-    // availability is the renderer's concern).
-    m.set(
-        "SetFont",
-        lua.create_function(
-            |lua, (this, path, height, flags): (Table, Option<String>, Option<f32>, Option<String>)| {
-                let rh = region_handle_of(lua, &this)?;
-                let mut model = lua.app_data_mut::<Model>().expect("model");
-                let d = model.region_data.entry(rh).or_default();
-                // Each argument actually supplied is an EXPLICIT set: it must survive a later
-                // mutation of the font object this region inherits (`FontExplicit`).
-                if let Some(p) = path.filter(|p| !p.is_empty()) {
-                    d.font_path = Some(p);
-                    d.font_explicit.face = true;
-                }
-                if let Some(h) = height {
-                    d.font_height = Some(h);
-                    d.font_explicit.height = true;
-                }
-                if let Some(f) = flags {
-                    d.outline = Outline::flags(&f);
-                    d.font_explicit.outline = true;
-                }
-                Ok(true)
-            },
-        )?,
-    )?;
-    // SetTextHeight(height) — switch the FontString to the scaled-string regime (§5-verified,
-    // wow-re `fontstring-overflow.md`: `0x771600` is the ONLY clearer of the one-to-one bit
-    // `0x200`; the literal size then flows through UNCAPPED, magnified from the raster). Stored
-    // as the distinct [`RegionData::text_height`] — the font object is untouched, so GetFont
-    // keeps reporting the face's own height like the real API.
-    m.set(
-        "SetTextHeight",
-        lua.create_function(|lua, (this, height): (Table, f32)| {
-            let rh = region_handle_of(lua, &this)?;
-            lua.app_data_mut::<Model>()
-                .expect("model")
-                .region_data
-                .entry(rh)
-                .or_default()
-                .text_height = Some(height);
-            Ok(())
-        })?,
-    )?;
-    // GetFont() → path, height, flags — the resolved face/size/outline (nil path if never set).
-    m.set(
-        "GetFont",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let model = lua.app_data_ref::<Model>().expect("model");
-            let d = model.region_data.get(&rh);
-            let path = d.and_then(|d| d.font_path.clone());
-            let height = d.and_then(|d| d.font_height);
-            let flags = d.map(|d| d.outline).unwrap_or_default().as_str();
-            let path = match path {
-                Some(p) => Value::String(lua.create_string(&p)?),
-                None => Value::Nil,
-            };
-            Ok((path, height, flags))
-        })?,
-    )?;
-    // SetTextColor(r, g, b [, a]) — a FontString's text color. A different binding name for the
-    // same `+0xb8` vertex-colour slot `SetVertexColor` writes: a FontString has no texel of its own
-    // to multiply against, so its vertex colour IS the colour it draws.
-    m.set(
-        "SetTextColor",
-        lua.create_function(
-            |lua, (this, r, g, b, a): (Table, f32, f32, f32, Option<f32>)| {
-                let rh = region_handle_of(lua, &this)?;
-                let mut model = lua.app_data_mut::<Model>().expect("model");
-                let d = model.region_data.entry(rh).or_default();
-                d.vertex_color = Some([r, g, b, a.unwrap_or(1.0)]);
-                d.font_explicit.color = true;
-                Ok(())
-            },
-        )?,
-    )?;
-    // GetTextColor() → r, g, b, a — `SetTextColor`'s missing pair, and a real binding in the same
-    // FontInstance family. 11 corpus sites read it off a FontString directly (`CustomNameplates`
-    // re-tints a level tag from the name's colour; `TipBuddy` snapshots every tooltip line), on top
-    // of the 65 that reach it through `GetFontObject()`. Never set = the white every region draws
-    // at, same convention as `GetVertexColor` (the same slot).
-    m.set(
-        "GetTextColor",
-        lua.create_function(|lua, this: Table| {
-            let rh = region_handle_of(lua, &this)?;
-            let model = lua.app_data_ref::<Model>().expect("model");
-            let c = model
-                .region_data
-                .get(&rh)
-                .and_then(|d| d.vertex_color)
-                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            Ok((c[0], c[1], c[2], c[3]))
-        })?,
-    )?;
+    let title_meta = lua.create_table()?;
+    let title_index = lua.create_function(|lua, (_this, key): (Table, Value)| {
+        let methods: Table = lua.named_registry_value(REG_TITLE_METHODS)?;
+        methods.get::<Value>(key)
+    })?;
+    title_meta.set("__index", title_index)?;
+    lua.set_named_registry_value(REG_TITLE_METHODS, title)?;
+    lua.set_named_registry_value(REG_TITLE_META, title_meta)?;
 
     lua.set_named_registry_value(REG_REGION_METHODS, m)?;
     Ok(())
@@ -1170,16 +498,110 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
 
 /// The layout [`super::layout::Handle`] a region anchors to by default: its **owner frame**'s id
 /// (minted if needed), or [`SCREEN`] if the region has somehow lost its owner.
-fn region_owner_id(model: &mut Model, rh: RegionHandle) -> u32 {
+/// This region's global name, or `None` when it was declared anonymously.
+///
+/// Scans the region-name registry rather than mirroring the name onto the region: that registry is
+/// the single authority (the widget arena deliberately holds none), and a second copy is one more
+/// thing to drift. Linear in NAMED regions, and every caller is human-rate.
+pub(super) fn region_name_of(model: &Model, id: u32) -> Option<String> {
+    model
+        .region_names
+        .iter()
+        .find(|&(_, &v)| v == id)
+        .map(|(k, _)| k.clone())
+}
+
+/// The string `GetObjectType()` answers for this region, and the leaf `IsObjectType` matches.
+///
+/// The reference reads a per-class `.data` `const char*` through `vtable[+0x1c]`; ours reads the
+/// arena's [`RegionKind`], which is the same fact stored once. A handle whose region has been
+/// destroyed answers `"Region"` — the base every leaf also matches, so an identity question about
+/// a dead handle degrades to the truthful half rather than naming a leaf it no longer is.
+pub(super) fn region_type_name(model: &Model, rh: RegionHandle) -> &'static str {
+    match model.arena.region(rh).map(|r| r.kind) {
+        Some(RegionKind::Texture) => "Texture",
+        Some(RegionKind::FontString) => "FontString",
+        // The title region's own type name — it is a Region and nothing more (Q6).
+        Some(RegionKind::Title) => "Region",
+        None => "Region",
+    }
+}
+
+pub(super) fn region_owner_id(model: &mut Model, rh: RegionHandle) -> u32 {
     match model.arena.region(rh).map(|r| r.owner) {
         Some(owner) => model.frame_id(owner),
         None => SCREEN,
     }
 }
 
+/// The client's **creation-path implicit anchor** (wow-re `system/ui/scratch/`
+/// `region-implicit-anchor.md`, §5 VERIFIED; decision 1310): a per-region-type post-step the real
+/// engine runs immediately after a region's LoadXML returns (`0x7701c0` texture / `0x771480`
+/// fontstring — the same two fire from the Button state-texture and ButtonText paths, and from Lua
+/// `CreateTexture`/`CreateFontString` only on a template-registry hit). Condition: the region has a
+/// parent AND every one of its nine anchor slots is empty — any anchor from any source suppresses
+/// it. Then:
+///
+/// - a **Texture** gets `SetAllPoints(parent)` — two corner anchors, TOPLEFT→TOPLEFT and
+///   BOTTOMRIGHT→BOTTOMRIGHT at (0,0). Two opposing corners pin all four edges, so an authored
+///   `<Size>` is **structurally unread** (the resolver law) — which is why the reference's
+///   stack-split plate authors a vestigial 256×32 and renders 172×96 (B180).
+/// - a **FontString** gets ONE middle-row `SetPoint` chosen by its live justify word
+///   (`[this+0x120] & 7`: 1 → LEFT→LEFT, 4 → RIGHT→RIGHT, else CENTER→CENTER, offsets (0,0)) —
+///   and its `<Size>` stays live (single anchor + W/H sizes the opposite edges).
+///   [`RegionData::justify`] *is* that word — `SetJustifyH` writes it and a font-object link
+///   merges into it behind the explicit mask — so reading it here is reading `+0x120`.
+/// - a **Title region** gets nothing (verified negative), and a templateless Lua region is never
+///   routed here at all: it stays rect-less and does not render.
+///
+/// These are ordinary anchors once installed: a later same-point `SetPoint` replaces only its own
+/// slot and the other implicit corner survives (verified) — callers that re-apply authored anchors
+/// over a materialized region must `ClearAllPoints` first, exactly as the reference's XML path
+/// avoids the mix by running this step *after* `<Anchors>` load.
+pub(crate) fn implicit_creation_anchor(model: &mut Model, rh: RegionHandle) {
+    let Some((kind, owner)) = model.arena.region(rh).map(|r| (r.kind, r.owner)) else {
+        return;
+    };
+    let owner_id = model.frame_id(owner);
+    let data = model.region_data.entry(rh).or_default();
+    if !data.anchors.is_empty() {
+        return;
+    }
+    use crate::layout::Point;
+    match kind {
+        RegionKind::Texture => {
+            data.anchors = vec![
+                Anchor::new(Point::TopLeft, owner_id, Point::TopLeft, 0.0, 0.0),
+                Anchor::new(Point::BottomRight, owner_id, Point::BottomRight, 0.0, 0.0),
+            ];
+        }
+        RegionKind::FontString => {
+            // The exact byte compare chain: `& 7` then equality against LEFT (1) and RIGHT (4) —
+            // every other value, the CENTER bit and the cleared axis included, falls to CENTER.
+            let point = match data.justify.0 & crate::justify::H_MASK {
+                0x01 => Point::Left,
+                0x04 => Point::Right,
+                _ => Point::Center,
+            };
+            data.anchors = vec![Anchor::new(point, owner_id, point, 0.0, 0.0)];
+        }
+        RegionKind::Title => return,
+    }
+    model.touch_layout();
+}
+
+/// [`implicit_creation_anchor`] behind a wrapper table — the loader-facing form (the loader holds
+/// region wrappers, not handles), same seam as [`apply_font_parts`].
+pub(crate) fn implicit_creation_anchor_lua(lua: &Lua, wrapper: &Table) -> mlua::Result<()> {
+    let rh = region_handle_of(lua, wrapper)?;
+    let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+    implicit_creation_anchor(&mut model, rh);
+    Ok(())
+}
+
 /// Resolve a `SetPoint`/`SetAllPoints` `relativeTo` argument (a frame/region wrapper table, a frame
 /// name, or nil) to a layout id, defaulting to `owner` when absent/unresolved.
-fn resolve_target(model: &mut Model, target: &Value, owner: u32) -> u32 {
+pub(super) fn resolve_target(model: &mut Model, target: &Value, owner: u32) -> u32 {
     match target {
         Value::Table(t) => decode_id(t)
             .ok()
@@ -1223,7 +645,7 @@ fn resolve_target(model: &mut Model, target: &Value, owner: u32) -> u32 {
 /// Bit-exact equality for a region's explicit size — the layout gate's own lens
 /// (`InputFingerprint::input` feeds `f32::to_bits`), so a setter's no-op detection and the gate
 /// can never disagree; see [`anchor_bits_eq`].
-fn size_bits_eq(a: Option<(f32, f32)>, b: Option<(f32, f32)>) -> bool {
+pub(super) fn size_bits_eq(a: Option<(f32, f32)>, b: Option<(f32, f32)>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some((aw, ah)), Some((bw, bh))) => {
@@ -1236,7 +658,12 @@ fn size_bits_eq(a: Option<(f32, f32)>, b: Option<(f32, f32)>) -> bool {
 /// `Region:SetPoint(point [, relativeTo [, relativePoint]] [, x, y])` — the region twin of
 /// [`super::object`]'s frame `SetPoint`, writing [`super::RegionData::anchors`]. The overload is
 /// disambiguated by argument *type* exactly as the frame version.
-fn region_set_point(lua: &Lua, this: &Table, point: &str, rest: [Value; 4]) -> mlua::Result<()> {
+pub(super) fn region_set_point(
+    lua: &Lua,
+    this: &Table,
+    point: &str,
+    rest: [Value; 4],
+) -> mlua::Result<()> {
     let point = point_from_str(point)
         .ok_or_else(|| mlua::Error::runtime(format!("SetPoint: unknown point '{point}'")))?;
     let rh = region_handle_of(lua, this)?;
@@ -1273,9 +700,43 @@ fn region_set_point(lua: &Lua, this: &Table, point: &str, rest: [Value; 4]) -> m
             .iter()
             .any(|a| a.point == point);
     if !same_at_tail {
+        // The frame twin's law (decision 1388): re-pointing the same anchor at the same target is
+        // a VALUE change and names its node; anything that moves the target set is structural.
+        // This is the castbar spark's and every combat-text string's per-frame write.
+        let structural = anchor_retarget_is_structural(&data.anchors, &new);
         data.anchors.retain(|a| a.point != point);
         data.anchors.push(new);
-        model.touch_layout();
+        if structural {
+            model.touch_layout();
+        } else {
+            model.touch_layout_region(rh);
+        }
     }
     Ok(())
+}
+
+/// The measured extent a FontString reports, falling back to an explicit `SetSize`.
+///
+/// Hoisted out of the text cluster when this file split (0716): `GetStringWidth`/`GetStringHeight`
+/// live in `region::text` and `GetWidth`/`GetHeight` in `region::layout`, and both read it.
+pub(super) fn measured_wh(lua: &Lua, this: &Table) -> mlua::Result<(f32, f32)> {
+    let rh = region_handle_of(lua, this)?;
+    // Same-tick measure when a host font engine is installed — see `region::text`'s `natural_w`.
+    // A no-op for a Texture (not a FontString) and for an already-current measure.
+    super::measure::ensure_measured(lua, rh);
+    let model = lua.app_data_ref::<Model>().expect("model");
+    let d = model.region_data.get(&rh);
+    // The key carries the owner's effective_scale ([`RegionData::measure_key`]) — the same
+    // recipe the request loop stamps, or every read under a SetScale'd owner reports stale.
+    let scale = model
+        .arena
+        .region(rh)
+        .and_then(|r| model.arena.frame(r.owner))
+        .map(|f| f.effective_scale)
+        .unwrap_or(1.0);
+    let m = d.and_then(|d| d.measured.filter(|m| m.key == d.measure_key(scale)));
+    let size = d.and_then(|d| d.size);
+    let w = m.map(|m| m.w).or(size.map(|s| s.0)).unwrap_or(0.0);
+    let h = m.map(|m| m.h).or(size.map(|s| s.1)).unwrap_or(0.0);
+    Ok((w, h))
 }

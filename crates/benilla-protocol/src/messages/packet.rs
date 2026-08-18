@@ -8,6 +8,7 @@ use super::{
     ActionButton, AttackerState, CastOutcome, ChannelNotify, Character, ChatMessage,
     CorpseLocation, DamageShield, EnvironmentalDamageLog, ExplorationXp, FriendEntry,
     FriendStatusUpdate, GameObjectQueryInfo, GossipOption, GroupLootInfo, GroupMemberEntry,
+    GuildCommandResult, GuildEventNotice, GuildInfo, GuildQueryResponse, GuildRoster,
     InitWorldStates, ItemInfo, ItemPushResult, JumpInfo, LevelUpInfo, LootAllPassed, LootItem,
     LootRoll, LootRollWon, LootStartRoll, MailListEntry, MirrorTimerStart, MoveMode, Object,
     PartyMemberStatsInfo, PeriodicAuraLog, PetMode, PetSpells, QuestComplete, QuestDetails,
@@ -206,6 +207,19 @@ pub enum ServerPacket {
         map: u32,
         area: u32,
     },
+    /// `SMSG_BINDER_CONFIRM` — an innkeeper is *asking* whether to make this your home
+    /// (decision 1331). The body is the innkeeper's guid, which must come back in
+    /// `CMSG_BINDER_ACTIVATE` for anything to happen: this packet binds nothing on its own.
+    BinderConfirm {
+        binder: u64,
+    },
+    /// `SMSG_PLAYERBOUND` — the bind took: who bound us and the AreaTable id we are now bound in.
+    /// Arrives beside [`Self::BindPoint`], which carries the same area id plus the position; this
+    /// one exists for the "X is now your home" acknowledgement.
+    PlayerBound {
+        binder: u64,
+        area: u32,
+    },
     /// `SMSG_SET_PROFICIENCY` (at login + on train): the subclass bitmask the player can equip
     /// for one item class (2 weapons / 4 armor) — the client's `0xc4d4a0[class]` store, the item
     /// tooltip's slot-line proficiency red (vmangos `Skill.h`: u8 itemClass + u32 mask).
@@ -225,6 +239,13 @@ pub enum ServerPacket {
     /// Same standing convention as [`Self::InitializeFactions`] (DBC base excluded).
     SetFactionStanding {
         standings: Vec<(u32, i32)>,
+    },
+    /// `SMSG_SET_FACTION_VISIBLE` — one reputation-list slot just became visible in the pane
+    /// (vmangos `ReputationMgr::SendVisible`, pushed the first time the player meets the faction).
+    /// It carries **no standing**: the slot's existing standing is already correct, and this only
+    /// lifts `FACTION_FLAG_VISIBLE` on it.
+    SetFactionVisible {
+        list_id: u32,
     },
     /// `SMSG_NAME_QUERY_RESPONSE` — a player character's identity, answering `CMSG_NAME_QUERY`:
     /// guid, name, realm (1.12.1 carries it, empty on a single realm), race/gender/class as `u32`s
@@ -286,6 +307,14 @@ pub enum ServerPacket {
         guid: u64,
         anim_id: u32,
     },
+    /// `SMSG_GAMEOBJECT_DESPAWN_ANIM` — an object plays its one-shot **Despawn** animation and
+    /// then goes away. Payload VERIFIED vmangos `WorldObject::SendObjectDeSpawnAnim`: a bare
+    /// `u64` guid. The client arms substate 12 (AnimationData **157 Despawn**) and PINS the
+    /// object so the `SMSG_DESTROY_OBJECT` that follows in the same server tick waits for the
+    /// play to finish (decision 1404).
+    GameObjectDespawnAnim {
+        guid: u64,
+    },
     /// `SMSG_FISH_NOT_HOOKED` — the fishing channel ended (expiry, or clicked before the splash)
     /// with nothing hooked. Empty body (VERIFIED vmangos `GameObject::Update`/`Use`); the red
     /// `ERR_FISH_NOT_HOOKED` toast (decision 1086).
@@ -323,11 +352,19 @@ pub enum ServerPacket {
     },
     /// `SMSG_TEXT_EMOTE` — a nearby unit performed a chat emote (`/wave`). Payload VERIFIED
     /// vmangos `EmoteChatBuilder`: `u64 guid, u32 textEmote (EmotesText.dbc), u32 emoteNum,
-    /// u32 namelen, char name[namelen]` (the target's name; namelen ≥ 1). The name is parsed
-    /// past and dropped (the chat line renders from it later; audio keys on ids).
+    /// u32 namelen, char name[namelen]` (the target's name; namelen ≥ 1, a lone NUL when there was
+    /// no target).
+    ///
+    /// **`target_name` is load-bearing and used to be dropped here** (decision 1274 / B156): it is
+    /// what selects the emote's sentence FORM — untargeted vs targeted vs "…at you" — in
+    /// `benilla_formats::EmoteTextCatalog`, and it is the raw wire string, never round-tripped
+    /// through a name cache, exactly as the reference passes it. `emoteNum` really is
+    /// dropped: the receive side reads it off the wire and never consumes it (wow-re
+    /// `ui/scratch/text-emote-composition.md` §3).
     TextEmote {
         guid: u64,
         text_emote: u32,
+        target_name: String,
     },
     /// `SMSG_EMOTE` — a unit plays an anim emote. Payload VERIFIED vmangos
     /// `Unit::HandleEmote`: `u32 emoteId (Emotes.dbc), u64 guid`.
@@ -969,6 +1006,32 @@ pub enum ServerPacket {
     FriendStatus(FriendStatusUpdate),
     /// `SMSG_WHO` — the `/who` answer: up to 49 rows plus the true match total.
     WhoResults(WhoResults),
+    /// `SMSG_GUILD_QUERY_RESPONSE` — one guild's public identity: name, its ten rank names, tabard.
+    /// The guild twin of the name query: an ask-once cache fill keyed by guild id.
+    GuildQueryResponse(GuildQueryResponse),
+    /// `SMSG_GUILD_ROSTER` — the whole guild: MOTD, info text, every rank's rights, every member.
+    /// Always a complete snapshot (the server re-sends it for any change), never a delta.
+    GuildRoster(GuildRoster),
+    /// `SMSG_GUILD_EVENT` — one thing that happened in the guild, as an event id plus its
+    /// already-formatted string arguments.
+    GuildEvent(GuildEventNotice),
+    /// `SMSG_GUILD_COMMAND_RESULT` — the verdict on a guild verb we sent. The command tag beside
+    /// the code is load-bearing, not decorative (result `0x08` means two different things).
+    GuildCommandResult(GuildCommandResult),
+    /// `SMSG_GUILD_INVITE` — somebody asked us into their guild. Answered by `CMSG_GUILD_ACCEPT` /
+    /// `CMSG_GUILD_DECLINE`, neither of which echoes anything back, so the pending invite is
+    /// client-side state.
+    GuildInvite {
+        inviter: String,
+        guild: String,
+    },
+    /// `SMSG_GUILD_DECLINE` — the player we invited turned it down. Sent only to the inviter.
+    GuildDecline {
+        name: String,
+    },
+    /// `SMSG_GUILD_INFO` — the "founded on / N members / N accounts" summary; a separate ask from
+    /// the roster, with no overlapping fields.
+    GuildInfo(GuildInfo),
     /// A `SMSG_SPLINE_SET_*_SPEED` — a speed change on a unit we don't control (a creature, or a
     /// player mid-spline): `[packed guid][f32 speed]`, no counter, no ack (decision 0441 — how an
     /// observed unit's mounted speed reaches us).
@@ -1009,6 +1072,13 @@ pub enum ServerPacket {
     /// sender is excluded from the broadcast, so this only ever names someone else's mount.
     MountSpecialAnim {
         guid: u64,
+    },
+    /// `SMSG_CLIENT_CONTROL_UPDATE` — packed mover guid + `u8` allowMove (VERIFIED vmangos
+    /// `Server/Packets/Misc.cpp:677-682`). Always addressed to us; `mover` is the unit it speaks
+    /// about, which is our own guid when the server is taking control *away*.
+    ClientControlUpdate {
+        mover: u64,
+        allow_move: bool,
     },
     /// `SMSG_SHOWTAXINODES` — the taxi map (vmangos `SendTaxiMenu`, `TaxiHandler.cpp:82-96`;
     /// layout in [`super::taxi::read_show_taxi_nodes`], decision 0484). `window` is the
@@ -1122,15 +1192,19 @@ impl ServerPacket {
             ServerPacket::TimeSpeed { .. } => "SMSG_LOGIN_SETTIMESPEED".into(),
             ServerPacket::QueryTimeResponse { .. } => "SMSG_QUERY_TIME_RESPONSE".into(),
             ServerPacket::BindPoint { .. } => "SMSG_BINDPOINTUPDATE".into(),
+            ServerPacket::BinderConfirm { .. } => "SMSG_BINDER_CONFIRM".into(),
+            ServerPacket::PlayerBound { .. } => "SMSG_PLAYERBOUND".into(),
             ServerPacket::SetProficiency { .. } => "SMSG_SET_PROFICIENCY".into(),
             ServerPacket::InitializeFactions { .. } => "SMSG_INITIALIZE_FACTIONS".into(),
             ServerPacket::SetFactionStanding { .. } => "SMSG_SET_FACTION_STANDING".into(),
+            ServerPacket::SetFactionVisible { .. } => "SMSG_SET_FACTION_VISIBLE".into(),
             ServerPacket::NameQueryResponse { .. } => "SMSG_NAME_QUERY_RESPONSE".into(),
             ServerPacket::CreatureQueryResponse { .. } => "SMSG_CREATURE_QUERY_RESPONSE".into(),
             ServerPacket::PetNameQueryResponse { .. } => "SMSG_PET_NAME_QUERY_RESPONSE".into(),
             ServerPacket::GameObjectQueryResponse { .. } => "SMSG_GAMEOBJECT_QUERY_RESPONSE".into(),
             ServerPacket::PageTextQueryResponse { .. } => "SMSG_PAGE_TEXT_QUERY_RESPONSE".into(),
             ServerPacket::GameObjectCustomAnim { .. } => "SMSG_GAMEOBJECT_CUSTOM_ANIM".into(),
+            ServerPacket::GameObjectDespawnAnim { .. } => "SMSG_GAMEOBJECT_DESPAWN_ANIM".into(),
             ServerPacket::FishNotHooked => "SMSG_FISH_NOT_HOOKED".into(),
             ServerPacket::FishEscaped => "SMSG_FISH_ESCAPED".into(),
             ServerPacket::PlaySound { .. } => "SMSG_PLAY_SOUND".into(),
@@ -1280,6 +1354,13 @@ impl ServerPacket {
             ServerPacket::IgnoreList { .. } => "SMSG_IGNORE_LIST".into(),
             ServerPacket::FriendStatus(..) => "SMSG_FRIEND_STATUS".into(),
             ServerPacket::WhoResults(..) => "SMSG_WHO".into(),
+            ServerPacket::GuildQueryResponse(..) => "SMSG_GUILD_QUERY_RESPONSE".into(),
+            ServerPacket::GuildRoster(..) => "SMSG_GUILD_ROSTER".into(),
+            ServerPacket::GuildEvent(..) => "SMSG_GUILD_EVENT".into(),
+            ServerPacket::GuildCommandResult(..) => "SMSG_GUILD_COMMAND_RESULT".into(),
+            ServerPacket::GuildInvite { .. } => "SMSG_GUILD_INVITE".into(),
+            ServerPacket::GuildDecline { .. } => "SMSG_GUILD_DECLINE".into(),
+            ServerPacket::GuildInfo(..) => "SMSG_GUILD_INFO".into(),
             ServerPacket::SplineSpeedChange { kind, .. } => {
                 format!("SMSG_SPLINE_SET_{kind:?}_SPEED")
             }
@@ -1287,6 +1368,7 @@ impl ServerPacket {
             ServerPacket::MountResult { mount: true, .. } => "SMSG_MOUNTRESULT".into(),
             ServerPacket::MountResult { mount: false, .. } => "SMSG_DISMOUNTRESULT".into(),
             ServerPacket::MountSpecialAnim { .. } => "SMSG_MOUNTSPECIAL_ANIM".into(),
+            ServerPacket::ClientControlUpdate { .. } => "SMSG_CLIENT_CONTROL_UPDATE".into(),
             ServerPacket::ShowTaxiNodes { .. } => "SMSG_SHOWTAXINODES".into(),
             ServerPacket::TaxiNodeStatus { .. } => "SMSG_TAXINODE_STATUS".into(),
             ServerPacket::ActivateTaxiReply { .. } => "SMSG_ACTIVATETAXIREPLY".into(),

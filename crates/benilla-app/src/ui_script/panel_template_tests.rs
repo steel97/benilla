@@ -302,11 +302,17 @@ fn an_input_box_from_the_template_carries_its_border_and_takes_text() {
 /// `MyScrollScrollBarScrollUpButton` through **two** levels of `$parent` — which is precisely what
 /// `ScrollFrame_OnLoad` getglobals on the way past.
 ///
-/// The `UpdateScrollChildRect` leg is also the falsifier for this file's one Lua divergence:
-/// `ScrollFrame_OnScrollRangeChanged` reaches the thumb through `GetThumbTexture()` rather than the
-/// reference's `getglobal(bar:GetName().."ThumbTexture")`, because our loader never publishes a
-/// named `<ThumbTexture>` as a global. If that divergence were reverted, this call would raise on a
+/// The `UpdateScrollChildRect` leg is also the falsifier for the `<ThumbTexture>` publication:
+/// `ScrollFrame_OnScrollRangeChanged` reaches the thumb through
+/// `getglobal(bar:GetName().."ThumbTexture")`, which resolves only because our loader publishes a
+/// named `<ThumbTexture>` as a global. If that publication regressed, this call would raise on a
 /// nil index and `s.errors()` would not be empty.
+///
+/// (This used to claim the opposite — that we diverged to `GetThumbTexture()` "because our loader
+/// never publishes a named `<ThumbTexture>`", and called it "this file's one Lua divergence". It
+/// was already false when written: the XML has used `getglobal` throughout, at HEAD and now.
+/// Corrected rather than deleted, because a doc comment asserting a divergence that does not exist
+/// is exactly how someone later introduces a real one by "restoring" it.)
 #[test]
 fn a_scroll_frame_from_the_template_wires_its_bar_two_parents_deep() {
     let mut s = harness();
@@ -426,7 +432,7 @@ fn the_options_check_button_resolves_its_whole_inheritance_chain() {
 /// real 1.12.1 client has, read from `reference/1.12-globals.tsv`.
 ///
 /// Scoped to these two files on purpose: the rest of `assets/ui` is full of deliberately
-/// benilla-shaped template names (`BenillaScrollBarTemplate`, `AddonListPanelButtonTemplate`,
+/// benilla-shaped template names (`BenillaScrollBarTemplate`, `BenillaMacroPanelButtonTemplate`,
 /// `OptionsRedButtonTemplate`), and a whole-tree sweep would be asserting something else. These
 /// two files make the opposite claim — *these are the reference's own names, which is why an addon
 /// can find them* — so that claim is the one worth gating. A template renamed to something

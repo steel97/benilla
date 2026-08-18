@@ -16,6 +16,8 @@
 //! caught (mlua's `Function::call` is a protected call) and returned to the caller, which records
 //! them in [`super::Model::errors`] — never a panic, never a print.
 
+use std::borrow::Cow;
+
 use mlua::{Function, Lua, MultiValue, Table, Value};
 
 use super::{Model, ScriptValue, REG_SCRIPTS};
@@ -157,9 +159,25 @@ pub(super) fn fire_visibility_changes(lua: &Lua, changed: Vec<FrameHandle>) {
         if let Err(e) = fire(lua, id, name, None, Vec::new()) {
             lua.app_data_mut::<Model>()
                 .expect("model")
-                .errors
-                .push(e.to_string());
+                .record_script_error(e.to_string());
         }
+    }
+}
+
+/// Is a handler bound under `script` for this frame id? — the **existence** question, asked
+/// without firing anything.
+///
+/// It exists for the keyboard walk ([`super::keyboard`]), where the reference's consumption gate is
+/// the presence of the slot rather than anything the handler does: `0x76b7d0` reads `[+0x188]`/
+/// `[+0x190]`, consumes on either, and fires only the first. A lookup failure reads as "absent" —
+/// the gate must never be able to raise out of the middle of a walk.
+pub(super) fn has_widget_handler(lua: &Lua, id: u32, script: &str) -> bool {
+    let Ok(scripts) = lua.named_registry_value::<Table>(REG_SCRIPTS) else {
+        return false;
+    };
+    match scripts.get::<Value>(id) {
+        Ok(Value::Table(per)) => matches!(per.get::<Value>(script), Ok(Value::Function(_))),
+        _ => false,
     }
 }
 
@@ -184,7 +202,29 @@ fn fire(
     };
 
     let wrapper = frame_wrapper(lua, id)?;
+    // The attribution seam (decision 1395). Tight around the call and *after* `frame_wrapper` —
+    // which documents that callers hold no model borrow here, so the profiler's own borrow cannot
+    // land in the middle of one. Off, it is a relaxed load and a not-taken branch; the guard closes
+    // the fire on the way out of this scope, including an unwind.
+    let _fire =
+        super::handler_prof::armed().then(|| super::handler_prof::Fire::open(lua, id, script));
     invoke_with_globals(lua, wrapper, &func, event_name, extra)
+}
+
+/// The legacy `argN` global names, pre-spelled through the arities that occur in practice so the
+/// per-arg save/set/restore below allocates nothing.
+const ARG_NAMES: [&str; 16] = [
+    "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "arg9", "arg10", "arg11",
+    "arg12", "arg13", "arg14", "arg15", "arg16",
+];
+
+/// The global name for arg `i` — **1-based**, matching the globals themselves (`arg1..`). Past
+/// [`ARG_NAMES`] it falls back to allocating.
+fn arg_name(i: usize) -> Cow<'static, str> {
+    match ARG_NAMES.get(i - 1) {
+        Some(&name) => Cow::Borrowed(name),
+        None => Cow::Owned(format!("arg{i}")),
+    }
 }
 
 /// The RF-0025 calling convention itself — the single home for it, shared by [`fire`] (registry
@@ -206,7 +246,7 @@ pub(crate) fn invoke_with_globals(
     let n = extra.len();
     let mut saved_args: Vec<Value> = Vec::with_capacity(n);
     for i in 1..=n {
-        saved_args.push(g.get::<Value>(format!("arg{i}"))?);
+        saved_args.push(g.get::<Value>(arg_name(i).as_ref())?);
     }
 
     g.set("this", wrapper.clone())?;
@@ -214,7 +254,7 @@ pub(crate) fn invoke_with_globals(
         g.set("event", lua.create_string(ev)?)?;
     }
     for (i, v) in extra.iter().enumerate() {
-        g.set(format!("arg{}", i + 1), v.clone())?;
+        g.set(arg_name(i + 1).as_ref(), v.clone())?;
     }
 
     let mut modern: Vec<Value> = Vec::with_capacity(2 + n);
@@ -230,7 +270,7 @@ pub(crate) fn invoke_with_globals(
     g.set("this", saved_this)?;
     g.set("event", saved_event)?;
     for (i, v) in saved_args.into_iter().enumerate() {
-        g.set(format!("arg{}", i + 1), v)?;
+        g.set(arg_name(i + 1).as_ref(), v)?;
     }
 
     outcome

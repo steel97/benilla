@@ -198,14 +198,71 @@ fn drive_child(
 }
 
 /// The **draw-set gate's** scene inputs, bundled: the far-clip wall the gate bounds emitters at
-/// (0678) and the exterior-window test a WMO interior applies to everything outside it (0786),
-/// with the camera's own room as its one exemption. One `SystemParam` because they are read
-/// together, at one place, and Bevy caps a system at 16 parameters.
+/// (0678), the exterior-window test a WMO interior applies to everything outside it (0786) with the
+/// camera's own room as its one exemption, and the per-frame portal PVS the rooms *inside* a
+/// building are gated by (0689/1289). One `SystemParam` because they are read together, at one
+/// place, and Bevy caps a system at 16 parameters — which `simulate_particles` already sits at, so
+/// the portal query joins this bundle rather than becoming a seventeenth.
+/// The **owner reads** — one bundle for the two questions this sim asks of an emitter's owner
+/// (a joint, a unit root, a placement submesh; never an emitter or child-draw entity, so both
+/// members are provably disjoint from the `&mut GlobalTransform` writes below): *where is it* and
+/// *is its model being drawn*. A `SystemParam` rather than two parameters because
+/// [`simulate_particles`] sits at Bevy's 16-param ceiling, and because the pair is one concept —
+/// the owner's frame — that no caller should be able to half-answer.
 #[derive(bevy::ecs::system::SystemParam)]
-pub(super) struct SceneGates<'w> {
+pub(crate) struct Owners<'w, 's> {
+    transforms:
+        Query<'w, 's, &'static GlobalTransform, (Without<ParticleEmitter>, Without<ChildDraw>)>,
+    visibility: Query<'w, 's, &'static InheritedVisibility>,
+}
+
+impl Owners<'_, '_> {
+    /// The owner's live world position — read every frame, never from a stored anchor: a frozen
+    /// emitter stops refreshing its anchor, so gating on the stored one would latch a moving owner
+    /// out of existence the first time it crossed the wall.
+    fn at(&self, owner: Entity) -> Option<Vec3> {
+        self.transforms.get(owner).ok().map(|gt| gt.translation())
+    }
+
+    /// Is the owner's model NOT being drawn this frame — the entity lane's draw-set term (decision
+    /// 1409). Last propagate's verdict (one frame of lag on a hide that holds while the model is
+    /// culled), and an owner we cannot read is not hidden: it falls through to the drain path.
+    fn hidden(&self, owner: Entity) -> bool {
+        matches!(self.visibility.get(owner), Ok(v) if !v.get())
+    }
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct SceneGates<'w, 's> {
     view: Res<'w, crate::view::ViewDistance>,
     exterior_windows: Res<'w, crate::wmo_portal::ExteriorWindows>,
     camera_claim: Res<'w, crate::wmo_portal::CameraInteriorClaim>,
+    portals: Query<'w, 's, &'static crate::wmo_portal::WmoPortalInstance>,
+}
+
+impl SceneGates<'_, '_> {
+    /// The three per-frame values every draw-set caller needs before it can ask
+    /// [`EmitterFade::in_draw_set`]: the far-clip wall, the built exterior gate, and the placement
+    /// the camera is standing in. Built ONCE per walk (the gate is a handful of 6-plane frusta).
+    pub(crate) fn scene(
+        &self,
+        cam: Option<(&GlobalTransform, &Projection)>,
+    ) -> (f32, crate::exterior_cull::ExteriorGate, Option<Entity>) {
+        (
+            self.view.farclip,
+            crate::exterior_cull::ExteriorGate::build(&self.exterior_windows, cam),
+            self.camera_claim.0.map(|c| c.room.instance),
+        )
+    }
+
+    /// This emitter's term 5 — the live placement its rooms belong to, resolved and asked.
+    pub(crate) fn room_admits(&self, fade: &EmitterFade) -> bool {
+        fade.room_admitted(
+            fade.room
+                .as_ref()
+                .and_then(|r| self.portals.get(r.instance).ok()),
+        )
+    }
 }
 
 /// The **water-plane interleave** inputs ([`crate::sky_order::FAR_SIDE_BIAS`], where the
@@ -357,9 +414,7 @@ pub(super) fn simulate_particles(
     interleave: WaterInterleave,
     mut commands: Commands,
     cam: Query<(Entity, &GlobalTransform, &Frustum, &Camera, &Projection), With<WorldCamera>>,
-    // Owner reads (joints/units/roots — never emitter or child-draw entities): disjoint from
-    // both `&mut GlobalTransform` queries below.
-    transforms: Query<&GlobalTransform, (Without<ParticleEmitter>, Without<ChildDraw>)>,
+    owners: Owners,
     // MODEL-particle instance entities ([`super::model`]): the draw-set gate hides them with
     // their frozen emitter.
     mut child_draws: Query<
@@ -430,13 +485,10 @@ pub(super) fn simulate_particles(
     // The far-clip wall's axis — the SAME forward `debug_panel::visibility` measures the owner
     // doodad's own cull along, so an emitter and its owner cross the wall together.
     let cam_fwd = Vec3::from(cam_tf.forward());
-    // The exterior gate, built once for the whole emitter walk — the same value the model
-    // visibility authority and `exterior_cull` ask (0784/0786: one spelling of the window test).
-    let exterior_gate = crate::exterior_cull::ExteriorGate::build(
-        &gates.exterior_windows,
-        Some((cam_tf, projection)),
-    );
-    let camera_instance = gates.camera_claim.0.map(|c| c.room.instance);
+    // The far-clip wall, the exterior gate and the camera's own room — built once for the whole
+    // emitter walk, the same values the model visibility authority and `exterior_cull` ask
+    // (0784/0786: one spelling of the window test).
+    let (farclip, exterior_gate, camera_instance) = gates.scene(Some((cam_tf, projection)));
     // `$WOW_PARTICLE_DEPTHDUMP` (B16): is this a dump frame? Decided once per run.
     let dump_frame = dumps.depth_frame(time.elapsed_secs());
     // `$WOW_EMIT_DUMP`: is this a dump tick? Decided once per frame, for the whole walk.
@@ -484,7 +536,7 @@ pub(super) fn simulate_particles(
             let in_set = f.in_draw_set(
                 cam_pos,
                 cam_fwd,
-                gates.view.farclip,
+                farclip,
                 // Lateral planes only (`intersect_far = false`) — the depth bound is the farclip
                 // term inside `in_draw_set`, deliberately; see `view::within_farclip`.
                 frustum.intersects_sphere(
@@ -498,6 +550,10 @@ pub(super) fn simulate_particles(
                 // outside is not in the worklist at all, so its emitter neither ticks nor draws —
                 // which the mesh gate already knew and this one did not.
                 f.exterior_admitted(&exterior_gate, camera_instance),
+                // …and the room term (0689/1289): the window above admits a whole BUILDING, which
+                // says nothing about the sealed room the owner prop actually stands in. The mesh
+                // gate has always known this one too, through the prop's own `WmoGroupVis`.
+                gates.room_admits(f),
             );
             if !in_set {
                 // Frozen: the pool writes no quads this frame (the shared stream is cleared
@@ -541,11 +597,26 @@ pub(super) fn simulate_particles(
             // frozen emitter stops refreshing its anchor, so gating on the stored one would latch a
             // moving owner out of existence the first time it crossed the wall.
             let subject = match emitter.owner {
-                Some(o) => transforms.get(o).ok().map(|gt| gt.translation()),
+                Some(o) => owners.at(o),
                 None => Some(emitter.anchor_pos),
             };
+            // **…and the owner's own draw verdict** (decision 1409). An emitter entity is a world
+            // root — `spawn_emitter` parents it to nothing, because its cloud is anchored, not
+            // carried — so every hide that reaches its model through the scene graph reaches the
+            // emitter not at all. The reference has no such gap: it ticks a model's particles
+            // inside that model's animate step, which runs only for models the frame draws. Ours
+            // ran regardless, which is a culled GameObject's fire still burning over bare ground —
+            // the Orgrimmar bonfires, flame and smoke intact with the wood gone. The world lane's
+            // `EmitterFade` says this in its own vocabulary (terms 4/5); the entity lane has no
+            // fade sphere to say it with, and its owner's propagated verdict is the same answer.
+            //
+            // `InheritedVisibility` is last propagate's — one frame of lag on a verdict that holds
+            // for as long as the model is culled — and an owner we cannot read falls through to the
+            // drain path below, exactly like a vanished one.
+            let owner_hidden = emitter.owner.is_some_and(|o| owners.hidden(o));
             if let Some(at) = subject {
-                if !crate::view::within_farclip(gates.view.farclip, cam_pos, cam_fwd, at, 0.0) {
+                if owner_hidden || !crate::view::within_farclip(farclip, cam_pos, cam_fwd, at, 0.0)
+                {
                     if !emitter.gated {
                         emitter.gated = true;
                         for slot in &emitter.model_instances {
@@ -600,7 +671,7 @@ pub(super) fn simulate_particles(
         // no anchor exists — a joint's transform is not the instance matrix, so that leg keeps
         // the sign-test fallback (`water_gt = None`).
         let water_model = (*anchor).or(*owner);
-        let water_gt = (*anchor).and_then(|e| transforms.get(e).ok().copied());
+        let water_gt = (*anchor).and_then(|e| owners.transforms.get(e).ok().copied());
         let water_bound = *water_bound;
         *age += dt;
         // Anchored mode (see [`Particle`]): positions are emitter-relative, so tracking a moving
@@ -614,7 +685,7 @@ pub(super) fn simulate_particles(
         //    emitter despawns itself. An instant despawn here popped every live particle of a
         //    fireball's trail at the moment of impact.
         if let Some(o) = *owner {
-            match transforms.get(o) {
+            match owners.transforms.get(o) {
                 Ok(gt) => *placement = gt.compute_transform(),
                 Err(_) => {
                     *owner = None;
@@ -665,7 +736,7 @@ pub(super) fn simulate_particles(
         // The live attach rotation `A(t)` (attached models only — see the field doc). A vanished
         // attach entity keeps the last rotation: the pool drains in its final frame.
         if let Some(a) = *attach {
-            if let Ok(gt) = transforms.get(a) {
+            if let Ok(gt) = owners.transforms.get(a) {
                 let (_, rot, _) = gt.to_scale_rotation_translation();
                 *attach_rot = rot;
             }
@@ -684,7 +755,7 @@ pub(super) fn simulate_particles(
         // one while the pool drains. A whole-model owner keeps anchor == owner — identical math.
         match *anchor {
             Some(a) => {
-                if let Ok(gt) = transforms.get(a) {
+                if let Ok(gt) = owners.transforms.get(a) {
                     *anchor_pos = gt.translation();
                 }
             }

@@ -28,7 +28,7 @@ use bevy::prelude::*;
 use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
 use benilla_formats::WaterSoundCatalog;
 
-use crate::net::SelfPlayer;
+use crate::net::Embodied;
 use benilla_assets::{AssetSet, LockRecover, WorldAssets};
 use benilla_world::schedule::WorldStage;
 
@@ -94,8 +94,8 @@ fn drive_liquid_loops(
     mut state: ResMut<LiquidLoopState>,
     water_sounds: Option<Res<WaterSounds>>,
     world: benilla_world::world_point::WorldPoint,
-    player: Query<&Transform, With<SelfPlayer>>,
-    mut emitters: Query<&mut Transform, Without<SelfPlayer>>,
+    player: Query<&Transform, With<Embodied>>,
+    mut emitters: Query<&mut Transform, Without<Embodied>>,
     time: Res<Time>,
     kits: Option<ResMut<SoundKits>>,
     assets: Option<Res<WorldAssets>>,
@@ -107,6 +107,14 @@ fn drive_liquid_loops(
     let (Some(water_sounds), Some(mut kits), Some(assets)) = (water_sounds, kits, assets) else {
         return;
     };
+    // Running silent — no audio device (`WOW_NOSOUND=1`, CI, an unattended probe). A loop that
+    // fails to start is never *held*, so this system re-attempts it every frame and every attempt
+    // warns: a 75 s lava probe logged 3975 identical `no audio device` lines, 89% of the file, and
+    // paid a failed kit resolve per frame for them. The device is a startup fact that nothing here
+    // can recover, and `sound::plugin` already warns about it once (see [`SoundOutput`]).
+    if out.mixer.is_none() {
+        return;
+    }
 
     // The submerge HARD stop (no fade) + the resurface instant-restart edge.
     if world.submersion().is_water() {
@@ -300,6 +308,7 @@ fn start_loop(
         None,
         Some(emitter),
         true,
+        None,
     ) {
         warn!("liquid loop kit {kit_id}: {e:#}");
         return;

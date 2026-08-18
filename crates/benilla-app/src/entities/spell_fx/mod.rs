@@ -138,6 +138,10 @@ fn fx_part_material(
     };
     let t0 = anim.sample(0.0);
     mat.extension.tint = Vec4::new(t0[0], t0[1], t0[2], 1.0);
+    // The clone must leave the shared mat-anim table (decision 1381): its tint is ticked per
+    // INSTANCE right here (the whole point of the clone), and a carried world slot would add the
+    // shared delta on top — a double animation the old asset-mutating lane could never produce.
+    mat.extension.anim_slots = Vec4::ZERO;
     let handle = wow_materials.add(mat);
     tint_reg.0.insert(handle.id(), (anim.clone(), now));
     handle
@@ -466,6 +470,9 @@ pub(crate) fn attach_effect_visuals(
             // This instance's own model alpha, chained to its host (0827/0833): a standalone
             // instance has none above it and draws exactly as before.
             Some(root),
+            // No fade sphere: an effect instance is not a placed model — it lives for its
+            // clip and is gated by its own model alpha one line up.
+            None,
         );
     }
     true
@@ -774,13 +781,16 @@ fn reap_matching(
 /// so the whole effect — meshes and particle emitters alike — rides the animating bone. The one
 /// exception is the kit's **world-plant slot** ([`benilla_formats::WORLD_EFFECT_TAG`], kit field
 /// 12): its root is a free world entity at the owner's position/facing/scale, [`WorldPlantFx`].
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // one Bevy system's full input set
 pub(super) fn attach_spell_fx(
     mut commands: Commands,
     mut units: Query<(
         Entity,
         &mut FxAttached,
         Option<&BoneAttach>,
+        // The unit's pose buffer: the attach joint spawns on first demand from the composed
+        // pose (`RigPose::anchor_for`, decision 1355).
+        Option<&mut benilla_world::rig_anim::RigPose>,
         &GlobalTransform,
     )>,
     fx: Option<Res<SpellFx>>,
@@ -795,7 +805,7 @@ pub(super) fn attach_spell_fx(
         return;
     };
     let now = time.elapsed_secs();
-    for (unit, mut att, bones, unit_gt) in &mut units {
+    for (unit, mut att, bones, mut pose, unit_gt) in &mut units {
         att.instances.retain_mut(|inst| {
             // Self-termination (the cast-release flash ran its span).
             if let Some(expires) = inst.expires {
@@ -877,7 +887,9 @@ pub(super) fn attach_spell_fx(
                         .chain(ATTACH_FALLBACKS)
                         .find_map(|tag| b.points.get(&tag).copied().map(|p| (tag, p)))
                         .and_then(|(tag, (bone, offset))| {
-                            b.anchor(bone).map(|joint| (tag, joint, offset))
+                            pose.as_mut()
+                                .and_then(|p| p.anchor_for(&mut commands, unit, bone))
+                                .map(|joint| (tag, joint, offset))
                         })
                 });
                 let ground_anchor = point.is_none_or(|(tag, ..)| tag == 0x13);

@@ -37,9 +37,11 @@
 //! (an opaque identity in a lightuserdata) — only the *encoding* differs.
 
 mod action;
+mod addon_message;
 mod aura;
 mod backdrop;
 mod bank;
+mod binder;
 mod binding_abi;
 mod button;
 mod channel;
@@ -56,6 +58,7 @@ mod death;
 mod editbox;
 pub(crate) use editbox::adopt_text_region;
 pub(crate) mod addon;
+pub mod addon_gate;
 mod client;
 mod cvars;
 mod dressup;
@@ -66,16 +69,21 @@ mod follow;
 pub(crate) mod font;
 mod font_block;
 mod gossip;
+mod guild;
+mod handler_prof;
+pub use handler_prof::HandlerRow;
 mod inspect;
 mod item_stats;
 mod item_text;
 pub mod keybind;
+mod keyboard;
 mod layout;
 mod loot;
 mod loot_roll;
 mod lua50;
 mod macros;
 mod mail;
+mod measure;
 mod merchant;
 mod messageframe;
 mod minimap;
@@ -89,10 +97,12 @@ mod pvp;
 mod quest;
 mod quest_log;
 mod region;
+mod reputation;
 mod saved;
 mod scrollframe;
 mod session;
 mod shapeshift;
+mod simplehtml;
 mod skills;
 mod slash;
 mod slider;
@@ -119,8 +129,9 @@ mod worldmap;
 
 pub use action::{ActionSlot, ActionState};
 pub use addon::AddOnInfo;
+pub use addon_message::{AddonDistribution, AddonSend};
 pub use aura::{AuraState, TrackingState};
-pub use backdrop::{pieces, Backdrop, BackdropPiece, Insets};
+pub use backdrop::{inset_atlas_bleed, pieces, Backdrop, BackdropPiece, Insets};
 pub use bank::BankState;
 pub use char_stats::{
     weapon_subclass_skill, InvSlotView, InventorySlots, UnitCombatStats, INVENTORY_SLOT_COUNT,
@@ -138,6 +149,10 @@ pub use dressup::DressUpIntent;
 pub use duel::DuelRequest;
 pub use follow::FollowRequest;
 pub use gossip::{GossipMenu, GossipOptionView, GossipQuestRow};
+pub use guild::{
+    GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildRequest, GuildState, LastOnline, UnitGuild,
+    MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
+};
 pub use inspect::InspectView;
 pub use item_stats::{item_usable, ItemSetView, ItemTemplateView, PlayerReqState};
 pub use item_text::ItemTextState;
@@ -145,14 +160,22 @@ pub use loot::{LootRow, LootState};
 pub use loot_roll::{LootRollEntry, LootRollsState};
 pub use macros::{MacroState, MacroView, MAX_MACROS, MAX_MACRO_BODY, MAX_MACRO_NAME};
 pub use mail::{MailInboxRow, MailSendRequest, MailState};
+pub use measure::TextMeasure;
 pub use merchant::{ItemStatsHead, MerchantItem, MerchantState};
 pub(crate) use model::Model;
+pub use model::TextureProbe;
 pub use party::{PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo};
 pub use pet::{PetActionView, PetStats};
 pub use quest::{QuestAction, QuestItemView, QuestPanel, QuestSelect, QuestState};
 pub use quest_log::{QuestLogDetail, QuestLogEntryView, QuestLogObjectiveView, QuestLogState};
+pub(crate) use region::{apply_font_parts, implicit_creation_anchor_lua};
+pub use reputation::{FactionEntry, ReputationSend, ReputationState};
 pub use session::SessionRequest;
 pub use shapeshift::ShapeshiftFormView;
+pub(crate) use simplehtml::{
+    apply_element_font_parts as apply_simplehtml_font_parts,
+    element_of_xml_tag as simplehtml_element_of_xml_tag,
+};
 pub use skills::{SkillEntry, SkillsState};
 pub use social::{FriendInfo, SocialRequest, SocialState, WhoInfo};
 pub use sound::SoundRequest;
@@ -173,7 +196,7 @@ pub use types::{
     Gradient, JustifyH, JustifyV, LineMeasureRequest, MeasureRequest, Outline, QuadContent,
     ScriptValue, TexCoords,
 };
-pub(crate) use types::{MeasuredText, RegionData};
+pub(crate) use types::{FontExplicit, MeasuredText, RegionData};
 pub use unit::{grey_band, level_reads_unknown, power_token, unit_is_grey, UnitState};
 pub use weapon_enchant::WeaponEnchant;
 pub use worldmap::{WorldMapContinentView, WorldMapOverlayView, WorldMapState, WorldMapZoneView};
@@ -189,6 +212,123 @@ const REG_FRAME_META: &str = "__benilla_frame_meta";
 const REG_REGION_META: &str = "__benilla_region_meta";
 const REG_FRAME_METHODS: &str = "__benilla_frame_methods";
 const REG_REGION_METHODS: &str = "__benilla_region_methods";
+/// The full table's registry key, exposed for the exhaustiveness gate in `tests::reference_surface`
+/// — the split's correctness is a property of what the VM HOLDS, not of the source that builds it.
+#[cfg(test)]
+pub(crate) const REG_REGION_METHODS_FOR_TEST: &str = REG_REGION_METHODS;
+/// The **title region's** method table + metatable — the 19 Region methods and nothing else.
+const REG_TITLE_METHODS: &str = "__benilla_title_methods";
+const REG_TITLE_META: &str = "__benilla_title_meta";
+/// The two region LEAF tables + metatables — Texture and FontString each answer their own map.
+const REG_TEXTURE_METHODS: &str = "__benilla_texture_methods";
+const REG_TEXTURE_META: &str = "__benilla_texture_meta";
+const REG_FONTSTRING_METHODS: &str = "__benilla_fontstring_methods";
+const REG_FONTSTRING_META: &str = "__benilla_fontstring_meta";
+/// The stdlib's out-of-the-box error handler, kept by identity so
+/// [`UiScript::dispatch_script_errors_to_handler`] can tell "nobody chose a handler" (skip — the
+/// default already reports into the host channel) from "FrameXML or an addon installed one"
+/// (dispatch — that is what the pair exists for). Stored at [`stdlib::install`] time, the one
+/// moment the default is known to be what `geterrorhandler()` answers.
+const REG_DEFAULT_ERRORHANDLER: &str = "__benilla_default_errorhandler";
+
+/// The **Region method map** (`0xcf54b4`) — the 19 names every region leaf reaches through its own
+/// lookup's fallback, carved in wow-re `system/ui/scratch/font-object-lua-surface.md` and asserted
+/// as a SET by `tests::reference_surface`. Named here because two things need the same list: that
+/// test, and the title region's narrower method table (1250 §5).
+/// Names on **both** region leaves — and each leaf registers its own copy, so these are NOT on the
+/// Region map and must not be hoisted into it (wow-re
+/// `system/ui/scratch/texture-fontstring-method-split.md`, stated there as a trap in as many words).
+/// `GetDrawLayer` is in the client's pair and absent here; absent is absent.
+pub(crate) const REGION_LEAF_SHARED: [&str; 8] = [
+    "SetDrawLayer",
+    "SetVertexColor",
+    "SetAlpha",
+    "GetAlpha",
+    "Show",
+    "Hide",
+    "IsVisible",
+    "IsShown",
+];
+
+/// **Texture-only.** Note `GetVertexColor` sits here while `SetVertexColor` is shared — an asymmetry
+/// no reasonable partition invents, and the carve calls it out. Also note the client's Texture map
+/// has `SetGradientAlpha` where FontString has `SetAlphaGradient`: a near-miss pair, and we install
+/// only the FontString one.
+///
+/// The tail three are OURS, not 1.12's, and are parked here rather than pruned: `SetPortraitToTexture`
+/// and `SetRotation` are texture verbs the carve's 22 does not list, and `SetSize` is an Era
+/// geometry verb absent from the Region map. Removing a superset is a separate question per name —
+/// this landing partitions, it does not prune.
+pub(crate) const TEXTURE_ONLY_METHODS: [&str; 11] = [
+    "SetGradient",
+    "SetGradientAlpha",
+    "GetTexture",
+    "SetTexture",
+    "GetTexCoord",
+    "SetTexCoord",
+    "SetBlendMode",
+    "SetDesaturated",
+    "GetVertexColor",
+    "SetRotation",
+    "SetSize",
+];
+
+/// **FontString-only** — the font/text/justify/shadow block plus the string metrics.
+///
+/// The tail two are OURS: `SetFormattedText` is not in the client's 32, and `SetSize` is the same
+/// Era geometry verb the Texture list carries. Parked, not pruned, pending their own checks.
+///
+/// `GetStringHeight` was here and is GONE (1251's first prune): byte-verified absent from 1.12 in
+/// every encoding, ours was a byte-identical duplicate of `GetHeight`, and every call site — two of
+/// our own XML files, two tests, and `Button:GetTextHeight`'s delegate — now goes through the
+/// Region method the reference itself uses.
+pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 23] = [
+    "SetFont",
+    "GetFont",
+    "SetFontObject",
+    "GetFontObject",
+    "SetTextColor",
+    "GetTextColor",
+    "SetShadowColor",
+    "GetShadowColor",
+    "SetShadowOffset",
+    "GetShadowOffset",
+    "SetJustifyH",
+    "GetJustifyH",
+    "SetJustifyV",
+    "GetJustifyV",
+    "SetText",
+    "GetText",
+    "SetTextHeight",
+    "GetStringWidth",
+    "SetNonSpaceWrap",
+    "CanNonSpaceWrap",
+    "SetAlphaGradient",
+    "SetFormattedText",
+    "SetSize",
+];
+
+pub(crate) const REGION_MAP_METHODS: [&str; 19] = [
+    "GetObjectType",
+    "IsObjectType",
+    "GetName",
+    "GetParent",
+    "SetParent",
+    "GetCenter",
+    "GetLeft",
+    "GetRight",
+    "GetTop",
+    "GetBottom",
+    "GetWidth",
+    "SetWidth",
+    "GetHeight",
+    "SetHeight",
+    "GetNumPoints",
+    "GetPoint",
+    "SetPoint",
+    "SetAllPoints",
+    "ClearAllPoints",
+];
 const REG_WRAPPERS: &str = "__benilla_wrappers";
 const REG_SCRIPTS: &str = "__benilla_scripts";
 
@@ -228,7 +368,7 @@ pub const SCREEN: crate::layout::Handle = 0;
 /// corpus call sites across 91 addons), but it removes working behaviour from those 30 sites, so it
 /// is a change to make deliberately with FrameXML fixed first — not a side effect of widening this
 /// list.
-const SCRIPT_KINDS: [&str; 32] = [
+const SCRIPT_KINDS: [&str; 35] = [
     "OnLoad",
     "OnEvent",
     "OnUpdate",
@@ -279,6 +419,16 @@ const SCRIPT_KINDS: [&str; 32] = [
     // [`crate::layout::size_changed`]'s byte-verified epsilon test — see
     // [`UiScript::resolve_layout`]. `OnSizeChanged(self, width, height)`.
     "OnSizeChanged",
+    // The three KEY channels, unblocked by [`keyboard`]'s walk (wow-re
+    // `scratch/frame-key-script-delivery.md`, VERIFIED). They were the standing exception in
+    // [`object::events_regions`]'s note — accepted only once something fired them, which is that
+    // module's whole rule. `OnKeyUp` rides in with the other two deliberately: it is *gated* today
+    // (a frame carrying only an OnKeyUp consumes every key-down and runs nothing — the reference's
+    // own asymmetry) even though this engine's host feeds no key-up to fire it with, and accepting
+    // the name is what makes that consumption reachable.
+    "OnChar",
+    "OnKeyDown",
+    "OnKeyUp",
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -299,7 +449,25 @@ const SCRIPT_KINDS: [&str; 32] = [
 /// [`pointer`]. What stays here is construction and the small host-facing state pushes/queries.
 pub struct UiScript {
     lua: Lua,
+    /// VM instructions executed, counted only while a budget is installed
+    /// ([`UiScript::set_instruction_budget`]). `Arc` because the hook callback outlives this
+    /// borrow; `Relaxed` because nothing orders against it — it is a bound, not a clock.
+    instructions: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// **This VM's identity** — see [`UiScript::session`].
+    session: u64,
 }
+
+/// Hands out [`UiScript::session`] ids. Process-global and monotone, so an id is never reused and
+/// two of them can be compared without holding either VM.
+static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// How often the instruction hook fires — the resolution of an instruction budget.
+///
+/// mlua's own documentation warns that a low value "can incur a very high overhead", and nothing
+/// wants a precise bound: the question a budget answers is "is this chunk ever going to stop?",
+/// where being out by a million instructions costs nothing and firing every instruction would cost
+/// the whole survey's runtime.
+pub const INSTRUCTION_HOOK_STEP: u32 = 1_000_000;
 
 /// The chunk name the CLIENT gives an addon's file: `Interface\AddOns\<Folder>\<File>`.
 ///
@@ -323,8 +491,12 @@ impl UiScript {
     pub fn new() -> mlua::Result<UiScript> {
         let lua = Lua::new();
         lua.set_app_data(Model::new());
+        // Before anything can fire a handler, and while nothing holds an app-data borrow — the two
+        // conditions the profiler's slot has to be installed under (decision 1395).
+        handler_prof::install(&lua);
 
         addon::install(&lua)?;
+        addon_message::install(&lua)?;
         chat_send::install(&lua)?;
         channel::install(&lua)?;
         chat_window::install(&lua)?;
@@ -340,6 +512,8 @@ impl UiScript {
         unit::install(&lua)?;
         party::install(&lua)?;
         social::install(&lua)?;
+        guild::install(&lua)?;
+        binder::install(&lua)?;
         duel::install(&lua)?;
         follow::install(&lua)?;
         session::install(&lua)?;
@@ -371,6 +545,7 @@ impl UiScript {
         dressup::install(&lua)?;
         tradeskill::install(&lua)?;
         craft::install(&lua)?;
+        reputation::install(&lua)?;
         skills::install(&lua)?;
         item_stats::install(&lua)?;
         char_stats::install(&lua)?;
@@ -381,6 +556,7 @@ impl UiScript {
         quest_log::install(&lua)?;
         messageframe::install(&lua)?;
         scrollframe::install(&lua)?;
+        simplehtml::install(&lua)?;
         slider::install(&lua)?;
         colorselect::install(&lua)?;
         minimap::install(&lua)?;
@@ -389,7 +565,12 @@ impl UiScript {
         worldmap::install(&lua)?;
         net_stats::install(&lua)?;
 
-        Ok(UiScript { lua })
+        let s = UiScript {
+            lua,
+            instructions: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            session: NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        Ok(s)
     }
 
     /// The embedded VM — for the Bevy plugin / TOC-XML loader to add the game-state API bindings
@@ -397,6 +578,86 @@ impl UiScript {
     /// object model this crate installs.
     pub fn lua(&self) -> &Lua {
         &self.lua
+    }
+
+    /// **Which VM this is** — a fresh number for every [`UiScript::new`], never reused.
+    ///
+    /// The client destroys its Lua state at logout and builds another at the next world entry
+    /// (the reference's own `0x490bd0` ↔ `0x48fbf0` pair), so a host that remembers *what it last
+    /// pushed into the VM* is remembering something that may no longer exist. Anything the host
+    /// seeded — a registry, a catalog, a change-detection memo — is only valid for the session it
+    /// was seeded into, and this number is what says so.
+    ///
+    /// A host keying its memory on this cannot go stale by omission: a new VM simply does not
+    /// match, so the seed happens again. That is the property, and it is why this is a VM-side fact
+    /// rather than a host-side counter the host must remember to bump.
+    pub fn session(&self) -> u64 {
+        self.session
+    }
+
+    /// **Bound how long a chunk may run, so an infinite loop reports instead of hanging.**
+    ///
+    /// A missing capability in this engine has always been a silently WRONG ANSWER — a setter that
+    /// ignores you, a getter that says nil (1203/1205/1211/1230). Decision 1247 met the other kind:
+    /// `date("*t")` returned a string where Lua returns a table, so `Accountant_WeekStart`'s
+    /// `while thisDay ~= weekstart` never terminated and the addon spun the VM forever. That is
+    /// invisible to every instrument we own, because an instrument that never returns produces no
+    /// roster to diff, no column to compare and no error row to read — the 218-addon survey simply
+    /// stopped finishing, and the cause was found by bisecting the corpus BY HAND.
+    ///
+    /// So a caller that runs untrusted chunks can bound them. Past `budget` VM instructions the
+    /// hook raises, and the raise propagates like any other Lua error: the addon reports as failed
+    /// with a distinctive message, and everything after it still runs.
+    ///
+    /// **This is opt-in, and the app arms it only on the world-entry load edge** (decision 1306;
+    /// it began harness-only, e463649e). A real session must not kill a player's addon for being
+    /// slow, so steady state — every OnUpdate, every event — runs unhooked; but a load walk that
+    /// never returns is a client frozen on the loading screen with zero diagnostics (B271's
+    /// class), so the entry edge is bounded and [`Self::clear_instruction_budget`] disarms before
+    /// the session's first frame.
+    ///
+    /// The hook fires every [`INSTRUCTION_HOOK_STEP`] instructions rather than every instruction:
+    /// mlua's own docs warn that a low value "can incur a very high overhead", and the step is the
+    /// resolution of the bound, which nothing here needs to be precise.
+    pub fn set_instruction_budget(&self, budget: u64) {
+        let used = self.instructions.clone();
+        used.store(0, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.lua.set_hook(
+            mlua::HookTriggers {
+                every_nth_instruction: Some(INSTRUCTION_HOOK_STEP),
+                ..Default::default()
+            },
+            move |_, _| {
+                let n = used.fetch_add(
+                    u64::from(INSTRUCTION_HOOK_STEP),
+                    std::sync::atomic::Ordering::Relaxed,
+                ) + u64::from(INSTRUCTION_HOOK_STEP);
+                if n > budget {
+                    return Err(mlua::Error::runtime(format!(
+                        "benilla: instruction budget exhausted after {n} VM instructions — \
+                         treating this as a non-terminating loop"
+                    )));
+                }
+                Ok(mlua::VmState::Continue)
+            },
+        );
+    }
+
+    /// Remove an installed instruction budget — the load edge's disarm (decision 1306): the bound
+    /// covers the world-entry walk, and a session's steady state runs unhooked exactly as before.
+    /// The counter keeps its last value, so [`Self::instructions_used`] still answers for the
+    /// phase that just ended.
+    pub fn clear_instruction_budget(&self) {
+        self.lua.remove_hook();
+    }
+
+    /// VM instructions executed since the last [`Self::set_instruction_budget`], to the resolution
+    /// of [`INSTRUCTION_HOOK_STEP`]. Zero when no budget was ever set — the hook is what counts.
+    ///
+    /// Reported rather than merely used, because the budget has to be CHOSEN from the corpus and a
+    /// number nobody can read is a number nobody can revisit.
+    pub fn instructions_used(&self) -> u64 {
+        self.instructions.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Set the screen-root rect from a pixel size (`[0,0]` origin, y-up). Top-level frames anchor to
@@ -434,13 +695,22 @@ impl UiScript {
     /// Push the player's WMO-containment state onto every Minimap widget (the client's `0xceaa60`).
     /// It selects which of the two persisted zoom indices `GetZoom`/`SetZoom` act on, so the zoom
     /// buttons drive the indoor level while indoors and the outdoor level while outside. The app
-    /// owns the containment test, so it owns this push — call it before the script tick.
+    /// owns the containment test, so it owns this push — call it before the script tick. The
+    /// caller pushes on the inside↔outside edge and whenever [`Self::minimap_widgets_created`]
+    /// moved (a widget born after the last transition still gets told, without paying the arena
+    /// walk every frame).
     pub fn set_minimap_inside(&mut self, inside: bool) {
         for (_, frame) in self.model_mut().arena.iter_frames_mut() {
             if let KindState::Minimap(m) = &mut frame.kind_state {
                 m.inside = inside;
             }
         }
+    }
+
+    /// Monotonic count of Minimap widgets ever created in this VM — the O(1) signal that a new
+    /// one exists and needs the containment state pushed.
+    pub fn minimap_widgets_created(&self) -> u64 {
+        self.model_ref().arena.minimap_created()
     }
 
     /// Seed every Minimap widget's two zoom indices from the persisted levels — the client's
@@ -607,6 +877,15 @@ impl UiScript {
             let mut model = self.model_mut();
             Self::resolve_layout(&mut model);
         }
+        // With a font engine installed ([`Self::set_text_measurer`]) the VM closes the measure
+        // round-trip itself, right here — solve, measure what the solve revealed, solve again.
+        // That is the same two-solve shape the host's own drive loop already runs, moved inside so
+        // a FontString's box is right in the frame its text was set rather than the frame after.
+        // Without an engine this is a no-op and the host's batch pass stays the only answer.
+        if self.fill_measures() {
+            let mut model = self.model_mut();
+            Self::resolve_layout(&mut model);
+        }
         event::fire_size_changes(&self.lua);
     }
 
@@ -620,11 +899,11 @@ impl UiScript {
     /// number, which is why [`Self::set_measured_text_unwrapped`] exists for tests.
     pub fn set_measured_text(&mut self, measures: &[(u32, f32, f32, f32, u64)]) {
         let mut model = self.model_mut();
-        let mut changed = false;
         for &(id, w, h, natural_w, key) in measures {
             let Some(&rh) = model.id_to_region.get(&id) else {
                 continue;
             };
+            let mut moved = false;
             if let Some(d) = model.region_data.get_mut(&rh) {
                 let new = MeasuredText {
                     w,
@@ -632,13 +911,18 @@ impl UiScript {
                     natural_w,
                     key,
                 };
-                changed |= d.measured != Some(new);
+                // The KEY always lands (or the region re-requests its own measure forever); the
+                // EPOCH moves only if the laid-out extent did — see `MeasuredText::layout_moved`.
+                moved = MeasuredText::layout_moved(d.measured, new);
                 d.measured = Some(new);
             }
-        }
-        if changed {
-            // Measured extents are the auto-size axes' inputs — the layout gate's read set.
-            model.touch_layout();
+            if moved {
+                // Measured extents are the auto-size axes' inputs — the layout gate's read set.
+                // Touched PER REGION rather than once for the batch (decision 1388): the batch
+                // touch could only say "some extent moved", which is exactly the whole-roster
+                // question the ledger exists to stop asking.
+                model.touch_layout_region(rh);
+            }
         }
     }
 
@@ -665,6 +949,25 @@ impl UiScript {
     /// engine deliberately never sees the seam scale — so staleness is the host's to declare; the
     /// round-trips re-answer on the frames that follow (the same one-frame convergence every
     /// measure already has).
+    /// Force the next [`UiScript::resolve`] to rebuild the **whole** layout graph rather than the
+    /// dirty closure a scoped resolve would (decision 1350) — and to run at all, rather than stop
+    /// at either change gate.
+    ///
+    /// This is the scoped resolve's own falsifier, and it exists so the claim the scope rests on —
+    /// *a node whose own inputs and whose dependencies did not move recomputes to the rect it
+    /// already holds* — is something a test can **disprove** rather than something the engine
+    /// argues. Drive a change, resolve, read the rects; call this, resolve again, read them again;
+    /// they must be identical. `WOW_LAYOUT_VERIFY` makes the same comparison automatically on every
+    /// SETTLED frame; this is for the frames that never settle, which is exactly the hover sweep
+    /// the scope was built for.
+    pub fn force_full_layout_resolve(&mut self) {
+        let mut model = self.model_mut();
+        model.layout_scope.invalidate();
+        model.layout_fingerprint = None;
+        model.layout_epoch_resolved = None;
+        model.touch_layout();
+    }
+
     pub fn invalidate_text_measures(&mut self) {
         let mut model = self.model_mut();
         for d in model.region_data.values_mut() {
@@ -689,27 +992,6 @@ impl UiScript {
         // Measured extents are auto-size inputs — the layout gate's read set, same as
         // [`Self::set_measured_text`]'s.
         model.touch_layout();
-    }
-
-    /// Feed the number font's per-digit advance widths (logical px, `'0'..='9'` in order) as the
-    /// Lua global table `BENILLA_DIGIT_W` (keyed by digit *string*, `["0"].."["9"]`). The
-    /// synchronous half of the money layout's metrics (the real `SmallMoneyFrame` calls
-    /// `GetTextWidth` mid-update — MoneyFrame.lua l.202 — while our `GetStringWidth` measure
-    /// round-trip is a frame late): the app measures NumberFontNormal's digits once per atlas
-    /// scale and `BenillaNumberWidth` (MerchantFrame.xml) sums them per price.
-    pub fn set_digit_advances(&mut self, advances: &[f32; 10]) {
-        let set = || -> mlua::Result<()> {
-            let t = self.lua.create_table()?;
-            for (i, w) in advances.iter().enumerate() {
-                t.set(i.to_string(), *w)?;
-            }
-            self.lua.globals().set("BENILLA_DIGIT_W", t)
-        };
-        if let Err(e) = set() {
-            self.model_mut()
-                .errors
-                .push(format!("set_digit_advances: {e}"));
-        }
     }
 
     // ── Input: pointer-leaves-window cleanup (decision 0216 §3; the hit-test/mouse dispatch that
@@ -750,7 +1032,11 @@ impl UiScript {
     /// focused box, inserts it (numeric/cap/password rules apply) or — for the Ctrl+A control code —
     /// selects all. Returns `true` if consumed (a focused box consumes every char).
     pub fn char_input(&mut self, text: &str) -> bool {
-        editbox::char_input(&self.lua, text)
+        // The frame walk first ([`keyboard`]): the focused box is a PARTICIPANT in it, at its own
+        // strata/level, so this is not "frames before boxes" — it is the reference's one dispatcher
+        // in the reference's order. An event no frame consumed still falls through to the box
+        // routing, which owns focus acquisition (`autoFocus` self-acquire and kin).
+        keyboard::char_input(&self.lua, text) || editbox::char_input(&self.lua, text)
     }
 
     /// Paste text from the host OS clipboard into the focused EditBox. The engine-free runtime can't
@@ -767,7 +1053,20 @@ impl UiScript {
     /// owns which chord means what). Routes per §1/§2; a focused box consumes the key even when
     /// it does nothing with it. Returns `true` if consumed.
     pub fn key_input(&mut self, key: &str) -> bool {
-        editbox::key_input(&self.lua, key)
+        // Same two-stage shape as `char_input` — see its note.
+        keyboard::key_input(&self.lua, key) || editbox::key_input(&self.lua, key)
+    }
+
+    /// A key the host delivers to a focused EditBox as an [`EditAction`] chord rather than by name
+    /// (BACKSPACE, DELETE, the arrows, HOME, END), offered to the **keyboard frames** first.
+    ///
+    /// Returns `true` if a frame consumed it, in which case the caller must NOT also dispatch the
+    /// chord — and the key's binding must not fire either (consumption suppresses it, wow-re §3).
+    /// A `false` means either nothing wanted it or the focused box owns it; the caller proceeds
+    /// exactly as it did before this entry point existed. See [`keyboard::frame_key_input`] for
+    /// why declining at the box is the faithful answer rather than skipping it.
+    pub fn frame_key_input(&mut self, key: &str) -> bool {
+        keyboard::frame_key_input(&self.lua, key)
     }
 
     /// One semantic text-editing operation on the focused EditBox — the output of the host's
@@ -793,6 +1092,21 @@ impl UiScript {
         self.model_ref().layout_solves
     }
 
+    /// How many resolves got past **tier 1** and paid the whole-roster preamble
+    /// ([`Model::layout_gate_walks`], decision 1385) — the gate's true cost counter, ≥
+    /// [`Self::layout_solves`] because a walk that concludes "nothing moved" pays the same
+    /// preamble and never reaches the solve counter.
+    pub fn layout_gate_walks(&self) -> u64 {
+        self.model_ref().layout_gate_walks
+    }
+
+    /// How many times a resolve DERIVED the layout graph from scratch ([`Model::layout_derives`])
+    /// — the whole-roster walk, and since decision 1388 the only expensive thing a resolve can do.
+    /// A UI that merely animates should hold this flat.
+    pub fn layout_derivations(&self) -> u64 {
+        self.model_ref().layout_derives
+    }
+
     /// Total fixpoint ROUNDS across every solve ([`Model::layout_rounds`]) — a solve costs
     /// rounds × the whole graph, so the ratio against [`Self::layout_solves`] is the per-pass
     /// depth.
@@ -800,16 +1114,33 @@ impl UiScript {
         self.model_ref().layout_rounds
     }
 
+    /// The last solve's SCOPE — `(frames solved, regions swept)`, decision 1350's meter.
+    ///
+    /// The third axis of a solve's cost, and the one that used to be "all of it": solves says how
+    /// OFTEN, rounds says how DEEP, this says how WIDE. A change that touches ten FontStrings must
+    /// read a handful here however large the UI grows; a scope that tracks the graph is the
+    /// regression, and it is asserted as a COUNT because milliseconds have twice failed to catch
+    /// this class (0735, 0771).
+    pub fn layout_last_scope(&self) -> (usize, usize) {
+        self.model_ref().layout_last_scope
+    }
+
     /// Is `name` a registered FrameXML template — one `CreateFrame`'s fourth argument or an
     /// `inherits=` can resolve (decision 1203)?
     ///
     /// A pure query on the VM's live registry, for the corpus harness: an addon naming a template
     /// we have not transcribed gets a bare frame and **no load error**, so nothing else can see it.
+    /// **Folded**, because the resolution it reports on is folded. An exact `contains_key` made this
+    /// census disagree with the loader the moment `inherits=` became case-insensitive: it went on
+    /// listing `UIDropdownMenuTemplate`, `CT_RaCheckButtonTemplate` and `MSBTColorSwatchTemplate` as
+    /// missing while the loader was resolving all three. An instrument that reports a gap the code
+    /// does not have is worse than no instrument — it is a build queue pointing at finished work
+    /// (1242/1246, and 1251 §3's rule that a source-derived answer be checked against the runtime
+    /// artefact).
     pub fn has_framexml_template(&self, name: &str) -> bool {
-        self.model_ref()
-            .framexml_templates
-            .borrow()
-            .contains_key(name)
+        let model = self.model_ref();
+        let templates = model.framexml_templates.borrow();
+        templates.contains_key(name) || templates.keys().any(|k| k.eq_ignore_ascii_case(name))
     }
 
     /// Is `name` a registered FONT object — the *other* thing an `inherits=` may legally name?
@@ -820,7 +1151,7 @@ impl UiScript {
     /// where that fork lives). A census that asks only the template registry reports every font in
     /// the corpus as a missing template.
     pub fn has_font_object(&self, name: &str) -> bool {
-        self.model_ref().font_objects.contains_key(name)
+        self.model_ref().font_object(name).is_some()
     }
 
     /// The **widget kind of a published name** — `"MessageFrame"`, `"Button"`, `"Texture"`, … — or
@@ -871,6 +1202,9 @@ impl UiScript {
         model.arena.region(h).map(|r| match r.kind {
             crate::widget::RegionKind::Texture => "Texture",
             crate::widget::RegionKind::FontString => "FontString",
+            // A title region is a plain Region and says so (Q6) — and it is unreachable by name
+            // anyway: `CreateTitleRegion` takes no name argument at all.
+            crate::widget::RegionKind::Title => "Region",
         })
     }
 
@@ -895,13 +1229,71 @@ impl UiScript {
         std::mem::take(&mut self.model_mut().warnings)
     }
 
+    /// Report a script error the host caught **outside** the VM's own dispatch — an addon file
+    /// that failed to compile or raised at file scope during the load walk. It joins the
+    /// handler-dispatch queue only: the caller has already logged it (the load walk's per-file
+    /// `error!` + `failures` contract), so putting it in `errors` too would double-log at the
+    /// app's per-frame drain.
+    pub fn report_script_error(&self, msg: &str) {
+        self.model_mut()
+            .pending_error_dispatch
+            .push(msg.to_string());
+    }
+
+    /// Hand every queued script error to the Lua-side error handler — the reference's own shape:
+    /// `seterrorhandler`/`geterrorhandler` are engine globals (wow-re `scratch/lua-dialect.md`,
+    /// the captured `_G`), the engine invokes the registered handler on a caught script error
+    /// (that is the pair's contract — a handler nothing invokes would be two dead globals), and
+    /// FrameXML answers with `_ERRORMESSAGE` → the red ScriptErrors dialog (decision 1305).
+    ///
+    /// Called at a safe seam (the app's per-frame drain), never from inside the failed call.
+    /// Three guards keep it bounded and honest:
+    /// - **The stdlib default handler is skipped by identity.** It reports into
+    ///   [`UiScript::errors`] — where every queued message already is — so dispatching it would
+    ///   only duplicate. The queue still drains, so a handler installed later starts clean.
+    /// - **A handler that raises is recorded on the host channel only** and never re-queued:
+    ///   the error path cannot recurse by construction.
+    /// - **One failure stops the batch** — a broken handler fails the same way for every message,
+    ///   and one line names it.
+    pub fn dispatch_script_errors_to_handler(&mut self) {
+        let pending = std::mem::take(&mut self.model_mut().pending_error_dispatch);
+        if pending.is_empty() {
+            return;
+        }
+        let handler: Option<mlua::Function> = self
+            .lua
+            .globals()
+            .get::<mlua::Function>("geterrorhandler")
+            .ok()
+            .and_then(|g| g.call::<mlua::Function>(()).ok());
+        let Some(handler) = handler else { return };
+        if let Ok(default) = self
+            .lua
+            .named_registry_value::<mlua::Function>(REG_DEFAULT_ERRORHANDLER)
+        {
+            if handler == default {
+                return;
+            }
+        }
+        for msg in pending {
+            if let Err(e) = handler.call::<()>(msg) {
+                self.model_mut()
+                    .errors
+                    .push(format!("error handler itself failed: {e}"));
+                break;
+            }
+        }
+    }
+
     /// Register a named virtual [`FontObject`] (a resolved `<Font>`), overwriting any prior one of
     /// the same name, **and publish it as the Lua global `name`** — the same pair
     /// `Loader::do_font` performs, so a font registered from Rust is addressable from Lua exactly
     /// like one declared in XML (`fs:SetFontObject(Name)`, `Name:GetFont()`). One registration act,
     /// one outcome: the two paths cannot drift.
     pub fn register_font_object(&self, name: &str, font: FontObject) {
-        self.model_mut().font_objects.insert(name.to_string(), font);
+        self.model_mut()
+            .font_objects_by_lower
+            .insert(name.to_ascii_lowercase(), font);
         // Publishing cannot fail for a fresh table + a string key; a registry hiccup is not worth
         // an unwrap in a host-facing setter, and the record is already in place either way.
         let _ = font::publish(&self.lua, name);
@@ -910,7 +1302,7 @@ impl UiScript {
     /// Look up a registered [`FontObject`] by name (the resolved paint), if any. Used by tests and by
     /// the `SetFontObject` binding.
     pub fn font_object(&self, name: &str) -> Option<FontObject> {
-        self.model_ref().font_objects.get(name).cloned()
+        self.model_ref().font_object(name).cloned()
     }
 
     /// Every registered [`FontObject`] (the resolved paints of all loaded `<Font>` nodes) — the
@@ -918,7 +1310,11 @@ impl UiScript {
     /// off this to know which outlined cell variants the shipped UI can actually request
     /// (the outlined-glyph bake, the fade-composite fold-back record).
     pub fn font_objects(&self) -> Vec<FontObject> {
-        self.model_ref().font_objects.values().cloned().collect()
+        self.model_ref()
+            .font_objects_by_lower
+            .values()
+            .cloned()
+            .collect()
     }
 
     // ── internals ────────────────────────────────────────────────────────────────────────────
@@ -936,7 +1332,7 @@ impl UiScript {
     }
 
     fn push_error(&self, e: mlua::Error) {
-        self.model_mut().errors.push(e.to_string());
+        self.model_mut().record_script_error(e.to_string());
     }
 }
 

@@ -104,6 +104,26 @@ pub struct MatKey {
     /// z-write on, drawn before its model's colour batches. Its own key axis so a twin can never
     /// dedupe onto a colour material.
     zfill: bool,
+    /// This batch is part of a **WMO skybox** ([`crate::wmo_sky`]) — the building-owned painted sky,
+    /// drawn on this lane like any other M2 since decision 1264. Its own key axis because the lane
+    /// changes pipeline state ([`SKY_DEPTH_MARKER`]: forced far depth, no early-Z) and sort rung
+    /// ([`skybox_sort_bias`]), so a skybox batch must never dedupe onto the identical-looking world
+    /// batch — `CavernsOfTimeSky` and Elwynn share no texture today, but nothing enforces that and
+    /// the collision would be a world doodad silently drawn at the far plane.
+    sky_depth: bool,
+    /// **This material belongs to one placement, not to the batch** — `None` for the shared
+    /// material every instance of a model reuses, which is every batch but one measured class.
+    ///
+    /// The animated-material registries ([`crate::doodad_anim::UvAnimMaterials`] and its tint twin)
+    /// are keyed by MATERIAL, so a batch whose animated loop depends on **which sequence its
+    /// instance is playing** cannot share one and be right: the BRM lava bubbles key their whole
+    /// flipbook inside a 50 %-weighted variation of animation id 0, and their 15 placements re-roll
+    /// independently every ~3.3 s (decision 0768), so at any instant some are on slot 0 and some on
+    /// slot 1. Keying the material by the placement's anim host gives each its own row and its own
+    /// sequence (decision 1408); the population is 22 batch-channels across 6 models
+    /// (`benilla-extract uvslotscan`), and the clones expire on the same distance evictor as every
+    /// other material ([`scope_model_materials`], decision 0785).
+    instance: Option<Entity>,
 }
 
 /// The per-material static terrain-shade **selector** baked into `sun_scale.x` — NOT an intensity
@@ -204,7 +224,15 @@ pub fn model_material(
     // WINDOW midpoint-light flag (`WowModelExt::sidn`).
     sidn: Option<[u8; 3]>,
     window: bool,
+    // This batch belongs to a **WMO skybox** — the sky lane: forced far depth, no rasterizer bias,
+    // and the skybox sort rung instead of the ordinary batch-order eps. See [`MatKey::sky_depth`].
+    sky_depth: bool,
     light: &Buffer,
+    // The ONE placement this material belongs to, or `None` for the shared batch material every
+    // instance of the model reuses. `Some` only for a batch whose animated UV/tint loop depends on
+    // the sequence its instance is playing (decision 1408): the animated-material registries are
+    // keyed by material, so such a batch cannot share one and be right. See `MatKey::instance`.
+    instance: Option<Entity>,
 ) -> Handle<WowModelMaterial> {
     let key = MatKey {
         light: light.id(),
@@ -228,6 +256,8 @@ pub fn model_material(
         sidn,
         window,
         zfill: false,
+        sky_depth,
+        instance,
     };
     if let Some(h) = cache.fetch(&key) {
         return h;
@@ -279,10 +309,17 @@ pub fn model_material(
     // load-bearing only for SAME-CENTRE stacks (M2 item overlays, always low-index); WMO batches
     // sort by their own distinct mesh centres. The cap stays under `FAR_KEY_PULL` so a far twin
     // of a capped batch still lands on the far band's one key integer.
-    let depth_bias = if matches!(alpha_mode, AlphaMode::Blend) {
-        (f32::from(batch_order) * BATCH_ORDER_SORT_EPS).min(BATCH_ORDER_SORT_CAP)
-    } else {
+    //
+    // The SKY lane takes the same shape one rung down: a skybox is camera-anchored, so its view-z
+    // is a few tens of yards and it would sort after the world's transparents rather than behind
+    // them ([`crate::sky_order::WMO_SKYBOX_BIAS`]). Its opaque batches still take no bias — the
+    // painted cube faces are in the opaque pass, which is exactly where the reference puts them.
+    let depth_bias = if !matches!(alpha_mode, AlphaMode::Blend) {
         0.0
+    } else if sky_depth {
+        skybox_sort_bias(batch_order)
+    } else {
+        (f32::from(batch_order) * BATCH_ORDER_SORT_EPS).min(BATCH_ORDER_SORT_CAP)
     };
     let base = match texture {
         Some(image) => StandardMaterial {
@@ -351,7 +388,8 @@ pub fn model_material(
                         | (u16::from(blend == ModelBlend::Mod) << 7)
                         | (u16::from(blend == ModelBlend::Mod2x) << 8)
                         | (u16::from(fade_variant && source_cutout) * TWIN_CUTOUT_MARKER)
-                        | (u16::from(env_map) * ENV_MAP_MARKER),
+                        | (u16::from(env_map) * ENV_MAP_MARKER)
+                        | (u16::from(sky_depth) * SKY_DEPTH_MARKER),
                 ),
                 0.0,
             ),
@@ -436,6 +474,9 @@ pub fn model_material(
                     if window { 1.0 } else { 0.0 },
                 )
             },
+            // Static until a sampler registers this material (decision 1381) — then the
+            // table slot is baked in exactly once.
+            anim_slots: Vec4::ZERO,
             light_buf: light.clone(),
         },
     });
@@ -459,6 +500,40 @@ pub(crate) const TWIN_CUTOUT_MARKER: u16 = 1 << 10;
 /// [`FAR_SIDE_MARKER`]. Deliberately **not** a [`benilla_assets::materials::WowModelKey`] axis: it changes
 /// only what the fragment stage samples, so it needs no pipeline of its own (decision 0837).
 pub(crate) const ENV_MAP_MARKER: u16 = 1 << 12;
+
+/// `clutter_fade.z` marker bit 13: the **WMO-skybox lane** — this batch is part of a building's
+/// painted sky, so `specialize` compiles the shader's `WOW_SKY_DEPTH` branch (forced far depth) and
+/// drops the rasterizer bias constant. It *is* a
+/// [`benilla_assets::materials::WowModelKey`] axis, unlike [`ENV_MAP_MARKER`]: writing
+/// `@builtin(frag_depth)` costs the pipeline its early-Z, so exactly one camera-anchored model may
+/// pay it and every other draw in the frame must keep the pipeline that doesn't.
+pub(crate) const SKY_DEPTH_MARKER: u16 = 1 << 13;
+
+/// Sort-bias step per authored batch on the **WMO-skybox lane** — [`BATCH_ORDER_SORT_EPS`]'s job,
+/// resized for the rung it has to survive.
+///
+/// The plain 1e-3 eps cannot be used here: added to [`crate::sky_order::WMO_SKYBOX_BIAS`] (−6e4) it
+/// falls *under the f32 ulp at that magnitude* (2¹⁵·2⁻²³ = 0.0039), so every batch rounds onto the
+/// same bias and the sort tie the eps exists to break comes back in silence. This step is 4 ulps
+/// there — exactly representable, strictly monotone. The tie is not a rare coplanar case on this
+/// lane: a skybox is anchored at the eye, so *every* pair of its batches shares a sort distance,
+/// every frame.
+pub(crate) const SKYBOX_ORDER_EPS: f32 = 0.015625;
+
+/// The skybox band's ceiling. With [`FAR_KEY_PULL`] it keeps the whole band on ONE pipeline-key
+/// integer — 0837's law: the base `StandardMaterialKey` packs `depth_bias as i32`, so a band
+/// straddling an integer is a live pipeline compile per side. Pulled by just under 1 and capped at
+/// 0.9, every batch lands in `(RUNG − 0.99, RUNG − 0.09]`, which truncates toward zero onto the
+/// same integer for all of them. The cap ties batches past index 57 (`0.9 / SKYBOX_ORDER_EPS`); the
+/// largest skybox the chain ships is 21 batches (`CavernsOfTimeSky.m2`).
+pub(crate) const SKYBOX_ORDER_CAP: f32 = 0.9;
+
+/// This batch's slot in the skybox band: the lane rung, pulled onto one pipeline key, plus the
+/// authored batch order. See [`SKYBOX_ORDER_EPS`] and [`crate::sky_order::WMO_SKYBOX_BIAS`].
+fn skybox_sort_bias(batch_order: u16) -> f32 {
+    crate::sky_order::WMO_SKYBOX_BIAS - FAR_KEY_PULL
+        + (f32::from(batch_order) * SKYBOX_ORDER_EPS).min(SKYBOX_ORDER_CAP)
+}
 
 /// The twin's `Transparent3d` sort bias (yards; **negative = drawn earlier** — the sign law is
 /// `sky_order`'s module doc). It must clear the spread of one model's part AABB centres, so **all**
@@ -524,6 +599,12 @@ pub fn zfill_material(
         sidn: None,
         window: false,
         zfill: true,
+        // A depth-prime twin exists to write depth for a fading model; the sky writes none, so no
+        // skybox batch ever has one (`M2BatchMaterials::skybox` builds no twins at all).
+        sky_depth: false,
+        // A z-fill twin carries no animated channel at all (no texture, no uv/rgb anim), so it can
+        // never be the per-placement lane — it stays the one shared depth prime per batch.
+        instance: None,
     };
     if let Some(h) = cache.fetch(&key) {
         return h;
@@ -556,6 +637,7 @@ pub fn zfill_material(
             sun_scale: Vec4::new(ShadeSel::Lit.selector(), 0.0, 0.0, 0.0),
             tint: Vec4::new(1.0, 1.0, 1.0, 0.0),
             sidn: Vec4::ZERO,
+            anim_slots: Vec4::ZERO,
             light_buf: light.clone(),
         },
     });
@@ -627,6 +709,16 @@ impl FarSideTwins {
         near: &Handle<WowModelMaterial>,
     ) -> Option<&Handle<WowModelMaterial>> {
         self.to_far.get(&near.id())
+    }
+
+    /// The near identity of a far twin, if `id` is one — the mat-anim draw scan asks, because
+    /// its registry keys are always near ids while a far-classified instance carries the twin's
+    /// (1375).
+    pub(crate) fn near_of(
+        &self,
+        id: AssetId<WowModelMaterial>,
+    ) -> Option<AssetId<WowModelMaterial>> {
+        self.to_near.get(&id).map(bevy::asset::Handle::id)
     }
 }
 
@@ -738,10 +830,11 @@ pub(crate) fn classify_water_side(
     mut removed: RemovedComponents<MeshMaterial3d<WowModelMaterial>>,
     mut eye_was_submerged: Local<Option<bool>>,
 ) {
-    // A texanim/tint ticker mutates the NEAR asset in place every drawn frame
-    // (`doodad_anim::tick_anim_materials`); mirror the edit into the live twin, or a far-side
-    // waterfall batch freezes its scroll the moment it classifies far. Our own twin writes touch
-    // only far ids (never `to_far` keys), so this can't feed back.
+    // Mirror any near-asset edit into the live twin. Since decision 1381 the texanim/tint lane
+    // animates through the shared table (the twin's clone carries the same slot and seed, so it
+    // scrolls in phase with no mirror needed), which leaves this listener idle in the steady
+    // state — it now catches only genuine one-off near edits (a debug repaint, a future lane).
+    // Our own twin writes touch only far ids (never `to_far` keys), so this can't feed back.
     let edited: Vec<AssetId<WowModelMaterial>> = near_edits
         .read()
         .filter_map(|ev| match ev {
@@ -871,7 +964,12 @@ fn classify_part(
     let far_now = marked || swapped;
     let qualifies = match materials.get(near.id()) {
         Some(m) => {
-            matches!(m.base.alpha_mode, AlphaMode::Blend) && m.extension.model_flags.x <= 0.5
+            matches!(m.base.alpha_mode, AlphaMode::Blend)
+                && m.extension.model_flags.x <= 0.5
+                // A WMO skybox is anchored at the eye and forces the far depth: it has no side of
+                // the water plane to be on, and the far twin's −4e4 would sink its own sort rung
+                // into the world band. The sky is never part of the interleave.
+                && (m.extension.clutter_fade.z as u16) & SKY_DEPTH_MARKER == 0
         }
         None => false,
     };
@@ -975,6 +1073,16 @@ pub fn plugin(app: &mut App) {
         visibility::apply_model_visibility
             .after(crate::wmo_portal::WmoPvsSet)
             .in_set(ModelVisSet),
+    );
+    // `WOW_VIS_TRACE=<label>`: watch one model's placements decide (see `visibility::VisTrace`).
+    // The resource is absent unless the env var names something, and the system's first line is
+    // the `None` check — so an ordinary run pays one `Option` read per frame.
+    if let Some(trace) = visibility::VisTrace::from_env() {
+        app.insert_resource(trace);
+    }
+    app.add_systems(
+        Update,
+        visibility::trace_model_visibility.after(ModelVisSet),
     );
     // The material dedup cache and its two evictors — the soft one (distance, decision 0785) and
     // the hard one (a cross-map transition, decision 0729). Both used to live in `entities`, which
@@ -1106,6 +1214,57 @@ mod tests {
             super::far_sort_bias(0.0) as i32,
             "the far band stays one pipeline key across the whole capped eps range"
         );
+    }
+
+    /// The **WMO-skybox band**: the four properties the lane's whole ordering rests on, none of
+    /// which survives being reasoned about in prose (decision 1264). The band is arithmetic at a
+    /// magnitude where f32 stops being able to represent the steps, which is exactly how the
+    /// ordinary eps would have failed here in silence.
+    #[test]
+    fn the_skybox_band_orders_its_batches_on_one_pipeline_key() {
+        // `CavernsOfTimeSky.m2` is 21 batches; `order` is the index + 1.
+        let band: Vec<f32> = (0..=21).map(super::skybox_sort_bias).collect();
+
+        // 1. STRICTLY INCREASING — the whole point. At −6e4 the ordinary 1e-3 eps rounds every
+        //    one of these onto the same f32 and the sort tie the eps exists to break comes back.
+        for pair in band.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "skybox batch order does not resolve at the rung's magnitude: {pair:?} — \
+                 SKYBOX_ORDER_EPS is under the f32 ulp there"
+            );
+        }
+
+        // 2. ONE PIPELINE KEY for the whole band (0837's law: `StandardMaterialKey` packs
+        //    `depth_bias as i32`, so a band straddling an integer is a live compile per side).
+        //    Checked for ANY u16 order, not just the 21 real ones — the cap is what holds it.
+        let key = band[0] as i32;
+        for order in [0u16, 1, 21, 57, 58, 1000, u16::MAX] {
+            assert_eq!(
+                super::skybox_sort_bias(order) as i32,
+                key,
+                "batch order {order} mints a second skybox pipeline"
+            );
+        }
+
+        // 3. UNDER EVERY WORLD TRANSPARENT. The deepest a world draw can sort is the far-side
+        //    water rung plus a far-plane view-z; the skybox's own camera-anchored view-z (its
+        //    shell radius, ~94 yd for Caverns of Time) rides on top of the rung and must not
+        //    close the gap.
+        const FAR_PLANE: f32 = 3000.0;
+        const SHELL: f32 = 128.0;
+        let deepest_world = crate::sky_order::FAR_SIDE_BIAS - FAR_PLANE - super::FAR_KEY_PULL;
+        assert!(
+            band.last().unwrap() + SHELL < deepest_world,
+            "a skybox can sort in front of a world transparent — the painted sky would paint \
+             over it (sky_order::WMO_SKYBOX_BIAS)"
+        );
+
+        // 4. The rung is the SMALLEST job it can be, per `sky_order`'s "as small as its ordering
+        //    job allows": a magnitude an order over the world band is margin, two is drift.
+        const {
+            assert!(crate::sky_order::WMO_SKYBOX_BIAS > 10.0 * crate::sky_order::FAR_SIDE_BIAS);
+        }
     }
 
     /// The far-side twin is its source shifted exactly one water rung with the marker bit added —

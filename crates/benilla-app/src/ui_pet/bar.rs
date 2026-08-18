@@ -57,8 +57,8 @@ pub(super) struct PetBarMemory {
 ///
 /// Both are returned as **the names of globals**, not values — the reference's token convention.
 /// The name keys ship in `GlobalStrings.lua` (`PET_ACTION_ATTACK` = "Attack" at l.3029-3032); the
-/// texture globals are declared by `PetActionBar.xml`, quoting the reference's
-/// `PetActionBarFrame.lua:6-12` verbatim.
+/// texture globals are declared by `PetActionBar.xml` — our own code, under the names and with the
+/// art paths the reference's `PetActionBarFrame.lua:6-12` specifies (1260).
 pub(super) fn command_token(action: u32) -> Option<(&'static str, &'static str)> {
     Some(match action {
         PET_COMMAND_STAY => ("PET_ACTION_WAIT", "PET_WAIT_TEXTURE"),
@@ -268,11 +268,12 @@ pub(super) fn feed_pet_bar(
     clock: Res<crate::ui_script::UiClock>,
     index: Res<GuidIndex>,
     stores: Query<&ObjectStore>,
-    mut memory: Local<PetBarMemory>,
+    mut memory: Local<crate::ui_script::VmMemo<PetBarMemory>>,
 ) {
     let Some(mut script) = script else {
         return;
     };
+    let memory = memory.get(&script);
     let now = Instant::now();
     let (anchor, ui_now) = (clock.anchor, clock.ui_now);
     let has_bar = bar.has_bar();

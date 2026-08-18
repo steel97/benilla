@@ -227,6 +227,12 @@ pub(crate) struct DisplayModel {
     /// fallback's input (`0x608640`: a unit whose model has no PlayerName attachment anchors overhead
     /// text at `feet + scale × this × 1.25`). `0.0` for a bounds-less display.
     pub(super) bbox_z_local: f32,
+    /// The **Stand animation** box's z-extent (model-local yards, pre-scale) — the CHAT BUBBLE's
+    /// anchor height (`0x711a20`, wow-re 2026-08-17; 1406). Distinct from `bbox_z_local` above,
+    /// which is the all-animation vertex box, and from the posed PlayerName attachment the overhead
+    /// NAME uses: this one is a file constant, queried once and cached, so the bubble's height
+    /// cannot move with the pose. `0.0` for a bounds-less display.
+    pub(super) stand_box_z_local: f32,
     /// The M2 vertex-box CENTRE in Bevy model-local (pre-scale) — the interior fold's MOLR
     /// reference point for a GameObject's footprint bake (the byte-cited `[def+0x5c]` anchor
     /// family; `benilla_world::interior`). `Vec3::ZERO` for a bounds-less / WMO / model-less display.
@@ -255,6 +261,18 @@ impl DisplayModel {
         self.parts
             .as_ref()
             .is_some_and(|p| p.iter().any(|part| part.welded_billboard))
+    }
+
+    /// Does this display name a model FILE at all? The line between **"the model's own answer is
+    /// draw nothing"** and **"we could not resolve one"** — which are the same empty `parts` list
+    /// and must never be treated alike (decision 1403).
+    ///
+    /// `true` once a display resolved through its catalog to a path we handed the asset server;
+    /// `false` only for [`empty_display`] — a display id absent from `CreatureDisplayInfo` /
+    /// `GameObjectDisplayInfo`, a zero-scale row, or a GameObject display naming no path. That
+    /// second set is *our* gap, and the debug cube is how a session sees it.
+    pub(super) fn names_a_model(&self) -> bool {
+        !matches!(self.handle, ModelHandle::None)
     }
 }
 
@@ -329,6 +347,7 @@ pub(crate) fn empty_shell() -> DisplayModel {
         portrait_camera: None,
         pane_camera: None,
         bbox_z_local: 0.0,
+        stand_box_z_local: 0.0,
         bake_center_local: Vec3::ZERO,
         terrain_tilt: 0,
         is_character_body: false,
@@ -382,6 +401,7 @@ pub(super) fn build_parts(
     let mut portrait_camera = None;
     let mut pane_camera = None;
     let mut bbox_z_local = 0.0;
+    let mut stand_box_z_local = 0.0;
     let mut bake_center_local = Vec3::ZERO;
     let parts = match &dm.handle {
         ModelHandle::M2(h) => {
@@ -423,6 +443,9 @@ pub(super) fn build_parts(
             bbox_z_local = model
                 .bounds
                 .map_or(0.0, |b| (b.bbox_max[2] - b.bbox_min[2]).max(0.0));
+            // The chat bubble's anchor height — the STAND sequence box's Z, off the same parse the
+            // selection ring takes its XY from, so the two can never resolve different animations.
+            stand_box_z_local = model.bounds.map_or(0.0, |b| b.stand_box_z);
             // The vertex-box centre (Bevy local) — a GameObject's interior-fold reference point.
             bake_center_local = model.bounds.map_or(Vec3::ZERO, |b| {
                 benilla_assets::coords::wow_to_bevy([
@@ -572,6 +595,7 @@ pub(super) fn build_parts(
     dm.portrait_camera = portrait_camera;
     dm.pane_camera = pane_camera;
     dm.bbox_z_local = bbox_z_local;
+    dm.stand_box_z_local = stand_box_z_local;
     dm.bake_center_local = bake_center_local;
     dm.terrain_tilt = terrain_tilt;
 }
@@ -624,4 +648,49 @@ fn model_dir(model_path: &str) -> &str {
         .rsplit_once(['\\', '/'])
         .map(|(dir, _)| dir)
         .unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The line the attach path's debug cube hangs on (decision 1403, bug B13). Both sides of it
+    /// carry the SAME empty `parts` list once built, so the handle is the only thing that can tell
+    /// them apart: `empty_display` is a display that named no model — our gap, worth a cube —
+    /// while a display holding a real handle has been answered by its model, even when the answer
+    /// is "draw nothing" (the invisible trigger creatures).
+    #[test]
+    fn only_a_display_with_no_model_file_earns_the_cube() {
+        assert!(
+            !empty_display().names_a_model(),
+            "a display that resolved to no model must stay cube-eligible"
+        );
+        assert!(
+            !DisplayModel {
+                handle: ModelHandle::None,
+                parts: Some(Vec::new()),
+                ..empty_shell()
+            }
+            .names_a_model(),
+            "the handle decides, not the parts"
+        );
+        assert!(
+            DisplayModel {
+                handle: ModelHandle::M2(Handle::default()),
+                // Built, and it drew nothing — `InvisibleStalker.m2`'s zero batches. Not a cube.
+                parts: Some(Vec::new()),
+                ..empty_shell()
+            }
+            .names_a_model(),
+            "a display that named an M2 is answered by that model, empty parts included"
+        );
+        assert!(
+            DisplayModel {
+                handle: ModelHandle::Wmo(Handle::default()),
+                ..empty_shell()
+            }
+            .names_a_model(),
+            "a WMO display names a model too"
+        );
+    }
 }

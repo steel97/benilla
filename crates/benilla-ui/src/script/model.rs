@@ -4,16 +4,19 @@ use crate::layout::{LayoutInput, LayoutSolver, Rect};
 use crate::widget::{FrameHandle, RegionHandle, WidgetArena};
 
 use super::{
-    backdrop, bank, char_stats, container, craft, cursor, death, duel, follow, gossip, inspect,
-    item_text, loot, loot_roll, macros, mail, merchant, party, quest, quest_log, session, skills,
-    slider, social, spellbook, taxi, trade, tradeskill, trainer, weapon_enchant, ActionSlot,
-    AuraState, FontObject, ItemTemplateView, PlayerReqState, RegionData, ScriptValue, SoundRequest,
-    UnitState,
+    backdrop, bank, char_stats, container, craft, cursor, death, duel, follow, gossip, guild,
+    inspect, item_text, loot, loot_roll, macros, mail, merchant, party, quest, quest_log,
+    reputation, session, simplehtml, skills, slider, social, spellbook, taxi, trade, tradeskill,
+    trainer, weapon_enchant, ActionSlot, AuraState, FontObject, ItemTemplateView, PlayerReqState,
+    RegionData, ScriptValue, SoundRequest, UnitState,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // The Rust-side model (plain data; lives in lua.app_data)
 // ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The host's texture-path resolvability oracle — see [`Model::texture_probe`].
+pub type TextureProbe = Box<dyn Fn(&str) -> bool>;
 
 /// The Rust-side model behind the Lua VM — the arena, the layout inputs + resolved rects, the
 /// id↔handle bijection, region visuals, and the event/script registrations. Held in `lua.app_data`
@@ -24,6 +27,17 @@ pub(crate) struct Model {
     pub(crate) addons: Vec<super::addon::AddOnInfo>,
     /// The AddOns folder, so `LoadAddOn` can read an addon's files from inside a Lua binding.
     pub(crate) addons_root: Option<std::path::PathBuf>,
+    /// The host's font engine ([`super::UiScript::set_text_measurer`]) — what lets a metric read
+    /// answer inside the Lua call that asked, instead of a frame later. `None` in every VM without
+    /// a font atlas, which is the measure round-trip's own world and behaves exactly as it did.
+    pub(crate) measurer: Option<Box<dyn super::TextMeasure>>,
+    /// The host's texture-path oracle ([`super::UiScript::set_texture_probe`]): does this sprite
+    /// reference resolve to a file — patch chain or loose addon folder? What lets the path form of
+    /// `SetTexture` return the reference's **1 | nil** load verdict inline (wow-re
+    /// `widget-api-batch-benilla.md` Q1 — Atlas branches on it to pick its map art). `None` in an
+    /// engine-less VM (tests, the addon harness), where the path form keeps answering nil: no
+    /// backend, nothing loads — which is also exactly what those tests always saw.
+    pub(crate) texture_probe: Option<TextureProbe>,
     /// Where per-addon saved variables live: the account-scoped folder, then this character's.
     /// Both are directories holding one `<Addon>.lua` per declaring addon.
     pub(crate) addons_saved_account: Option<std::path::PathBuf>,
@@ -71,11 +85,46 @@ pub(crate) struct Model {
     /// change-gated — `tooltip::append_line`, and the gate
     /// `layout_gate::the_hover_re_enter_loop_neither_re_measures_nor_re_solves`.
     pub(crate) layout_epoch: u64,
-    /// The [`Self::layout_epoch`] value the last SETTLED resolve closed on — one whose
-    /// fingerprint matched, proving the input set (seeds included) has stopped moving. `None`
-    /// forces the next resolve through tier 1: the initial state, a cycle-bailed pass, and every
-    /// real solve (whose stored fingerprint answers for now-outgrown seeds — layout.rs, "Tier 1
-    /// closes ONLY on a settled frame").
+    /// [`Self::layout_epoch`]'s **precise** form: the nodes a write actually NAMED since the last
+    /// converged resolve — tier 1 promoted from "something moved" to "*these* moved" (decision
+    /// 1388).
+    ///
+    /// `Some(nodes)` carries a second, stronger claim than its contents: **every** write since the
+    /// cached graph was built named its node *and* left the graph's SHAPE alone, so
+    /// [`super::layout::LayoutScope`]'s roster, edges and per-node hashes still describe the live
+    /// model and a resolve may seed the dirty closure straight from this list. `None` is the
+    /// conservative state — a write that could not name its node, or one that moved the roster or
+    /// an anchor's TARGET — and forces the next resolve to derive the graph from scratch, which is
+    /// exactly what every resolve did before 1388.
+    ///
+    /// That asymmetry is the safety argument. A site that keeps calling plain
+    /// [`Model::touch_layout`] is *correct by construction* (it lands in `None`, i.e. today's
+    /// behaviour); only a site that opts into [`Model::touch_layout_region`] /
+    /// [`Model::touch_layout_frame`] can be wrong, and `WOW_LAYOUT_VERIFY` re-resolves every
+    /// incremental pass in full scope and compares rects, so being wrong fails a test rather than
+    /// shipping a stale one.
+    /// The list holds **layout ids**, not handles: the touch sites below already have to prove the
+    /// node is in the cached roster before they may name it, and that proof is a `node_of[id]`
+    /// probe — which hands back the roster row, and with it the handle, for free at resolve time.
+    pub(crate) layout_touched: Option<Vec<u32>>,
+    /// `WOW_LAYOUT_VERIFY`'s flag that the resolve just taken was the incremental one and owes a
+    /// full-derive re-run to prove it (see `layout::UiScript::resolve_layout`). Always `false` in
+    /// production — nothing reads it unless the verify build set it.
+    pub(crate) layout_verify_recheck: bool,
+    /// Per-node input hashes + the dirty-closure scratch — what makes a resolve cost the nodes
+    /// that MOVED rather than the whole graph (decision 1350; see `script::layout::LayoutScope`).
+    /// Tiers 1 and 2 above decide *whether* to solve; this decides *what*.
+    pub(crate) layout_scope: super::layout::LayoutScope,
+    /// The [`Self::layout_epoch`] value the last CONVERGED resolve closed on. `None` forces the
+    /// next resolve through tier 1: the initial state, a cycle-bailed pass, and
+    /// [`super::UiScript::force_full_layout_resolve`].
+    ///
+    /// **Every converged resolve closes tier 1** (decision 1385) — a real solve as much as a
+    /// skipping one. It could not, while the fingerprint was hashed over the 0294 seeds as well
+    /// as the inputs: a solve outgrew the value it had just stored, so a mutated frame paid three
+    /// whole-roster walks (solve, settle, skip) instead of one. Hashing inputs alone makes the
+    /// stored fingerprint exactly the one the next mutation-free resolve recomputes, so a
+    /// per-frame layout write — the castbar's spark, any addon that animates a region — costs one.
     pub(crate) layout_epoch_resolved: Option<u64>,
     /// How many times the change gate has LET A RESOLVE THROUGH. `UiScript::resolve` is called
     /// unconditionally every frame, so the gap between call count and this is the gate's whole
@@ -83,6 +132,44 @@ pub(crate) struct Model {
     /// merely producing the same rects. Counts the gate's decision, so it reads the same with the
     /// `WOW_LAYOUT_VERIFY` self-check on (which re-runs skipped resolves) as with it off.
     pub(crate) layout_solves: u64,
+    /// How many times a resolve got **past tier 1** — the count of whole-roster preamble WALKS
+    /// (decision 1385). This, not [`Self::layout_solves`], is the honest cost counter for the
+    /// gate: a walk that ends in `gate_skips` still rebuilt the ids/plan, re-synced every frame's
+    /// scale and re-hashed all ~10k anchored regions to conclude "nothing moved" — ~1.0 ms at the
+    /// Stormwind pin — and `layout_solves` cannot see it, because it counts only the walks that
+    /// went on to solve.
+    ///
+    /// The castbar pin is why it exists: one moving spark cost **three** walks per frame and only
+    /// two of them were solves, so the counter the tests asserted on under-reported the bug by a
+    /// third. `resolve_bench::a_region_moving_every_frame_costs_one_gate_walk_on_the_shipped_ui`
+    /// is the guard that reads it.
+    ///
+    /// **Unlike [`Self::layout_solves`], this is NOT verify-independent.** Under
+    /// `layout_verify_enabled` a tier-1-clean resolve falls through and walks anyway, so a verify
+    /// build counts walks production never pays — which is the honest reading (the walk happened)
+    /// but makes the number useless as an assertion there. Assert on it only from a crate that
+    /// consumes `benilla-ui` as a dependency, where `cfg!(test)` is false and the count is
+    /// production's; inside this crate's own tests, assert on `layout_solves`.
+    pub(crate) layout_gate_walks: u64,
+    /// How many times a resolve **derived the layout graph** — the whole-roster walk that rebuilds
+    /// the frame/region roster, the reverse edges and every per-node hash (decision 1388).
+    ///
+    /// This is the cost counter [`Self::layout_gate_walks`] used to be. 1385 got a moving castbar
+    /// spark down from three walks per frame to one; 1388 made that one walk *cheap* by seeding the
+    /// dirty closure from a ledger of named nodes instead of rediscovering it, so "walks" no longer
+    /// separates the 1.48 ms case from the 20 µs one and this does. A UI that animates anything
+    /// should hold this at **zero** frame after frame — a non-zero steady-state reading means some
+    /// write site is falling back to the conservative `touch_layout`, and that is the regression.
+    ///
+    /// Verify-independent in the direction that matters: the `WOW_LAYOUT_VERIFY` re-run's
+    /// derivation is counted, but `resolve_layout` restores the meter afterwards, so a test reads
+    /// the same number in both modes.
+    pub(crate) layout_derives: u64,
+    /// The SCOPE of the last solve that ran: `(frames solved, regions swept)` — decision 1350's
+    /// own meter, and the number its gate asserts on. `layout_solves` says how often the gate let
+    /// a solve through and `layout_rounds` how deep each went; this says how WIDE, which is the
+    /// axis that used to be "the whole UI" and is the one a growing UI silently inflates.
+    pub(crate) layout_last_scope: (usize, usize),
     /// How many fixpoint ROUNDS those solves ran in total. A solve's cost is rounds × the whole
     /// graph, so this is what separates "the gate let too much through" from "each pass is doing
     /// too much" — the two have different fixes.
@@ -101,10 +188,25 @@ pub(crate) struct Model {
     /// `SetBackdrop`). Absent ⇒ the frame draws no plate. Stored beside the arena like `region_data`
     /// (the arena models structure, not paint). The client's `frame+0x1ac` pointer.
     pub(crate) backdrops: HashMap<FrameHandle, backdrop::Backdrop>,
+    /// Per-`SimpleHTML` widget state (decision-free transcription of `CSimpleHTML`'s own members):
+    /// the four element fonts `+0x350`, the hyperlink format `+0x360`, and the CONTENTNODE list
+    /// `+0x340` of blocks the last `SetText` built. Stored beside the arena, like `backdrops`,
+    /// because its contents are script-layer types and `widget::kinds` is the layer below.
+    pub(crate) simple_html: simplehtml::SimpleHtmlStates,
     /// The named virtual **Font object** registry (`<Font name=…>` → resolved paint), keyed by name.
     /// Populated by the loader as it walks top-level `<Font>` nodes; read by `SetFontObject` and by
     /// FontString `inherits=` resolution. Data only — no Lua handles (MAXCSTACK discipline).
-    pub(crate) font_objects: HashMap<String, FontObject>,
+    /// The named `<Font>` objects, **keyed by the ASCII-LOWERCASED name**.
+    ///
+    /// 1.12's font registry hashes the name and compares keys with `SStrCmpI` — case-INSENSITIVE
+    /// (`0x783870`/`0x7838c7`, wow-re `system/ui/scratch/font-object-lua-surface.md`: *"Font names
+    /// are matched case-insensitively"*), and a name string handed to `SetFontObject` folds the
+    /// same way. `Recap/RecapOptions.xml:32` inherits `GameFontHighLightSmall` — the shipped font
+    /// is `GameFontHighlightSmall`, one letter's case apart — and on the real client that resolves.
+    ///
+    /// Read it through [`Model::font_object`], never directly: that is where the fold lives, and
+    /// the name says so because nothing else guards the invariant (1247's shape).
+    pub(crate) font_objects_by_lower: HashMap<String, FontObject>,
     /// The last [`UiScript::resolve`] result for **anchored** regions (those with a non-empty
     /// [`RegionData::anchors`]): the region's own resolved rect, owner-relative (see [`extract`]).
     /// Regions with no anchors are absent here — they fall to the size-centered / fill-owner path.
@@ -174,6 +276,14 @@ pub(crate) struct Model {
 
     /// Script errors collected from `pcall`'d handlers (never panics, never prints — decision 0068).
     pub(crate) errors: Vec<String>,
+    /// Script errors awaiting dispatch to the **Lua-side** error handler (decision 1305) — the
+    /// reference calls `geterrorhandler()`'s function on every caught script error, which is how
+    /// FrameXML's `_ERRORMESSAGE` puts the red ScriptErrors dialog on the player's screen. Every
+    /// message recorded through [`Model::record_script_error`] lands here as well as in `errors`;
+    /// [`super::UiScript::dispatch_script_errors_to_handler`] drains it at a safe seam (never from
+    /// inside the failed call). A message produced *by* the handler itself goes to `errors` only —
+    /// that asymmetry is the recursion guard.
+    pub(crate) pending_error_dispatch: Vec<String>,
     /// Non-fatal warnings surfaced to the host (e.g. `CreateFrame`'s ignored `inherits=` template).
     pub(crate) warnings: Vec<String>,
     /// The screen-root rect (`[bottom, left, top, right]`), the anchor base for top-level frames.
@@ -183,7 +293,19 @@ pub(crate) struct Model {
     /// …), read by the `Unit*` Lua bindings ([`unit`]). Plain data — the engine never touches the
     /// ECS/net; the app's feed writes here via [`UiScript::set_unit`] (decision 0068 §3). A token
     /// absent from the map is a non-existent unit (`UnitExists` false, numbers `0`/nil).
-    pub(crate) units: HashMap<String, UnitState>,
+    ///
+    /// **Keyed by the ASCII-LOWERCASED token, and the name says so because the invariant has no
+    /// other guard.** 1.12's shared token resolver `0x515970` compares every literal with
+    /// `SStrCmpI` → `_strnicmp`, which folds `'A'..'Z'` by `+0x20`; not one of its ten compares
+    /// reaches the case-sensitive sibling. So `"Player"`, `"PLAYER"` and `"player"` are the same
+    /// unit on the real client, and ~10 corpus addons rely on it — `Accountant.lua:107`'s
+    /// `UnitFactionGroup("Player")` is the one that cost an addon its session.
+    ///
+    /// Read it through [`Model::unit`], never directly: that is where the fold lives. The field was
+    /// called `units` until the fold landed, and it was renamed precisely so that every existing
+    /// reader had to come through here rather than be trusted to remember (wow-re
+    /// `system/ui/scratch/unit-token-grammar.md`).
+    pub(crate) units_by_lower: HashMap<String, UnitState>,
     /// Per-unit-token aura list, **in display order**, pushed by the app's aura feed each frame and
     /// read by the `UnitAura` family ([`super::aura`]). The order is the app's decision, not the
     /// engine's: the local player's is a maintained insertion-order cache, every other unit's is
@@ -224,7 +346,7 @@ pub(crate) struct Model {
     /// The channels this session has CONFIRMED joining, in join order — the client-side number
     /// law `GetChannelName` answers with ([`super::channel`]). Mirrored from `ui_chat`'s
     /// `ChannelState` by `set_joined_channels`; empty until the server's first YOU_JOINED.
-    pub(crate) joined_channels: Vec<String>,
+    pub(crate) joined_channels: Vec<Option<String>>,
     pub(crate) party: party::PartyState,
     /// Party/loot intents (`AcceptGroup`/`InviteToParty`/`SetLootMethod`/…) queued since the
     /// app's last [`super::UiScript::take_party_requests`] drain — the outbound seam ([`party`]).
@@ -237,6 +359,19 @@ pub(crate) struct Model {
     /// Social intents (`AddFriend`/`RemoveFriend`/`SendWho`/…) queued since the app's last
     /// [`super::UiScript::take_social_requests`] drain — the outbound seam ([`social`]).
     pub(crate) social_requests: Vec<social::SocialRequest>,
+    /// The guild snapshot the app pushes (roster, ranks, MOTD, info text — decision 1257):
+    /// `GetNumGuildMembers`/`GetGuildRosterInfo`/`GuildControlGetRankFlags`/… read it
+    /// ([`guild`]). Already display-resolved and already sorted + filtered, because the sort
+    /// field and the show-offline toggle live app-side where the roster does.
+    pub(crate) guild: guild::GuildState,
+    /// The rank-control popup's staging buffer ([`guild::GuildRankEdit`]) — deliberately NOT part
+    /// of [`Self::guild`], because a snapshot push mid-edit would discard the user's unsaved
+    /// checkbox clicks. Flushed by `GuildControlSaveRank`.
+    pub(crate) guild_control: guild::GuildRankEdit,
+    /// Guild intents (`GuildInviteByName`/`GuildSetMOTD`/`GuildControlSaveRank`/…) queued since
+    /// the app's last [`super::UiScript::take_guild_requests`] drain — the outbound seam
+    /// ([`guild`]).
+    pub(crate) guild_requests: Vec<guild::GuildRequest>,
     /// Whisper targets `ChatFrame_SendTell` queued since the app's last
     /// [`super::UiScript::take_tell_requests`] drain — the app opens its chat edit box prefilled
     /// `/w <name> ` (the unit popup's WHISPER action; [`party`] registers the global).
@@ -276,6 +411,13 @@ pub(crate) struct Model {
     /// The CVar table (decision 0954, [`super::cvars`]): lowercase name → slot. Host-registered
     /// only; Lua reads/writes through `GetCVar`/`SetCVar`/`GetCVarDefault`.
     pub(crate) cvars: HashMap<String, super::cvars::CvarSlot>,
+    /// The persisted values registration honors (decision 1291): lowercase name → the config
+    /// file's value, set by the host **before** any registration. A CVar registered while its
+    /// name is in here — host-registered or an addon's `RegisterCVar` — starts at the saved
+    /// value, not the default. This is what makes a knobless CVar (`statusBarText`) and an
+    /// addon-declared one survive the VM being replaced: in the reference the table is engine
+    /// memory and outlives every `ReloadUI`; ours is per-VM, so the file value is the bridge.
+    pub(crate) cvars_saved_base: HashMap<String, String>,
     /// `(registered name, new value)` per Lua `SetCVar` since the app's last
     /// [`super::UiScript::take_cvar_changes`] drain — the knob-sync + config-dirty cue.
     pub(crate) cvar_changes: Vec<(String, String)>,
@@ -523,6 +665,9 @@ pub(crate) struct Model {
     /// with nothing moving, and a move outlives the mouse button (the reference's mouse-up
     /// auto-stop skips the Lua drag type).
     pub(crate) moving: Option<super::object::FrameMove>,
+    /// The in-flight `StartSizing` drag — the resize twin of [`Self::moving`], cleared by the same
+    /// `StopMovingOrSizing` (`0x776990`).
+    pub(crate) sizing: Option<super::object::FrameSizing>,
     /// The in-flight Slider thumb drag: set when a LeftButton press lands on a Slider's thumb, held
     /// until release / pointer-leave (decision 0250 §5, the engine's C++-equivalent thumb drag —
     /// like a scrollbar dragging in the real client, no Lua involved). `None` between drags
@@ -880,6 +1025,24 @@ pub(crate) struct Model {
     /// server's skill-field update, vmangos `SkillHandler.cpp`'s `SetSkill(id, 0, 0)` round trip).
     pub(crate) skill_abandons: Vec<u32>,
 
+    /// The reputation-pane snapshot the app pushes ([`reputation::ReputationState`]) and the
+    /// synthesized display tree built from it ([`reputation::UiScript::set_reputation`]) — the
+    /// reputation seam ([`reputation`]).
+    pub(crate) reputation: reputation::ReputationState,
+    pub(crate) reputation_groups: Vec<reputation::FactionGroup>,
+    /// The header groups the player has folded, by HEADER KEY (a `Faction.dbc` id, or the
+    /// synthetic `0` "Other" / `-1` "Inactive") — an identity a re-push cannot move, unlike a row
+    /// index. Reset to all-expanded-but-Inactive on every push, exactly as
+    /// [`Model::skills_collapsed`] is: the client's own rebuild does the same.
+    pub(crate) reputation_collapsed: HashSet<i64>,
+    /// The engine-held selection, by REPUTATION-LIST SLOT (not visible index — see
+    /// [`reputation`]'s module doc).
+    pub(crate) reputation_selected: Option<u32>,
+    /// Reputation verbs the pane's bindings queued since the app's last
+    /// [`UiScript::take_reputation_sends`] drain — the outbound seam. Unlike the skills abandon
+    /// above, the engine DOES mutate locally first: none of the three sends is acked.
+    pub(crate) reputation_sends: Vec<reputation::ReputationSend>,
+
     /// Chat lines the input EditBox submitted (its `OnEnterPressed` → the `SubmitChatInput` Lua
     /// binding) since the app's last [`UiScript::take_chat_input`] drain — the outbound Lua→app seam
     /// for the chat input (the twin of `loot_picks`). The app routes each through its slash-command
@@ -907,7 +1070,32 @@ pub(crate) struct Model {
     /// (decision 1199). Deliberately a different queue from the chat box's input: the box's drain
     /// runs the slash grammar and this one must not.
     pub(crate) chat_sends: Vec<super::chat_send::ChatSend>,
+    /// Broadcasts an addon queued with `SendAddonMessage`, drained by the app into the wire
+    /// (decision 1235). Its own queue rather than [`Self::chat_sends`] because it is a different
+    /// wire: `LANG_ADDON` in the language field, a four-value distribution set, and a payload the
+    /// binding already composed as `prefix` TAB `message`.
+    pub(crate) addon_sends: Vec<super::addon_message::AddonSend>,
+    /// `RequestTimePlayed()` asks queued since the app last drained them — each is one
+    /// `CMSG_PLAYED_TIME`. A COUNT, not a payload, for [`super::pvp`]'s reason: the packet is
+    /// empty, so two asks in a frame are two sends rather than one collapsed intent.
+    pub(crate) played_time_asks: u32,
     pub(crate) realm_name: String,
+    /// The hearthstone bind location's NAME, behind `GetBindLocation()` — the app resolves the
+    /// `SMSG_BINDPOINTUPDATE` area id through the same AreaTable catalog the hearthstone's `$z`
+    /// token already uses, and pushes the resolved string here.
+    ///
+    /// Empty only before that packet has landed — `""`, never nil, matching [`Self::realm_name`]
+    /// beside it: a consumer concatenates this (`Necrosis.lua:1089`), so nil would be a raise.
+    pub(crate) bind_location: String,
+    /// `ConfirmBinder()` calls queued since the app last drained them — each is one
+    /// `CMSG_BINDER_ACTIVATE`. A COUNT for [`Self::played_time_asks`]'s reason: the intent carries
+    /// no payload (the app holds the innkeeper's guid), so two calls are two sends.
+    pub(crate) binder_confirms: u32,
+    /// Is an innkeeper's bind question still live and in range — the answer `CheckBinderDist()`
+    /// gives, pushed by the app each frame ([`super::UiScript::set_binder_pending`]). The
+    /// CONFIRM_BINDER dialog polls it from OnUpdate and hides itself when it goes false, which is
+    /// how walking away from the innkeeper takes the question off screen (decision 1331).
+    pub(crate) binder_pending: bool,
     /// Frames per second, behind `GetFramerate()`. Pushed per tick by the app, which owns the
     /// clock this crate does not have.
     pub(crate) framerate: f64,
@@ -918,10 +1106,51 @@ pub(crate) struct Model {
 }
 
 impl Model {
+    /// A unit token's snapshot, **case-folded the way the client folds it**.
+    ///
+    /// 1.12's resolver `0x515970` compares each of its literals with `SStrCmpI` → `_strnicmp`,
+    /// whose fold is `'A'..'Z' += 0x20` and nothing else: the `jb`/`ja` bounds are unsigned, so a
+    /// byte ≥ 0x80 is never folded. `to_ascii_lowercase` is exactly that rule, and the reason this
+    /// does not use `to_lowercase()` — a locale-aware fold would map bytes the client leaves alone.
+    ///
+    /// The uppercase scan is a fast path, not an optimisation for its own sake: every internal
+    /// caller passes a lowercase literal (`"player"`, `"target"`), so the common case allocates
+    /// nothing and only an addon's `"Player"` pays for a `String`.
+    /// A named font object, **case-folded the way the client folds it** — `SStrCmpI` over the font
+    /// registry's keys. ASCII only, and the uppercase scan is a fast path: every internal caller
+    /// passes an exact shipped name, so only an addon's odd spelling pays for a `String`.
+    pub(crate) fn font_object(&self, name: &str) -> Option<&FontObject> {
+        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.font_objects_by_lower.get(&name.to_ascii_lowercase())
+        } else {
+            self.font_objects_by_lower.get(name)
+        }
+    }
+
+    /// Record one script error on **both** channels: the host's `errors` vec (the instruments'
+    /// channel — the harness blocker tables, the app's log drain) and the handler-dispatch queue
+    /// (the player's channel — decision 1305). Every engine-caught script error goes through here;
+    /// a failure raised by the error handler *itself* is pushed to `errors` directly instead,
+    /// which is what keeps the dispatch from recursing.
+    pub(crate) fn record_script_error(&mut self, msg: String) {
+        self.pending_error_dispatch.push(msg.clone());
+        self.errors.push(msg);
+    }
+
+    pub(crate) fn unit(&self, token: &str) -> Option<&UnitState> {
+        if token.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.units_by_lower.get(&token.to_ascii_lowercase())
+        } else {
+            self.units_by_lower.get(token)
+        }
+    }
+
     pub(crate) fn new() -> Model {
         Model {
             addons: Vec::new(),
             addons_root: None,
+            measurer: None,
+            texture_probe: None,
             addons_saved_account: None,
             addons_saved_character: None,
             framexml_templates: Default::default(),
@@ -931,15 +1160,22 @@ impl Model {
             solver: LayoutSolver::new(),
             layout_fingerprint: None,
             layout_epoch: 0,
+            layout_touched: None,
+            layout_verify_recheck: false,
+            layout_derives: 0,
+            layout_scope: super::layout::LayoutScope::default(),
+            layout_last_scope: (0, 0),
             layout_epoch_resolved: None,
             layout_solves: 0,
+            layout_gate_walks: 0,
             layout_rounds: 0,
             resolved: HashMap::new(),
             link_spans: HashMap::new(),
             chat_tab: false,
             region_data: HashMap::new(),
             backdrops: HashMap::new(),
-            font_objects: HashMap::new(),
+            simple_html: simplehtml::SimpleHtmlStates::new(),
+            font_objects_by_lower: HashMap::new(),
             region_resolved: HashMap::new(),
             next_id: 1,
             id_to_frame: HashMap::new(),
@@ -956,11 +1192,12 @@ impl Model {
             last_click: HashMap::new(),
             pending_size_changed: Vec::new(),
             errors: Vec::new(),
+            pending_error_dispatch: Vec::new(),
             warnings: Vec::new(),
             // Classic Era's UIParent virtual space is 1024×768-ish; a sensible default the host can
             // override with `set_screen_size`. y-up: [bottom, left, top, right].
             screen: Rect::new(0.0, 0.0, 768.0, 1024.0),
-            units: HashMap::new(),
+            units_by_lower: HashMap::new(),
             auras: HashMap::new(),
             cancel_aura_requests: Vec::new(),
             tracking: None,
@@ -973,6 +1210,9 @@ impl Model {
             party_requests: Vec::new(),
             social: social::SocialState::default(),
             social_requests: Vec::new(),
+            guild: guild::GuildState::default(),
+            guild_control: guild::GuildRankEdit::default(),
+            guild_requests: Vec::new(),
             tell_requests: Vec::new(),
             open_chat_requests: Vec::new(),
             default_language: None,
@@ -982,6 +1222,7 @@ impl Model {
             pvp_toggles: 0,
             sound_queue: Vec::new(),
             cvars: HashMap::new(),
+            cvars_saved_base: HashMap::new(),
             cvar_changes: Vec::new(),
             cvars_warned: HashSet::new(),
             saved_names: Vec::new(),
@@ -1038,6 +1279,7 @@ impl Model {
             drag_registered: HashMap::new(),
             drag: None,
             moving: None,
+            sizing: None,
             slider_drag: None,
             gossip: None,
             gossip_selects: Vec::new(),
@@ -1130,7 +1372,12 @@ impl Model {
             pending_events: Vec::new(),
             cursor_pos: (0.0, 0.0),
             chat_sends: Vec::new(),
+            addon_sends: Vec::new(),
+            played_time_asks: 0,
             realm_name: String::new(),
+            bind_location: String::new(),
+            binder_confirms: 0,
+            binder_pending: false,
             framerate: 0.0,
             modifiers: (false, false, false),
             money: 0,
@@ -1172,6 +1419,11 @@ impl Model {
             skills_collapsed: HashSet::new(),
             skills_selected: None,
             skill_abandons: Vec::new(),
+            reputation: reputation::ReputationState::default(),
+            reputation_groups: Vec::new(),
+            reputation_collapsed: HashSet::new(),
+            reputation_selected: None,
+            reputation_sends: Vec::new(),
         }
     }
 
@@ -1215,6 +1467,129 @@ impl Model {
     /// exactly the failure `WOW_LAYOUT_VERIFY` (on for every benilla-ui test) exists to catch
     /// loudly, by proving the fingerprint still matches whenever tier 1 claims quiet.
     pub(crate) fn touch_layout(&mut self) {
+        // The conservative half of the tier-1 ledger (decision 1388): this write did not name a
+        // node, so the cached graph can no longer be trusted to describe the live model and the
+        // next resolve must derive it in full. Every site that has NOT been migrated to a precise
+        // touch lands here, which is why migration can be incremental and a missed one is slow
+        // rather than wrong.
+        self.layout_touched = None;
+        self.bump_layout_epoch();
+    }
+
+    /// A write that moved **one region's** layout inputs and changed nothing else about the graph:
+    /// its anchor OFFSETS, its explicit size, its measured extent. Not its anchor targets, not its
+    /// membership, not its liveness — those move edges or the roster, and belong on
+    /// [`Self::touch_layout`].
+    ///
+    /// Falls back to the conservative touch whenever it cannot prove the region is a node of the
+    /// **cached** graph: no minted id, an id past the roster's arrays, or an id the last derive
+    /// left unmapped (an anchor-less region, a region born since). That fallback is what makes the
+    /// call safe to reach for — the worst a mistaken one can do is derive the graph again.
+    pub(crate) fn touch_layout_region(&mut self, rh: RegionHandle) {
+        match self.region_to_id.get(&rh) {
+            Some(&id) => self.touch_layout_node(id),
+            None => self.touch_layout(),
+        }
+    }
+
+    /// [`Self::touch_layout_region`]'s frame twin — an anchor offset, a width/height, and nothing
+    /// that moves an edge or the roster.
+    pub(crate) fn touch_layout_frame(&mut self, h: FrameHandle) {
+        match self.frame_to_id.get(&h) {
+            Some(&id) => self.touch_layout_node(id),
+            None => self.touch_layout(),
+        }
+    }
+
+    /// Name a node **without opening tier 1** — for the resolve's own pre-pass
+    /// (`tooltip::layout_tooltips`), which writes layout inputs derived from state that already
+    /// arrived through touched paths.
+    ///
+    /// It deliberately does not call [`Self::touch_layout`]: bumping the epoch from inside a
+    /// resolve would pin the gate open forever (the pre-pass runs on every let-through resolve, so
+    /// it would re-dirty the very resolve it is running in). But the ledger still has to hear about
+    /// it, or an incremental pass would inherit a node whose hash the pre-pass moved and no write
+    /// site named — the one shape that could ship a stale rect. Naming it is free: the hash it
+    /// recomputes is unchanged on the frames the pre-pass writes idempotently, which is nearly all
+    /// of them, so no dirty seed comes of it.
+    pub(crate) fn note_layout_frame_write(&mut self, h: FrameHandle) {
+        if self.layout_touched.is_some() {
+            match self.frame_to_id.get(&h) {
+                Some(&id) if self.layout_scope.has_node(id) => {
+                    self.layout_touched
+                        .as_mut()
+                        .expect("checked above")
+                        .push(id);
+                }
+                _ => self.layout_touched = None,
+            }
+        }
+    }
+
+    /// [`Self::note_layout_frame_write`]'s region twin.
+    pub(crate) fn note_layout_region_write(&mut self, rh: RegionHandle) {
+        if self.layout_touched.is_some() {
+            match self.region_to_id.get(&rh) {
+                Some(&id) if self.layout_scope.has_node(id) => {
+                    self.layout_touched
+                        .as_mut()
+                        .expect("checked above")
+                        .push(id);
+                }
+                _ => self.layout_touched = None,
+            }
+        }
+    }
+
+    /// Name `id` as the only thing this write moved — if the cached graph has a node for it and no
+    /// earlier write in this frame already gave up on naming.
+    fn touch_layout_node(&mut self, id: u32) {
+        let in_graph = self.layout_scope.has_node(id);
+        match &mut self.layout_touched {
+            // Already conservative: a precise touch cannot un-say an imprecise one.
+            None => {}
+            Some(_) if !in_graph => self.layout_touched = None,
+            Some(list) => list.push(id),
+        }
+        self.bump_layout_epoch();
+    }
+
+    /// Tier 1's counter, shared by every touch above. Bumping it is what re-opens the gate; which
+    /// of [`Self::layout_touched`]'s two states the caller leaves behind is what decides how much
+    /// the re-opened resolve has to derive.
+    fn bump_layout_epoch(&mut self) {
         self.layout_epoch = self.layout_epoch.wrapping_add(1);
+        // `WOW_LAYOUT_TOUCH_TRACE=<n>` — name the epoch's per-frame toucher: print a backtrace
+        // for the first n touches (a mechanism probe, meaningful in a debuginfo build). Built
+        // because the SW meters read `resolve≈240 µs, solves=0` on every steady frame: the
+        // tier-1 gate is being defeated by a toucher whose writes never move a fingerprint,
+        // and 48 call sites is too many to tag by hand.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::OnceLock;
+        // Spec `<secs>:<n>`: arm after `secs` (past UI load + settle, so the trace names the
+        // STEADY toucher, not the thousands of legitimate load-time touches), then print `n`.
+        static SPEC: OnceLock<Option<(std::time::Instant, f64, AtomicU32)>> = OnceLock::new();
+        let spec = SPEC.get_or_init(|| {
+            let v = std::env::var("WOW_LAYOUT_TOUCH_TRACE").ok()?;
+            let (secs, n) = v.split_once(':')?;
+            Some((
+                std::time::Instant::now(),
+                secs.trim().parse().ok()?,
+                AtomicU32::new(n.trim().parse().ok()?),
+            ))
+        });
+        if let Some((t0, delay, left)) = spec {
+            if t0.elapsed().as_secs_f64() >= *delay
+                && left
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+                    .is_ok()
+            {
+                eprintln!(
+                    "[layout-touch] epoch={} at:\n{}",
+                    self.layout_epoch,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
     }
 }

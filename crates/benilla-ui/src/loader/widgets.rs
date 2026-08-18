@@ -2,7 +2,7 @@ use mlua::{ObjectLike, Table};
 
 use crate::framexml::{self, Element};
 
-use super::{children_named, color_of, tex_coords_of, Loader};
+use super::{abs_dim, abs_value, children_named, color_of, tex_coords_of, Loader};
 
 impl Loader<'_> {
     /// `<StatusBar>` LoadXML extras (RF-28, byte-verified table `0x782ef0`): `minValue`/`maxValue`
@@ -110,7 +110,20 @@ impl Loader<'_> {
                     if let Some(mode) = t.attr("alphaMode") {
                         this.call_region(&region, "SetBlendMode", mode.to_string(), dbg);
                     }
+                    // The setter above MATERIALIZED the region with the runtime path's implicit
+                    // SetAllPoints (decision 1310) — but this is the XML path, where the real
+                    // engine routes state textures through the region adder (`0x778903`…: authored
+                    // `<Anchors>` first, the implicit step after). Reproduce that order: clear,
+                    // apply the authored layout, then re-run the conditional step — a same-point
+                    // SetPoint over a live implicit corner would otherwise leave the OTHER corner
+                    // standing (the slot law) and weld an anchored state texture to the button.
+                    this.call_region(&region, "ClearAllPoints", (), dbg);
                     this.apply_region_layout(t, &region, self_name, dbg);
+                    if let Err(e) = crate::script::implicit_creation_anchor_lua(this.lua, &region) {
+                        this.report
+                            .errors
+                            .push(format!("{dbg}: implicit anchor: {e}"));
+                    }
                     if let Some(tc) = tex_coords_of(t) {
                         this.call_region(&region, "SetTexCoord", tc, dbg);
                     }
@@ -155,7 +168,18 @@ impl Loader<'_> {
             };
             self.call(wrapper, "SetText", label, dbg);
             if let Ok(region) = wrapper.call_method::<Table>("GetFontString", ()) {
+                // Same clear→layout→implicit order as the state textures above (decision 1310):
+                // SetText materialized the label with the runtime path's implicit CENTER anchor;
+                // the XML path re-derives it AFTER the element's own `<Anchors>`/justify apply
+                // (so a `<ButtonText justifyH="LEFT">` with no anchors seats LEFT, as the real
+                // FontString post-step `0x771480` would).
+                self.call_region(&region, "ClearAllPoints", (), dbg);
                 self.apply_region_layout(bt, &region, self_name, dbg);
+                if let Err(e) = crate::script::implicit_creation_anchor_lua(self.lua, &region) {
+                    self.report
+                        .errors
+                        .push(format!("{dbg}: implicit anchor: {e}"));
+                }
                 // Publish the label under its resolved name (`<ButtonText name="$parentText">`) —
                 // the ref kit addresses tab/button labels by exactly this global
                 // (PanelTemplates_TabResize's `getglobal(tabName.."Text")`).
@@ -183,8 +207,26 @@ impl Loader<'_> {
             ("DisabledFont", "SetDisabledFontObject"),
         ] {
             for f in children_named(el, child) {
-                if let Some(name) = f.attr("inherits") {
-                    self.call(wrapper, method, name.to_string(), dbg);
+                // These three are `<Font>`-TYPED elements — `CSimpleButton::LoadXML 0x7788c0`
+                // routes them at `0x778bf4` into the SAME `0x783c30` a top-level `<Font>` uses — so
+                // they take `inherits=` and `font=` alike, and `font=` wins: both land in one slot
+                // and `0x770c60` unlinks the previous parent (wow-re
+                // `fontstring-loadxml-font-attrs.md` C5; `font=`'s registry-first path is
+                // `0x783d15` → `0x783d22 call 0x770c60` → `0x783d27 jmp 0x783ee0`).
+                //
+                // Reading only `inherits=` here left every corpus button that writes `font=` on its
+                // own default font — Bagnon writes it at seven sites, which is why its character
+                // list's names and its "Show Bags" label were not the Large/normal faces they ask
+                // for. Real FrameXML always writes `inherits=`, so nothing we ship noticed.
+                //
+                // `style=` is deliberately NOT read: it does not exist in 1.12.1. An isolated-token
+                // scan for it returns zero against nine controls that each return one — it is a
+                // later-client idiom, and the reference writes `<NormalFont inherits="GameFontNormal"/>`
+                // (`UIPanelTemplates.xml:20-22`).
+                for attr in ["inherits", "font"] {
+                    if let Some(name) = f.attr(attr) {
+                        self.call(wrapper, method, name.to_string(), dbg);
+                    }
                 }
                 // An element-level justify (`<NormalFont inherits="QuestFont" justifyH="LEFT"/>`)
                 // lands on the label region itself — v1: one region-level set (the ref declares
@@ -391,6 +433,132 @@ impl Loader<'_> {
                     }
                 }
             }
+        }
+    }
+
+    /// `<SimpleHTML>` LoadXML extras — `CSimpleHTML::LoadXML 0x78a130`, whose whole job past the
+    /// base `CSimpleFrame::LoadXML 0x769820` is to fill the four **element fonts** and the
+    /// hyperlink format (wow-re `simplehtml-markup-engine.md` §5.5):
+    ///
+    /// - attribute **`font="NAME"`** (`0x78a152`) — looked up as a font object and `SetFontObject`ed
+    ///   onto **all four** elements at once (the `edi = 4` loop at `0x78a17a`), with
+    ///   `"Couldn't find font object named %s"` on a miss.
+    /// - child **`<FontString>`** → `elementFont[0]` (`P`), **`<FontStringHeader1|2|3>`** →
+    ///   `[1]`/`[2]`/`[3]` (`0x78a1fe`…`0x78a26e`), each through `CSimpleFont::LoadXML 0x783c30`.
+    /// - attribute **`hyperlinkFormat`** (`0x87a87c` → `0x78a540`) and attribute **`file`**
+    ///   (`0x8710b8`), the latter a localized-string lookup fed straight to `SetText`.
+    ///
+    /// **These `<FontString>` children are font DECLARATIONS, not regions**, which is why
+    /// [`Self::apply_special_fontstrings`] skips a `<SimpleHTML>`: creating a real FontString for
+    /// one would put an extra, unanchored string on the frame and leave the element font empty.
+    ///
+    /// Stock `ItemTextFrame.xml` declares exactly one `<FontString inherits="ItemTextFontNormal"/>`,
+    /// which is the whole reason an `<H1>` in a `page_text` body renders at the `<P>` size: nothing
+    /// declares a header font, so `0x78ae30`'s empty-path test sends every element back to `P`'s.
+    pub(super) fn apply_simplehtml(&mut self, el: &Element, wrapper: &Table, dbg: &str) {
+        if !el.tag.eq_ignore_ascii_case("SimpleHTML") {
+            return;
+        }
+        if let Some(fmt) = el.attr("hyperlinkFormat") {
+            self.call(wrapper, "SetHyperlinkFormat", fmt.to_string(), dbg);
+        }
+        // `font=` on the widget itself paints all four elements; a per-element child below can
+        // still override any of them, exactly as the reference's ordering allows.
+        if let Some(name) = el.attr("font").filter(|n| !n.is_empty()) {
+            if self.is_font_object(name) {
+                for elem in ["P", "H1", "H2", "H3"] {
+                    self.call(wrapper, "SetFontObject", (elem, name.to_string()), dbg);
+                }
+            } else {
+                self.warn_once(
+                    &format!("shtmlfont:{name}"),
+                    format!("{dbg}: <SimpleHTML font=\"{name}\">: couldn't find font object"),
+                );
+            }
+        }
+        for child in &el.children {
+            let Some(elem) = crate::script::simplehtml_element_of_xml_tag(&child.tag) else {
+                continue; // <Size>/<Anchors>/<Scripts>/<Layers>/... have their own passes
+            };
+            let child = &self.expand_region(child);
+            self.apply_element_font(child, wrapper, elem, dbg);
+        }
+        if let Some(raw) = el.attr("file") {
+            let text = self.resolve_text(raw, dbg);
+            self.call(wrapper, "SetText", text, dbg);
+        }
+    }
+
+    /// One `<FontString>`/`<FontStringHeaderN>` child of a `<SimpleHTML>` → one element font.
+    ///
+    /// The `inherits=` → `font=` gate is the same three-outcome law a `<Layers>` `<FontString>`
+    /// takes ([`Self::apply_fontstring_font`], `0x7710e1`-`0x771254`): a `font=` naming a registered
+    /// object is a `SetFontObject` and **skips** `<FontHeight>`/`outline=` entirely; a `font=`
+    /// naming anything else is a file with those two as its companions; no `font=` at all means
+    /// neither is ever parsed. Only `<Color>`/`<Shadow>`/`justifyH`/`justifyV`/`spacing` sit past
+    /// that join and are genuine post-link overrides.
+    fn apply_element_font(&mut self, el: &Element, wrapper: &Table, elem: usize, dbg: &str) {
+        let name = ["P", "H1", "H2", "H3"][elem];
+        if let Some(inherits) = el.attr("inherits").filter(|n| !n.is_empty()) {
+            let resolved = self
+                .font_object_through_templates(inherits)
+                .unwrap_or_else(|| inherits.to_string());
+            self.call(wrapper, "SetFontObject", (name, resolved), dbg);
+        }
+        match el.attr("font") {
+            Some(f) if self.is_font_object(f) => {
+                self.call(wrapper, "SetFontObject", (name, f.to_string()), dbg);
+            }
+            Some(path) => {
+                let height = children_named(el, "FontHeight").last().and_then(abs_value);
+                let outline = el.attr("outline").map(str::to_string);
+                if let Err(e) = crate::script::apply_simplehtml_font_parts(
+                    self.lua,
+                    wrapper,
+                    elem,
+                    Some(path.to_string()),
+                    height,
+                    outline,
+                ) {
+                    self.report
+                        .errors
+                        .push(format!("{dbg}: <SimpleHTML> {name} font attrs: {e}"));
+                }
+            }
+            None => {}
+        }
+        if let Some(c) = children_named(el, "Color").last().map(color_of) {
+            self.call(wrapper, "SetTextColor", (name, c[0], c[1], c[2], c[3]), dbg);
+        }
+        if let Some(sh) = children_named(el, "Shadow").last() {
+            if let Some(c) = children_named(sh, "Color").next().map(color_of) {
+                self.call(
+                    wrapper,
+                    "SetShadowColor",
+                    (name, c[0], c[1], c[2], c[3]),
+                    dbg,
+                );
+            }
+            if let Some((x, y)) = children_named(sh, "Offset").next().map(abs_dim) {
+                self.call(
+                    wrapper,
+                    "SetShadowOffset",
+                    (name, x.unwrap_or(0.0), y.unwrap_or(0.0)),
+                    dbg,
+                );
+            }
+        }
+        if let Some(j) = el.attr("justifyH") {
+            self.call(wrapper, "SetJustifyH", (name, j.to_string()), dbg);
+        }
+        if let Some(j) = el.attr("justifyV") {
+            self.call(wrapper, "SetJustifyV", (name, j.to_string()), dbg);
+        }
+        if let Some(sp) = el
+            .attr("spacing")
+            .and_then(|v| v.trim().parse::<f32>().ok())
+        {
+            self.call(wrapper, "SetSpacing", (name, sp), dbg);
         }
     }
 }

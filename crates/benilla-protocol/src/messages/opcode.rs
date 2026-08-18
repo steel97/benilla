@@ -56,7 +56,17 @@ pub const SMSG_TRIGGER_CINEMATIC: u16 = 0x00FA;
 pub const CMSG_COMPLETE_CINEMATIC: u16 = 0x00FC;
 pub const SMSG_MONSTER_MOVE: u16 = 0x00DD;
 pub const SMSG_INITIALIZE_FACTIONS: u16 = 0x0122;
+/// A faction became visible in the reputation pane (VERIFIED vmangos `Opcodes_1_12_1.h`: 291,
+/// sender `ReputationMgr::SendVisible`) — body one `u32` reputation-list slot. The server sets the
+/// slot's `FACTION_FLAG_VISIBLE` on first contact and pushes *only* this, never a fresh standing:
+/// a client that ignores it keeps a correct standing on a row the pane refuses to list.
+pub const SMSG_SET_FACTION_VISIBLE: u16 = 0x0123;
 pub const SMSG_SET_FACTION_STANDING: u16 = 0x0124;
+/// The reputation pane's three send verbs (VERIFIED vmangos `Opcodes.cpp`'s `DEFINE_HANDLER`
+/// registrations: 293, 791, 792). Bodies in [`super::reputation`]; none is acked.
+pub const CMSG_SET_FACTION_ATWAR: u16 = 0x0125; // 293
+pub const CMSG_SET_FACTION_INACTIVE: u16 = 0x0317; // 791
+pub const CMSG_SET_WATCHED_FACTION: u16 = 0x0318; // 792
 pub const SMSG_AUTH_CHALLENGE: u16 = 0x01EC;
 pub const SMSG_AUTH_RESPONSE: u16 = 0x01EE;
 /// The Warden anticheat challenge. A server that sends this starts a response-timeout clock
@@ -135,6 +145,21 @@ pub const SMSG_CAST_RESULT: u16 = 0x0130; // 304
 
 // The pet action bar's inbound wire (decision 0982; VERIFIED vmangos `Opcodes_1_12_1.h`:
 // 377/378/710/312). Bodies in [`super::pet`].
+/// The control handoff (VERIFIED vmangos `Opcodes_1_12_1.h`: 345; built at
+/// `Server/Packets/Misc.cpp:677-682`). Body: **packed** mover guid, then a `u8` `allowMove`.
+///
+/// It is the whole of possession's control half, and it is a *statement about one unit*, not a
+/// swap: the server always sends it to our own session, naming some unit and whether we may drive
+/// it. Mind Control's start sends the caster `(victim, 1)` and the victim `(victim, 0)`; the end
+/// sends the caster `(self, 1)` **then** `(victim, 0)`, and the victim `(victim, 1)`.
+///
+/// **Two consequences the server leans on us for.** It expects a
+/// [`CMSG_SET_ACTIVE_MOVER`] reply and drops every `MSG_MOVE_*` for the new mover until it
+/// arrives (`Player::GetConfirmedMover`). And it never immobilises a possessed *player* — no root,
+/// no speed change, and its `StopMoving()` is a documented no-op for one — nor does it validate
+/// their movement, so `allowMove = 0` for our own guid is the **only** thing standing between a
+/// mind-controlled player and walking away. Enforcing that is the client's job.
+pub const SMSG_CLIENT_CONTROL_UPDATE: u16 = 0x0159; // 345
 /// The whole pet bar in one body — the ten slots, the react/command state, the pet's spell list
 /// and its cooldowns. Its **8-byte guid-only form is the teardown** (`Player::RemovePetActionBar`),
 /// and the only signal that the bar has gone away.
@@ -313,6 +338,18 @@ pub const CMSG_GAMEOBJ_USE: u16 = 0x00B1; // 177
 /// `gameobject-anim-arm.md` §"one-shot channel" step 8. The load-bearing sender: the fishing
 /// bobber's bite (`animId 0` — the splash; decision 1086).
 pub const SMSG_GAMEOBJECT_CUSTOM_ANIM: u16 = 0x00B3; // 179
+/// The **other** one-shot GameObject arm channel (VERIFIED vmangos `Opcodes_1_12_1.h`: 533,
+/// `WorldObject::SendObjectDeSpawnAnim` → `WorldPackets::Misc::GameObjectDespawnAnim`). Body in
+/// [`super::gameobject`]: a bare `u64` guid. The client arms substate **12** — AnimationData id
+/// **157 Despawn** — and the object then survives its own `SMSG_DESTROY_OBJECT` for the length of
+/// that play (wow-re `gameobject-anim-arm.md` §2c's code table `0x80b0e0[6]` → the `0x8607e4` LUT,
+/// and `go-display-sound-events.md` §6d's arm-time pin). The load-bearing sender: a TRAP that has
+/// spent its charges — UBRS's Rookery Eggs hatch on this packet (decision 1404).
+///
+/// It is **not** GameObject-only: `SendObjectDeSpawnAnim` lives on `WorldObject`, so a totem's
+/// death and a DynamicObject's expiry send it too. The consumer treats a guid with nothing armable
+/// as an ordinary destroy.
+pub const SMSG_GAMEOBJECT_DESPAWN_ANIM: u16 = 0x0215; // 533
 /// VERIFIED vmangos `Opcodes_1_12_1.h:183`: 180 — and the reference writes this literal
 /// (`0x5e2110`, its area-trigger check, builds `0xb4` + the trigger id). Body in
 /// [`super::area_trigger`]: the `AreaTrigger.dbc` id the player just walked into.
@@ -431,6 +468,27 @@ pub const CMSG_ATTACKSTOP: u16 = 0x0142; // 322
 pub const CMSG_SETSHEATHED: u16 = 0x01E0; // 480
 pub const CMSG_AUTH_SESSION: u16 = 0x01ED;
 pub const CMSG_SET_ACTIVE_MOVER: u16 = 0x026A;
+/// The other half of the mover handshake (VERIFIED vmangos `Opcodes_1_12_1.h`: 721,
+/// `MovementHandler.cpp:886-965`). Body: the full u64 guid of the mover we are *giving up*, then a
+/// whole `MovementInfo`. It clears the server's `m_clientMoverGuid` and re-broadcasts a stop under
+/// the old guid, so skipping it strands observers on that mover's last relayed pose.
+pub const CMSG_MOVE_NOT_ACTIVE_MOVER: u16 = 0x02D1; // 721
+/// The far-sight **toggle vote** (VERIFIED vmangos `Opcodes_1_12_1.h`: 634,
+/// `MiscHandler.cpp:1138-1155`). Body is a single `u8`: `1` = look through the object, `0` = look
+/// through my own body again.
+///
+/// **The client never names the object.** The server resolves it from `PLAYER_FARSIGHT`, which
+/// only the server writes — so this is a vote on a view it already chose, not a request. Both
+/// branches pass `update_far_sight_field = false`, so **neither touches the field**: it keeps
+/// naming the object while the view toggles under it.
+///
+/// **Sending `0` is destructive and must be deliberate.** It moves the server's *visibility*
+/// source back to our body while `PLAYER_FARSIGHT` still names the object — the world around that
+/// object stops streaming while the camera is still anchored to it. Sending nothing is the safe
+/// default: the server tracks no reply, and it has already attached the viewpoint before we could
+/// answer. `1` is a no-op in every normal flow (`Camera::SetView` early-returns on an unchanged
+/// source); it exists for the buff-click toggle, whose only shipped user is Sentry Totem.
+pub const CMSG_FAR_SIGHT: u16 = 0x027A; // 634
 /// Empty body. The real client sends it from exactly ONE site — inside the local auto-repeat
 /// cancel `0x6ea080` (`0x6ea0c6`) — so it rides along with *every* cancel trigger (wow-re
 /// `nocked-ammo-cancel.md`). vmangos `HandleCancelAutoRepeatSpellOpcode` interrupts the held
@@ -620,9 +678,20 @@ pub const CMSG_TRAINER_BUY_SPELL: u16 = 0x01B2; // 434
 pub const SMSG_TRAINER_BUY_SUCCEEDED: u16 = 0x01B3; // 435
 pub const SMSG_TRAINER_BUY_FAILED: u16 = 0x01B4; // 436
 
-// The bank set (VERIFIED vmangos `Opcodes_1_12_1.h`: 439,440-441,642-643 — 0x01B5/0x01B6
-// `CMSG_BINDER_ACTIVATE`/`SMSG_PLAYERBINDERROR` sit between the trainer set and this one but are
-// out of scope, decision 0604). `CMSG_BANKER_ACTIVATE` right-clicks a pure banker;
+// The innkeeper bind set (VERIFIED vmangos `Opcodes_1_12_1.h`: 437, 344, 747; decision 1331).
+// Selecting an innkeeper's `GOSSIP_OPTION_INNKEEPER` line makes the server close the gossip menu
+// and send `SMSG_BINDER_CONFIRM` — a QUESTION, not a bind. Nothing is bound until the client
+// answers `CMSG_BINDER_ACTIVATE`, which is what the confirm dialog's Accept sends; the server then
+// has the innkeeper cast spell 3286 "Bind" on the player, whose `SPELL_EFFECT_BIND` sends
+// `SMSG_BINDPOINTUPDATE` (above) and `SMSG_PLAYERBOUND` (vmangos `SpellEffects.cpp` `EffectBind`).
+// Bodies in [`super::binder`]. `SMSG_PLAYERBINDERROR` (0x01B6) is the refusal and is not parsed:
+// vmangos never sends it on any path (`SendBindPoint` simply returns inside an instance).
+pub const CMSG_BINDER_ACTIVATE: u16 = 0x01B5; // 437
+pub const SMSG_PLAYERBOUND: u16 = 0x0158; // 344
+pub const SMSG_BINDER_CONFIRM: u16 = 0x02EB; // 747
+
+// The bank set (VERIFIED vmangos `Opcodes_1_12_1.h`: 439,440-441,642-643).
+// `CMSG_BANKER_ACTIVATE` right-clicks a pure banker;
 // `SMSG_SHOW_BANK` also arrives unprompted from the `GOSSIP_OPTION_BANKER` gossip option. Slot
 // purchase and deposit/withdraw bodies in [`super::bank`].
 pub const CMSG_BANKER_ACTIVATE: u16 = 0x01B7; // 439
@@ -733,6 +802,49 @@ pub const CMSG_DEL_FRIEND: u16 = 0x006A; // 106
 pub const SMSG_IGNORE_LIST: u16 = 0x006B; // 107
 pub const CMSG_ADD_IGNORE: u16 = 0x006C; // 108
 pub const CMSG_DEL_IGNORE: u16 = 0x006D; // 109
+
+// The guild family — the query/roster caches, invitations, the member verbs, rank administration
+// and the event broadcast (VERIFIED vmangos `Opcodes_1_12_1.h:87-88`, `:132-151`, `:562-566`,
+// `:765` + `Server/Packets/Guild.{h,cpp}`, `Guild/Guild.{h,cpp}`, `Handlers/GuildHandler.cpp`; the
+// client side of `SMSG_GUILD_EVENT` is wow-re's RF-0077,
+// `system/object-layer/scratch/rf77-smsg-chat-wire-order.md`, which pins handler `0x5e7180` to
+// this 0x92 and reads its guild-init registration/teardown block). Bodies in [`super::guild`].
+//
+// The numbers are two contiguous runs plus two strays: the query pair sits with the other ask-once
+// caches at 0x54/0x55, the core family runs 0x81-0x93 immediately after the group family, rank
+// administration was appended at 0x231-0x235, and the guild info text at 0x2FC. The
+// charter/petition/tabard opcodes that *found* a guild are a separate slice and are not here.
+pub const CMSG_GUILD_QUERY: u16 = 0x0054; // 84
+pub const SMSG_GUILD_QUERY_RESPONSE: u16 = 0x0055; // 85
+/// vmangos registers this `STATUS_NEVER` (`Opcodes.cpp:210`): at 1.12 a guild is founded through
+/// the charter/petition flow, not by this packet. Modelled for completeness; no reply comes back.
+pub const CMSG_GUILD_CREATE: u16 = 0x0081; // 129
+pub const CMSG_GUILD_INVITE: u16 = 0x0082; // 130
+pub const SMSG_GUILD_INVITE: u16 = 0x0083; // 131
+pub const CMSG_GUILD_ACCEPT: u16 = 0x0084; // 132
+pub const CMSG_GUILD_DECLINE: u16 = 0x0085; // 133
+pub const SMSG_GUILD_DECLINE: u16 = 0x0086; // 134
+pub const CMSG_GUILD_INFO: u16 = 0x0087; // 135
+pub const SMSG_GUILD_INFO: u16 = 0x0088; // 136
+pub const CMSG_GUILD_ROSTER: u16 = 0x0089; // 137
+/// The widest packet in the game — the sender truncates its member list to `0x8000 - 4` bytes —
+/// and the one conditional-field trap in the family: see [`super::guild::read_guild_roster`].
+pub const SMSG_GUILD_ROSTER: u16 = 0x008A; // 138
+pub const CMSG_GUILD_PROMOTE: u16 = 0x008B; // 139
+pub const CMSG_GUILD_DEMOTE: u16 = 0x008C; // 140
+pub const CMSG_GUILD_LEAVE: u16 = 0x008D; // 141
+pub const CMSG_GUILD_REMOVE: u16 = 0x008E; // 142
+pub const CMSG_GUILD_DISBAND: u16 = 0x008F; // 143
+pub const CMSG_GUILD_LEADER: u16 = 0x0090; // 144
+pub const CMSG_GUILD_MOTD: u16 = 0x0091; // 145
+pub const SMSG_GUILD_EVENT: u16 = 0x0092; // 146
+pub const SMSG_GUILD_COMMAND_RESULT: u16 = 0x0093; // 147
+pub const CMSG_GUILD_RANK: u16 = 0x0231; // 561
+pub const CMSG_GUILD_ADD_RANK: u16 = 0x0232; // 562
+pub const CMSG_GUILD_DEL_RANK: u16 = 0x0233; // 563
+pub const CMSG_GUILD_SET_PUBLIC_NOTE: u16 = 0x0234; // 564
+pub const CMSG_GUILD_SET_OFFICER_NOTE: u16 = 0x0235; // 565
+pub const CMSG_GUILD_INFO_TEXT: u16 = 0x02FC; // 764
 
 // The group/party family — invite/accept/decline/kick/leader/disband, the loot-method setting, the
 // roster push (`SMSG_GROUP_LIST`), party command feedback, live member stats for the party/raid

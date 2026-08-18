@@ -51,6 +51,16 @@ pub struct UnitState {
     /// predicate — its wire health is 1 (decision 0308 §1); the trio is dead / [`Self::ghost`] /
     /// dead-or-ghost, the real client's three tests.
     pub dead: bool,
+    /// Whether somebody is charming this unit (`UnitIsCharmed`).
+    ///
+    /// **`UNIT_FIELD_CHARMEDBY != 0`, and the asymmetry is the fact worth keeping.** The binding
+    /// `0x516cf0` reads fields 10/11 as one 64-bit value and tests it non-zero — not a
+    /// `UNIT_FIELD_FLAGS` bit, and not a comparison against the player (its body contains no `cmp`
+    /// at all). The field means *"who charms me"*; its mirror `UNIT_FIELD_CHARM` (*"whom I charm"*)
+    /// is never read here. So a **charmer** answers nil, a **charmed** pet answers 1, and an
+    /// ordinary **summoned** pet answers nil — `"pet"` is itself charm-else-summon in the resolver.
+    /// (wow-re `system/ui/scratch/unit-verbs-controlled-charmed-creaturetype.md`.)
+    pub charmed: bool,
     /// Whether the unit is a released ghost (`UnitIsGhost` — `PLAYER_FLAGS` bit 0x10, decision
     /// 0308 §1). Only meaningful for player tokens; creatures stay `false`.
     pub ghost: bool,
@@ -80,6 +90,11 @@ pub struct UnitState {
     /// This token is a PLAYER character (guid family) — the unit tooltip's level line renders
     /// "Race Class (Player)" instead of the creature type (decision 0276's verified law).
     pub is_player: bool,
+    /// The unit's guild membership (`GetGuildInfo(unit)`, decision 1257). `None` = guildless, or
+    /// a creature, or a player whose `PLAYER_GUILDID` has not streamed yet. Filled from the
+    /// PUBLIC descriptor fields 191/192 joined against the app's guild-identity cache — see
+    /// [`super::guild::UnitGuild`].
+    pub guild: Option<super::guild::UnitGuild>,
     /// The NPC subtitle line ("Stable Master") — the creature template's subname; the unit
     /// tooltip's second line. `None` for players/untitled creatures.
     pub subtitle: Option<String>,
@@ -258,11 +273,14 @@ impl super::UiScript {
         {
             let mut model = self.model_mut();
             match state {
+                // Folded on the way IN as well as on the way out — the map's key type is the
+                // canonical lowercase token, so a feed that ever pushed `"Target"` could not create
+                // a second, shadowing entry.
                 Some(s) => {
-                    model.units.insert(token.to_string(), s);
+                    model.units_by_lower.insert(token.to_ascii_lowercase(), s);
                 }
                 None => {
-                    model.units.remove(token);
+                    model.units_by_lower.remove(&token.to_ascii_lowercase());
                 }
             }
         }
@@ -356,27 +374,102 @@ impl super::UiScript {
 /// Pick the interesting token from a directional two-unit call (`UnitIsEnemy(a, b)`): whichever
 /// arg isn't `"player"` — our snapshot stores the relationship on the non-player unit (target),
 /// and the ref calls both argument orders.
+///
+/// **The `"player"` test folds case**, like every other token comparison here and like the client's
+/// own resolver. It is the kind of site the map's fold does not cover on its own: an addon passing
+/// `UnitIsEnemy("Player", "target")` would otherwise be read as naming a non-player first arg, and
+/// this would answer about the wrong unit — a wrong ANSWER rather than a missing one, which is the
+/// worse failure of the two.
 fn pick_unit_token(a: &Option<String>, b: &Option<String>) -> Option<String> {
     match (a, b) {
-        (Some(x), _) if x != "player" => Some(x.clone()),
+        (Some(x), _) if !x.eq_ignore_ascii_case("player") => Some(x.clone()),
         (_, Some(y)) => Some(y.clone()),
         (x, _) => x.clone(),
     }
 }
 
+/// The token prefixes 1.12's resolver `0x515970` recognises, in its own order.
+///
+/// The order is the binary's and is preserved even though our recogniser is order-insensitive:
+/// `partypet` must be tested before `party` and `raidpet` before `raid` for a *resolver* to pick the
+/// right unit, and the day this grows from a boolean into a resolver, the list is already right.
+///
+/// **These are PREFIX tests.** The compare length is the literal's, and `_strnicmp` stops at either
+/// string's NUL, so `"playerfoo"` matches `player` — which is why it is a quiet nil rather than a
+/// raise. `npc` is the sole FULL-STRING compare in the resolver, so `"npctarget"` matches nothing
+/// and raises; it is deliberately absent from this list and handled separately below.
+const UNIT_TOKEN_PREFIXES: [&str; 8] = [
+    "player",
+    "pet",
+    "target",
+    "partypet",
+    "party",
+    "raidpet",
+    "raid",
+    "mouseover",
+];
+
+/// Does 1.12's resolver RECOGNISE this token — whether or not it names a live unit?
+///
+/// This is the whole raise/nil distinction, so it is worth being exact about what it is not: it does
+/// not ask whether a unit exists. `"party5"` on a solo character, `"pet"` with no pet, and
+/// `"playerfoo"` are all *recognised* and answer nil; only a token the resolver's nine compares
+/// never match raises `Unknown unit name`.
+pub(crate) fn token_recognised(token: &str) -> bool {
+    // `npc` full-string, everything else a prefix — and folded, like every compare in the resolver
+    // (`SStrCmpI` -> `_strnicmp`, ASCII only; 1247).
+    token.eq_ignore_ascii_case("npc")
+        || UNIT_TOKEN_PREFIXES
+            .iter()
+            // BYTES, not a string slice. `token[..p.len()]` panics when the token is multibyte
+            // UTF-8 and the prefix length lands mid-character ("byte index N is not a char
+            // boundary") — an addon passing a non-ASCII token would take the client down. The
+            // client's own compare is `_strnicmp` over bytes with an ASCII-only fold, so byte
+            // comparison is both the safe form and the faithful one.
+            .any(|p| {
+                token.len() >= p.len()
+                    && token.as_bytes()[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+            })
+}
+
+/// The gate every `Unit*` binding puts an addon-supplied token through.
+///
+/// **An unrecognised token RAISES and does not return** — `0x515970` falls off the end of its nine
+/// compares into `luaL_error(L, "Unknown unit name: %s")`, which longjmps (wow-re
+/// `system/ui/scratch/unit-token-grammar.md`). Ours answered nil for everything unknown, which is
+/// 1203's shape pointed the other way: a failure the client reports, silently swallowed.
+///
+/// The split is THREE-way, not two, and the two quiet legs are as carved:
+///   * **absent argument** — quiet nil (the per-binding argument gates are NOT uniform; `UnitName`
+///     has its own `lua_isstring` gate and `UnitExists` has none at all, and only those two poles
+///     are verified, so this does not invent a gate for the other ~102);
+///   * **`""`** — quiet nil;
+///   * a **recognised** token naming nothing (`"party5"` solo, `"playerfoo"`) — quiet nil.
+pub(crate) fn check_unit_token(token: &Option<String>) -> mlua::Result<()> {
+    match token {
+        Some(t) if !t.is_empty() && !token_recognised(t) => {
+            Err(mlua::Error::runtime(format!("Unknown unit name: {t}")))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Read a unit token's snapshot under a short model borrow, mapping it through `f`; `default` when the
 /// token is absent (the "unit doesn't exist" path).
+///
+/// Raises for an unrecognised token ([`check_unit_token`]) before it looks anything up.
 fn with_unit<T>(
     lua: &Lua,
     token: &Option<String>,
     default: T,
     f: impl FnOnce(&UnitState) -> T,
-) -> T {
+) -> mlua::Result<T> {
+    check_unit_token(token)?;
     let model = lua.app_data_ref::<Model>().expect("model app_data");
-    match token.as_ref().and_then(|t| model.units.get(t)) {
+    Ok(match token.as_ref().and_then(|t| model.unit(t)) {
         Some(u) => f(u),
         None => default,
-    }
+    })
 }
 
 /// The `Unit*`/`GetQuestGreenRange` Lua binding registrations — split from this module's

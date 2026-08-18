@@ -46,9 +46,27 @@
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::alpha_discard,
     pbr_bindings,
-    forward_io::{VertexOutput, FragmentOutput},
+    forward_io::VertexOutput,
     mesh_view_bindings::view,
     mesh_functions,
+}
+
+// Our own fragment output, so the SKY lane can force the far depth. Bevy's `forward_io::FragmentOutput`
+// is `@location(0) color` and nothing else (bevy_pbr 0.18.1 `forward_io.wgsl`), so this is that struct
+// plus one optional builtin — not a divergence from it.
+//
+// **`WOW_SKY_DEPTH` is a pipeline-key branch, never an unconditional field.** Declaring
+// `@builtin(frag_depth)` disables early-Z for the whole pipeline, and the model lane draws every
+// doodad, creature and WMO wall in the frame. The def is pushed only for the WMO-skybox lane
+// (`clutter_fade.z` bit 13, `model_render::SKY_DEPTH_MARKER`), which is one camera-anchored model.
+struct WowFragOut {
+    @location(0) color: vec4<f32>,
+#ifdef WOW_SKY_DEPTH
+    // Reverse-Z "infinitely far", under bevy's `GreaterEqual` test — the sky depth law
+    // (`benilla_world::sky_order`, "The depth law"): the world paints over the sky whatever the
+    // shell's radius, and the sky can never land in front of world geometry.
+    @builtin(frag_depth) depth: f32,
+#endif
 }
 
 // Per-material model uniforms packed at binding 100 (see `WowModelExt` in terrain.rs). Light + fog + the
@@ -85,6 +103,11 @@ struct ModelParams {
     // midpoint pair — ambient AND diffuse = (Direct + Ambient)/2, ambient +16/255 — the warm pane
     // seen from inside a building (derivation 0x6d37e0, byte-verified).
     sidn: vec4<f32>,
+    // The shared mat-anim TABLE slots (decision 1381): x = the UV-scroll slot, y = the animated-
+    // tint slot — 0 (the pinned-zero identity row) for every static material, so the folds below
+    // add the row unconditionally, branch-free. The rows are DELTAS from the built seeds
+    // (sun_scale.zw / tint.xyz), which stay exactly as built; zw free.
+    anim_slots: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> m: ModelParams;
 
@@ -164,6 +187,12 @@ struct WowLight {
     // back as `origin − camera`, so a skinned vertex is never expressed as an absolute world
     // coordinate in f32 — which is what the ~1 mm/frame character shimmer was.
     rig_origin: array<vec4<f32>, 2048>,
+    // The mat-anim delta table (decision 1381; mat_anim_table.rs mirrors the size): row 0 is the
+    // pinned-zero identity every static material's anim_slots = 0 reads; a live row is the drawn
+    // batch's sampled UV-scroll delta (xy, added to sun_scale.zw) or tint delta (xyz, added to
+    // tint.rgb). Zero region = every batch at its built seed — the studio buffers and
+    // deterministic captures ride that exactly like the tint table's zero-identity.
+    matanim: array<vec4<f32>, 2048>,
     palettes: array<vec4<f32>>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(90) var<storage, read> wow_light: WowLight;
@@ -213,6 +242,29 @@ struct WowVsOut {
 // (the FFP never enables GL_LIGHT_MODEL_TWO_SIDE — no per-face flip). A selected light reaches every
 // vertex of its unit with no distance cutoff, exactly like a committed GL light — selection pops at
 // unit granularity (the authored vanilla behaviour), never mid-surface. Mirrored in terrain.wgsl.
+// **Zero-normal-safe normalize — the M2 corpus authors `(0,0,0)` vertex normals and the reference
+// draws them lit** (decision 1268). `Creature\QuirajProphet` (the AQ40 Qiraji Brainwasher)
+// authors them on 28 of its sleeve batch's 40 vertices; `Creature\TitanFemale` (Uldaman's Ironaya)
+// on 82. A plain `normalize()` turns that legal, shipped datum into NaN, and NaN poisons the whole
+// lighting chain: every SH dot is NaN, `clamp(NaN, 0, 1)` floors to 0, and the batch renders PURE
+// BLACK over its correct texture — the reported symptom, which only "came back" while the unit was
+// targeted because the highlight's `+64/255` emissive rides OUTSIDE the poisoned factor.
+//
+// The reference lands on the zero vector instead: its `Model2.bls` lit permutations normalize with
+// the era's `RSQ`/`MUL` pair (wow-re `models/scratch/model2-bls-vertex-sh.md` §2), where the
+// `0 × INF` product resolves to 0, so the order-2 SH quadratic form is evaluated at `N = 0` and
+// collapses to its **DC term** — the flat, direction-independent ambient the reference's own
+// screenshots show on exactly these surfaces. Passing the zero vector through reproduces that
+// through every lane here: the SH lobe keeps `c10.w + sun_dc`, `lit_nl` keeps its ambient, and
+// `point_light_sum`'s `max(N·L, 0)` is 0.
+// Guarded around the SAME `normalize` rather than an open-coded `v · inverseSqrt(l2)`: every
+// non-degenerate normal — i.e. the whole corpus outside these few batches — keeps its existing bits,
+// so the visual baselines cannot drift by a rounding step on account of this fix.
+fn wow_normalize(v: vec3<f32>) -> vec3<f32> {
+    let l2 = dot(v, v);
+    return select(vec3<f32>(0.0), normalize(v), l2 > 1e-12);
+}
+
 fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
     let count = u32(wow_light.point_count.x);
     var sel = array<u32, 3>(0u, 0u, 0u);
@@ -345,7 +397,7 @@ fn inverse_transpose_3x3m(in: mat3x3<f32>) -> mat3x3<f32> {
 // (Translation-free by construction — so the rig-relative frame of decision 0974 feeds it
 // unchanged: a normal never cared where the rig stands.)
 fn wow_skin_normals(frame_from_local: mat4x4<f32>, normal: vec3<f32>) -> vec3<f32> {
-    return normalize(
+    return wow_normalize(
         inverse_transpose_3x3m(mat3x3<f32>(
             frame_from_local[0].xyz,
             frame_from_local[1].xyz,
@@ -492,7 +544,7 @@ fn vertex(vertex: WowVertex) -> WowVsOut {
 }
 
 @fragment
-fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> FragmentOutput {
+fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     // HARD FAR-CLIP WALL (faithful `farclip` ~777 yd) — see terrain.wgsl. Per-pixel discard beyond the
     // projection far plane (planar eye-Z), so distant buildings/trees reveal closest-part-first and the
     // sky/WDL shows behind. `wow_light.fog_params.w` = farclip (0 ⇒ disabled). Clutter (≤70 yd) never hits it.
@@ -528,7 +580,7 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> FragmentOutp
     if ((u32(m.clutter_fade.z) & 4096u) != 0u) {
         vo.uv = in.uv;
     } else {
-        vo.uv = in.uv + m.sun_scale.zw;
+        vo.uv = in.uv + m.sun_scale.zw + wow_light.matanim[u32(m.anim_slots.x)].xy;
     }
 #endif
 #ifdef VERTEX_UVS_B
@@ -664,7 +716,9 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> FragmentOutp
     // normal, WMO by its own (both genuinely fixed-function reference programs).
     let is_clutter = m.clutter_fade.w > 0.5;
     let L = -normalize(wow_light.light_sun.xyz);
-    let n_m2 = normalize(pbr_input.world_normal);
+    // `wow_normalize`, not `normalize`: the unskinned lane carries an authored `(0,0,0)` normal
+    // through to here unchanged, and a NaN out of this line blacks the whole batch (see the helper).
+    let n_m2 = wow_normalize(pbr_input.world_normal);
     // Bevy negates `world_normal` on the back faces of any DOUBLE-SIDED material — two-sided foliage
     // cross-quads (grass tufts, leaf cards) AND every WMO group face (our WMO loader marks all WMO
     // submeshes two-sided, models.rs). The reference has NO such per-face negation: WoW sets the GL
@@ -848,7 +902,7 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> FragmentOutp
     // authored values. (The old fog_params.z linear-space A/B is dead — settled by the lane.)
     // `m.tint` is the animated M2Color RGB (identity 1 for static batches) — the same per-batch
     // tint the vertex colours carry for constant tracks, so it folds at the same point.
-    let albedo = base.rgb * m.tint.rgb;
+    let albedo = base.rgb * (m.tint.rgb + wow_light.matanim[u32(m.anim_slots.y)].xyz);
     // Unlit fullbright (model_flags.w): M2 UNLIT (0x01) glass/glow cards, or WMO UNLIT on an
     // exterior-group batch (`tex × white` — the inn's always-lit outside panes). Wins over the lit
     // path; faithfully receives NO emission terms (lighting is off, so GL_EMISSION is dead there).
@@ -986,7 +1040,10 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> FragmentOutp
     }
 
 
-    var out: FragmentOutput;
+    var out: WowFragOut;
+#ifdef WOW_SKY_DEPTH
+    out.depth = 0.0;
+#endif
     // Raw gamma out (GAMMA LANE, 0161 — the frame's one decode is the FFXGlow combine). Alpha = the
     // faded cutout alpha (tex × fade) for the blend twin; ignored (blend off) on steady/opaque draws.
     // OPAQUE-INTENT alpha pin (clutter_fade.z bit 3, set in model_render for steady opaque/alpha-key

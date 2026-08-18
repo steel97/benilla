@@ -11,26 +11,44 @@
 //! sheet calls with `"pet"` (ref `PetPaperDollFrame.lua:73-81`), through these very bindings. So
 //! `UnitStat`/`UnitResistance`/`UnitArmor`/… route on the token — `"player"` and `"pet"` each read
 //! their own pushed snapshot, and **every other token (and a snapshot the app has not pushed yet)
-//! serves the absent shape**: zeros, `percent` 1.0. That last part *is* faithful — the 1.12 fields
-//! behind these (`UNIT_FIELD_STAT*`, `POSSTAT`/`NEGSTAT`, the damage/AP block) are
-//! PRIVATE/OWNER_ONLY, so no third unit ever streams them. A pet's descriptor carries the UNIT
-//! half and no PLAYER block at all, which is why its buff decompositions read `0` and the ref's
-//! own pet sheet shows plain white numbers.
+//! serves the absent shape**: zeros, `percent` 1.0. A pet's descriptor carries the UNIT half and no
+//! PLAYER block at all, which is why its buff decompositions read `0` and the ref's own pet sheet
+//! shows plain white numbers.
 //!
 //! (Until 1057 the router was a hard `token == "player"` test documented as "the faithful
 //! player-only gate". It was neither: it was "no consumer yet". The reference passes `"pet"` into
 //! the same bindings, and the gate was simply never exercised.)
 //!
-//! Return shapes are the ref Lua's own inverse math (ref-PaperDollFrame): the descriptor carries
-//! the *effective* value plus the split positive/negative buff deltas; `base = effective − pos −
-//! neg`. The negative deltas arrive **negative-or-zero** (vmangos `Player.h:1505`
-//! `ApplyStatBuffMod` routes a debuff's already-negative amount into `NEGSTAT`;
-//! `StatSystem.cpp:335-336` writes the AP mods' negative half the same way), matching the ref's
-//! `negBuff < 0` tests.
+//! **The absent shape for a third unit is the right ANSWER for `UnitStat` and a known GAP for the
+//! resistance pair — and the reason it used to be filed as blanket-faithful was wrong.** The
+//! binary does not gate slots 1/2 on SELF at all: `UnitStat`'s are NULL + typemask bit 3 only, and
+//! it returns whatever the client's copy of `UNIT_FIELD_STAT0+i` holds (VERIFIED wow-re
+//! `ui/scratch/pet-paperdoll-stat-api.md` §4). What makes our zeros agree there is the *server's*
+//! visibility, not a client gate: `UNIT_FIELD_STAT*` is PRIVATE + OWNER_ONLY, and the only
+//! owner-visible units a 1.12 unit token can name are the two we already serve — so a stranger's
+//! copy is zero on the reference too. `UNIT_FIELD_RESISTANCES` carries a third flag,
+//! **`SPECIAL_INFO`**, which vmangos grants to the caster of `SPELL_AURA_EMPATHY` — its own comment
+//! reads `// Beast Lore` (`Player.cpp:2603-2610`, `Object.cpp:1065-1067`). So with Beast Lore up on
+//! a beast, the reference's `UnitResistance("target", i)` / `UnitArmor("target")` return that
+//! creature's real numbers through their non-SELF leg, and ours return zeros. That is a real,
+//! reachable divergence, unfed rather than decided: the app pushes snapshots for two tokens only.
+//! `unit_combat_stats` already works over any store, so the missing piece is a third push.
+//!
+//! **Return shapes differ BY FAMILY, and the reference Lua's own asymmetry is the tell**
+//! (decision 1397 — reading one and assuming the other is how 0208 got the stat row wrong).
+//! `UnitStat` serves the **raw** `UNIT_FIELD_STAT` twice — once as-is, once clamped at zero — and
+//! leaves the subtraction to `PaperDollFrame_SetStats`, which writes `(stat - posBuff - negBuff)`
+//! itself. `UnitResistance`/`UnitArmor` serve a **decomposed** first return, because the engine
+//! helper `0x5efcd0` does that subtraction for them; their callers use it directly.
+//!
+//! The negative deltas are **negative-or-zero** where the wire can carry them at all, matching the
+//! ref's `negBuff < 0` tests — but see 1397 for how little of that survives a given server: these
+//! four arrays are stored float and narrowed to int by `Object::BuildValuesUpdate`, and that cast
+//! saturates a negative to `0` on an arm64 host while wrapping it correctly on x86.
 
 use mlua::{Lua, Value};
 
-use super::Model;
+use super::{binding_abi, Model};
 
 /// The 1.12 weapon-subclass → `SkillLine.dbc` id table, transcribed from vmangos
 /// `ItemPrototype::GetProficiencySkill`'s `item_weapon_skills` (`Objects/Item.cpp:700-707`;
@@ -255,7 +273,7 @@ pub type InventorySlots = [Option<InvSlotView>; INVENTORY_SLOT_COUNT];
 /// untranscribed. The oddballs among the 24: `BackSlot` shows the **Chest** art and `AmmoSlot` the
 /// **Ranged** art (both confirmed by their `SlotTexture` offset pointing at that other row's
 /// string, not a fresh one).
-const SLOT_INFO: [(&str, i64, &str); 24] = [
+const SLOT_INFO: [(&str, i64, &str); 36] = [
     ("AmmoSlot", 0, "Ranged"),
     ("HeadSlot", 1, "Head"),
     ("NeckSlot", 2, "Neck"),
@@ -280,6 +298,28 @@ const SLOT_INFO: [(&str, i64, &str); 24] = [
     ("Bag1Slot", 21, "Bag"),
     ("Bag2Slot", 22, "Bag"),
     ("Bag3Slot", 23, "Bag"),
+    // The twelve rows this table was short of. The shipped DBC has **36 records, not 24**, and
+    // `Bag1`..`Bag12` at SlotNumbers 64..75 are in the very table this binding scans — 64..69 is
+    // exactly the bank-bag band `ContainerIDToInventoryID` produces. This file used to call them
+    // "a different, unrelated numbering — not `GetInventorySlotInfo` names, out of scope"; that is
+    // refuted, and the scan reaches them like any other row.
+    //
+    // All twelve share ONE string-block offset with `Bag0Slot`..`Bag3Slot` — sixteen rows, one
+    // string (`+1001`). Read at the offset rather than resolved from the row name, because that is
+    // how this column works: 36 rows carry only 17 distinct offsets, which is why `BackSlot` shows
+    // the Chest art and `AmmoSlot` the Ranged art rather than art of their own.
+    ("Bag1", 64, "Bag"),
+    ("Bag2", 65, "Bag"),
+    ("Bag3", 66, "Bag"),
+    ("Bag4", 67, "Bag"),
+    ("Bag5", 68, "Bag"),
+    ("Bag6", 69, "Bag"),
+    ("Bag7", 70, "Bag"),
+    ("Bag8", 71, "Bag"),
+    ("Bag9", 72, "Bag"),
+    ("Bag10", 73, "Bag"),
+    ("Bag11", 74, "Bag"),
+    ("Bag12", 75, "Bag"),
 ];
 
 /// The durability-alert regions in the client's own slot table (`0x806eb8`, VERIFIED wow-re
@@ -424,7 +464,7 @@ fn with_unit_stats<T>(
 /// `ui/scratch/pet-paperdoll-stat-api.md`). Nothing here is skill data — a creature has no skill
 /// block at all, which is exactly why the client substitutes a formula.
 fn cgunit_skill(model: &Model, token: &str) -> i64 {
-    model.units.get(token).map_or(0, |u| i64::from(u.level)) * 5
+    model.unit(token).map_or(0, |u| i64::from(u.level)) * 5
 }
 
 /// Read inventory slot `slot` under a short borrow, cloned out so the caller holds no borrow.
@@ -463,28 +503,68 @@ impl Model {
     }
 }
 
+/// The four reference `.data` literals the two indexed stat bindings raise with — read out of the
+/// shipped 5875 image, verbatim, and NOT paraphrased (the house rule `GetInventorySlotInfo` sets:
+/// an addon may compare or key on the message text).
+///
+/// **Each binding has TWO raises with different strings, and the string pool interleaves them so
+/// that "the nearest `Usage:`" picks the WRONG binding's.** The layout is
+/// `Usage: UnitResistance…` (`0x8510fc`) · `Invalid resistance index…` (`0x85112c`) ·
+/// `Usage: UnitStat…` (`0x851158`) · `Invalid stat index…` (`0x85117c`) — so the `Usage:` two
+/// padding bytes after `UnitResistance`'s index message belongs to `UnitStat`. Each literal is
+/// fixed by the `push <VA>` that names it (`0x5187d6`/`0x5187ed` for `UnitStat`,
+/// `0x5185cb`/`0x5185e2` for `UnitResistance`), never by proximity. This is the same trap
+/// `GetInventorySlotInfo`'s transcription records, one degree worse.
+///
+/// The **index** arm is these two — no `Usage:` prefix, and the offending index is *not*
+/// interpolated (`luaL_error` is called cdecl with exactly two dwords at all four sites: the `L`
+/// and the message, no varargs, so the literal is never a format string).
+const STAT_INDEX_ERROR: &str = "Invalid stat index in UnitStat";
+const RESISTANCE_INDEX_ERROR: &str = "Invalid resistance index in UnitResistance";
+/// The **argument-type** arm — a separate, earlier raise, reached only by a value that is neither
+/// numeric nor a numeric string (the guards are coercion-aware: `UnitStat("player", "3")` serves
+/// stat 3). [`binding_abi`] owns that contract.
+const STAT_USAGE: &str = "Usage: UnitStat(\"unit\", statIndex)";
+const RESISTANCE_USAGE: &str = "Usage: UnitResistance(\"unit\", resistanceIndex)";
+
 /// Register the paper-doll stat/slot globals (decision 0208 §3).
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 
-    // UnitStat("player", i /*1..=5*/) → (stat, effectiveStat, posBuff, negBuff): effective is the
-    // UNIT_FIELD_STAT value, pos/neg the POSSTAT/NEGSTAT deltas (neg ≤ 0), and stat (base) their
-    // inverse — the ref computes base = effective − pos − neg and branches on negBuff < 0.
-    // Out-of-range i (the ref never passes one) serves the absent zeros.
+    // UnitStat("player", i /*1..=5*/) → (stat, effectiveStat, posBuff, negBuff).
+    //
+    // **The first two returns are the same field, UNDECOMPOSED** — `UNIT_FIELD_STAT0+i` raw
+    // (`fild`, `0x518689`), then that same value clamped at zero (`0x5186a3`–`0x5186b7`:
+    // `setl cl; dec ecx; and ecx,eax`). Slots 3/4 are `PLAYER_FIELD_POSSTAT0+i` (`0x518712`) and
+    // `NEGSTAT0+i` (`0x518772`), each behind a SELF gate. VERIFIED, wow-re
+    // `ui/scratch/pet-paperdoll-stat-api.md` §4.
+    //
+    // This served `effective − pos − neg` as the first return until decision 1397. Subtracting is
+    // the ref Lua's *own* job — `PaperDollFrame_SetStats` writes the tooltip's base as
+    // `(stat - posBuff - negBuff)` — so a pre-subtracted `stat` deducts the buff twice. It was
+    // invisible only because pos/neg were stuck at 0 by the field-decode bug 1397 fixes; the two
+    // are one repair.
+    //
+    // **Note the contrast with the two resistance bindings below**, whose first return really *is*
+    // the decomposed base (`0x5efcd0`: `*arg2 = raw - pos - neg`). The reference reads the two
+    // families differently, and the ref Lua's own asymmetry — `SetStats` subtracts, `SetResistances`
+    // and `PaperDollFormatStat` do not — is the tell.
+    //
+    // **An out-of-range index RAISES; it does not answer zeros** (see [`STAT_INDEX_ERROR`]).
     g.set(
         "UnitStat",
-        lua.create_function(|lua, (token, i): (Option<String>, i64)| {
-            Ok(with_unit_stats(lua, &token, |s| {
-                let Some(idx) = i.checked_sub(1).and_then(|v| usize::try_from(v).ok()) else {
-                    return (0, 0, 0, 0);
-                };
-                if idx >= 5 {
-                    return (0, 0, 0, 0);
-                }
-                let (eff, pos, neg) = (s.stats[idx], s.stat_pos[idx], s.stat_neg[idx]);
+        lua.create_function(|lua, (token, i): (Value, Value)| {
+            let token = binding_abi::string_arg(lua, token, STAT_USAGE)?;
+            let idx = binding_abi::number_arg(lua, i, STAT_USAGE)? - 1;
+            if !(0..5).contains(&idx) {
+                return Err(mlua::Error::RuntimeError(STAT_INDEX_ERROR.into()));
+            }
+            let idx = idx as usize;
+            Ok(with_unit_stats(lua, &Some(token), |s| {
+                let (raw, pos, neg) = (s.stats[idx], s.stat_pos[idx], s.stat_neg[idx]);
                 (
-                    i64::from(eff - pos - neg),
-                    i64::from(eff),
+                    i64::from(raw),
+                    i64::from(raw.max(0)),
                     i64::from(pos),
                     i64::from(neg),
                 )
@@ -493,22 +573,28 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // UnitResistance("player", school /*0..=6*/) → (base, resistance, positive, negative) — the
-    // same inverse math per school ([0] = armor).
+    // decomposition helper `0x5efcd0` per school ([0] = armor): `base = raw − pos − neg`, computed
+    // BEFORE the clamp, and `resistance = max(raw, 0)`. A school cursed below zero therefore reads
+    // a *displayed* 0 with the real (negative) total still folded out of `base`.
+    // Out-of-range raises too, with its own string ([`RESISTANCE_INDEX_ERROR`]).
     g.set(
         "UnitResistance",
-        lua.create_function(|lua, (token, school): (Option<String>, i64)| {
-            Ok(with_unit_stats(lua, &token, |s| {
-                let Some(idx) = usize::try_from(school).ok().filter(|&v| v < 7) else {
-                    return (0, 0, 0, 0);
-                };
-                let (eff, pos, neg) = (
+        lua.create_function(|lua, (token, school): (Value, Value)| {
+            let token = binding_abi::string_arg(lua, token, RESISTANCE_USAGE)?;
+            let school = binding_abi::number_arg(lua, school, RESISTANCE_USAGE)?;
+            if !(0..7).contains(&school) {
+                return Err(mlua::Error::RuntimeError(RESISTANCE_INDEX_ERROR.into()));
+            }
+            let idx = school as usize;
+            Ok(with_unit_stats(lua, &Some(token), |s| {
+                let (raw, pos, neg) = (
                     s.resistances[idx],
                     s.resistance_pos[idx],
                     s.resistance_neg[idx],
                 );
                 (
-                    i64::from(eff - pos - neg),
-                    i64::from(eff),
+                    i64::from(raw - pos - neg),
+                    i64::from(raw.max(0)),
                     i64::from(pos),
                     i64::from(neg),
                 )
@@ -516,17 +602,18 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // UnitArmor("player") → (base, effectiveArmor, armor, posBuff, negBuff) — school 0 of the
-    // resistance block; the ref reads effectiveArmor and armor equivalently (both the total).
+    // UnitArmor("player") → (base, effectiveArmor, armor, posBuff, negBuff) — school 0 through the
+    // same `0x5efcd0`, whose 3rd and 4th out-params are both the clamped total (the ref reads
+    // effectiveArmor and armor equivalently, and both are zeroed together when raw < 0).
     g.set(
         "UnitArmor",
         lua.create_function(|lua, token: Option<String>| {
             Ok(with_unit_stats(lua, &token, |s| {
-                let (eff, pos, neg) = (s.resistances[0], s.resistance_pos[0], s.resistance_neg[0]);
+                let (raw, pos, neg) = (s.resistances[0], s.resistance_pos[0], s.resistance_neg[0]);
                 (
-                    i64::from(eff - pos - neg),
-                    i64::from(eff),
-                    i64::from(eff),
+                    i64::from(raw - pos - neg),
+                    i64::from(raw.max(0)),
+                    i64::from(raw.max(0)),
                     i64::from(pos),
                     i64::from(neg),
                 )
@@ -812,17 +899,57 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "GetInventorySlotInfo",
         lua.create_function(|lua, name: String| {
-            let Some((_, id, art)) = SLOT_INFO.iter().find(|(n, _, _)| *n == name) else {
-                return Err(mlua::Error::runtime(format!(
-                    "GetInventorySlotInfo: unknown slot name '{name}'"
-                )));
+            // **The name match is CASE-INSENSITIVE, and that was the whole bug.** `0x4c8215` calls
+            // `0x64a4c0` -> `0x414310`, the CRT `_strnicmp`, whose comparison folds BOTH operands
+            // (`0x414352 add ah,dh` / `0x41435c add al,dh`, with `dh = 0x20` and the A-Z bounds in
+            // `bh`/`bl`) before the byte compare — ASCII folding, which is exactly
+            // `eq_ignore_ascii_case`. Its locale-aware arm folds too, so the verdict does not
+            // depend on one. `maxlen` is `0x7fffffff` and the loop stops at the first NUL on either
+            // side, so it is a FULL-STRING compare, not a prefix. The non-circular control is that
+            // the image also ships a byte-identical case-SENSITIVE wrapper (`0x64a480` ->
+            // `0x40de80`, `rep cmpsb`, no fold) and this binding does not call it.
+            //
+            // Two 1.12-era corpus addons died at session start on this and both worked on the real
+            // client: `FuBar_AmmoFu` passes `"ammoSlot"` and `FuBar_PoisonFu` `"MAINHANDSLOT"`.
+            // The 36 shipped names stay pairwise distinct after folding, so first-match-wins cannot
+            // become ambiguous.
+            let Some((_, id, art)) = SLOT_INFO
+                .iter()
+                .find(|(n, _, _)| n.eq_ignore_ascii_case(&name))
+            else {
+                // The raise is faithful — there is no nil path, and `0x4c823c xor eax,eax; ret` is
+                // dead code after `luaL_error` longjmps. The message is the reference's own
+                // (`.rdata 0x848894`): no `Usage:` prefix, and the offending name is NOT
+                // interpolated. The `Usage:` literals either side of it in the string pool belong
+                // to `KeyRingButtonIDToInvSlotID` and `GetInventoryItemTexture` — the adjacency
+                // trap.
+                return Err(mlua::Error::runtime(
+                    "Invalid inventory slot in GetInventorySlotInfo",
+                ));
             };
             Ok((
                 *id,
+                // The DBC string, VERBATIM. `0x4c825b` pushes `[esi+4]` straight through
+                // (`0x6f3890`, `repne scasb` for the length) with no normalisation anywhere, and
+                // the stored bytes are `interface\paperdoll\UI-PaperDoll-Slot-Bag.blp` — a
+                // LOWERCASE directory, and the `.blp` extension present. Only the
+                // `UI-PaperDoll-Slot-` leaf is mixed case. Texture *loading* would not care (the
+                // asset VFS folds case), but this is a Lua-visible string: anything that compares
+                // it, keys a table by it or concatenates it sees these bytes.
                 Value::String(
-                    lua.create_string(format!("Interface\\Paperdoll\\UI-PaperDoll-Slot-{art}"))?,
+                    lua.create_string(format!(
+                        "interface\\paperdoll\\UI-PaperDoll-Slot-{art}.blp"
+                    ))?,
                 ),
-                false,
+                // `checkRelic` — the NUMBER 1, never a boolean, and only for `RangedSlot`
+                // (`0x4c8263 dec ecx; cmp ecx,0x11`, i.e. SlotNumber 18); nil for every other slot.
+                // It shipped as a constant `false` here, which is falsey like nil but is the wrong
+                // type for a caller that compares it to 1, and wrong outright for the ranged slot.
+                if *id == 18 {
+                    Value::Integer(1)
+                } else {
+                    Value::Nil
+                },
             ))
         })?,
     )?;
@@ -859,7 +986,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{weapon_subclass_skill, SKILL_UNARMED};
+    use super::{
+        weapon_subclass_skill, RESISTANCE_INDEX_ERROR, SKILL_UNARMED, STAT_INDEX_ERROR, STAT_USAGE,
+    };
     use crate::script::{InvSlotView, UiScript, UnitCombatStats};
 
     /// A filled snapshot exercising every field the bindings read.
@@ -940,38 +1069,94 @@ mod tests {
     }
 
     #[test]
-    fn unit_stat_serves_effective_and_the_derived_base() {
+    fn unit_stat_serves_the_raw_field_twice_and_the_buff_split() {
         let mut s = UiScript::new().unwrap();
         s.set_player_combat_stats(Some(stats()));
-        // Str: effective 25, pos 4, neg 0 → base 21.
+        // Str: the raw field 25 in BOTH of the first two slots, then the +4/0 split. The ref Lua
+        // does the subtraction itself (`stat - posBuff - negBuff` = 21 for the tooltip's base) —
+        // this binding must not pre-subtract, or the buff is deducted twice.
         assert_eq!(
             s.eval::<(i64, i64, i64, i64)>(r#"return UnitStat("player", 1)"#)
                 .unwrap(),
-            (21, 25, 4, 0)
+            (25, 25, 4, 0)
         );
-        // Agi: effective 20, pos 0, neg −2 → base 22 (the ref tests negBuff < 0).
+        // Agi: raw 20 with a −2 debuff (the ref tests negBuff < 0 to pick red over green).
         assert_eq!(
             s.eval::<(i64, i64, i64, i64)>(r#"return UnitStat("player", 2)"#)
                 .unwrap(),
-            (22, 20, 0, -2)
+            (20, 20, 0, -2)
         );
+        // Only the SECOND return is clamped: a stat driven below zero keeps its sign in slot 1.
+        s.set_player_combat_stats(Some(UnitCombatStats {
+            stats: [-3, 20, 22, 10, 11],
+            ..stats()
+        }));
+        assert_eq!(
+            s.eval::<(i64, i64, i64, i64)>(r#"return UnitStat("player", 1)"#)
+                .unwrap(),
+            (-3, 0, 4, 0)
+        );
+        s.set_player_combat_stats(Some(stats()));
         // A non-player token serves the absent zeros (no other unit streams these fields).
         assert_eq!(
             s.eval::<(i64, i64, i64, i64)>(r#"return UnitStat("target", 1)"#)
                 .unwrap(),
             (0, 0, 0, 0)
         );
-        // Out-of-range index: zeros, no error.
+    }
+
+    /// The index arm **raises**, and the truncation that decides which side of the range an
+    /// argument lands on happens FIRST. Both ends converge on one raise (`0x51865a js` and
+    /// `0x518663 jge` → `0x5187d6`), and `_ftol` chops toward zero rather than flooring, so `1.9`
+    /// is a valid `1` while `0.5` and any negative are not.
+    #[test]
+    fn an_out_of_range_stat_index_raises_the_references_own_string() {
+        let mut s = UiScript::new().unwrap();
+        s.set_player_combat_stats(Some(stats()));
+        for arg in ["6", "0", "-3", "0.5", "-0.5"] {
+            let err = s
+                .eval::<(i64, i64, i64, i64)>(&format!(r#"return UnitStat("player", {arg})"#))
+                .unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(STAT_INDEX_ERROR),
+                "UnitStat(\"player\", {arg}) must raise {STAT_INDEX_ERROR:?}, got {msg:?}"
+            );
+            // The index arm carries no `Usage:` prefix, and the pool's interleaving makes the
+            // WRONG binding's usage line the nearest one — so assert we took neither.
+            assert!(!msg.contains("Usage:"), "no Usage: prefix on the index arm");
+        }
+        // Truncation toward zero, ahead of the range test: 1.9 → 1 → stat 0, the valid answer.
         assert_eq!(
-            s.eval::<(i64, i64, i64, i64)>(r#"return UnitStat("player", 6)"#)
+            s.eval::<(i64, i64, i64, i64)>(r#"return UnitStat("player", 1.9)"#)
                 .unwrap(),
-            (0, 0, 0, 0)
+            (25, 25, 4, 0)
         );
+        // The guard is coercion-aware — a numeric STRING is a number here.
         assert_eq!(
-            s.eval::<(i64, i64, i64, i64)>(r#"return UnitStat("player", 0)"#)
+            s.eval::<(i64, i64, i64, i64)>(r#"return UnitStat("player", "2")"#)
                 .unwrap(),
-            (0, 0, 0, 0)
+            (20, 20, 0, -2)
         );
+        // Neither numeric nor a numeric string takes the OTHER raise, with the other string.
+        for arg in ["nil", "{}", "true", r#""abc""#] {
+            let msg = format!(
+                "{}",
+                s.eval::<(i64, i64, i64, i64)>(&format!(r#"return UnitStat("player", {arg})"#))
+                    .unwrap_err()
+            );
+            assert!(
+                msg.contains(STAT_USAGE) && !msg.contains(STAT_INDEX_ERROR),
+                "UnitStat(\"player\", {arg}) must take the Usage arm, got {msg:?}"
+            );
+        }
+        // A missing unit token fails the same way (`0x6f3510` reports NULL past the top as
+        // neither number nor string).
+        assert!(format!(
+            "{}",
+            s.eval::<i64>(r#"return UnitStat(nil, 1)"#).unwrap_err()
+        )
+        .contains(STAT_USAGE));
     }
 
     #[test]
@@ -990,11 +1175,12 @@ mod tests {
                 .unwrap(),
             (0, 20, 25, -5)
         );
-        // A cursed school can read negative (arcane: −5 total, all from the debuff).
+        // A school cursed below zero (arcane: −5 total, all from the debuff): the DISPLAYED total
+        // is clamped to 0 (`0x5efcd0`'s tail), while `base` keeps the pre-clamp decomposition.
         assert_eq!(
             s.eval::<(i64, i64, i64, i64)>(r#"return UnitResistance("player", 6)"#)
                 .unwrap(),
-            (0, -5, 0, -5)
+            (0, 0, 0, -5)
         );
         // UnitArmor is school 0 with the five-return shape (effectiveArmor = armor = the total).
         assert_eq!(
@@ -1002,17 +1188,31 @@ mod tests {
                 .unwrap(),
             (130, 150, 150, 30, -10)
         );
-        // Out of range / non-player: zeros.
-        assert_eq!(
-            s.eval::<(i64, i64, i64, i64)>(r#"return UnitResistance("player", 7)"#)
-                .unwrap(),
-            (0, 0, 0, 0)
-        );
+        // A non-player token: zeros. (UnitArmor takes no index and so has no index raise.)
         assert_eq!(
             s.eval::<(i64, i64, i64, i64, i64)>(r#"return UnitArmor("target")"#)
                 .unwrap(),
             (0, 0, 0, 0, 0)
         );
+        // Out of range RAISES, with UnitResistance's own string — not UnitStat's, which is the
+        // literal sitting two padding bytes away in the reference's string pool.
+        for arg in ["7", "-1"] {
+            let msg = format!(
+                "{}",
+                s.eval::<(i64, i64, i64, i64)>(&format!(
+                    r#"return UnitResistance("player", {arg})"#
+                ))
+                .unwrap_err()
+            );
+            assert!(
+                msg.contains(RESISTANCE_INDEX_ERROR) && !msg.contains("UnitStat"),
+                "UnitResistance(\"player\", {arg}) must raise {RESISTANCE_INDEX_ERROR:?}, got {msg:?}"
+            );
+        }
+        // School 0 is in range and is armor — the low end is inclusive, unlike UnitStat's.
+        assert!(s
+            .eval::<(i64, i64, i64, i64)>(r#"return UnitResistance("player", 0)"#)
+            .is_ok());
     }
 
     #[test]
@@ -1127,7 +1327,7 @@ mod tests {
         assert_eq!(
             s.eval::<(i64, i64, i64, i64)>(r#"return UnitStat("player", 1)"#)
                 .unwrap(),
-            (21, 25, 4, 0)
+            (25, 25, 4, 0)
         );
         // Resistances: fire (school 2) — 15 for the pet, 20 (+25/−5) for the player.
         assert_eq!(
@@ -1195,7 +1395,7 @@ mod tests {
         assert_eq!(
             s.eval::<(i64, i64, i64, i64)>(r#"return UnitStat("player", 1)"#)
                 .unwrap(),
-            (21, 25, 4, 0)
+            (25, 25, 4, 0)
         );
     }
 
@@ -1376,36 +1576,31 @@ mod tests {
     fn get_inventory_slot_info_serves_the_dbc_rows() {
         let s = UiScript::new().unwrap();
         assert_eq!(
-            s.eval::<(i64, String, bool)>(r#"return GetInventorySlotInfo("HeadSlot")"#)
+            s.eval::<(i64, String)>(r#"return GetInventorySlotInfo("HeadSlot")"#)
                 .unwrap(),
-            (
-                1,
-                "Interface\\Paperdoll\\UI-PaperDoll-Slot-Head".into(),
-                false
-            )
+            (1, "interface\\paperdoll\\UI-PaperDoll-Slot-Head.blp".into())
         );
         // The DBC's oddballs: BackSlot shows the Chest art, AmmoSlot the Ranged art.
         assert_eq!(
-            s.eval::<(i64, String, bool)>(r#"return GetInventorySlotInfo("BackSlot")"#)
+            s.eval::<(i64, String)>(r#"return GetInventorySlotInfo("BackSlot")"#)
                 .unwrap(),
             (
                 15,
-                "Interface\\Paperdoll\\UI-PaperDoll-Slot-Chest".into(),
-                false
+                "interface\\paperdoll\\UI-PaperDoll-Slot-Chest".to_string() + ".blp"
             )
         );
         assert_eq!(
-            s.eval::<(i64, String, bool)>(r#"return GetInventorySlotInfo("AmmoSlot")"#)
+            s.eval::<(i64, String)>(r#"return GetInventorySlotInfo("AmmoSlot")"#)
                 .unwrap(),
             (
                 0,
-                "Interface\\Paperdoll\\UI-PaperDoll-Slot-Ranged".into(),
-                false
+                "interface\\paperdoll\\UI-PaperDoll-Slot-Ranged.blp".into()
             )
         );
-        // The four equipped-bag icons (decision 0216 slice 2's bag bar): ids 20..23, re-verified
-        // this session against the real PaperDollItemFrame.dbc — every one shares the same empty-
-        // slot art.
+        // The bag rows: the four equipped-bag icons at 20..23 AND `Bag1`..`Bag12` at 64..75, which
+        // this table was short of until the DBC was re-read (36 records, not 24). All SIXTEEN share
+        // one string-block offset, which is why they answer the same art.
+        const BAG_ART: &str = "interface\\paperdoll\\UI-PaperDoll-Slot-Bag.blp";
         for (name, id) in [
             ("Bag0Slot", 20),
             ("Bag1Slot", 21),
@@ -1413,23 +1608,26 @@ mod tests {
             ("Bag3Slot", 23),
         ] {
             assert_eq!(
-                s.eval::<(i64, String, bool)>(&format!(r#"return GetInventorySlotInfo("{name}")"#))
+                s.eval::<(i64, String)>(&format!(r#"return GetInventorySlotInfo("{name}")"#))
                     .unwrap(),
-                (
-                    id,
-                    "Interface\\Paperdoll\\UI-PaperDoll-Slot-Bag".into(),
-                    false
-                ),
+                (id, BAG_ART.into()),
                 "{name}"
             );
         }
+        for n in 1..=12i64 {
+            assert_eq!(
+                s.eval::<(i64, String)>(&format!(r#"return GetInventorySlotInfo("Bag{n}")"#))
+                    .unwrap(),
+                (63 + n, BAG_ART.into()),
+                "Bag{n}"
+            );
+        }
         assert_eq!(
-            s.eval::<(i64, String, bool)>(r#"return GetInventorySlotInfo("SecondaryHandSlot")"#)
+            s.eval::<(i64, String)>(r#"return GetInventorySlotInfo("SecondaryHandSlot")"#)
                 .unwrap(),
             (
                 17,
-                "Interface\\Paperdoll\\UI-PaperDoll-Slot-SecondaryHand".into(),
-                false
+                "interface\\paperdoll\\UI-PaperDoll-Slot-SecondaryHand.blp".into()
             )
         );
         // An unknown slot name is a Lua error (the client's own behavior).

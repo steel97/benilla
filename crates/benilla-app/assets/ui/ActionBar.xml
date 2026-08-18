@@ -23,18 +23,18 @@
         - Page up/down + the page number are ART ONLY (we have no bar paging — only the bonus-bar
           offset; ref-ActionBarFrame.xml l.159-217). The page number renders a static "1".
         - HotKey renders the LIVE binding label, abbreviated the ref's own way since 1008
-          (GetBindingText(key, "KEY_", 1) — UIParent.xml carries the transcription; "s-2" for
+          (GetBindingText(key, "KEY_", 1) — UIParent.xml carries our own version; "s-2" for
           SHIFT-2, "·" for a 2+-modifier chord). A slot with NO binding wears the ref's
           RANGE_INDICATOR dot path instead (red dot only while out of range); a bound slot's
           out-of-range read is the label's red tint (the OnUpdate range timer below).
-        - The state/feedback layer (decision 0137 phase 4) is the ref ActionButton.lua transcribed:
+        - The state/feedback layer (decision 0137 phase 4) is the ref ActionButton.lua re-expressed:
           UpdateState (checked on IsCurrentAction/IsAutoRepeatAction), UpdateUsable (the 1/1/1 ·
           0.5/0.5/1 · 0.4/0.4/0.4 vertex-color trio), UpdateCooldown (CooldownFrame_SetTimer),
           the Border's equipped green, and the 0.4 s Flash blink — with ONE structural deviation:
           the event set registers on the BAR frame and fans to all 12 buttons, instead of the
           ref's per-button Register/Unregister churn on HasAction (12 fixed buttons make the
           skip-empties optimization noise; the handlers themselves are the ref's).
-        - Count: ActionButton_UpdateCount transcribed, gated on IsConsumableAction exactly as the
+        - Count: ActionButton_UpdateCount re-expressed, gated on IsConsumableAction exactly as the
           ref does (0216 §7's "count > 0" simplification is retired — it put a stack number under
           a mount, which has no stack; the engine-side law is ItemInfo::is_consumable, byte-cited
           from 0x4e5250).
@@ -67,12 +67,12 @@
         --
         -- Found by the use-probe, which is the only column that touches anything.
         --
-        -- `CURRENT_ACTIONBAR_PAGE` is deliberately NOT among them. It is the reference's mutable
-        -- page cursor (ActionButton.lua:64/74 walk it), and benilla does not page the main bar that
-        -- way — the bonus offset re-pages it instead. Defining it as a frozen 1 would hand every
-        -- addon a number that is silently wrong forever; absent, a reader fails loudly and we find
-        -- out. That is this arc's own rule (1203/1205/1230: a silent wrong answer costs more than
-        -- a missing one), applied to ourselves.
+        -- `CURRENT_ACTIONBAR_PAGE` used to be withheld from this list on the grounds that it is the
+        -- reference's MUTABLE page cursor and we did not page the main bar — "defining it as a
+        -- frozen 1 would hand every addon a number that is silently wrong forever". That reasoning
+        -- was right and is now discharged rather than overruled: the bar pages, the global is live
+        -- state the paged-id formula reads, and it is declared with the paging verbs below rather
+        -- than here among the true constants. A frozen 1 would still be a lie; this one moves.
         NUM_ACTIONBAR_PAGES = 6
         NUM_ACTIONBAR_BUTTONS = 12
         BOTTOMLEFT_ACTIONBAR_PAGE = 6
@@ -99,7 +99,7 @@
 
         -- One button's HotKey corner — the ref's ActionButton_UpdateHotkeys law in FULL since
         -- 1008 (closing 0997's raw-token residue): the ABBREVIATED binding text through the
-        -- real GetBindingText transcription (UIParent.xml — one modifier abbreviates, "s-2";
+        -- GetBindingText the ref specifies (ours, in UIParent.xml — one modifier abbreviates, "s-2";
         -- two or more collapse to the ref's "·"), and with NO binding the ref's no-binding
         -- leg — an empty label the OnUpdate range timer fills with the RANGE_INDICATOR dot
         -- while out of range (until 1008 that leg was multibar-only; now any unbound slot,
@@ -133,6 +133,80 @@
         -- at OnLoad). The fan-out roster for the bar-level events below: the ref registers the
         -- feedback events per-button; our bar-level fan needs the full set in one place.
         BENILLA_ACTION_BUTTONS = {}
+
+        -- ── Main-bar paging (ref ActionButton.lua l.1-12 and l.63-101) ───────────────────────
+        -- The main bar has six pages, and we already hold every slot they address: the app owns
+        -- the authoritative 1..120 action table, so the DATA for pages 2-6 was always there and
+        -- only the page SELECTOR was missing. Its absence was on screen, not just in the API —
+        -- the page arrows below shipped as art with no OnClick, which this file's own comment
+        -- admitted ("ART ONLY - we have no bar paging, so the clicks are no-ops").
+        --
+        -- `Bartender2.lua:686` is the corpus tell: three bare `ChangeActionBarPage()` calls, and
+        -- the addon died on the nil global at session start.
+        CURRENT_ACTIONBAR_PAGE = 1
+        -- "Table of actionbar pages and whether they're viewable or not" (the reference's own
+        -- comment). The page walk below honours it rather than counting, which is what makes the
+        -- next two lines work at all.
+        --
+        -- **Pages 5 and 6 are deliberately NOT viewable, and that is the reference's own rule
+        -- applied to our configuration rather than a deviation from it.**
+        -- `MultiActionBar_Update` (ref MultiActionBars.lua l.49-60) blanks
+        -- `VIEWABLE_ACTION_BAR_PAGES[BOTTOMLEFT_ACTIONBAR_PAGE]` whenever MultiBarBottomLeft is
+        -- SHOWN — a page a multibar already displays must not also be reachable on the main bar,
+        -- or paging up shows you the twelve actions already on screen below. benilla's two bottom
+        -- bars are always-on with no `SHOW_MULTI_ACTIONBAR_*` state (0270, the director's call),
+        -- and they own pages 6 and 5 (MultiBars.xml: BottomLeft = actions 61..72, BottomRight =
+        -- 49..60), so the two rows are blanked at declaration instead of by a toggle.
+        --
+        -- MultiBarLeft/Right (pages 4 and 3) stay viewable because ours ship HIDDEN (1219), which
+        -- is the same state the reference is in with SHOW_MULTI_ACTIONBAR_3/4 unset.
+        VIEWABLE_ACTION_BAR_PAGES = {1, 1, 1, 1}
+        VIEWABLE_ACTION_BAR_PAGES[BOTTOMRIGHT_ACTIONBAR_PAGE] = nil
+        VIEWABLE_ACTION_BAR_PAGES[BOTTOMLEFT_ACTIONBAR_PAGE] = nil
+
+        -- `ChangeActionBarPage()` takes NO arguments — every reference caller sets
+        -- CURRENT_ACTIONBAR_PAGE first and then calls this to apply it (l.79, l.100), and
+        -- Bartender2 calls it bare.
+        --
+        -- Upstream it is a client binding; here it is FrameXML, deliberately. Our paged action id
+        -- is computed in Lua by `BenillaActionBar_ActionFor`, so the page IS this global and the
+        -- only work left for the verb is the repaint the reference gets by firing
+        -- ACTIONBAR_PAGE_CHANGED. Addons CALL this, they never replace it, so the divergence is
+        -- unobservable from Lua — unlike a name we shadow, which is 1222's class.
+        function ChangeActionBarPage()
+            for i = 1, table.getn(BENILLA_ACTION_BUTTONS) do
+                BenillaActionButton_Update(BENILLA_ACTION_BUTTONS[i])
+            end
+        end
+
+        function ActionBar_PageUp()
+            local page = CURRENT_ACTIONBAR_PAGE + 1
+            local nextPage
+            for i = page, NUM_ACTIONBAR_PAGES do
+                if VIEWABLE_ACTION_BAR_PAGES[i] then nextPage = i break end
+            end
+            -- Past the last viewable page, wrap to 1 — the reference wraps to the LITERAL 1 here
+            -- rather than to the first viewable page, which is its own asymmetry with PageDown
+            -- (which rescans). Kept, because it is observable: with page 1 blanked, paging up off
+            -- the end lands on a page the down-walk would have skipped.
+            CURRENT_ACTIONBAR_PAGE = nextPage or 1
+            ChangeActionBarPage()
+        end
+
+        function ActionBar_PageDown()
+            local page = CURRENT_ACTIONBAR_PAGE - 1
+            local prevPage
+            for i = page, 1, -1 do
+                if VIEWABLE_ACTION_BAR_PAGES[i] then prevPage = i break end
+            end
+            if not prevPage then
+                for i = NUM_ACTIONBAR_PAGES, 1, -1 do
+                    if VIEWABLE_ACTION_BAR_PAGES[i] then prevPage = i break end
+                end
+            end
+            CURRENT_ACTIONBAR_PAGE = prevPage
+            ChangeActionBarPage()
+        end
 
         -- Seat a TOP-LEVEL frame that anchors INTO the bar art (the bag bar + backpack toggle,
         -- BagFrame.xml; the micro-button row, MicroMenu.xml) one frame level above the art, so its
@@ -224,6 +298,11 @@
             local base = 0
             if offset > 0 then
                 base = (6 + offset - 1) * 12
+            else
+                -- The paged main bar. A bonus page (stance/form/stealth) OUTRANKS it, which is
+                -- why this is the else arm and not an addition: the reference's own
+                -- `ActionButton_GetPagedID` takes the bonus branch first.
+                base = (CURRENT_ACTIONBAR_PAGE - 1) * 12
             end
             return base + index
         end
@@ -232,6 +311,36 @@
         -- (ActionButton_GetPagedID:446-467 — MultiBarBottomLeft ⇒ page 6, MultiBarBottomRight ⇒
         -- page 5, else the paged/bonus formula); we carry the fork as data — a fixed per-button
         -- page base set at OnLoad (MultiBars.xml), nil for the bonus-paged main bar.
+        -- **Adopt a button that never ran our OnLoad.**
+        --
+        -- Our handlers read a region cache (`button.icon`, `.count`, `.cooldown`, …) that
+        -- `BenillaActionButton_OnLoad` fills. An addon inheriting `ActionBarButtonTemplate` gets
+        -- those handlers and supplies its OWN `<OnLoad>`, which REPLACES the template's rather
+        -- than chaining — so ours never runs and every one of those reads was nil. zBar.xml:7 is
+        -- the corpus shape; it died in OUR file at `ActionBar.xml:529` on `button.icon`.
+        --
+        -- Resolving from the derived names is not a fallback bolted on: it is exactly what our
+        -- OnLoad does, and what the REFERENCE does on every access (`ActionButton_Update` reads
+        -- `getglobal(this:GetName().."Icon")` each time rather than caching). We cache because it
+        -- is cheaper; this is the same lookup for the buttons that never got cached.
+        --
+        -- It deliberately does NOT join `BENILLA_ACTION_BUTTONS`. That roster is the event fan-out
+        -- for OUR bars, and a foreign button's owner drives its own updates — adding it would have
+        -- us repainting somebody else's button behind their back.
+        function BenillaActionButton_Adopt(button)
+            if not button or button.icon then return end
+            local n = button:GetName()
+            if not n then return end
+            button.icon = getglobal(n .. "Icon")
+            button.hotkey = getglobal(n .. "HotKey")
+            button.count = getglobal(n .. "Count")
+            button.flash = getglobal(n .. "Flash")
+            button.border = getglobal(n .. "Border")
+            button.cooldown = getglobal(n .. "Cooldown")
+            button.flashing = button.flashing or 0
+            button.flashtime = button.flashtime or 0
+        end
+
         function BenillaActionButton_Action(button)
             -- `index` falls back to the button's ID, which is where the REFERENCE reads it from:
             -- `ActionButton_GetPagedID` uses `this:GetID()`, and our `.index` is only that value
@@ -254,14 +363,27 @@
         -- tooltip with its rank column, an ITEM slot the shared item renderer; ref
         -- ActionButton_SetTooltip). The re-enter keeps it live across page flips.
         -- Anchor: ref ActionButton_SetTooltip (ActionButton.lua l.366-372) branches on the
-        -- UberTooltips CVar — "1" → the default corner, else RIGHT/LEFT by bar. UberTooltips
-        -- registers with default "1" (byte-read: WoW.exe 0x48fdd9, default string 0x82e748;
-        -- sibling rows BlockTrades→"0", UnitNameRenderMode→"2" confirm the layout), and benilla
-        -- ships no CVar state, so the branch collapses to the stock-client one: action-bar
-        -- tooltips live at the screen's bottom-right, above the bags.
+        -- UberTooltips CVar — "1" → the default corner, else beside the button, LEFT for the bars
+        -- that sit at the screen edge and RIGHT for the rest. This branch was collapsed to the "1"
+        -- leg until B230, on the reason that benilla shipped no CVar state for anything to move
+        -- it; 0954 ended that and cvars.rs now registers the key (default "1", byte-read — the
+        -- evidence lives on that row), so the fork is live and the stock look is unchanged.
+        --
+        -- The ref's LEFT set is {MultiBarBottomRight, MultiBarRight, MultiBarLeft}. Only the first
+        -- exists here — the two VERTICAL bars are deliberately not shipped (see the header of
+        -- MultiBars.xml) — so it is the whole test, and the day they land they join it.
         function BenillaActionButton_OnEnter(button)
+            BenillaActionButton_Adopt(button)
             if not GameTooltip then return end -- engine tests load file subsets
-            GameTooltip_SetDefaultAnchor(GameTooltip, button)
+            if GetCVar("UberTooltips") == "0" then
+                if button:GetParent() == MultiBarBottomRight then
+                    GameTooltip:SetOwner(button, "ANCHOR_LEFT")
+                else
+                    GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
+                end
+            else
+                GameTooltip_SetDefaultAnchor(GameTooltip, button)
+            end
             GameTooltip:SetAction(BenillaActionButton_Action(button))
         end
 
@@ -305,6 +427,7 @@
         -- Ref ActionBarFrame.xml:12-22's fork verbatim: shift picks up, else uses (checkCursor=1 —
         -- the engine routes a click-with-payload to PlaceAction instead, decision 0216 §7).
         function BenillaActionButton_OnClick(button)
+            BenillaActionButton_Adopt(button)
             local action = BenillaActionButton_Action(button)
             if IsShiftKeyDown() then
                 PickupAction(action)
@@ -320,12 +443,14 @@
         -- stops the *drag*, and shift-click stays the deliberate way to move an action with the bar
         -- locked — which is what makes the setting usable rather than a wall.
         function BenillaActionButton_OnDragStart(button)
+            BenillaActionButton_Adopt(button)
             if LOCK_ACTIONBAR == "1" then return end
             PickupAction(BenillaActionButton_Action(button))
             BenillaActionButton_Update(button)
         end
 
         function BenillaActionButton_OnReceiveDrag(button)
+            BenillaActionButton_Adopt(button)
             if LOCK_ACTIONBAR == "1" then return end
             PlaceAction(BenillaActionButton_Action(button))
             BenillaActionButton_Update(button)
@@ -333,7 +458,7 @@
 
         -- The default ACTIONBUTTON1..12 key bindings (ref Bindings.xml:121-127: keys 1..9,0,-,=
         -- run ActionButtonDown on keystate "down" and ActionButtonUp on "up" via runOnUp), both
-        -- transcribed from ActionButton.lua:15-28/30-45 and routed here from the app's key feed.
+        -- re-expressed from ActionButton.lua:15-28/30-45 and routed here from the app's key feed.
         -- DOWN pushes the button only from NORMAL; UP fires the action only from PUSHED — the
         -- state pair is both the pushed visual and the debounce (a key-repeat DOWN or a stray UP
         -- is a no-op). Calls UseAction DIRECTLY with NO checkCursor argument — unlike the
@@ -427,6 +552,7 @@
         -- tints red/grey, an unbound one wears the RANGE_INDICATOR dot (both legs the ref's,
         -- unified in 1008 — the SCOPE note).
         function ActionButton_OnUpdate(elapsed)
+            BenillaActionButton_Adopt(this)
             local button = this
             if ( button.flashing == 1 ) then
                 button.flashtime = button.flashtime - elapsed
@@ -466,7 +592,7 @@
             end
         end
 
-        -- ref ActionButton.lua:285-292 ActionButton_UpdateCount, transcribed. The gate is
+        -- the ref's count law (ActionButton.lua:285-292), re-expressed here. The gate is
         -- IsConsumableAction, NOT "count > 0": a consumable you have run out of shows a literal
         -- "0", and an item that is not consumable (a mount, a trinket, a bag) shows nothing at
         -- all, however many copies you hold.
@@ -499,7 +625,78 @@
         -- arguments are real state our per-container registration needs, so no adapter can supply
         -- them. That is the per-button event registration change already at the top of the arc
         -- queue, not a naming fix.
+        -- **`ActionButton_OnLoad()` — the reference's own, taking nothing and reading `this`.**
+        --
+        -- This sat at the top of the arc queue for the whole wave, recorded as unadaptable: ours
+        -- takes `(button, index, base, commandPrefix)` and the reference's takes none, so "no
+        -- adapter can supply them". Reading ref ActionButton.lua:103-119 shows that was wrong —
+        -- the reference derives all three from `this` and it is our own signature that caches
+        -- them:
+        --
+        --   index          -> `this:GetID()` (what ActionButton_GetPagedID reads)
+        --   commandPrefix  -> `this.buttonType`, a field the BAR sets, "ACTIONBUTTON" by default
+        --                     (ref l.118 `ActionButton_UpdateHotkeys(this.buttonType)`)
+        --   base           -> not an OnLoad concept at all; the reference forks on the PARENT's
+        --                     NAME at read time. A foreign bar ("zBar1") matches no multibar, so
+        --                     the paged/bonus formula applies — which is what leaving `base` nil
+        --                     already does here.
+        --
+        -- The events are registered on the BUTTON, as the reference does, and reach it through the
+        -- `<OnEvent>` this change adds to `ActionBarButtonTemplate`. Our own bars do NOT call this
+        -- and never register, so they keep being driven by the BENILLA_ACTION_BUTTONS fan-out and
+        -- cannot be double-driven.
+        function ActionButton_OnLoad()
+            local button = this
+            if not button then return end
+            BenillaActionButton_Adopt(button)
+            button.index = button.index or button:GetID()
+            button.bindingCommand = (button.buttonType or "ACTIONBUTTON") .. (button.index or 1)
+            button.showgrid = 0
+            button.flashing = 0
+            button.flashtime = 0
+            button:RegisterForDrag("LeftButton", "RightButton")
+            button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+            button:RegisterEvent("PLAYER_ENTERING_WORLD")
+            button:RegisterEvent("UPDATE_BONUS_ACTIONBAR")
+            button:RegisterEvent("ACTIONBAR_SHOWGRID")
+            button:RegisterEvent("ACTIONBAR_HIDEGRID")
+            button:RegisterEvent("ACTIONBAR_PAGE_CHANGED")
+            button:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
+            button:RegisterEvent("UPDATE_BINDINGS")
+            BenillaActionButton_PaintHotkey(button)
+            BenillaActionButton_Update(button)
+        end
+
+        -- The per-button event arm the reference's own template carries. Only buttons that ran
+        -- `ActionButton_OnLoad` ever registered, so this is a no-op for ours.
+        function ActionButton_OnEvent()
+            local button = this
+            if not button then return end
+            BenillaActionButton_Adopt(button)
+            if event == "ACTIONBAR_SHOWGRID" then
+                button.showgrid = 1
+            elseif event == "ACTIONBAR_HIDEGRID" then
+                button.showgrid = 0
+            elseif event == "UPDATE_BINDINGS" then
+                BenillaActionButton_PaintHotkey(button)
+            end
+            BenillaActionButton_Update(button)
+        end
+
+        -- ref ActionButton.lua:446 — the action id a button displays, forked on its parent bar.
+        -- `BenillaActionButton_Action` IS this function; only the name was ours. CT_BarMod calls it
+        -- the moment there is an action to page, which is why an EMPTY-world survey never saw it:
+        -- it surfaced only when the fixture started seating a populated session.
+        function ActionButton_GetPagedID(button)
+            return BenillaActionButton_Action(button or this)
+        end
+
         function ActionButton_Update()
+            -- Adopt here too: this adapter carries the REFERENCE's name, so `this` is very often a
+            -- button somebody else built (zBar's, CT_BarMod's) that never ran our OnLoad and so has
+            -- no region cache. The handler-boundary adopts do not cover it — an addon calls this
+            -- global directly, without any of our scripts in the stack.
+            BenillaActionButton_Adopt(this)
             BenillaActionButton_Update(this)
         end
 
@@ -739,54 +936,269 @@
             ExhaustionTick.timer = nil
         end
 
-        -- ── The max-level rail (ref-ReputationFrame.lua, the max-level slice) ─────────────────
-        -- ref l.14: the constant lives in ReputationFrame.lua, which isn't built yet — it moves
-        -- there with the reputation system.
-        MAX_PLAYER_LEVEL = 60
+        -- ══ The reputation WATCH BAR (ref-ReputationFrame.xml l.869-1036 + ref-ReputationFrame.lua
+        --    l.3-14 and l.161-270) ═══════════════════════════════════════════════════════════════
+        --
+        -- **THE PLACEMENT IS A DELIBERATE CALL, and this is its justification.** The reference
+        -- declares `ReputationWatchBar` and defines its update, its two text verbs, MAX_PLAYER_LEVEL
+        -- and FACTION_BAR_COLORS in `ReputationFrame.{xml,lua}`, because FrameXML loads MainMenuBar
+        -- and ReputationFrame in one breath and neither can exist without the other. benilla's
+        -- manifest is not one breath: this file is entry 94, `ReputationFrame.xml` is 213, and the
+        -- engine's per-window test harnesses deliberately load FILE SUBSETS — the XP bar's harness
+        -- loads no character window, the character window's loads no action bar.
+        --
+        -- Every frame `ReputationWatchBar_Update` touches except the watch bar itself is declared
+        -- in THIS file: MainMenuExpBar, MainMenuBarMaxLevelBar, ExhaustionTick, MainMenuBarArtFrame
+        -- and MainMenuBar. So does every frame that reads the bar back: `ExhaustionTick_Update`
+        -- below consults `ReputationWatchBar:IsShown()` twice, which is the reference's own pair of
+        -- guards. Splitting the bar's FRAME from the bar's UPDATE across a 120-entry manifest gap
+        -- would leave each subset holding half a mechanism and would put a nil-guard on every one
+        -- of those sites — the exact "special case to dodge a problem" shape the contract forbids.
+        -- The bar therefore stays whole, in the file that owns its collaborators, and
+        -- `ReputationFrame.xml` — which owns the PANE — reaches `ReputationWatchBar_Update()` by
+        -- name at click time, the direction that always resolves.
+        --
+        -- What DID move is the half-mechanism. `BenillaMaxLevelBar_Update` covered "the
+        -- no-watched-faction branch only" of the reference's function, parked on the rail frame
+        -- because the watch bar was driven by nothing; it is gone, replaced in place by the whole
+        -- `ReputationWatchBar_Update(newLevel)`. `MainMenuBarMaxLevelBar` accordingly carries NO
+        -- scripts any more — the reference's rail carries none either, because this function is its
+        -- only driver — and the event fan that sat on it is now the watch bar's own OnLoad/OnEvent,
+        -- which is where the reference puts it.
+        MAX_PLAYER_LEVEL = 60 -- ref-ReputationFrame.lua l.14 (with the ref's own "Hard coded =(")
 
-        function BenillaMaxLevelBar_OnLoad(bar)
-            bar:RegisterEvent("PLAYER_ENTERING_WORLD")
-            bar:RegisterEvent("PLAYER_LEVEL_UP")
+        -- The eight rank colours, quoted from ref-ReputationFrame.lua l.3-12 — a table of the
+        -- client's own rgb facts, which have no other value they could take. Indexed by the 1-based
+        -- standingID both `GetFactionInfo` and `GetWatchedFactionInfo` report (benilla-ui
+        -- `script::reputation`), so the pane's 15 bars and this one bar can never disagree about a
+        -- colour. Declared HERE rather than in ReputationFrame.xml (its reference home) for the
+        -- placement reason above: this file must be able to index it with no reputation file
+        -- loaded, and ReputationFrame.xml cannot be loaded without this one.
+        FACTION_BAR_COLORS = {
+            [1] = { r = 0.8, g = 0.3, b = 0.22 },
+            [2] = { r = 0.8, g = 0.3, b = 0.22 },
+            [3] = { r = 0.75, g = 0.27, b = 0 },
+            [4] = { r = 0.9, g = 0.7, b = 0 },
+            [5] = { r = 0, g = 0.6, b = 0.1 },
+            [6] = { r = 0, g = 0.6, b = 0.1 },
+            [7] = { r = 0, g = 0.6, b = 0.1 },
+            [8] = { r = 0, g = 0.6, b = 0.1 },
+        }
+
+        -- THE TWO POSTURES the watched strip can take, as data. `ref-ReputationFrame.lua`
+        -- l.184-230 is the specification and every number below is quoted from it; the shape is
+        -- ours, because the reference's two arms differ in exactly four numbers and which of the
+        -- two end-art sets is up, and that is a table and one application rather than two
+        -- hand-written branches that have to be diffed to be read.
+        --
+        -- STACKED is the below-max-level posture: an 8px strip sitting 3 above MainMenuBar, wearing
+        -- the UI-ReputationWatchBar end art, with the XP bar still underneath it. REPLACING is the
+        -- max-level one: 13px on MainMenuBar's own TOP, wearing the dwarf XP-bar art instead so the
+        -- strip reads as the bar it took over from.
+        BENILLA_WATCHBAR_POSTURE = {
+            stacked = { height = 8, seat = "BOTTOM", seatY = -3, textY = 3, art = "ReputationWatchBarTexture" },
+            replacing = { height = 13, seat = "TOP", seatY = 0, textY = 1, art = "ReputationXPBarTexture" },
+        }
+
+        -- Seat the strip in one posture and take the other's art down with it. Both end-art sets
+        -- are four 256-wide slices of the 1024 strip, named `<set>0` .. `<set>3`.
+        function BenillaWatchBar_SetPosture(stacked)
+            local wear, drop = BENILLA_WATCHBAR_POSTURE.replacing, BENILLA_WATCHBAR_POSTURE.stacked
+            if stacked then
+                wear, drop = drop, wear
+            end
+            ReputationWatchStatusBar:SetHeight(wear.height)
+            ReputationWatchBar:ClearAllPoints()
+            ReputationWatchBar:SetPoint(wear.seat, MainMenuBar, "TOP", 0, wear.seatY)
+            ReputationWatchStatusBarText:SetPoint("CENTER", ReputationWatchBarOverlayFrame, "CENTER", 0, wear.textY)
+            for slice = 0, 3 do
+                getglobal(wear.art .. slice):Show()
+                getglobal(drop.art .. slice):Hide()
+            end
         end
 
-        -- ref ReputationWatchBar_Update's else arm (ref-ReputationFrame.lua l.161-166 +
-        -- l.236-244), the no-watched-faction branch only — the reputation branches wait for the
-        -- reputation system: at MAX_PLAYER_LEVEL the XP strip gives way to the rail and the
-        -- tick goes with it. Login seam: the ref initializes off UPDATE_FACTION (its OnEvent's
-        -- else arm; the faction list lands at every login), an event benilla doesn't carry yet,
-        -- so the rail listens to PLAYER_ENTERING_WORLD instead — same moment, same values.
-        function BenillaMaxLevelBar_Update(newLevel)
-            if not newLevel then
-                newLevel = UnitLevel("player")
-            end
-            if newLevel == MAX_PLAYER_LEVEL then
-                MainMenuExpBar:Hide()
-                MainMenuBarMaxLevelBar:Show()
-                ExhaustionTick:Hide()
-            else
+        -- The XP strip and the rested tick that rides it go up and down together: with no strip
+        -- there is nothing for the tick to sit on. Every site the reference hides the strip from it
+        -- also hides the tick, and `ExhaustionTick_Update` enforces the same rule from the other
+        -- side on every event (its own last statement) — so it is one verb, not a pairing three
+        -- call sites have to remember.
+        function BenillaExpStrip_SetShown(shown)
+            if shown then
                 MainMenuExpBar:Show()
-                MainMenuBarMaxLevelBar:Hide()
+            else
+                MainMenuExpBar:Hide()
+                ExhaustionTick:Hide()
             end
         end
 
-        -- The ref's event fan (ref-ReputationFrame.xml l.1002-1016): PLAYER_LEVEL_UP passes
-        -- arg1 (the new level — the level FIELD may not have landed yet), everything else
-        -- re-reads UnitLevel.
-        function BenillaMaxLevelBar_OnEvent()
-            if event == "PLAYER_LEVEL_UP" then
-                BenillaMaxLevelBar_Update(arg1)
+        -- The watched faction's strip on the main bar — `ref-ReputationFrame.lua`
+        -- `ReputationWatchBar_Update` (l.161-250) is the specification. THREE states: a watched
+        -- faction takes one of the two postures above (the level picks), and no watched faction
+        -- leaves the XP bar — or, at max level, the brass rail — holding that space instead.
+        --
+        -- `newLevel` is the reference's own parameter: PLAYER_LEVEL_UP carries the new level as
+        -- arg1 because the level FIELD may not have landed yet, and every other caller re-reads
+        -- UnitLevel. Note the two level tests are deliberately NOT the same test: watched forks on
+        -- `< MAX_PLAYER_LEVEL`, unwatched on `== MAX_PLAYER_LEVEL`, which is the reference's own
+        -- asymmetry and only differs above the cap, where nothing can go.
+        --
+        -- ONE GUARD ADDED, at the tail: `updateContainerFrameAnchors` is defined by
+        -- ContainerFrameAdapters.xml (manifest 206, below this file), and a harness that shows this
+        -- bar without it would take a nil call on a line that only ever runs on a visibility flip.
+        -- The `if <global> then` shape is this codebase's own subset-load idiom (CharacterFrame.xml's
+        -- `if UpdateMicroButtons then`). `UIParent_ManageFramePositions` needs no such guard:
+        -- UIParent.xml is manifest 42, above every consumer.
+        function ReputationWatchBar_Update(newLevel)
+            newLevel = newLevel or UnitLevel("player")
+            local name, reaction, rankMin, rankMax, standing = GetWatchedFactionInfo()
+            -- Whether the strip's visibility FLIPS is all the tail below needs, so read it once
+            -- here and compare once at the end rather than threading a flag through both arms.
+            local wasShown = ReputationWatchBar:IsShown()
+            if name then
+                -- The engine reports the rank window ABSOLUTE for exactly this reason (benilla-ui
+                -- `script::reputation`'s module doc): the strip's range is the window's WIDTH, and
+                -- its value the distance into it.
+                local width = rankMax - rankMin
+                local progress = standing - rankMin
+                ReputationWatchStatusBar:SetMinMaxValues(0, width)
+                ReputationWatchStatusBar:SetValue(progress)
+                ReputationWatchStatusBarText:SetText(name .. " " .. progress .. " / " .. width)
+                local color = FACTION_BAR_COLORS[reaction]
+                ReputationWatchStatusBar:SetStatusBarColor(color.r, color.g, color.b)
+                ReputationWatchBar:Show()
+                ReputationWatchStatusBar:SetFrameLevel(MainMenuBarArtFrame:GetFrameLevel() - 1)
+
+                -- Stacked, the XP bar is still the bar underneath; replacing, it goes away with its
+                -- tick. Either way the brass rail is not wanted — the strip fills that space.
+                local stacked = newLevel < MAX_PLAYER_LEVEL
+                BenillaWatchBar_SetPosture(stacked)
+                BenillaExpStrip_SetShown(stacked)
+                MainMenuBarMaxLevelBar:Hide()
             else
-                BenillaMaxLevelBar_Update()
+                -- Nothing watched (the arm decision 1094 shipped alone): the strip goes down, and
+                -- at the cap the brass rail is what takes the XP bar's place.
+                ReputationWatchBar:Hide()
+                local capped = newLevel == MAX_PLAYER_LEVEL
+                BenillaExpStrip_SetShown(not capped)
+                if capped then
+                    MainMenuBarMaxLevelBar:Show()
+                else
+                    MainMenuBarMaxLevelBar:Hide()
+                end
             end
+            if wasShown ~= ReputationWatchBar:IsShown() then
+                UIParent_ManageFramePositions()
+                if updateContainerFrameAnchors then updateContainerFrameAnchors() end
+            end
+        end
+
+        -- The numerals lock, to ref-ReputationFrame.lua l.252-270. A two-key lock: `cvarLocked`
+        -- records that the statusBarText cvar (not a hover) asked for the text, and `textLocked`
+        -- that the text is currently pinned on — which is what the bar's own OnLeave reads before
+        -- hiding it again. Note the Show verb only ever shows the text AT MAX LEVEL, where the
+        -- strip has replaced the XP bar and is tall enough to hold numerals; below that it falls
+        -- through to the Hide one. Both function names, both field names and the FontString are the
+        -- addon-visible contract, so these two bodies have almost no freedom left in them and read
+        -- close to the reference's — which is what a compatible implementation of a four-line lock
+        -- over fixed names looks like, not a transcription.
+        function ShowWatchedReputationBarText(lock)
+            if lock then
+                ReputationWatchBar.cvarLocked = lock
+            end
+            if UnitLevel("player") == MAX_PLAYER_LEVEL and ReputationWatchBar:IsVisible() then
+                ReputationWatchStatusBarText:Show()
+                ReputationWatchBar.textLocked = 1
+            else
+                HideWatchedReputationBarText()
+            end
+        end
+
+        function HideWatchedReputationBarText(unlock)
+            if unlock or not ReputationWatchBar.cvarLocked then
+                ReputationWatchBar.cvarLocked = nil
+                ReputationWatchStatusBarText:Hide()
+                ReputationWatchBar.textLocked = nil
+            end
+        end
+
+        -- ── The watch bar's own handlers ────────────────────────────────────────────────────────
+        -- Chunk functions rather than the reference's inline bodies, so the departures below have
+        -- somewhere to be explained (ReputationFrame.xml's chunk-boundary rule).
+        -- `ref-ReputationFrame.xml` l.996-1035 is the specification.
+        --
+        -- PLAYER_ENTERING_WORLD is benilla's ADDITION (decision 1094's own): our faction feed only
+        -- fires once the catalog and the player's race/class are up, which can be a tick or two
+        -- after world entry, and the max-level rail must be right from the first frame. The arm it
+        -- lands in is idempotent, so the extra registration only ever costs a no-op. The event fan
+        -- is here rather than on `MainMenuBarMaxLevelBar`, where it sat while the watch bar was
+        -- driven by nothing — the rail is this function's output, not its own driver.
+        function BenillaWatchBar_OnLoad(bar)
+            bar:RegisterEvent("UPDATE_FACTION")
+            bar:RegisterEvent("PLAYER_LEVEL_UP")
+            bar:RegisterEvent("CVAR_UPDATE")
+            bar:RegisterEvent("PLAYER_ENTERING_WORLD")
+        end
+
+        -- Every event but one ends in a repaint of the bar, so the odd one out — the cvar that
+        -- pins the numerals on and off — is answered first and leaves.
+        --
+        -- TWO ARMS read as odd and are the reference's own:
+        --   · a faction push repaints the PANE, from the BAR's handler. The pane registers
+        --     UPDATE_FACTION itself (ReputationFrame.xml), so this is the reference double-driving
+        --     it; kept rather than "fixed", and harmless because the pane's repaint is idempotent.
+        --     Guarded on existence because this file loads WITHOUT ReputationFrame.xml in the
+        --     engine's per-window subset harnesses.
+        --   · the `statusBarText` token is DEAD CODE in shipped 1.12 and stays: the CVAR_UPDATE
+        --     token is the caller's third SetCVar argument, and 1.12's own options panels pass the
+        --     uppercase display name ("STATUS_BAR_TEXT"), never the cvar's own name (benilla-ui
+        --     `script::cvars`, decision 1140, which carves exactly this).
+        function BenillaWatchBar_OnEvent(bar, event)
+            if event == "CVAR_UPDATE" and arg1 == "statusBarText" then
+                if arg2 == "1" then
+                    ShowWatchedReputationBarText("lock")
+                else
+                    HideWatchedReputationBarText("unlock")
+                end
+                return
+            end
+            if event == "UPDATE_FACTION" and bar:IsVisible() and ReputationFrame_Update then
+                ReputationFrame_Update()
+            end
+            -- PLAYER_LEVEL_UP is the one event that knows the level; every other asks for nil and
+            -- lets the update re-read UnitLevel.
+            if event == "PLAYER_LEVEL_UP" then
+                ReputationWatchBar_Update(arg1)
+            else
+                ReputationWatchBar_Update()
+            end
+        end
+
+        -- Coming up with the cvar set means the numerals were meant to be pinned on all along.
+        function BenillaWatchBar_OnShow()
+            if GetCVar("statusBarText") == "1" then
+                ShowWatchedReputationBarText("lock")
+            end
+            UIParent_ManageFramePositions()
         end
 
         -- ── The exhaustion tick (ref-MainMenuBar.lua ExhaustionTick_*) ────────────────────────
         -- The round marker riding the XP bar at the point where rested XP runs out, plus the
-        -- pale fill between the bar's value and that point. One transcription cut left, named:
-        -- the ref's two ReputationWatchBar guards (the max-level+rep tick hide, l.51-54, and
-        -- the rep-bar-replaced-the-xp-bar hide, l.69-71) reference the faction watch bar, not
-        -- built — its frame can't be shown, so the cut is an unreachable-code cut, not a
-        -- behavior cut. The MainMenuBarMaxLevelBar guard is live since 1094 (the rail below).
+        -- pale fill between the bar's value and that point. NOTHING of the specification is cut
+        -- here any more: the two ReputationWatchBar guards that used to be missing (the
+        -- max-level-plus-rep tick hide, ref-MainMenuBar.lua l.51-54, and the
+        -- rep-bar-replaced-the-xp-bar hide, l.69-71) were dropped as UNREACHABLE — the watch bar
+        -- could never show — and it shows now, so both are live in ExhaustionTick_Update below.
+        -- The MainMenuBarMaxLevelBar guard is live since 1094.
+        --
+        -- The rest-state palette, keyed by GetRestState's own state id (ref-MainMenuBar.lua
+        -- l.56-66 is the specification; the two rgb triples are its). Rested is the light blue,
+        -- normal the purple; the ids above 2 are the beta-era tiers the live server never sends and
+        -- the reference paints nothing for either.
+        BENILLA_REST_STATE_COLOR = {
+            [1] = { r = 0.0, g = 0.39, b = 0.88 },
+            [2] = { r = 0.58, g = 0.0, b = 0.55 },
+        }
+
         function ExhaustionTick_OnLoad()
             local tick = this
             tick:RegisterEvent("PLAYER_ENTERING_WORLD")
@@ -829,20 +1241,32 @@
                             "TOPLEFT", exhaustionTickSet, 0)
                     end
                 end
-            end
-            -- The rest-state paint (only these two events repaint it, the ref's own split):
-            -- rested = light blue bar + pale blue fill-to-tick, normal = the purple default.
-            if event == "PLAYER_ENTERING_WORLD" or event == "UPDATE_EXHAUSTION" then
-                local exhaustionStateID = GetRestState()
-                if exhaustionStateID == 1 then
-                    MainMenuExpBar:SetStatusBarColor(0.0, 0.39, 0.88, 1.0)
-                    ExhaustionLevelFillBar:SetVertexColor(0.0, 0.39, 0.88, 0.15)
-                    ExhaustionTickHighlight:SetVertexColor(0.0, 0.39, 0.88)
-                elseif exhaustionStateID == 2 then
-                    MainMenuExpBar:SetStatusBarColor(0.58, 0.0, 0.55, 1.0)
-                    ExhaustionLevelFillBar:SetVertexColor(0.58, 0.0, 0.55, 0.15)
-                    ExhaustionTickHighlight:SetVertexColor(0.58, 0.0, 0.55)
+                -- ref-MainMenuBar.lua l.51-54: at max level with a watched faction the strip the
+                -- tick rides is the REPUTATION bar, which has no rested pool — hide the tick.
+                if UnitLevel("player") == MAX_PLAYER_LEVEL and ReputationWatchBar:IsShown() then
+                    ExhaustionTick:Hide()
                 end
+            end
+            -- The rest-state paint (only these two events repaint it, the ref's own split): one
+            -- rest state, one hue, worn by all three pieces at once — the strip's fill, the pale
+            -- wash up to the tick at a sixth alpha, and the tick's own ADD highlight. A state with
+            -- no row paints nothing, which is what the reference's if/elseif does for every id but
+            -- these two (and GetRestState answers nil off a wire that has not spoken yet, which
+            -- indexes to the same nothing).
+            if event == "PLAYER_ENTERING_WORLD" or event == "UPDATE_EXHAUSTION" then
+                local rest = BENILLA_REST_STATE_COLOR[GetRestState()]
+                if rest then
+                    MainMenuExpBar:SetStatusBarColor(rest.r, rest.g, rest.b, 1.0)
+                    ExhaustionLevelFillBar:SetVertexColor(rest.r, rest.g, rest.b, 0.15)
+                    ExhaustionTickHighlight:SetVertexColor(rest.r, rest.g, rest.b)
+                end
+            end
+            -- ref-MainMenuBar.lua l.69-71, the function's own last statement: the watch bar has
+            -- REPLACED the XP bar (max level), so there is no XP strip left for the tick to sit on
+            -- whatever the event was. Distinct from the guard above, which only runs on the four
+            -- position events; this one runs on every one.
+            if ReputationWatchBar:IsShown() and not MainMenuExpBar:IsShown() then
+                ExhaustionTick:Hide()
             end
         end
 
@@ -924,7 +1348,7 @@
         -- ref-MainMenuBar.xml l.344-407: a 16x64 frame in the bar's own right-hand recess whose
         -- 20x66 bar texture is TINTED green/yellow/red by the connection's latency, plus an
         -- all-points button on top for the hover tooltip. The thresholds, the 10 s poll and the
-        -- inline handlers below are the ref's, transcribed out of its XML into named functions.
+        -- inline handlers below are the ref's, re-expressed out of its XML into named functions.
         -- The meter shows LATENCY ONLY: 1.12 never scales the bar's height, only its color.
         PERFORMANCEBAR_LOW_LATENCY = 300
         PERFORMANCEBAR_MEDIUM_LATENCY = 600
@@ -1075,6 +1499,7 @@
     <!-- The bar half: the reference's `ActionBarButtonTemplate`, regions inherited, handlers added. -->
     <CheckButton name="ActionBarButtonTemplate" inherits="ActionButtonTemplate" virtual="true">
         <Scripts>
+            <OnEvent>ActionButton_OnEvent()</OnEvent>
             <OnClick>BenillaActionButton_OnClick(self)</OnClick>
             <OnDragStart>BenillaActionButton_OnDragStart(self)</OnDragStart>
             <OnReceiveDrag>BenillaActionButton_OnReceiveDrag(self)</OnReceiveDrag>
@@ -1220,8 +1645,12 @@
                 flat brass rail that replaces the XP strip at MAX_PLAYER_LEVEL — four 256×7
                 quarters of UI-MainMenuBar-MaxLevel, riding just above the frame's own 7 px rect
                 (each quarter's BOTTOM sits on the frame's TOP, the ref's own geometry).
-                Shown/hidden by BenillaMaxLevelBar_Update (decision 1094). The ref's OnShow/
-                OnHide call UIParent_ManageFramePositions, which benilla doesn't build
+                Shown and hidden by ReputationWatchBar_Update (above) and by nothing else — which
+                is the reference's own arrangement, and why this frame carries NO Scripts. It held
+                a benilla OnLoad/OnEvent pair while the watch bar was driven by nothing (decision
+                1094); those were a transcription of the WATCH BAR's own handlers parked here, and
+                they have gone back to it. The ref's OnShow/OnHide call
+                UIParent_ManageFramePositions, which benilla doesn't build
                 (DurabilityFrame.xml's note) — a named cut.
             -->
             <Frame name="MainMenuBarMaxLevelBar" enableMouse="true" hidden="true">
@@ -1261,10 +1690,6 @@
                         </Texture>
                     </Layer>
                 </Layers>
-                <Scripts>
-                    <OnLoad>BenillaMaxLevelBar_OnLoad(self)</OnLoad>
-                    <OnEvent>BenillaMaxLevelBar_OnEvent()</OnEvent>
-                </Scripts>
             </Frame>
 
             <!--
@@ -1378,8 +1803,8 @@
                     </CheckButton>
 
                     <!-- Page up/down: 32x32 at CENTER of the art frame's TOPLEFT +(522,-22)/(522,-42)
-                         (ref-ActionBarFrame.xml l.159-217). ART ONLY — we have no bar paging, so the
-                         clicks are no-ops (no OnClick handler). -->
+                         (ref-ActionBarFrame.xml l.159-217). Live now that the bar pages — they were
+                         art with no OnClick for as long as `CURRENT_ACTIONBAR_PAGE` did not exist. -->
                     <Button name="ActionBarUpButton">
                         <Size><AbsDimension x="32" y="32"/></Size>
                         <Anchors>
@@ -1388,6 +1813,7 @@
                         <NormalTexture file="Interface\MainMenuBar\UI-MainMenu-ScrollUpButton-Up"/>
                         <PushedTexture file="Interface\MainMenuBar\UI-MainMenu-ScrollUpButton-Down"/>
                         <HighlightTexture file="Interface\MainMenuBar\UI-MainMenu-ScrollUpButton-Highlight" alphaMode="ADD"/>
+                        <Scripts><OnClick>ActionBar_PageUp()</OnClick></Scripts>
                     </Button>
                     <Button name="ActionBarDownButton">
                         <Size><AbsDimension x="32" y="32"/></Size>
@@ -1397,6 +1823,7 @@
                         <NormalTexture file="Interface\MainMenuBar\UI-MainMenu-ScrollDownButton-Up"/>
                         <PushedTexture file="Interface\MainMenuBar\UI-MainMenu-ScrollDownButton-Down"/>
                         <HighlightTexture file="Interface\MainMenuBar\UI-MainMenu-ScrollDownButton-Highlight" alphaMode="ADD"/>
+                        <Scripts><OnClick>ActionBar_PageDown()</OnClick></Scripts>
                     </Button>
                 </Frames>
             </Frame>
@@ -1536,5 +1963,126 @@
                 <Scripts><OnLoad>BenillaActionButton_OnLoad(self, 12)</OnLoad></Scripts>
             </CheckButton>
         </Frames>
+    </Frame>
+
+    <!-- **The reputation watch bar** — built to `ref-ReputationFrame.xml:869-1036`, whose geometry
+         and art it quotes (those are the client's own facts) and whose handlers it implements in
+         this file's script block. It
+         shipped built-and-hidden with 1223 (three corpus addons index it by name — `FuBar_FuXPFu`,
+         `CT_BottomBar`, `zBarEx` — and FuXPFu dies at `FuBar_FuXPFu.lua:227` on the nil); it is
+         DRIVEN now, by `ReputationWatchBar_Update` in this file's script block, whose own comment
+         carries the reason the reputation watch-bar slice lives here rather than in
+         ReputationFrame.xml where the reference declares it.
+
+         Geometry quoted from the reference: a 1024x11 frame whose BOTTOM sits on MainMenuBar's TOP
+         at (0,-3), holding a 1024x8 `ReputationWatchStatusBar` at TOP. TWO sets of end art ride the
+         status bar and the update swaps between them: the four `ReputationWatchBarTexture*` slices
+         of `UI-ReputationWatchBar` for the stacked-above-the-XP-bar posture, and the four
+         `ReputationXPBarTexture*` slices of the dwarf `UI-MainMenuBar-Dwarf` sheet for the
+         replaces-the-XP-bar posture at max level, where the strip has to look like the bar it took
+         over from. The numerals live on their own DIALOG-strata overlay child so they draw over
+         both. -->
+    <Frame name="ReputationWatchBar" enableMouse="true" parent="MainMenuBar" hidden="true">
+        <Size><AbsDimension x="1024" y="11"/></Size>
+        <Anchors>
+            <Anchor point="BOTTOM" relativeTo="MainMenuBar" relativePoint="TOP"><Offset><AbsDimension x="0" y="-3"/></Offset></Anchor>
+        </Anchors>
+        <Frames>
+            <StatusBar name="ReputationWatchStatusBar" drawLayer="ARTWORK">
+                <Size><AbsDimension x="1024" y="8"/></Size>
+                <Anchors><Anchor point="TOP"/></Anchors>
+                <Layers>
+                    <Layer level="OVERLAY">
+                        <!-- ref l.890-929: four 256-wide quarters of the 1024 strip, each its own
+                             band of the sheet. The TexCoords were MISSING while the frame was a
+                             stub that could not show; without them every quarter draws the whole
+                             sheet. -->
+                        <Texture name="ReputationWatchBarTexture0" file="Interface\PaperDollInfoFrame\UI-ReputationWatchBar">
+                            <Size><AbsDimension x="256" y="11"/></Size>
+                            <Anchors><Anchor point="TOPLEFT"><Offset><AbsDimension x="0" y="2"/></Offset></Anchor></Anchors>
+                            <TexCoords left="0" right="1.0" top="0" bottom="0.171875"/>
+                        </Texture>
+                        <Texture name="ReputationWatchBarTexture1" file="Interface\PaperDollInfoFrame\UI-ReputationWatchBar">
+                            <Size><AbsDimension x="256" y="11"/></Size>
+                            <Anchors><Anchor point="LEFT" relativeTo="ReputationWatchBarTexture0" relativePoint="RIGHT"/></Anchors>
+                            <TexCoords left="0" right="1.0" top="0.171875" bottom="0.34375"/>
+                        </Texture>
+                        <Texture name="ReputationWatchBarTexture2" file="Interface\PaperDollInfoFrame\UI-ReputationWatchBar">
+                            <Size><AbsDimension x="256" y="11"/></Size>
+                            <Anchors><Anchor point="LEFT" relativeTo="ReputationWatchBarTexture1" relativePoint="RIGHT"/></Anchors>
+                            <TexCoords left="0" right="1.0" top="0.34375" bottom="0.515625"/>
+                        </Texture>
+                        <Texture name="ReputationWatchBarTexture3" file="Interface\PaperDollInfoFrame\UI-ReputationWatchBar">
+                            <Size><AbsDimension x="256" y="11"/></Size>
+                            <Anchors><Anchor point="LEFT" relativeTo="ReputationWatchBarTexture2" relativePoint="RIGHT"/></Anchors>
+                            <TexCoords left="0" right="1.0" top="0.515625" bottom="0.6875"/>
+                        </Texture>
+                        <!-- ref l.930-969: the max-level alternate, four bands of the SAME dwarf
+                             sheet the XP bar's own notch art comes from, so the replaced bar reads
+                             as the bar it replaced. Hidden until the max-level arm shows them. -->
+                        <Texture name="ReputationXPBarTexture0" file="Interface\MainMenuBar\UI-MainMenuBar-Dwarf" hidden="true">
+                            <Size><AbsDimension x="256" y="10"/></Size>
+                            <Anchors><Anchor point="TOPLEFT"/></Anchors>
+                            <TexCoords left="0" right="1.0" top="0.79296875" bottom="0.83203125"/>
+                        </Texture>
+                        <Texture name="ReputationXPBarTexture1" file="Interface\MainMenuBar\UI-MainMenuBar-Dwarf" hidden="true">
+                            <Size><AbsDimension x="256" y="10"/></Size>
+                            <Anchors><Anchor point="LEFT" relativeTo="ReputationXPBarTexture0" relativePoint="RIGHT"/></Anchors>
+                            <TexCoords left="0" right="1.0" top="0.54296875" bottom="0.58203125"/>
+                        </Texture>
+                        <Texture name="ReputationXPBarTexture2" file="Interface\MainMenuBar\UI-MainMenuBar-Dwarf" hidden="true">
+                            <Size><AbsDimension x="256" y="10"/></Size>
+                            <Anchors><Anchor point="LEFT" relativeTo="ReputationXPBarTexture1" relativePoint="RIGHT"/></Anchors>
+                            <TexCoords left="0" right="1.0" top="0.29296875" bottom="0.33203125"/>
+                        </Texture>
+                        <Texture name="ReputationXPBarTexture3" file="Interface\MainMenuBar\UI-MainMenuBar-Dwarf" hidden="true">
+                            <Size><AbsDimension x="256" y="10"/></Size>
+                            <Anchors><Anchor point="LEFT" relativeTo="ReputationXPBarTexture2" relativePoint="RIGHT"/></Anchors>
+                            <TexCoords left="0" right="1.0" top="0.04296875" bottom="0.08203125"/>
+                        </Texture>
+                    </Layer>
+                    <!-- ref l.971-975: the half-alpha black backing the fill rides over. -->
+                    <Layer level="BACKGROUND">
+                        <Texture name="ReputationWatchStatusBarBackground">
+                            <Color r="0.0" g="0.0" b="0.0" a="0.5"/>
+                        </Texture>
+                    </Layer>
+                </Layers>
+                <!-- ref l.977-978. The purple is only the load-time default: every painted state
+                     takes FACTION_BAR_COLORS[reaction] instead. -->
+                <BarTexture file="Interface\TargetingFrame\UI-StatusBar"/>
+                <BarColor r="0.58" g="0.0" b="0.55"/>
+            </StatusBar>
+            <!-- ref l.980-994: the numerals sit on a DIALOG-strata child of their own so they clear
+                 both sets of end art. Hidden by default; the hover shows them, and at max level the
+                 statusBarText cvar can pin them (ShowWatchedReputationBarText). -->
+            <Frame name="ReputationWatchBarOverlayFrame" frameStrata="DIALOG" setAllPoints="true">
+                <Layers>
+                    <Layer level="ARTWORK">
+                        <FontString name="ReputationWatchStatusBarText" inherits="NumberFontNormal" hidden="true">
+                            <Anchors><Anchor point="CENTER"><Offset><AbsDimension x="0" y="3"/></Offset></Anchor></Anchors>
+                        </FontString>
+                    </Layer>
+                </Layers>
+            </Frame>
+        </Frames>
+        <!-- ref l.996-1035. The three that carry any thought are chunk functions in this file's
+             script block, where their departures are documented (`BenillaWatchBar_OnLoad` /
+             `_OnEvent` / `_OnShow`); the three below are one statement each and stay where the
+             reference has them. The numerals hover is the pair: coming onto the bar shows them
+             unconditionally, leaving takes them down UNLESS the statusBarText cvar has pinned them
+             on — `textLocked` is the pin, and the two text verbs above are what set it. -->
+        <Scripts>
+            <OnLoad>BenillaWatchBar_OnLoad(self)</OnLoad>
+            <OnEvent>BenillaWatchBar_OnEvent(self, event)</OnEvent>
+            <OnShow>BenillaWatchBar_OnShow()</OnShow>
+            <OnHide>UIParent_ManageFramePositions()</OnHide>
+            <OnEnter>ReputationWatchStatusBarText:Show()</OnEnter>
+            <OnLeave>
+                if not ReputationWatchBar.textLocked then
+                    ReputationWatchStatusBarText:Hide()
+                end
+            </OnLeave>
+        </Scripts>
     </Frame>
 </Ui>

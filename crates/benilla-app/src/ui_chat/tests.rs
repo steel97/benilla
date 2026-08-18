@@ -2,7 +2,7 @@ use crate::net::ChatKind;
 
 use super::event::{default_color, ChatEvent, ChatEventKind as K};
 use super::frames::compose;
-use super::input::{emote_send_eligible, ParsedChat};
+use super::input::{emote_send_eligible, emote_target, ParsedChat};
 
 /// A player-line event (the wire bridge's output shape) — sender resolved, optional flag.
 fn ev(kind: K, text: &str, sender: &str) -> ChatEvent {
@@ -103,6 +103,114 @@ fn system_and_loot_lines_are_verbatim() {
         .unwrap(),
         "You receive loot: |cffffffff|Hitem:117:0:0:0|h[Tough Jerky]|h|r."
     );
+}
+
+/// B156's visible half, in one assertion: a TEXT_EMOTE line renders **verbatim**, and setting the
+/// performer in `sender` (arg2, for addons) must not make the composer bracket a name onto it the
+/// way it does for SAY. If this ever starts reading "[Bob] Bob waves.", the sender slot has leaked
+/// into the render.
+#[test]
+fn text_emote_lines_are_verbatim_and_never_wear_the_senders_name() {
+    let e = ev(K::TextEmote, "Bob waves at you.", "Bob");
+    assert_eq!(compose(&e, K::TextEmote).unwrap(), "Bob waves at you.");
+    // The control: the same event as a SAY *does* get the bracketed link, so the assertion above
+    // is about the TEXT_EMOTE arm and not about `compose` having stopped decorating anything.
+    assert!(compose(&ev(K::Say, "hi", "Bob"), K::Say)
+        .unwrap()
+        .contains("[Bob]"));
+}
+
+/// **A self-target goes out as guid 0** — `DoEmote`'s last act before it builds the packet
+/// (`0x5ef611`), and the reason vanilla has no self-emote sentence (decision 1282, correcting
+/// 1274's claim that you would read "You wave at ⟨YourName⟩.").
+///
+/// Without this the server echoes your own name back as the emote's target and the *whole zone*
+/// reads "Sam waves at Sam." — so the control below (a selection that is someone else survives
+/// intact) is what makes this a gate and not a mute button.
+#[test]
+fn emoting_at_your_own_selection_sends_an_untargeted_emote() {
+    use crate::target::Selection;
+    use bevy::prelude::Entity;
+
+    let me = Entity::from_raw_u32(7).unwrap();
+    let them = Entity::from_raw_u32(9).unwrap();
+
+    // Myself selected: the guid is dropped on the floor, exactly as `mov [ebp+0xc],ebx` does.
+    let sel = Selection {
+        target: Some(me),
+        guid: Some(0xdead_beef),
+    };
+    assert_eq!(emote_target(&sel, Some(me)), 0);
+
+    // The control — someone else selected: the guid goes out untouched.
+    let sel = Selection {
+        target: Some(them),
+        guid: Some(0xdead_beef),
+    };
+    assert_eq!(emote_target(&sel, Some(me)), 0xdead_beef);
+
+    // No selection at all is already untargeted, and a not-yet-streamed self entity must not make
+    // an empty selection look like a self-target (the `me.is_some()` guard).
+    assert_eq!(emote_target(&Selection::default(), Some(me)), 0);
+    let sel = Selection {
+        target: Some(them),
+        guid: Some(0xdead_beef),
+    };
+    assert_eq!(emote_target(&sel, None), 0xdead_beef);
+}
+
+/// The receive half of B156 on the real tables (decision 1274): the five reachable sentence forms,
+/// the performer in arg2, and the three silent rows. The composition law itself is pinned in
+/// `benilla_formats::emote_text`; what this covers is the seam — that the app hands the composer
+/// the right facts and puts the result in the right slots. Skips without client data.
+#[test]
+fn a_received_text_emote_composes_its_sentence_and_names_the_performer() {
+    let data = benilla_formats::wow_data_or_skip!();
+    let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+    let cat = benilla_formats::load_emote_text_catalog(&mut chain).expect("emote text catalog");
+    const WAVE: u32 = 101;
+    const SIT: u32 = 86;
+
+    fn them(target: &'static str) -> benilla_formats::EmoteLine<'static> {
+        benilla_formats::EmoteLine {
+            performer: "Bob",
+            performer_is_you: false,
+            performer_female: false,
+            target: if target == "-" { "" } else { target },
+            your_name: "Me",
+        }
+    }
+    fn mine(target: &'static str) -> benilla_formats::EmoteLine<'static> {
+        benilla_formats::EmoteLine {
+            performer: "Me",
+            performer_is_you: true,
+            ..them(target)
+        }
+    }
+    let line = |text_id, l| super::feed::text_emote_event(&cat, text_id, &l);
+
+    for (l, expected) in [
+        (them("Jane"), "Bob waves at Jane."),
+        (them("Me"), "Bob waves at you."),
+        (them("-"), "Bob waves."),
+    ] {
+        let e = line(WAVE, l).expect("a sentence");
+        assert_eq!(e.text, expected);
+        assert_eq!(e.kind, Some(K::TextEmote));
+        // arg2 is the performer, not the target — the reference pushes the performer's NameCache
+        // record (`0x49b47c`).
+        assert_eq!(e.sender, "Bob");
+    }
+    for (l, expected) in [
+        (mine("Jane"), "You wave at Jane."),
+        (mine("-"), "You wave."),
+    ] {
+        let e = line(WAVE, l).expect("a sentence");
+        assert_eq!(e.text, expected);
+        assert_eq!(e.sender, "Me");
+    }
+    // SIT's columns point at EmotesTextData rows that ship blank: no line, not an empty one.
+    assert!(line(SIT, them("-")).is_none(), "/sit prints nothing");
 }
 
 #[test]
@@ -213,6 +321,12 @@ fn channel_line_prefixes_the_stripped_channel() {
     );
 }
 
+/// The notice arms print arg4 **whole** — zone tail and all (1275).
+///
+/// The pair to hold in view is [`channel_line_prefixes_the_stripped_channel`] directly above: the
+/// same channel, the same arg4, and the reference renders them differently. `gsub(arg4,
+/// "%s%-%s.*", "")` lives at l.1463, inside the speech `else` arm, *after* every notice arm has
+/// returned — so speech says "[General]" and the join notice says "[General - Elwynn Forest]".
 #[test]
 fn channel_notices_compose_by_the_notice_law() {
     let mut e = ChatEvent::text_only(K::ChannelNotice, String::new());
@@ -220,7 +334,7 @@ fn channel_notices_compose_by_the_notice_law() {
     e.notice = "2".into(); // YOU_JOINED
     assert_eq!(
         compose(&e, K::ChannelNotice).unwrap(),
-        "Joined Channel: [General]"
+        "Joined Channel: [General - Elwynn Forest]"
     );
     let mut kick = ChatEvent::text_only(K::ChannelNotice, String::new());
     kick.channel = "World".into();
@@ -500,8 +614,8 @@ fn a_channel_we_are_not_in_fires_the_bare_name_and_zeroes() {
 #[test]
 fn stamping_a_channel_splits_the_display_form_from_the_base_name() {
     let mut channels = super::edit::ChannelState::default();
-    channels.joined.push("World".into());
-    channels.joined.push("General - Elwynn Forest".into());
+    channels.claim_slot("World");
+    channels.claim_slot("General - Elwynn Forest");
 
     let mut e = ev(K::Channel, "wts boar livers", "Bob");
     e.channel = "General - Elwynn Forest".into();
@@ -520,6 +634,219 @@ fn stamping_a_channel_splits_the_display_form_from_the_base_name() {
     assert_eq!(other.channel_number, 0); // arg8
     assert_eq!(other.channel_base, ""); // arg9 — NOT the name
     assert_eq!(other.zone_channel_id, 0); // arg7
+}
+
+/// **A channel notice renders in the CHANNEL row, not the CHANNEL_NOTICE row** (1275).
+///
+/// `ChatFrame_OnEvent` looks up `ChatTypeInfo[type]` and then overwrites it for the whole channel
+/// family: `info = ChatTypeInfo["CHANNEL"..arg8]` (l.1381). So the grey C0C0C0 the CHANNEL_NOTICE
+/// row carries is looked up and thrown away, and the join line comes out the channel's FFC0C0 —
+/// which is what the director's eye caught: our notices read white-grey where the client's read
+/// warm. Driven through the real router into the real window and read back off the extracted
+/// quad, because the color that matters is the one that reaches the screen.
+#[test]
+fn a_channel_notice_renders_in_the_channels_color_not_the_notice_row() {
+    use benilla_ui::script::QuadContent;
+
+    let mut s = chat_vm();
+    let mut windows = super::frames::ChatWindows::default();
+    let mut channels = super::edit::ChannelState::default();
+    channels.claim_slot("General - Elwynn Forest");
+
+    let mut e = ChatEvent::text_only(K::ChannelNotice, String::new());
+    e.channel = "General - Elwynn Forest".into();
+    e.notice = "2".into(); // YOU_JOINED
+    super::feed::deliver(&mut s, &mut windows, &mut channels, &mut e);
+    s.resolve();
+
+    let line = "Joined Channel: [1. General - Elwynn Forest]";
+    let color = s
+        .extract()
+        .iter()
+        .find_map(|q| match &q.content {
+            QuadContent::Text {
+                text: Some(t),
+                color: Some(c),
+                ..
+            } if t == line => Some(*c),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the notice line {line:?} rendered"));
+    let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+    assert!(
+        near(color[0], 1.0) && near(color[1], 192.0 / 255.0) && near(color[2], 192.0 / 255.0),
+        "FFC0C0 (the CHANNEL1 row), not C0C0C0 (the CHANNEL_NOTICE row): {color:?}"
+    );
+}
+
+/// The two rows the reference's own guard exempts from that override, and the family it covers.
+///
+/// The condition is `strsub(type,1,7) == "CHANNEL" and type ~= "CHANNEL_LIST" and (arg1 ~= "INVITE"
+/// or type ~= "CHANNEL_NOTICE_USER")` — so CHANNEL_LIST keeps C08080 and an INVITE notice keeps the
+/// CHANNEL_NOTICE_USER grey, while everything else in the family takes the channel's color even
+/// though their own rows differ (CHANNEL_JOIN/LEAVE are C08080, the notices C0C0C0).
+#[test]
+fn the_channel_color_override_covers_the_family_but_not_its_two_exemptions() {
+    use super::event::resolved_color;
+
+    let chan = [255, 192, 192];
+    let mut joined = ev(K::ChannelJoin, "", "Ann");
+    joined.channel_number = 2;
+    assert_eq!(resolved_color(&joined, K::ChannelJoin), chan);
+    assert_eq!(resolved_color(&joined, K::ChannelLeave), chan);
+    assert_eq!(resolved_color(&joined, K::Channel), chan);
+
+    let mut notice = ChatEvent::text_only(K::ChannelNotice, String::new());
+    notice.notice = "3".into(); // YOU_LEFT
+    notice.channel_number = 2;
+    assert_eq!(resolved_color(&notice, K::ChannelNotice), chan);
+    assert_ne!(resolved_color(&notice, K::ChannelNotice), [192, 192, 192]);
+
+    // CHANNEL_LIST: exempt, keeps its own C08080.
+    let list = ChatEvent::text_only(K::ChannelList, "Ann, Bob".into());
+    assert_eq!(resolved_color(&list, K::ChannelList), [192, 128, 128]);
+
+    // INVITE (0x18) on CHANNEL_NOTICE_USER: exempt, keeps the notice grey — and the exemption is
+    // arg1's, so the same kind carrying any other token does take the channel color.
+    let mut invite = ChatEvent::text_only(K::ChannelNoticeUser, String::new());
+    invite.notice = "24".into();
+    assert_eq!(
+        resolved_color(&invite, K::ChannelNoticeUser),
+        [192, 192, 192]
+    );
+    invite.notice = "23".into(); // PLAYER_ALREADY_MEMBER
+    assert_eq!(resolved_color(&invite, K::ChannelNoticeUser), chan);
+}
+
+/// **The leave line still knows its number, because the record dies after the line** (1275).
+///
+/// [`super::feed::deliver`] is the ordering under test: we used to drop the channel from the joined
+/// list before composing, so `stamp_channel` missed and the line came out "Left Channel: [General]"
+/// — unnumbered, and (with the color override above) resolved against arg8 = 0. The reference's
+/// YOU_LEFT arm flags the teardown and runs it *after* the fire (`0x49c5b0` fire, `0x49c5c2 call
+/// 0x49bbd0`), so the line is numbered and an addon's handler still sees the channel.
+#[test]
+fn a_leave_notice_keeps_its_number_because_the_record_dies_after_the_line() {
+    let mut s = chat_vm();
+    let mut windows = super::frames::ChatWindows::default();
+    let mut channels = super::edit::ChannelState::default();
+    channels.claim_slot("World");
+    channels.claim_slot("General - Elwynn Forest");
+
+    let mut e = ChatEvent::text_only(K::ChannelNotice, String::new());
+    e.channel = "General - Elwynn Forest".into();
+    e.notice = "3".into(); // YOU_LEFT
+    super::feed::deliver(&mut s, &mut windows, &mut channels, &mut e);
+
+    assert_eq!(e.channel, "2. General - Elwynn Forest", "arg4 was stamped");
+    assert_eq!(
+        e.channel_number, 2,
+        "arg8 — what the color resolves through"
+    );
+    assert_eq!(
+        super::frames::compose(&e, K::ChannelNotice).unwrap(),
+        "Left Channel: [2. General - Elwynn Forest]"
+    );
+    assert_eq!(
+        channels.joined,
+        [Some("World".to_string()), None],
+        "and only THEN is the record gone — as a HOLE at slot 2, not a shortened list (1286)"
+    );
+}
+
+/// **A channel that leaves does not renumber the ones that stay** (1286).
+///
+/// The director's teleport tour: `Left Channel: [1. General - Teldrassil]` /
+/// `Joined Channel: [2. General - The Barrens]` / `Left Channel: [1. LocalDefense - Teldrassil]`,
+/// with Trade shuffling 1 → 2 → 3 across the same few seconds — every number in the window moving
+/// because the list closed each hole. The reference frees the slot in place and refills the first
+/// free one, so a zone hop *renames* a channel and leaves its number alone.
+#[test]
+fn a_freed_slot_is_reused_and_the_others_keep_their_numbers() {
+    let mut c = super::edit::ChannelState::default();
+    assert_eq!(c.claim_slot("General - Teldrassil"), Some(1));
+    assert_eq!(c.claim_slot("Trade - City"), Some(2));
+    assert_eq!(c.claim_slot("LocalDefense - Teldrassil"), Some(3));
+
+    // Cross a zone border: General and LocalDefense rename, Trade is untouched.
+    assert_eq!(c.free_slot("General - Teldrassil"), Some(1));
+    assert_eq!(
+        c.claim_slot("General - The Barrens"),
+        Some(1),
+        "the freed slot is reused — the client scans for a zeroed record before growing"
+    );
+    assert_eq!(c.free_slot("LocalDefense - Teldrassil"), Some(3));
+    assert_eq!(c.claim_slot("LocalDefense - The Barrens"), Some(3));
+    assert_eq!(
+        c.number_of("Trade - City"),
+        Some(2),
+        "Trade never moved: /2 still reaches it, which is the whole complaint"
+    );
+
+    // Leaving the city drops Trade; the hole it leaves is what the next join takes.
+    assert_eq!(c.free_slot("Trade - City"), Some(2));
+    assert_eq!(c.name_of(2), None, "a hole answers 'not joined'");
+    assert_eq!(c.number_of("General - The Barrens"), Some(1), "still 1");
+    assert_eq!(
+        c.claim_slot("Trade - City"),
+        Some(2),
+        "and back into slot 2"
+    );
+
+    // The ceiling is the reference's ten (`0x49b9c0: cmp ecx,0xa`), counted in SLOTS.
+    for i in 4..=super::edit::MAX_CHANNELS {
+        assert_eq!(c.claim_slot(&format!("Custom{i}")), Some(i as u32));
+    }
+    assert_eq!(c.claim_slot("OneTooMany"), None);
+    assert_eq!(c.free_slot("Custom7"), Some(7));
+    assert_eq!(
+        c.claim_slot("OneTooMany"),
+        Some(7),
+        "full means no free slot, not a permanent ceiling"
+    );
+}
+
+/// **The next character does not inherit this one's chat window** (1288).
+///
+/// The reference ends a session by destroying its Lua state, so the window that comes back is
+/// empty. We keep the VM (`ui_script::IngameUiLoaded` is the latch standing in for that teardown),
+/// so the director saw the previous character's `Joined Channel:` lines still sitting under the
+/// new character's. Everything the module remembers across a box open goes with the lines.
+#[test]
+fn a_session_end_empties_the_window_and_the_boxs_memory() {
+    let mut s = chat_vm();
+    let mut windows = super::frames::ChatWindows::default();
+    let mut edit = super::edit::ChatEditState::default();
+    let mut log = super::ChatLog::default();
+
+    super::frames::route(&mut s, &mut windows, &ev(K::Say, "hi there", "Bob"));
+    super::frames::route(&mut s, &mut windows, &ev(K::Whisper, "psst", "Ann"));
+    edit.remember_tell("Ann");
+    edit.sticky = super::edit::SendType::Guild;
+    log.push_event(ChatEvent::text_only(K::System, "queued".into()));
+    assert_eq!(
+        lines_in_window(&s),
+        2,
+        "the window has this session's lines"
+    );
+
+    super::end_chat_session(Some(&mut s), &mut windows, &mut edit, &mut log);
+
+    assert_eq!(
+        lines_in_window(&s),
+        0,
+        "and the next character starts clean"
+    );
+    assert!(
+        edit.last_tell.is_empty(),
+        "the tell ring was that character's"
+    );
+    assert_eq!(
+        edit.sticky,
+        super::edit::SendType::Say,
+        "sticky back to SAY"
+    );
+    assert_eq!(windows.tell_alert_left, 0.0, "the chime throttle resets");
 }
 
 /// Every notice byte the composer renders has a token to fire, and vice versa — the two tables are
@@ -1018,12 +1345,17 @@ fn real_alias_table_resolves_the_shipped_commands() {
     assert_eq!(parse_line("/macrohelp"), ParsedChat::MacroHelp);
     // The whole shipped surface, so a table that half-loaded fails loudly: **225 distinct emote
     // commands** over the 169 `EmotesText` names (the strings repeat — `EMOTE87_CMD1` and `_CMD2`
-    // are both "/sit" — and EMOTE27 "UNUSED" has no row, so it contributes none), and **67 distinct
-    // aliases** across the 34 registered `SlashCmdList` indices (0886 added TARGET's `/target`
+    // are both "/sit" — and EMOTE27 "UNUSED" has no row, so it contributes none), and **68 distinct
+    // aliases** across the 36 registered `SlashCmdList` indices (0886 added TARGET's `/target`
     // `/tar` and ASSIST's `/assist` `/a` to 0881's 55; 0890 added FOLLOW's `/f` `/follow` `/fol`;
-    // 0983 added CAST's `/cast` `/spell`, MACRO's `/macro` `/m`, and MACROHELP's `/macrohelp`).
+    // 0983 added CAST's `/cast` `/spell`, MACRO's `/macro` `/m`, and MACROHELP's `/macrohelp`;
+    // 1291 added CONSOLE's `/console` — one distinct alias, SLASH_CONSOLE1 and 2 are both the
+    // same string).
     //
-    // The third number is the **seam** (decision 1179): benilla's own instrument commands
+    // The third number is benilla's own player-facing additions (1291): `/reload` — present in
+    // every build, deliberately counted apart from the shipped surface so the seam stays visible.
+    //
+    // The fourth is the instrument **seam** (decision 1179): benilla's own instrument commands
     // (`/castvis` `/chattest` `/partytest` `/shot` `/liquid` `/reaction` `/react` — 7 aliases over 6
     // commands) are registered only when `run_mode::dev_affordances()`, so a player build claims
     // none of them and `/partytest` falls through to the reference's "unknown command". Asserted
@@ -1035,8 +1367,8 @@ fn real_alias_table_resolves_the_shipped_commands() {
     };
     assert_eq!(
         table.counts(),
-        (67, 225, instruments),
-        "(slash, emote, instrument) aliases"
+        (68, 225, 1, instruments),
+        "(slash, emote, benilla addition, instrument) aliases"
     );
 }
 
@@ -1116,4 +1448,156 @@ fn a_sticky_whose_group_is_gone_opens_as_say() {
     // Everything ungated passes through untouched.
     assert_eq!(sticky_on_open(SendType::Guild, &solo), SendType::Guild);
     assert_eq!(sticky_on_open(SendType::Say, &solo), SendType::Say);
+}
+
+/// **The inbound addon split, and the direction a reimplementation gets backwards.**
+///
+/// `CHAT_MSG_ADDON` (event 227) carries `(prefix, message, distribution, sender)`. The text divides
+/// on its **FIRST** tab (`0x49a8d0`) — and with **no tab at all the whole text is the PREFIX** with
+/// an empty message, not the reverse. wow-re records that direction explicitly because it is the
+/// counter-intuitive one; this test is where it is pinned.
+///
+/// `distribution` is the remap at `0x49aff4`: only the four lanes have names, and anything else
+/// reports `"UNKNOWN"` rather than being dropped — the reference hands the addon a string it can
+/// branch on either way.
+#[test]
+fn an_inbound_addon_line_splits_on_the_first_tab_only() {
+    // **Imported, not hand-copied.** These read `0x03`/`0x04`/`0x18` for RAID/GUILD/BATTLEGROUND,
+    // which are all wrong — and because the test carried the SAME wrong bytes as the code under
+    // test, it agreed with the defect instead of catching it. A test that restates the value it is
+    // checking cannot fail on that value; taking it from the protocol crate is what makes it a
+    // check rather than an echo.
+    use benilla_protocol::messages as m;
+    let party = m::CHAT_TYPE_PARTY as u8;
+    let raid = m::CHAT_TYPE_RAID as u8;
+    let guild = m::CHAT_TYPE_GUILD as u8;
+    let battleground = m::CHAT_TYPE_BATTLEGROUND as u8;
+    let say = m::CHAT_TYPE_SAY as u8;
+    #[allow(non_snake_case)]
+    let (PARTY, RAID, GUILD, BATTLEGROUND, SAY) = (party, raid, guild, battleground, say);
+
+    let mut log = super::feed::ChatLog::default();
+    // The ordinary shape.
+    log.push_addon("oRA\tSYNC:1", PARTY, 7);
+    // A message that itself contains tabs: only the FIRST one divides.
+    log.push_addon("CTRA\tA\tB\tC", RAID, 7);
+    // NO TAB — the whole text is the prefix, the message is empty.
+    log.push_addon("BareTag", GUILD, 7);
+    // An empty message after a trailing tab is still an empty message, not a missing one.
+    log.push_addon("Tag\t", BATTLEGROUND, 7);
+    // A lane with no name still arrives, labelled.
+    log.push_addon("X\ty", SAY, 7);
+
+    assert_eq!(
+        log.pending_addons(),
+        vec![
+            ("oRA".into(), "SYNC:1".into(), "PARTY".into()),
+            ("CTRA".into(), "A\tB\tC".into(), "RAID".into()),
+            ("BareTag".into(), String::new(), "GUILD".into()),
+            ("Tag".into(), String::new(), "BATTLEGROUND".into()),
+            ("X".into(), "y".into(), "UNKNOWN".into()),
+        ]
+    );
+}
+
+/// **`CHAT_MSG_ADDON` reaches Lua with the reference's four arguments, in the reference's order.**
+///
+/// The split test above covers the parse; this covers the FIRE, which is the half that can be
+/// silently wrong — an addon reading `arg3` as the sender instead of the distribution gets a string
+/// either way and misbehaves without erroring.
+///
+/// wow-re carves the shape as `SignalEvent2(227, "%s%s%s%s", prefix, message, distribution, sender)`
+/// (`0x49a95f`); `BigWigs` self-delivers the identical order by hand. The handler below records all
+/// four positionally, so a reordering fails on the values rather than on a count.
+#[test]
+fn the_addon_event_reaches_lua_with_four_arguments_in_order() {
+    let mut s = benilla_ui::script::UiScript::new().unwrap();
+    s.run(
+        r#"
+        seen = nil
+        f = CreateFrame("Frame", "AddonSink")
+        f:RegisterEvent("CHAT_MSG_ADDON")
+        f:SetScript("OnEvent", function()
+            seen = { arg1, arg2, arg3, arg4 }
+        end)
+        "#,
+    )
+    .unwrap();
+
+    super::feed::fire_addon_message(
+        &mut s,
+        "oRA".into(),
+        "SYNC:1".into(),
+        "PARTY".into(),
+        "Someone".into(),
+    );
+
+    assert!(
+        s.errors().is_empty(),
+        "the fire must not raise: {:?}",
+        s.errors()
+    );
+    assert_eq!(
+        s.eval::<String>("return seen[1]").unwrap(),
+        "oRA",
+        "arg1 is the PREFIX"
+    );
+    assert_eq!(
+        s.eval::<String>("return seen[2]").unwrap(),
+        "SYNC:1",
+        "arg2 is the MESSAGE"
+    );
+    assert_eq!(
+        s.eval::<String>("return seen[3]").unwrap(),
+        "PARTY",
+        "arg3 is the DISTRIBUTION, not the sender"
+    );
+    assert_eq!(
+        s.eval::<String>("return seen[4]").unwrap(),
+        "Someone",
+        "arg4 is the SENDER, and a name rather than a guid"
+    );
+}
+
+/// **The two halves of the addon lane, against each other.**
+///
+/// Send (1235/1236) and receive (7bd5567f) landed in different sessions, and the agent that built
+/// the send half flagged the gap honestly: they pass together but *"I have not independently
+/// exercised the two together."* A two-account live loopback is still the only thing that proves
+/// the round trip on the wire — this proves the halves agree with each OTHER, which is the part
+/// that can drift without either side looking wrong on its own.
+///
+/// The composition and the split are separate transcriptions of the same byte law (`0x49f9b3`
+/// composes on a tab, `0x49a8d0` splits on the first one), written by different sessions from the
+/// same note. If one had picked a different separator, or split last-tab instead of first, every
+/// test on both sides would still pass.
+///
+/// A message CONTAINING tabs is the case that discriminates: compose glues one tab, the split takes
+/// only the first, so the payload must come back with its own tabs intact.
+#[test]
+fn an_addon_message_survives_its_own_send_and_receive() {
+    let mut s = benilla_ui::script::UiScript::new().unwrap();
+    s.run(r#"SendAddonMessage("oRA", "SYNC\t1\t2", "PARTY")"#)
+        .unwrap();
+    assert!(s.errors().is_empty(), "send raised: {:?}", s.errors());
+
+    let sends = s.take_addon_sends();
+    assert_eq!(sends.len(), 1, "one broadcast queued");
+    let sent = &sends[0];
+    assert_eq!(sent.distribution.token(), "PARTY");
+
+    // Now the wire turns around: the same text arrives as an ordinary PARTY line carrying
+    // LANG_ADDON, and the receive half parses it.
+    let mut log = super::feed::ChatLog::default();
+    log.push_addon(&sent.text, 0x01, 7);
+
+    assert_eq!(
+        log.pending_addons(),
+        vec![(
+            "oRA".to_string(),
+            "SYNC\t1\t2".to_string(),
+            "PARTY".to_string()
+        )],
+        "what one half composed, the other must recover — tabs in the payload included"
+    );
 }

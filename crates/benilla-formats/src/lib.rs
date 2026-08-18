@@ -16,6 +16,9 @@ use benilla_dbc::{DbcParser, FieldType, Schema, SchemaField};
 
 mod chain;
 pub use chain::{Chain, ChainEntry};
+/// The UI texture table's other half — loose `.tga` art (addon folders; decision 1322).
+mod tga;
+pub use tga::tga_to_rgba;
 /// Where the WoW install is — the one resolver (decision 1175). Paired with [`Chain`]: this says
 /// *where*, that opens it.
 mod install;
@@ -43,7 +46,8 @@ mod itemsubclass;
 pub use itemsubclass::{load_item_sub_classes, ItemSubClassCatalog, ItemSubClassInfo};
 mod factions;
 pub use factions::{
-    load_faction_catalog, reputation_rank, FactionCatalog, FactionInfo, FactionTemplate, Reaction,
+    faction_flags, load_faction_catalog, reputation_rank, FactionCatalog, FactionInfo,
+    FactionTemplate, Reaction,
 };
 mod creature_types;
 pub use creature_types::{load_creature_type_flags, CreatureTypeFlags};
@@ -122,6 +126,8 @@ mod npc_greeting;
 pub use npc_greeting::{load_npc_greeting_catalog, NpcGreeting, NpcGreetingCatalog};
 mod emotes;
 pub use emotes::{load_emote_sound_catalog, EmoteSoundCatalog};
+mod emote_text;
+pub use emote_text::{load_emote_text_catalog, EmoteLine, EmoteTextCatalog};
 mod environmental_damage;
 pub use environmental_damage::{load_environmental_damage, EnvironmentalDamageTable};
 mod footsteps;
@@ -181,10 +187,10 @@ mod models;
 pub use models::{
     accumulate_wmo_group_camera_collision, accumulate_wmo_group_camera_only_collision,
     accumulate_wmo_group_collision, hand_grip_finger_poses, load_m2_animation_summary,
-    load_m2_bounds, load_m2_collision_hull, load_m2_mesh, load_m2_mesh_skinned, load_object_model,
-    load_wmo, load_wmo_collision_tris, m2_owner_reach, m2_ribbon_emitter_count,
-    m2_texture_transform_count, non_separable_billboard_bones, owner_last_rung,
-    owner_last_rung_bucket, parse_m2_animation_lookup, parse_m2_animation_summary,
+    load_m2_bone_spins, load_m2_bounds, load_m2_collision_hull, load_m2_mesh, load_m2_mesh_skinned,
+    load_object_model, load_wmo, load_wmo_collision_tris, m2_bone_spins, m2_owner_reach,
+    m2_ribbon_emitter_count, m2_texture_transform_count, non_separable_billboard_bones,
+    owner_last_rung, owner_last_rung_bucket, parse_m2_animation_lookup, parse_m2_animation_summary,
     parse_m2_animations, parse_m2_attachments, parse_m2_bounds, parse_m2_camera,
     parse_m2_cch_marker, parse_m2_collision_hull, parse_m2_event_markers,
     parse_m2_global_sequence_bones, parse_m2_lights, parse_m2_playable_animation_lookup,
@@ -193,18 +199,19 @@ pub use models::{
     wmo_group_doodad_refs, wmo_group_fixed_colors, wmo_group_footprint_tris, wmo_group_header,
     wmo_group_light_refs, wmo_group_liquid_mesh, wmo_group_raw_colors, wmo_group_submeshes,
     wmo_root_id, AlphaAnim, AlphaSeq, AnimEvent, Billboard, BillboardKind, BoneKeys, BoneScaleAnim,
-    CharSkinSlot, CollisionMesh, EmitterBoneLink, EventMarker, FogPolicy, FootprintTris,
-    GlobalSeqBone, GlobalSeqChannel, GroundQuad, M2AnimSummary, M2Attachment, M2Bounds, M2Light,
-    M2PortraitCamera, ModelAnimation, ModelBlend, ParentArm, ParentBasis, PlayableAnim,
-    RenderSubmesh, RgbAnim, ScalarAnim, Skeleton, SkeletonBone, StringAnchors, UvAnim,
+    BoneSpin, CharSkinSlot, CollisionMesh, EmitterBoneLink, EventMarker, FogPolicy, FootprintTris,
+    GlobalSeqBone, GlobalSeqChannel, GroundQuad, KeyAnim, M2AnimSummary, M2Attachment, M2Bounds,
+    M2Light, M2PortraitCamera, ModelAnimation, ModelBlend, ParentArm, ParentBasis, PlayableAnim,
+    RenderSubmesh, RgbAnim, ScalarAnim, SeqLoops, Skeleton, SkeletonBone, StringAnchors, UvAnim,
     WmoBatchClass, WmoDoodad, WmoDoodadSet, WmoFog, WmoGroupHeader, WmoGroupInfo, WmoLight,
     WmoPortalInfo, WmoPortalRef, WmoPortals, WmoRoot, NO_GROUP_LIQUID, OWNER_RUNG_BUCKETS,
 };
 mod terrain;
 pub use terrain::{
-    adt_to_tile_mesh, area_id_at, find_tile_near, ground_effect_at, load_tile_mesh,
+    adt_to_tile_mesh, area_id_at, find_tile_near, ground_effect_at, impassable_at, load_tile_mesh,
     load_tiles_around, mcsh_shadowed_at, terrain_height_at, triangle_z_at, ChunkMesh, Doodad,
-    MapTiles, TileMesh, WmoInstance, ALPHA_MAP_SIZE, SHADOW_MAP_SIZE, STORMWIND_XY, TILE_SIZE,
+    MapTiles, TileMesh, WmoInstance, ALPHA_MAP_SIZE, CHUNK_SIZE, SHADOW_MAP_SIZE, STORMWIND_XY,
+    TILE_SIZE,
 };
 mod wdl;
 /// World (x, y) ↔ ADT tile `(col, row)` — the same mapping the streamer uses to pick tiles
@@ -259,27 +266,30 @@ pub use taxi_nodes::{load_taxi_nodes, TaxiNode, TaxiNodes};
 mod taxi_path;
 pub use taxi_path::{load_taxi_paths, TaxiPath, TaxiPaths};
 
-/// Vanilla 1.12.1 MPQ load order, **lowest priority first**.
+/// The ten vanilla base content archives, **lowest priority first** — the reference mounter's
+/// table (`0x82e12c`) at its carved fixed priorities (`dbc.MPQ` = 0x36 … `model.MPQ` = 0x3f),
+/// reversed so [`Chain`]'s later-wins order reproduces them (decision 1300).
 ///
-/// Later archives override earlier ones for files sharing an internal path. The base
-/// content archives hold the bulk of the data but carry **no `(listfile)`**; the master
-/// `(listfile)` (and most overrides) live in `patch.MPQ` / `patch-2.MPQ`, which is why the
-/// chain — not a single archive — is the correct unit to read from. Verified against the
-/// build-5875 client (`patch.MPQ` listfile = 26,350 entries).
-pub const VANILLA_LOAD_ORDER: &[&str] = &[
-    "base.MPQ",
+/// This is only the *base* set: `patch.MPQ`, the `patch-?.MPQ` archives, and the optional
+/// `speech2.MPQ` are **discovered**, not listed — the whole mount law lives in [`Chain::open`].
+/// `base.MPQ` is deliberately absent: the reference opens it once for `telemetry.dat` and closes
+/// it before the mounter runs, so its contents are unreachable as assets (wow-re, VERIFIED).
+///
+/// The base archives hold the bulk of the data but carry **no `(listfile)`**; the master
+/// `(listfile)` (and most overrides) live in the patch archives, which is why the chain — not a
+/// single archive — is the correct unit to read from. Verified against the build-5875 client
+/// (`patch.MPQ` listfile = 26,350 entries).
+pub const VANILLA_BASE_ORDER: &[&str] = &[
     "dbc.MPQ",
+    "speech.MPQ",
     "fonts.MPQ",
     "interface.MPQ",
     "misc.MPQ",
-    "model.MPQ",
     "sound.MPQ",
-    "speech.MPQ",
+    "wmo.MPQ",
     "terrain.MPQ",
     "texture.MPQ",
-    "wmo.MPQ",
-    "patch.MPQ",
-    "patch-2.MPQ",
+    "model.MPQ",
 ];
 
 /// Open a [`Chain`] from either a single `.MPQ` file or a vanilla `Data` directory. Thin wrapper over

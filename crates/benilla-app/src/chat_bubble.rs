@@ -27,7 +27,11 @@
 //!   PLAIN (`||`→`|`, color/hyperlink escapes stripped — [`sanitize`]).
 //! - **Anchor** (`0x4b0c30`): `worldZ = unit.z + attachmentHeight·modelScale + 0.7`, projected
 //!   by the plate/name projector, seated **BOTTOM at the point, growing upward** (the mirror
-//!   of the plate, which hangs down).
+//!   of the plate, which hangs down). `attachmentHeight` is `0x4b0e38 call 0x711a20` — a read of
+//!   the **MD20 header image**, i.e. the **Stand sequence CAaBox's Z extent**, a file constant
+//!   with no bone matrix anywhere in its call tree — and the scaled product is **latched** at
+//!   `bubble+0x354` behind a parity guard, so it is queried exactly **once per chat line**
+//!   ([`crate::entities::StandBoxHeight`], wow-re's anchor cross-check 2026-08-17; 1406).
 //!
 //! Named divergences (all deliberate, decisions 0598/0599):
 //! - **`ChatBubblesParty` defaults ON** (binary default "0") — the director asked for `/p`
@@ -37,10 +41,14 @@
 //!   bubbles too — but that category claim is INFERRED on an OPEN wire-type remap
 //!   (chat-bubble.md §1) and contradicts the remembered reference look, so the uncontested
 //!   set ships and a capture can widen it ([`bubble_cvar`]).
-//! - **The anchor height is the posed overhead attachment** ([`overhead_anchor`], the
-//!   `0x608640` chain) rather than the client's `0x711a20` model-attachment query — the
-//!   attachment behind `0x711a20` is not identified in the note (INFERRED equivalence; both
-//!   are "the head-region attachment height, model-scaled").
+//! - ~~**The anchor height is the posed overhead attachment**~~ — **REFUTED and removed (1406).**
+//!   This shipped as an INFERRED equivalence ("both are the head-region attachment height,
+//!   model-scaled") between the overhead-name chain `0x608640` and the bubble's `0x711a20`. They
+//!   are not equivalent, and they differ on exactly the axis that mattered: `0x608640` reads the
+//!   live posed palette and tracks the pose, `0x711a20` reads file bytes. The overhead *name*
+//!   keeps `0x608640`; the bubble now takes the Stand-box constant the bytes actually specify. It
+//!   sits **0.199 model units lower** on a human male (2.0128 vs the attachment's 2.2120) — a
+//!   deliberate, measured move toward the reference, not a regression.
 //! - **Sizes ride the plates' damped diagonal basis** ([`plate_basis`], decisions 0185/0186)
 //!   so bubble text and plate text stay the same em at every window — the same director-pinned
 //!   deviation from the unbounded byte law.
@@ -57,15 +65,15 @@ use bevy::ecs::entity::EntityHashSet;
 use bevy::prelude::*;
 
 use benilla_ui::layout::Rect as GxRect;
-use benilla_ui::script::{pieces, Backdrop, Insets};
+use benilla_ui::script::{inset_atlas_bleed, pieces, Backdrop, Insets};
 use benilla_ui::script::{JustifyH, JustifyV, Outline};
 
-use crate::entities::{overhead_anchor, BoneAttach, OverheadFallback};
-use crate::net::{Guid, NetEntity, SelfGuid, SelfPlayer};
+use crate::entities::StandBoxHeight;
+use crate::net::{Embodied, Guid, NetEntity, SelfGuid};
 use crate::ui_chat::{default_color, ChatEventKind};
 use crate::ui_pass::{UiQuad, UiQuadAppend, UiQuads, UvRect};
 use crate::ui_text::{layout_text_quads, measure_text, FontSpec, Justify, UiFontAtlas};
-use crate::vplates::{gx_px, plate_basis, text_px, VPlateSet, VPlates};
+use crate::vplates::{device_snap, gx_px, plate_basis, text_px, VPlateSet, VPlates};
 use benilla_assets::{AssetSet, WorldAssets};
 use benilla_world::view::WorldCamera;
 
@@ -204,6 +212,31 @@ fn sanitize(text: &str) -> String {
     out
 }
 
+/// The bleed inset for one border piece, `Vec2::ZERO` texels meaning "art size unknown, leave the
+/// UVs alone" (a bare test app with no patch chain).
+fn pieces_inset(uvs: [[f32; 2]; 4], texels: Vec2) -> [[f32; 2]; 4] {
+    if texels.x <= 0.0 || texels.y <= 0.0 {
+        return uvs;
+    }
+    inset_atlas_bleed(uvs, texels.x, texels.y)
+}
+
+/// The frame's bottom-left origin for a projected seat: BOTTOM-CENTER on the seat, then both
+/// coordinates snapped onto the **device** pixel grid ([`device_snap`], the plate's law).
+///
+/// Split out so the snap law is nameable and pinned. It shipped as a plain logical `round()`,
+/// which is 1 device pixel only at scale 1: on the 2× display we play on it stepped the bubble
+/// two physical pixels per axis over a continuously-sliding world, and at a fractional scale
+/// (1.25/1.5) it never landed on a texel boundary at all — so it paid the stepping without even
+/// buying the crispness it exists for. Same bug, same fix as the plate (0188's snap → the plate's
+/// device grid); the bubble was the site that never got it (1398).
+fn seat_origin(seat: Vec2, w: f32, scale: f32) -> Vec2 {
+    Vec2::new(
+        device_snap(seat.x - w * 0.5, scale),
+        device_snap(seat.y, scale),
+    )
+}
+
 /// The border-unit in logical px for this viewport: 16/1024 of the screen width, carried
 /// through the damped size basis (so it shrinks in step with plate/text sizes past the knee).
 fn border_px(viewport: Vec2, basis: f32) -> f32 {
@@ -229,6 +262,18 @@ impl BubbleQueue {
         text: &str,
     ) {
         if sender_guid == 0 || !bubble_cvar(kind, cfg).unwrap_or(false) {
+            if benilla_assets::trace::enabled_for("bub") {
+                let why = match (sender_guid, bubble_cvar(kind, cfg)) {
+                    (0, _) => "senderless".to_string(),
+                    (_, None) => format!("{kind:?}-never-bubbles"),
+                    (_, Some(false)) => format!("{kind:?}-cvar-off"),
+                    _ => unreachable!("the guard above admits nothing else"),
+                };
+                benilla_assets::trace::line(
+                    "bub",
+                    &format!("refuse guid={sender_guid:#x} push:{why}"),
+                );
+            }
             return;
         }
         self.0.push((sender_guid, kind, text.to_string()));
@@ -245,6 +290,11 @@ struct Bubble {
     born: f32,
     /// The steady window past the fade-in ([`duration_secs`]).
     duration: f32,
+    /// The **latched** anchor height above the speaker's feet: the Stand box's Z extent
+    /// ([`crate::entities::StandBoxHeight`]) already multiplied by the unit's model scale, queried
+    /// ONCE here and never re-read — the reference caches exactly this product at `bubble+0x354`
+    /// behind a parity guard, so it is one query per chat line (1406).
+    lift: f32,
     /// Current fade alpha 0..1 — ramped 250 ms linear toward the eligibility verdict.
     alpha: f32,
 }
@@ -266,6 +316,10 @@ struct BubbleArt {
     bg: Handle<Image>,
     edge: Handle<Image>,
     tail: Handle<Image>,
+    /// The edge atlas's size in texels, for the half-texel bleed inset
+    /// ([`benilla_ui::script::backdrop::inset_atlas_bleed`] — 1402). Stamped at load because the
+    /// draw has no `Assets<Image>` and this never changes.
+    edge_texels: Vec2,
 }
 
 fn load_bubble_art(
@@ -283,7 +337,16 @@ fn load_bubble_art(
         warn!("chat_bubble: bubble art missing from the patch chain — bubbles will not draw");
         return;
     };
-    commands.insert_resource(BubbleArt { bg, edge, tail });
+    let edge_texels = images.get(&edge).map_or(Vec2::ZERO, |i| {
+        let s = i.texture_descriptor.size;
+        Vec2::new(s.width as f32, s.height as f32)
+    });
+    commands.insert_resource(BubbleArt {
+        bg,
+        edge,
+        tail,
+        edge_texels,
+    });
 }
 
 /// Spawn, tick, and draw, every frame: drain the queue through the spawn gate (`0x608ac0`),
@@ -300,19 +363,16 @@ fn drive_bubbles(
     vplates: Res<VPlates>,
     self_guid: Res<SelfGuid>,
     units: Query<(Entity, &Guid, &Transform), With<NetEntity>>,
-    self_q: Query<&Transform, With<SelfPlayer>>,
+    self_q: Query<&Transform, With<Embodied>>,
     camera: Query<(&Camera, &Transform), With<WorldCamera>>,
     mut atlas: Option<ResMut<UiFontAtlas>>,
     mut quads: ResMut<UiQuads>,
     art: Option<Res<BubbleArt>>,
-    // The overhead-anchor inputs ([`overhead_anchor`]).
-    anchor_q: (
-        Query<&BoneAttach>,
-        Query<&OverheadFallback>,
-        Query<&GlobalTransform>,
-        Query<(), With<crate::entities::mount::MountChild>>,
-    ),
+    // The latched anchor height, read once per bubble at spawn ([`StandBoxHeight`]).
+    heights: Query<&StandBoxHeight>,
     time: Res<Time>,
+    // The device scale, for the seat's pixel snap ([`device_snap`]).
+    window: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
     active.0.clear();
     let now = time.elapsed_secs();
@@ -323,13 +383,25 @@ fn drive_bubbles(
     let find = |guid: u64| units.iter().find(|(_, g, _)| g.0 == guid);
 
     // ── The spawn/replace gate (`0x608ac0`) ─────────────────────────────────────────────────
+    // Every arm below reports its REFUSAL under the `bub` tag. A bubble that never appears used to
+    // be a silent five-way question — no text, no unit, a plate in the way, no local player, out of
+    // range — with nothing in any log to separate them, and the draw trace beside it says nothing
+    // because the draw never runs. One line per refusal is the difference between reading the
+    // answer and bisecting for it.
+    let refuse = |why: &str, guid: u64| {
+        if benilla_assets::trace::enabled_for("bub") {
+            benilla_assets::trace::line("bub", &format!("refuse guid={guid:#x} {why}"));
+        }
+    };
     for (guid, kind, raw) in queue.0.drain(..) {
         let text = sanitize(&raw);
         let words = word_count(&text);
         if words == 0 {
+            refuse("empty-text", guid);
             continue; // empty text → duration 0 → no bubble
         }
         let Some((entity, _, tf)) = find(guid) else {
+            refuse("sender-not-a-live-unit", guid);
             continue; // sender not resolvable to a live unit → NO bubble
         };
         // An active V-plate blocks bubble creation (`0x608adc` — the mutual exclusion,
@@ -337,16 +409,24 @@ fn drive_bubbles(
         // OFF (0599's other half), so friendly/party bubbles have room; a plated hostile
         // yelling shows no bubble, exactly like the reference with plates toggled on.
         if vplates.0.contains(&entity) {
+            refuse("v-plate-on-speaker", guid);
             continue;
         }
         let Some(self_tf) = self_tf else {
+            refuse("no-local-player", guid);
             continue; // the local player must resolve
         };
-        if (tf.translation - self_tf.translation).length_squared() > MAX_DIST_SQ {
+        let d2 = (tf.translation - self_tf.translation).length_squared();
+        if d2 > MAX_DIST_SQ {
+            refuse(&format!("out-of-range dist={:.1}yd", d2.sqrt()), guid);
             continue; // 20 yd at spawn
         }
         let is_self = self_guid.0 == Some(guid);
         let c = default_color(kind);
+        // The one-time attachment query (`0x4b0e38 call 0x711a20`, scaled by `[unit+0x90]`): a file
+        // constant × this unit's model scale. A speaker with no bounds reads 0 and the bubble sits
+        // at the feet + 0.7, which is the reference's own degenerate for a bounds-less model.
+        let lift = heights.get(entity).map_or(0.0, |h| h.0) * tf.scale.y;
         // Replace, never queue: the insert tears the old bubble down (`0x608c00`) and the
         // fresh one fades in from 0.
         bubbles.0.insert(
@@ -360,6 +440,7 @@ fn drive_bubbles(
                 ],
                 born: now,
                 duration: duration_secs(words, is_self),
+                lift,
                 alpha: 0.0,
             },
         );
@@ -371,6 +452,7 @@ fn drive_bubbles(
     // ── Tick + draw ─────────────────────────────────────────────────────────────────────────
     let cam = camera.single().ok();
     let art = art.as_deref();
+    let scale = window.single().map_or(1.0, Window::scale_factor);
     let trace = std::env::var("WOW_BUBBLE_TRACE").as_deref() == Ok("1");
     let mut dead = Vec::new();
     for (guid, b) in bubbles.0.iter_mut() {
@@ -407,26 +489,40 @@ fn drive_bubbles(
         else {
             continue; // no camera/atlas/art — lifetimes still tick, nothing draws
         };
-        // World anchor: unit position, Z lifted by the posed attachment height + 0.7 yd —
-        // seated BOTTOM at the projected point, growing upward. A point behind the camera
-        // draws nothing (state kept — it fades back the moment it projects again).
-        let anchor = overhead_anchor(
-            entity,
-            tf,
-            &anchor_q.0,
-            &anchor_q.1,
-            &anchor_q.2,
-            &anchor_q.3,
-        );
-        let seat_world = Vec3::new(tf.translation.x, anchor.y + LIFT, tf.translation.z);
+        // World anchor (`0x4b0c30`): the unit's position, Z lifted by the LATCHED Stand-box height
+        // + 0.7 yd — seated BOTTOM at the projected point, growing upward. Every term is this
+        // frame's `Transform` or a constant, so there is no pose to read and no clock to get wrong.
+        // A point behind the camera draws nothing (state kept — it fades back the moment it
+        // projects again).
+        let seat_world = tf.translation + Vec3::Y * (b.lift + LIFT);
         let cam_tf = GlobalTransform::from(*cam_pose);
+        // The SEVENTH silent cause, and the one that cost the most to find: a seat behind the
+        // camera fails to project and the bubble draws nothing — alive, ticking, invisible, and
+        // (before this) invisible to the trace too, because every `bub` line is written by the
+        // draw. A probe whose camera had been restored pitched into the ground therefore read as
+        // "bubbles are broken" for six runs (1402). Reported like the spawn gate's refusals.
         let Ok(seat) = cam.world_to_viewport(&cam_tf, seat_world) else {
+            refuse("not-on-screen (behind the camera)", *guid);
             continue;
         };
         let Some(viewport) = cam.logical_viewport_size() else {
+            refuse("no-viewport", *guid);
             continue;
         };
-        draw_bubble(atlas, &mut quads, art, b, seat, viewport, trace);
+        draw_bubble(
+            atlas,
+            &mut quads,
+            art,
+            b,
+            seat,
+            viewport,
+            scale,
+            trace,
+            entity,
+            seat_world,
+            tf.translation,
+            cam_pose,
+        );
     }
     for g in dead {
         bubbles.0.remove(&g);
@@ -435,6 +531,7 @@ fn drive_bubbles(
 
 /// Append one bubble's draw list: the Backdrop pieces (bg fill inset by the border-unit +
 /// the 8-piece edge), the tail square, and the wrapped, centered, chatType-colored text.
+#[allow(clippy::too_many_arguments)] // the draw inputs + the jitter trace's decomposition
 fn draw_bubble(
     atlas: &mut UiFontAtlas,
     quads: &mut UiQuads,
@@ -442,47 +539,54 @@ fn draw_bubble(
     b: &Bubble,
     seat: Vec2,
     viewport: Vec2,
+    scale: f32,
     trace: bool,
+    // The `bub` jitter-decomposition trace's inputs — see the tail of this function.
+    entity: Entity,
+    anchor: Vec3,
+    unit_pos: Vec3,
+    cam_pose: &Transform,
 ) {
     let basis = plate_basis(viewport);
     let border = border_px(viewport, basis);
     let margin = gx_px(MARGIN, basis);
 
-    // Shape at the nearest baked atlas size, then rescale to the exact window-derived em —
-    // the plate-text recipe (`crate::vplates::plate_text`).
+    // The exact window-derived em, laid out AT that em. This used to shape at the nearest baked
+    // ladder size and rescale the finished quads by `px/shaped` around the box centre — a bubble's
+    // size is derived from the viewport and so lands on nothing round, which meant every bubble on
+    // screen was a resampled bitmap. Since decision 1342 the raster follows the request.
     let px = text_px(TEXT_H, basis);
-    let shaped = atlas.snap_size(px);
-    if shaped <= 0.0 {
+    if px <= 0.0 {
         return;
     }
-    let s = px / shaped;
+    let mut e = atlas.lock();
     let spec = FontSpec {
-        path: None, // NAMEPLATE_FONT — Friz Quadrata, the atlas default
-        height: Some(shaped),
+        path: None, // NAMEPLATE_FONT — Friz Quadrata, the engine's default face
+        height: Some(px),
         outline: Outline::None,
-        paint_halo: true,
         alpha_gradient: None,
     };
     // The wrap law (`0x4b1600` tail): single-line width > 0.2 gx → hard-cap (forces wrap);
-    // else max(measured, 2·border-unit). All in shaped space, rescaled after.
-    let cap_s = gx_px(WRAP_W, basis) / s;
-    let floor_s = (2.0 * border) / s;
-    let (line_w, _) = measure_text(atlas, &b.text, None, spec);
-    let box_w_s = if line_w > cap_s {
-        cap_s
-    } else {
-        line_w.max(floor_s)
-    };
-    let (_, box_h_s) = measure_text(atlas, &b.text, Some(box_w_s), spec);
-    let (text_w, text_h) = ((box_w_s * s).ceil(), (box_h_s * s).ceil());
+    // else max(measured, 2·border-unit).
+    let cap = gx_px(WRAP_W, basis);
+    let floor = 2.0 * border;
+    let (line_w, _) = measure_text(&mut e, &b.text, None, spec);
+    let box_w = if line_w > cap { cap } else { line_w.max(floor) };
+    let (_, box_h) = measure_text(&mut e, &b.text, Some(box_w), spec);
+    let (text_w, text_h) = (box_w.ceil(), box_h.ceil());
 
     // The auto-fit body: the frame hugs the text layout ± the flat margin; BOTTOM-center on
-    // the seat, growing upward. Snapped to whole logical px (the plate divergence — a
-    // fractional corner bilinear-smears the border art).
+    // the seat, growing upward. Snapped onto the **device** pixel grid (the plate divergence —
+    // a fractional corner bilinear-smears the border art), which is [`device_snap`], the plate's
+    // own law, not the plain logical `round()` this shipped with: the quad lane is logical px, so
+    // rounding there quantized the bubble to `scale_factor` PHYSICAL pixels — two pixels of
+    // stepping per axis on the 2× display we play on, against a world sliding continuously
+    // underneath, and no texel alignment at all at a fractional scale. It is the same bug the
+    // plate was carrying and the same fix; the bubble is simply the site that never got it (1398).
     let w = text_w + 2.0 * margin;
     let h = text_h + 2.0 * margin;
-    let left = (seat.x - w * 0.5).round();
-    let bottom = seat.y.round();
+    let origin = seat_origin(seat, w, scale);
+    let (left, bottom) = (origin.x, origin.y);
     let frame = Rect::new(left, bottom - h, left + w, bottom);
     let alpha = b.alpha;
 
@@ -513,6 +617,15 @@ fn draw_bubble(
             p.corners[2][0],
             -p.corners[2][1],
         );
+        // The border pieces share one 256×32 atlas; without the half-texel inset, bilinear at each
+        // piece's own edge blends in the neighbour's first column — and the column beside the TOP
+        // slice is WHITE at alpha 0, which is the pale line that ran through the bubble (1402). The
+        // bg is its own texture and keeps its UVs.
+        let uvs = if p.is_bg {
+            p.uvs
+        } else {
+            pieces_inset(p.uvs, art.edge_texels)
+        };
         quads.overlays.push(UiQuad {
             rect,
             z_key: if p.is_bg { Z_BG } else { Z_EDGE },
@@ -521,7 +634,7 @@ fn draw_bubble(
             } else {
                 art.edge.clone()
             }),
-            uv: UvRect::from_corners(p.uvs),
+            uv: UvRect::from_corners(uvs),
             color: [1.0, 1.0, 1.0, alpha],
             ..default()
         });
@@ -538,13 +651,13 @@ fn draw_bubble(
         color: [1.0, 1.0, 1.0, alpha],
         ..default()
     });
-    // The text: centered in the margin box, wrapped at the shaped-space cap, rescaled around
-    // the box center to the exact em (uniform, so wrap points survive the rescale).
+    // The text: centered in the margin box, wrapped at the cap. No rescale pass — the glyphs came
+    // out of the cache at this em.
     let center = Vec2::new(cx, (frame.min.y + frame.max.y) * 0.5);
     let mut text_quads = layout_text_quads(
-        atlas,
+        &mut e,
         &b.text,
-        Rect::from_center_size(center, Vec2::new(box_w_s, box_h_s)),
+        Rect::from_center_size(center, Vec2::new(box_w, box_h)),
         [b.color[0], b.color[1], b.color[2], alpha],
         Justify {
             h: JustifyH::Center,
@@ -553,18 +666,54 @@ fn draw_bubble(
         Z_TEXT,
         spec,
     );
-    for q in text_quads.iter_mut() {
-        q.rect = Rect::new(
-            center.x + (q.rect.min.x - center.x) * s,
-            center.y + (q.rect.min.y - center.y) * s,
-            center.x + (q.rect.max.x - center.x) * s,
-            center.y + (q.rect.max.y - center.y) * s,
-        );
-    }
+    drop(e);
     if trace {
         eprintln!(
             "bubble-trace: viewport={viewport:?} frame=({:.1},{:.1})..({:.1},{:.1}) border={border:.1} alpha={alpha:.2} text={:?}",
             frame.min.x, frame.min.y, frame.max.x, frame.max.y, b.text
+        );
+    }
+    // **The jitter decomposition** (`WOW_MOVE_TRACE` tag `bub`, one line per bubble per frame) —
+    // the plate's `vpl` line ([`crate::vplates`]) for the bubble: the seat's world point, the
+    // camera pose that projected it, the raw projected seat, and the snapped frame origin. "The
+    // bubble is jittery when running" is then attributed from numbers rather than from the eye —
+    // a moving anchor, a noisy camera, or the pixel snap. Since 1406 `anchor=` and `pos=` differ by
+    // a LATCHED constant on Y and by nothing at all on X/Z, so any wobble between them is a defect
+    // by construction. (Through 1398 they were read on different clocks — the anchor computed
+    // through a `GlobalTransform` Bevy propagates in `PostUpdate`, i.e. last frame's — and their
+    // difference measured exactly that lag: the term 1341 cleared for the plate by measuring a unit
+    // that was STANDING STILL, where it is identically zero. Dropping the pose read removes the
+    // seam rather than correcting it.) It rides the shared tag-filtered trace and NOT the `WOW_BUBBLE_TRACE`
+    // eprintln beside it, whose unbuffered writes would distort the frame pacing the question is
+    // about (the 0880 lesson, the same reason `vpl` lives there).
+    if benilla_assets::trace::enabled_for("bub") {
+        let (cp, cf) = (cam_pose.translation, cam_pose.forward());
+        benilla_assets::trace::line(
+            "bub",
+            &format!(
+                "e={} vp=({:.0},{:.0}) anchor=[{:.4},{:.4},{:.4}] cam=[{:.4},{:.4},{:.4}] \
+                 fwd=[{:.4},{:.4},{:.4}] pos=[{:.4},{:.4},{:.4}] scr=({:.3},{:.3}) \
+                 frame=({:.2},{:.2}) scale={scale:.2}",
+                entity.index(),
+                viewport.x,
+                viewport.y,
+                anchor.x,
+                anchor.y,
+                anchor.z,
+                cp.x,
+                cp.y,
+                cp.z,
+                cf.x,
+                cf.y,
+                cf.z,
+                unit_pos.x,
+                unit_pos.y,
+                unit_pos.z,
+                seat.x,
+                seat.y,
+                frame.min.x,
+                frame.max.y,
+            ),
         );
     }
     quads.overlays.append(&mut text_quads);
@@ -684,6 +833,63 @@ mod tests {
             bubble_cvar(K::Party, &no_say),
             Some(true),
             "party has its own switch"
+        );
+    }
+
+    /// The seat snaps on the DEVICE grid, not the logical one — the plate's law
+    /// ([`device_snap`]), which the bubble shipped without. At the 2× display we play on, a
+    /// logical `round()` moved the bubble two physical pixels per axis against a world that
+    /// slides continuously; this moves it one, the smallest step that still lands the border
+    /// blit on a texel boundary. Pinned so `scale` can't be "simplified" back out into `round()`.
+    #[test]
+    fn the_bubble_seat_snaps_on_the_device_grid() {
+        // 2×: the grid is every half logical pixel, and every snapped edge is a whole physical px.
+        for (seat_y, want) in [(10.0, 10.0), (10.2, 10.0), (10.3, 10.5), (10.6, 10.5)] {
+            let o = seat_origin(Vec2::new(100.0, seat_y), 40.0, 2.0);
+            assert_eq!(o.y, want, "seat y {seat_y} at 2×");
+            assert_eq!(
+                (o.y * 2.0).fract(),
+                0.0,
+                "{} is a whole physical pixel",
+                o.y
+            );
+        }
+        // The x half is the same law applied to the CENTERED left edge (seat − w/2), so an odd
+        // width still lands the left edge — the one the border blit starts from — on the grid.
+        let o = seat_origin(Vec2::new(100.4, 0.0), 41.0, 2.0);
+        assert_eq!(o.x, 80.0);
+        assert_eq!(((100.4_f32 - 20.5) * 2.0).round() / 2.0, o.x);
+        // 1×: identical to the logical round() it replaces — the fix costs nothing at scale 1.
+        assert_eq!(seat_origin(Vec2::new(0.0, 10.4), 0.0, 1.0).y, 10.0);
+        assert_eq!(seat_origin(Vec2::new(0.0, 10.6), 0.0, 1.0).y, 11.0);
+        // 1.5× (the Windows norm), where a logical round() was never texel-aligned at all.
+        for v in [10.4, 10.9, 11.2] {
+            let o = seat_origin(Vec2::new(0.0, v), 0.0, 1.5);
+            assert_eq!(
+                (o.y * 1.5).fract(),
+                0.0,
+                "{v} at 1.5× is a whole physical px"
+            );
+        }
+    }
+
+    /// The snap must not be a *quantizer with a large step*: over a continuous glide, the extra
+    /// displacement it adds to any one frame is bounded by half a device pixel. This is the
+    /// property the jitter report is about — at 2× the old logical round() allowed a whole
+    /// logical pixel (two physical) of extra step, which is what read as judder.
+    #[test]
+    fn the_snap_adds_at_most_half_a_device_pixel_of_step() {
+        let scale = 2.0;
+        let mut worst: f32 = 0.0;
+        // A continuous glide across ~40 px at a fractional per-frame speed, like a run.
+        for i in 0..400 {
+            let seat = 137.317 + 0.1013 * i as f32;
+            let snapped = seat_origin(Vec2::new(0.0, seat), 0.0, scale).y;
+            worst = worst.max((snapped - seat).abs());
+        }
+        assert!(
+            worst <= 0.5 / scale + f32::EPSILON,
+            "snap displacement {worst} exceeds half a device pixel"
         );
     }
 

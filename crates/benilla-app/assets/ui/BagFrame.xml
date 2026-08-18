@@ -306,10 +306,10 @@
                 -- Fixed art, again because there is no bag item: the keyring's own portrait
                 -- (ref ContainerFrame.lua l.419) and its own background variant, snug-fitted to the
                 -- level-gated slot count exactly like an equipped bag.
-                local portrait = getglobal(frame:GetName() .. "Portrait")
-                if portrait then
-                    portrait:SetPortraitToTexture("Interface\\ContainerFrame\\KeyRing-Bag-Icon")
-                end
+                -- The GLOBAL form, which is the reference's own (ContainerFrame.lua l.419
+                -- writes exactly this call) — 1.12 has no such Texture method.
+                SetPortraitToTexture(frame:GetName() .. "Portrait",
+                    "Interface\\ContainerFrame\\KeyRing-Bag-Icon")
                 local size = GetContainerNumSlots(bagId)
                 if size > 0 then BenillaBagWindow_FitBackground(frame, size) end
             else
@@ -331,7 +331,7 @@
                         -- The circular crop (the real SetBagPortaitTexture is C-side and masks the
                         -- icon to the ring's inscribed circle): a raw square icon pokes its corners
                         -- past the round rim — the director's bank-bag popout artifact.
-                        portrait:SetPortraitToTexture(icon)
+                        SetPortraitToTexture(frame:GetName() .. "Portrait", icon)
                     else
                         -- The backpack fallback art is authored round — no crop to apply.
                         portrait:SetTexture("Interface\\Buttons\\Button-Backpack-Up")
@@ -440,8 +440,7 @@
         -- directly to count backpack repaints, e.g. delete_item_tests.rs's stuck-darkening
         -- regression check) — and BenillaBagWindow_Update generically for every other window. Every
         -- runtime repaint trigger (a slot click, an event, OpenAllBags' pre-show paint) goes
-        -- through this; BenillaBagBarSlot_OnClick calls BenillaBagWindow_Update directly (it only ever
-        -- targets bags 1..4).
+        -- through this (BenillaBagBarSlot_OnClick reaches it through the ToggleBag global too).
         function BenillaBagWindow_Repaint(frame)
             if frame:GetID() == 0 then
                 BenillaBagFrame_Update()
@@ -597,18 +596,31 @@
             if anyOpen then CloseAllBags() else OpenAllBags() end
         end
 
-        -- The backpack button (MainMenuBarBackpackButton) and the 'B' binding: if any bag window is open,
-        -- close them all; otherwise open every existing bag (ref ToggleBackpack — "if numOpen > 0
-        -- then CloseAllBags() else OpenAllBags()").
+        -- The backpack button (MainMenuBarBackpackButton): if any bag window is open, close them
+        -- all; otherwise open every existing bag (ref ToggleBackpack — "if numOpen > 0 then
+        -- CloseAllBags() else OpenAllBags()").
+        --
+        -- ONE STATED DIVERGENCE from ref BackpackButton_OnClick (MainMenuBarBagButtons.lua
+        -- l.55-69). The ref's tail re-derives the checked state from a scan of its NATIVE
+        -- ContainerFrames — and OnShow/OnHide dispatch is SYNCHRONOUS in the reference (wow-re
+        -- `onshow-onhide-dispatch-order.md`: Show binder 0x775750 → transition 0x76ae10 → notify
+        -- 0x76b260 → lua_pcall, every hop a direct call), so when an addon owns the bags its
+        -- OnShow's `SetChecked(1)` (Bagnon.lua l.33) lands FIRST and the ref tail stomps it: on
+        -- the real client the backpack button ends UNLIT after clicking it with Bagnon, and
+        -- lights only via the key binding (whose body is the bare `ToggleBackpack()`, no tail).
+        -- That click-path outcome contradicts the addon's evident intent and the director's call,
+        -- so ours swaps the scan for the auto-toggle UNDO below: checked belongs to the WINDOWS'
+        -- OnShow/OnHide writes — ours (BenillaBagFrame_OnShow/_OnHide) and any addon's alike —
+        -- and this handler only repairs what the CheckButton widget flipped before it ran. Every
+        -- stock outcome is identical to the ref's (the transition writes land inside
+        -- ToggleBackpack and are the last word); the addon case ends lit instead of stomped.
+        -- The widget-flip UNDO itself lives in the button's XML <OnClick> wrapper — the one seat
+        -- where the CheckButton auto-toggle has just happened — so every DIRECT caller of this
+        -- function (the tests, a macro) gets pure toggle semantics with no checked bookkeeping
+        -- to corrupt.
         function BenillaBagToggle_OnClick()
-            -- Through the GLOBAL, so an addon that replaced `ToggleBackpack` gets the click. This
-            -- one line is the whole Bagnon fix; the rest below is our own button's checked art,
-            -- which is ours to keep whatever the bag window turns out to be.
+            -- Through the GLOBAL, so an addon that replaced `ToggleBackpack` gets the click.
             ToggleBackpack()
-            -- The auto-toggle is provisional (ref BackpackButton_OnClick l.58-67): the button
-            -- lights for the BACKPACK window specifically, whatever the all-toggle just did.
-            local backpack = getglobal(BENILLA_BAG_WINDOWS[1])
-            getglobal("MainMenuBarBackpackButton"):SetChecked(backpack and backpack:IsShown())
         end
 
         -- The window's bar button (ref ContainerFrame_OnShow/OnHide: bag 0 →
@@ -778,23 +790,28 @@
             BenillaBagBarSlot_Update(button)
         end
 
+        -- ref BagSlotButton_OnClick (MainMenuBarBagButtons.lua l.3-21): the cursor arm first (the
+        -- ref's PutItemInBag; ours is the equip/swap PickupInventoryItem arm, decision 0208 1b),
+        -- otherwise the toggle goes THROUGH THE GLOBAL `ToggleBag` — the exact name
+        -- Bagnon_Core/Overrides.lua replaces — with the ref's own button sound on that arm only.
+        -- Toggling the window directly here (what this did before) made every bag addon's override
+        -- silently inert for the four slot buttons while the backpack button honoured it: the
+        -- 517-line rule above ("the reference's names are the real entry points") applied to only
+        -- one of the five buttons, and the director met the other four.
         function BenillaBagBarSlot_OnClick(button)
             if CursorHasItem() then
                 BenillaBagBarSlot_Place(button) -- drop/equip the carried bag onto this slot
             else
-                local frame = getglobal("BenillaBagFrame" .. button.bagId)
-                if frame then
-                    if frame:IsShown() then
-                        frame:Hide()
-                    else
-                        BenillaBagWindow_Update(frame)
-                        frame:Show()
-                    end
-                end
+                ToggleBag(button.bagId)
+                PlaySound("BAGMENUBUTTONPRESS")
             end
-            -- The click's own CheckButton auto-toggle is provisional — re-derive from the
-            -- window on every branch, the ref's exact tail (BagSlotButton_OnClick l.12-20:
-            -- SetChecked(isVisible) whether the click toggled, placed a bag, or did nothing).
+            -- The click's own CheckButton auto-toggle is provisional — re-derive from the NATIVE
+            -- window on every branch, the ref's exact tail (BagSlotButton_OnClick l.12-20 scans
+            -- ContainerFrame1..N: SetChecked(isVisible) whether the click toggled, placed a bag,
+            -- or did nothing). Reading the WINDOW rather than what ToggleBag did is load-bearing
+            -- both ways: stock, the flag is already set when the tail runs; with an addon holding
+            -- the bags, the native stays hidden and the slot button stays unlit — the reference's
+            -- own behaviour (its scan is equally blind to addon frames).
             local frame = getglobal("BenillaBagFrame" .. button.bagId)
             button:SetChecked(frame and frame:IsShown())
         end
@@ -1016,20 +1033,33 @@
         -- starts moving, so the drop reads as the icon being drawn into the bag rather than as a
         -- solid tile sliding. Those numbers are the file's, not ours.
         --
-        -- THE ONE AUTHORED NUMBER is the model-unit → pixel scale, because a <Model> frame's 3D
-        -- projection is not RE-recorded (the ref's ItemAnim frame has no <Size> at all, so the rect
-        -- cannot be it) — see decision 0887's named gap. 1200 px/unit is the sibling calibration:
-        -- CooldownFrameTemplate is the same kind of degenerate UI model, its four quads span 0.04
-        -- units, and at its scale="0.75" that sweep covers a 36px action button ⇒ 0.04·K·0.75 = 36.
-        -- At K = 1200 this model's own numbers land on 36 px of icon (exactly a bag-bar button),
-        -- a 48 px fall and a 12 px sideways drift — which is why the sizes below are stated as the
-        -- model's ratios times the icon, not as free pixels: correct the scale in one place and the
-        -- whole animation stays in proportion.
-        BENILLA_ITEM_PUSH_PX_PER_UNIT = 1200
+        -- THE MODEL-UNIT → PIXEL SCALE is no longer ours to calibrate: the <Model> widget's
+        -- projection is RE-recorded now (wow-re `system/ui/scratch/modelframe-animation-clock.md`,
+        -- dispatched over the pet bar's B228 and folded back with it). The ortho leg gives
+        --
+        --     px per model unit = (5/3) * modelScale * layoutScale * screenHeightPx
+        --
+        -- which in FrameXML units is **1280 * modelScale * layoutScale**, aspect- and
+        -- resolution-independent, with the model ORIGIN at the frame rect's bottom-left. The ref's
+        -- `ItemAnimTemplate` (MainMenuBarBagButtons.xml:4) carries **no `scale` attribute**, so
+        -- modelScale is 1 and the constant is a flat 1280. Decision 0887's named gap is closed.
+        --
+        -- This REPLACES a back-fit, and the back-fit is worth naming because it looked like
+        -- evidence. The old 1200 came from assuming CooldownFrameTemplate's 0.04-unit sweep
+        -- *exactly* covers a 36 px action button at its scale="0.75" (⇒ K = 1200). The assumption
+        -- is the error: at the real projection that sweep is 0.04 · 1280 · 0.75 = **38.4 px**, so
+        -- it overhangs its button by 6.7% rather than fitting it — exactly as the autocast shine's
+        -- 30.72 px square overhangs its 30 px button. Solving against a wrong premise produced a
+        -- number that then "cross-checked" against a second model derived the same wrong way, and
+        -- both files cited the agreement as the reason to trust it.
+        --
+        -- Everything below is the model's own ratios times this constant, so the correction lands
+        -- in one place and the animation stays in proportion.
+        BENILLA_ITEM_PUSH_PX_PER_UNIT = 1280
         BENILLA_ITEM_PUSH_DURATION = 1.0
-        BENILLA_ITEM_PUSH_SIZE  = 0.03 * BENILLA_ITEM_PUSH_PX_PER_UNIT   -- 36
-        BENILLA_ITEM_PUSH_FALL  = 0.04 * BENILLA_ITEM_PUSH_PX_PER_UNIT   -- 48
-        BENILLA_ITEM_PUSH_DRIFT = 0.01 * BENILLA_ITEM_PUSH_PX_PER_UNIT   -- 12
+        BENILLA_ITEM_PUSH_SIZE  = 0.03 * BENILLA_ITEM_PUSH_PX_PER_UNIT   -- 38.4
+        BENILLA_ITEM_PUSH_FALL  = 0.04 * BENILLA_ITEM_PUSH_PX_PER_UNIT   -- 51.2
+        BENILLA_ITEM_PUSH_DRIFT = 0.01 * BENILLA_ITEM_PUSH_PX_PER_UNIT   -- 12.8
         -- {time, value} keyframes, linear between (M2 track interpolation 1) — the file's own keys.
         BENILLA_ITEM_PUSH_ALPHA = { {0.000, 0.0}, {0.133, 1.0}, {0.267, 1.0}, {1.000, 0.0} }
         BENILLA_ITEM_PUSH_SCALE = { {0.000, 1.0}, {0.133, 1.2}, {0.267, 1.0}, {1.000, 0.014} }
@@ -1144,7 +1174,8 @@
                 SetDesaturation(b.icon, nil)
             end
             -- The four slots' own paint decides their restored colour: an item locked on the cursor
-            -- wants 0.4 grey, not the flat white SetDesaturation(nil) just left.
+            -- wants its 0.4 grey back, which the un-desaturate above does not restore (it clears
+            -- the greyscale flag, not the tint).
             for i = 1, 4 do
                 BenillaBagBarSlot_Update(getglobal("CharacterBag" .. (i - 1) .. "Slot"))
             end
@@ -1717,7 +1748,13 @@
                 self.icon = getglobal("MainMenuBarBackpackButtonIconTexture")
                 if BenillaActionBarArt_SeatAbove then BenillaActionBarArt_SeatAbove(self) end
             </OnLoad>
-            <OnClick>BenillaBagToggle_OnClick()</OnClick>
+            <!-- The undo repairs the CheckButton widget's own pre-handler flip; from there the
+                 checked state belongs to the windows' OnShow/OnHide writes (ours and any
+                 addon's) — the stated divergence at BenillaBagToggle_OnClick's comment. -->
+            <OnClick>
+                self:SetChecked(not self:GetChecked())
+                BenillaBagToggle_OnClick()
+            </OnClick>
             <OnEnter>BenillaBagToggle_OnEnter(self)</OnEnter>
             <OnLeave>BenillaBagBarButton_OnLeave()</OnLeave>
         </Scripts>

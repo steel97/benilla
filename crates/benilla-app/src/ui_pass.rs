@@ -156,6 +156,33 @@ pub(crate) struct UiQuad {
     /// real client's round bake stencil). Splits the run like `additive`; in practice a portrait's
     /// render-target texture is unique to it, so no batching is actually lost.
     pub circular: bool,
+    /// Draw the sampled texel as its **luminance** — `Texture:SetDesaturated(1)`, the greyed-out
+    /// icon every disabled affordance in the reference wears (decision 1327). Folded in the
+    /// client's GAMMA byte space and applied BEFORE the vertex-colour multiply, so the reference's
+    /// own `SetItemButtonDesaturated(button, 1, 0.65, 0.65, 0.65)` lands as greyscale *and* dim.
+    /// Splits the run like `additive`/`circular`.
+    pub desaturated: bool,
+    /// The sampled texture already carries **premultiplied** colour, so the shader must not weight
+    /// it by its own alpha a second time — the booth render targets ([`crate::portrait`]), and
+    /// nothing else.
+    ///
+    /// A booth that clears **transparent** (the `<PlayerModel>` body panes and the dressing room,
+    /// which composite over the page's own art — decision 1083) builds its target the way any
+    /// render-to-texture does: opaque geometry writes `a = 1`, alpha batches blend over it, and an
+    /// **additive particle adds light while contributing no coverage** (`wow_effect.wgsl`'s
+    /// `(rgb·a, 0)` under a premultiplied state). That buffer is premultiplied by construction —
+    /// colour is emitted light, alpha is coverage. Sampling it as *straight* alpha and applying the
+    /// usual `rgb·a` multiplies every effect hanging in EMPTY pane space by zero: the R14
+    /// pauldrons' fire vanished outright, and a weapon glow survived only where it happened to
+    /// overlap the model's own opaque pixels — chopped to a hard edge at the silhouette (the
+    /// director's paper-doll/dressing-room report). The opaque-cleared round portraits hid it,
+    /// because `a = 1` everywhere makes the extra multiply a no-op — exactly the way opaque panels
+    /// hid the identical defect one level up, in this camera's own output blend (see
+    /// [`spawn_player_ui_camera`]'s note on `rgb·a²`).
+    ///
+    /// Splits the run like `additive`/`circular`; a booth target is its own texture anyway, so no
+    /// batching is lost.
+    pub premultiplied: bool,
     /// CPU-clip stand-in for a real scissor rect (see the module doc). `None` = unclipped.
     pub clip: Option<Rect>,
     /// Rotate the quad's corners by this many radians **clockwise on screen** about the rect's
@@ -200,6 +227,8 @@ impl Default for UiQuad {
             color: [1.0, 1.0, 1.0, 1.0],
             additive: false,
             circular: false,
+            desaturated: false,
+            premultiplied: false,
             clip: None,
             rotation: 0.0,
             mask: None,
@@ -277,6 +306,12 @@ pub(crate) struct UiQuadMaterial {
     /// Mask to the inscribed circle (live unit portraits) — see [`UiQuad::circular`].
     #[uniform(3)]
     circular: u32,
+    /// Fold the texel to luminance — see [`UiQuad::desaturated`].
+    #[uniform(7)]
+    desaturate: u32,
+    /// The texel is already premultiplied (a booth bake) — see [`UiQuad::premultiplied`].
+    #[uniform(8)]
+    premultiplied: u32,
     /// The screen-anchored mask span in **physical framebuffer px** (`min.xy, max.xy` — the
     /// fragment shader compares `@builtin(position)`, which is physical): [`UiQuadMask::rect`]
     /// scaled by the window's scale factor at mesh build. `z <= x` (degenerate) disables masking.
@@ -339,6 +374,44 @@ impl Material2d for UiQuadMaterial {
 /// frame's — sub-frame head motion, imperceptible next to camera pan.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiQuadAppend;
+
+/// Project a world point for a world-anchored overlay, **with the reference projector's own accept
+/// verdict** — `None` means "this one does not draw", and the caller must honour it.
+///
+/// `0x483ee0` returns a boolean (wow-re `object-layer/scratch/nameplate-offscreen-cull.md`,
+/// §5-VERIFIED 2026-08-15). It rejects a point behind the near plane (`483f7a`) **and** a point
+/// outside the viewport — the four tests at `484075`/`484086`/`484096`/`4840a6`, against the
+/// **WorldFrame**'s own region (`[0xb4b2bc]`, mirrored ÷G44/÷G48 at `0x483970`), so the accept
+/// region is exactly the viewport, inclusive. Both plate and worldtext callers **destroy** the
+/// thing they were about to place when it comes back false.
+///
+/// **The trap this exists to remove:** on the viewport rejections the projector has *already
+/// written* the out-param (`484065`/`484067`), so a caller that ignores the verdict reads a
+/// perfectly plausible off-screen coordinate and sails on — which is exactly how benilla ended up
+/// clamping the plates of units nobody can see onto the screen border (1341). Returning `Option`
+/// makes the verdict unignorable at the call site.
+///
+/// The chat bubble deliberately does **not** call this: the reference's bubble seat is the one
+/// caller of the three that ignores the boolean, so a bubble simply slides off the edge with its
+/// speaker. Bevy's own `Err` covers only the behind-camera half, which is why the viewport test
+/// has to be here rather than left to it.
+pub(crate) fn project_overlay(
+    cam: &Camera,
+    cam_tf: &GlobalTransform,
+    world: Vec3,
+    viewport: Vec2,
+) -> Option<Vec2> {
+    // Bevy's `Err` is the near-plane half (`483f7a`); `accepts` is the viewport half.
+    let p = cam.world_to_viewport(cam_tf, world).ok()?;
+    accepts(p, viewport).then_some(p)
+}
+
+/// The accept REGION: exactly the viewport, **inclusive**. `[0xb4b2bc]` is the WorldFrame, and its
+/// region rect is mirrored ÷G44/÷G48 into the compare fields (`0x483970`), so the aspect factors
+/// cancel exactly and the test is against the raw screen box.
+fn accepts(p: Vec2, viewport: Vec2) -> bool {
+    (0.0..=viewport.x).contains(&p.x) && (0.0..=viewport.y).contains(&p.y)
+}
 
 /// Owns the player-UI camera + the per-frame quad→mesh rebuild. See the module doc for the
 /// camera-order arbitration and the batching/ordering approach.
@@ -485,6 +558,8 @@ struct Run {
     texture: Handle<Image>,
     additive: bool,
     circular: bool,
+    desaturated: bool,
+    premultiplied: bool,
     mask: Option<UiQuadMask>,
     positions: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
@@ -497,12 +572,16 @@ impl Run {
         texture: Handle<Image>,
         additive: bool,
         circular: bool,
+        desaturated: bool,
+        premultiplied: bool,
         mask: Option<UiQuadMask>,
     ) -> Self {
         Self {
             texture,
             additive,
             circular,
+            desaturated,
+            premultiplied,
             mask,
             positions: Vec::new(),
             uvs: Vec::new(),
@@ -577,12 +656,37 @@ impl Run {
 struct BatchPools {
     entities: Vec<Entity>,
     meshes: Vec<Handle<Mesh>>,
+    /// Each slot's last-written content — the per-run skip gate (decision 1361): a slot whose
+    /// run is bit-identical to what its pooled mesh already holds is not rewritten, so one
+    /// animating quad no longer drags every batch through the GPU mesh allocator.
+    stored: Vec<StoredRun>,
     materials: std::collections::HashMap<MatKey, Handle<UiQuadMaterial>>,
+}
+
+/// One pooled batch slot's full identity: the mesh bytes plus everything the entity was last
+/// written with (material key, z). Equality is exact — see the skip gate's comment for why a
+/// hash was rejected.
+#[derive(PartialEq)]
+struct StoredRun {
+    positions: Vec<[f32; 3]>,
+    uvs: Vec<[f32; 2]>,
+    colors: Vec<[f32; 4]>,
+    indices: Vec<u32>,
+    z_bits: u32,
+    key: MatKey,
 }
 
 /// A material's full identity: texture, blend/shape flags, mask texture + mask rect (as bits, so
 /// NaN/-0.0 can't split cache entries byte-equal materials would share).
-type MatKey = (AssetId<Image>, bool, bool, Option<AssetId<Image>>, [u32; 4]);
+type MatKey = (
+    AssetId<Image>,
+    bool,
+    bool,
+    bool,
+    bool,
+    Option<AssetId<Image>>,
+    [u32; 4],
+);
 
 /// Retire every pooled batch entity (blank frame / no drawable content). Mesh handles and the
 /// material cache stay — assets referenced only by the pool cost nothing to keep and come back
@@ -591,6 +695,9 @@ fn retire_batches(pools: &mut BatchPools, commands: &mut Commands) {
     for entity in pools.entities.drain(..) {
         commands.entity(entity).despawn();
     }
+    // The skip gate must forget with them (decision 1361): a retired slot's entity is gone, so
+    // "content unchanged" must not skip the respawn when the UI returns.
+    pools.stored.clear();
 }
 
 /// Per frame: when the BASE lane flagged a change ([`UiQuads::dirty`]) or the APPEND lane's
@@ -598,6 +705,19 @@ fn retire_batches(pools: &mut BatchPools, commands: &mut Commands) {
 /// texture-identity runs, and write the runs into the pooled batches ([`BatchPools`]). See the
 /// module doc for the full approach (painter's order within/across runs) and its batching
 /// consequence.
+fn ui_mesh_frozen() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WOW_FREEZE_UI_MESH").is_some())
+}
+
+/// `WOW_UI_DIFF` presence — launch-time knob, read once (the rebuild path re-ran getenv per frame).
+static UI_DIFF: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("WOW_UI_DIFF").is_some());
+
+/// `WOW_UI_PROBE=1` — launch-time knob, read once (the per-run check re-ran getenv ~90×/frame).
+static UI_PROBE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("WOW_UI_PROBE").as_deref() == Ok("1"));
+
 fn rebuild_ui_mesh(
     mut quads: ResMut<UiQuads>,
     mut commands: Commands,
@@ -630,6 +750,40 @@ fn rebuild_ui_mesh(
     if !q.dirty && q.overlays == q.last_overlays {
         return;
     }
+    // `WOW_UI_DIFF=1` — WHO re-triggers the rebuild? Names the first differing overlay quad (or
+    // says the BASE lane's dirty flag did it), once a second. The instrument behind the
+    // Stormwind mesh-churn hunt: a widget re-emitting a moving/jittering quad every frame drags
+    // every batch through a full rebuild and the GPU allocator through ~90 frees+reallocs.
+    if *UI_DIFF {
+        if q.dirty {
+            eprintln!("[ui-diff] BASE lane dirty");
+        } else {
+            let i = q
+                .overlays
+                .iter()
+                .zip(&q.last_overlays)
+                .position(|(a, b)| a != b);
+            match i {
+                Some(i) => {
+                    let (a, b) = (&q.overlays[i], &q.last_overlays[i]);
+                    eprintln!(
+                        "[ui-diff] overlay {i}/{} differs: tex={:?} rect {:?} -> {:?} uv_changed={} color_changed={}",
+                        q.overlays.len(),
+                        a.texture.as_ref().and_then(|t| t.path()),
+                        b.rect,
+                        a.rect,
+                        a.uv != b.uv,
+                        a.color != b.color,
+                    );
+                }
+                None => eprintln!(
+                    "[ui-diff] overlay COUNT changed: {} -> {}",
+                    q.last_overlays.len(),
+                    q.overlays.len()
+                ),
+            }
+        }
+    }
     q.dirty = false;
     q.last_overlays.clone_from(&q.overlays);
 
@@ -660,7 +814,7 @@ fn rebuild_ui_mesh(
     // Geometry probe (`WOW_UI_PROBE=1`): dump each textured quad's screen rect once — the
     // capture-harness companion for diagnosing extracted-vs-rendered geometry by data instead of
     // by eyeballing PNGs.
-    if std::env::var("WOW_UI_PROBE").as_deref() == Ok("1") {
+    if *UI_PROBE {
         // Fire on every rebuild (rebuilds are change-driven and rare); read the LAST block.
         {
             info!(
@@ -711,10 +865,19 @@ fn rebuild_ui_mesh(
             r.texture == texture
                 && r.additive == q.additive
                 && r.circular == q.circular
+                && r.desaturated == q.desaturated
+                && r.premultiplied == q.premultiplied
                 && r.mask == q.mask
         });
         if !same_run {
-            runs.push(Run::new(texture, q.additive, q.circular, q.mask.clone()));
+            runs.push(Run::new(
+                texture,
+                q.additive,
+                q.circular,
+                q.desaturated,
+                q.premultiplied,
+                q.mask.clone(),
+            ));
         }
         let run = runs.last_mut().unwrap();
         match (q.corners, plain) {
@@ -753,27 +916,6 @@ fn rebuild_ui_mesh(
             continue;
         }
         let z = -450.0 + (i as f32 / run_count) * 900.0;
-        // MAIN_WORLD too (not RENDER_WORLD-only): the pool rewrites this asset in place next
-        // rebuild, so the main-world copy must survive extraction.
-        let mut mesh = Mesh::new(
-            PrimitiveTopology::TriangleList,
-            RenderAssetUsages::default(),
-        );
-        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, run.positions);
-        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, run.uvs);
-        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, run.colors);
-        mesh.insert_indices(Indices::U32(run.indices));
-        let mesh_handle = match pools.meshes.get(used) {
-            Some(handle) => {
-                let _ = meshes.insert(handle.id(), mesh);
-                handle.clone()
-            }
-            None => {
-                let handle = meshes.add(mesh);
-                pools.meshes.push(handle.clone());
-                handle
-            }
-        };
         // The mask span converts to physical framebuffer px here (the shader compares
         // `@builtin(position)`); a maskless run gets a degenerate rect, which disables the branch.
         let scale = window.scale_factor();
@@ -789,7 +931,7 @@ fn rebuild_ui_mesh(
             ),
             None => (Vec4::new(0.0, 0.0, -1.0, -1.0), None),
         };
-        if std::env::var("WOW_UI_PROBE").as_deref() == Ok("1") && run.mask.is_some() {
+        if *UI_PROBE && run.mask.is_some() {
             info!(
                 "ui probe: masked run {i}: mask_rect={mask_rect:?} scale={scale} tex={:?}",
                 run.mask.as_ref().map(|m| m.texture.id())
@@ -799,9 +941,66 @@ fn rebuild_ui_mesh(
             run.texture.id(),
             run.additive,
             run.circular,
+            run.desaturated,
+            run.premultiplied,
             mask.as_ref().map(bevy::asset::Handle::id),
             mask_rect.to_array().map(f32::to_bits),
         );
+        // The per-slot skip gate (decision 1361). A rebuild fires for the WHOLE quad stream the
+        // moment anything differs — and one continuously-animating quad (the resting blink on
+        // the player frame, in every city) fires it every frame. The run that quad lives in is
+        // the only one whose bytes moved; the other ~90 slots are bit-identical to what their
+        // pooled mesh already holds, and rewriting them anyway put every UI batch through the
+        // GPU mesh allocator's free+realloc each frame (0.86 ms/frame at the Stormwind pin).
+        // Full content compare, not a hash — a stale batch drawn over a collision would be a
+        // rendering bug no one could reproduce.
+        let stored = StoredRun {
+            positions: run.positions,
+            uvs: run.uvs,
+            colors: run.colors,
+            indices: run.indices,
+            z_bits: z.to_bits(),
+            key,
+        };
+        if pools.stored.get(used) == Some(&stored) {
+            used += 1;
+            continue;
+        }
+        // MAIN_WORLD too (not RENDER_WORLD-only): the pool rewrites this asset in place next
+        // rebuild, so the main-world copy must survive extraction.
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, stored.positions.clone());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, stored.uvs.clone());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, stored.colors.clone());
+        mesh.insert_indices(Indices::U32(stored.indices.clone()));
+        if pools.stored.len() > used {
+            pools.stored[used] = stored;
+        } else {
+            pools.stored.push(stored);
+        }
+        let mesh_handle = match pools.meshes.get(used) {
+            Some(handle) => {
+                // `WOW_FREEZE_UI_MESH=1` — never rewrite a pooled batch mesh in place (the UI
+                // freezes at its first-built frame). An EXPERIMENT knob (the 1370 bracket): the
+                // resting blink's ~2 rewrites/frame are one-asset `Assets<Mesh>` mutations, and
+                // bevy 0.18's `AssetChanged<Mesh3d>` fast path is all-or-nothing — one modified
+                // mesh arms a hash probe over every `Mesh3d` row in the scene (~44k at the SW
+                // pin) in three PostUpdate walks. This lever prices that arming; `WOW_MESH_EVENTS`
+                // confirms it (events/s → 0). First build (the `None` arm) is untouched.
+                if !ui_mesh_frozen() {
+                    let _ = meshes.insert(handle.id(), mesh);
+                }
+                handle.clone()
+            }
+            None => {
+                let handle = meshes.add(mesh);
+                pools.meshes.push(handle.clone());
+                handle
+            }
+        };
         let material_handle = pools
             .materials
             .entry(key)
@@ -810,6 +1009,8 @@ fn rebuild_ui_mesh(
                     additive: u32::from(run.additive),
                     texture: Some(run.texture),
                     circular: u32::from(run.circular),
+                    desaturate: u32::from(run.desaturated),
+                    premultiplied: u32::from(run.premultiplied),
                     mask_rect,
                     mask,
                 })
@@ -846,6 +1047,7 @@ fn rebuild_ui_mesh(
         commands.entity(entity).despawn();
     }
     pools.meshes.truncate(used);
+    pools.stored.truncate(used);
 }
 
 /// Deliberately-overlapping synthetic content proving the sort: 5 z strata × 40 quads each, offset both
@@ -957,6 +1159,29 @@ mod tests {
         app
     }
 
+    /// The projector's accept region is **exactly the viewport, inclusive** — the WorldFrame's own
+    /// region mirrored ÷G44/÷G48 (`0x483970`), so the aspect factors cancel. A point on the edge
+    /// draws (the seat's clamp, not this, is what keeps the rect fully inside); a point outside it
+    /// does not, however plausible the coordinate the projector already wrote looks. The last row
+    /// is the measured phantom that bought this: a unit two thirds of a screen below the bottom,
+    /// whose plate used to be dragged up onto the border (1341).
+    #[test]
+    fn the_accept_region_is_the_viewport_inclusive() {
+        let vp = Vec2::new(1440.0, 810.0);
+        assert!(accepts(Vec2::new(720.0, 405.0), vp));
+        assert!(accepts(Vec2::ZERO, vp), "the corner is in view");
+        assert!(accepts(vp, vp), "so is the far corner");
+        for out in [
+            Vec2::new(-0.5, 405.0),
+            Vec2::new(1440.5, 405.0),
+            Vec2::new(720.0, -0.5),
+            Vec2::new(720.0, 810.5),
+            Vec2::new(1409.0, 1332.0),
+        ] {
+            assert!(!accepts(out, vp), "{out:?} is not on screen");
+        }
+    }
+
     fn batches(app: &mut App) -> usize {
         app.world_mut()
             .query_filtered::<(), With<UiQuadBatch>>()
@@ -993,6 +1218,47 @@ mod tests {
             batches(&mut app),
             1,
             "the UI comes back on the same content"
+        );
+    }
+
+    /// **The desaturation flag reaches the MATERIAL, and splits the run** (decision 1327).
+    ///
+    /// Everything upstream of here can be right — the Lua sets it, extract carries it, the quad
+    /// holds it — and the screen still not change, because the greyscale lives in a shader uniform
+    /// and a uniform only exists per material. Two quads that differ ONLY in `desaturated` must
+    /// therefore batch apart; if they merged, whichever of the two came first would decide the look
+    /// of both, and the visible symptom would be a talent tree that greys in blocks.
+    #[test]
+    fn desaturation_splits_the_run_and_lands_on_the_material() {
+        let mut app = rebuild_app();
+        // Same texture (the shared white), same blend, adjacent in z — everything that batches
+        // agrees, so `desaturated` is the only thing that can split them.
+        let mut quads = app.world_mut().resource_mut::<UiQuads>();
+        quads.quads.push(UiQuad {
+            rect: Rect::new(64.0, 0.0, 128.0, 64.0),
+            z_key: 1,
+            desaturated: true,
+            ..default()
+        });
+        quads.dirty = true;
+        app.update();
+        assert_eq!(
+            batches(&mut app),
+            2,
+            "a desaturated quad cannot share a material with a full-colour one"
+        );
+
+        let mut flags: Vec<u32> = app
+            .world_mut()
+            .resource::<Assets<UiQuadMaterial>>()
+            .iter()
+            .map(|(_, m)| m.desaturate)
+            .collect();
+        flags.sort_unstable();
+        assert_eq!(
+            flags,
+            vec![0, 1],
+            "one material greys and one does not — the uniform the shader branches on"
         );
     }
 

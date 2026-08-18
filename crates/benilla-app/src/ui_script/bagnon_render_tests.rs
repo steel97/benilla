@@ -63,6 +63,27 @@ macro_rules! corpus_or_skip {
     };
 }
 
+/// The corpus **and** a client install — for the tests whose subject is a global that comes from
+/// the reference file this client SOURCES off the player's own patch chain rather than shipping
+/// ([`super::reference_ui`], decision 1234).
+///
+/// `corpus_or_skip!` alone is the wrong precondition for them. With the corpus present but no
+/// install, `ContainerFrameItemButton_OnEnter`/`_OnClick` are *legitimately* nil — that is the
+/// documented "no install, no file" behaviour, not a defect — and the test then fails for a reason
+/// that is not a bug. `reference_ui`'s own header already says tests that need the file gate on the
+/// install the way every other client-data test does; these four never got that gate when 1234
+/// added the sourcing seam and the tests in one landing.
+///
+/// It stayed invisible because it only bites where the install is *not* found, which on a dev
+/// machine is only `scripts/gates.sh`'s `player-tests` rung: `--no-default-features` compiles out
+/// the `dev` project-folder candidate, so the `WoW` symlink beside the worktree stops being visible.
+macro_rules! corpus_and_install_or_skip {
+    () => {{
+        let _data = benilla_formats::wow_data_or_skip!();
+        corpus_or_skip!()
+    }};
+}
+
 fn read_toc(root: &Path, name: &str) -> Toc {
     let path = root.join(name).join(format!("{name}.toc"));
     Toc::parse(&benilla_ui::source::decode(
@@ -537,7 +558,7 @@ fn the_roster_seat_names_the_character_the_addons_will_meet() {
 /// hover over every slot raised and no tooltip ever appeared.
 #[test]
 fn hovering_a_bagnon_slot_shows_the_items_tooltip() {
-    let root = corpus_or_skip!();
+    let root = corpus_and_install_or_skip!();
     let mut s = open_bagnon(&root);
     let occupied = bagnon_button_for_slot(&s, 0, 1);
 
@@ -574,7 +595,7 @@ fn hovering_a_bagnon_slot_shows_the_items_tooltip() {
 /// `PickupContainerItem(this:GetParent():GetID(), this:GetID())`. The observable is the cursor.
 #[test]
 fn left_clicking_a_bagnon_slot_picks_the_item_up() {
-    let root = corpus_or_skip!();
+    let root = corpus_and_install_or_skip!();
     let mut s = open_bagnon(&root);
     let occupied = bagnon_button_for_slot(&s, 0, 1);
 
@@ -615,7 +636,7 @@ fn left_clicking_a_bagnon_slot_picks_the_item_up() {
 /// `UseContainerItem(bag, slot)` — use/equip the item.
 #[test]
 fn right_clicking_a_bagnon_slot_uses_the_item() {
-    let root = corpus_or_skip!();
+    let root = corpus_and_install_or_skip!();
     let mut s = open_bagnon(&root);
     let occupied = bagnon_button_for_slot(&s, 0, 1);
 
@@ -638,7 +659,7 @@ fn right_clicking_a_bagnon_slot_uses_the_item() {
 /// `ignoreModifiers` arm. Driven as a real gesture: press, move past the threshold, release.
 #[test]
 fn dragging_a_bagnon_slot_picks_the_item_up() {
-    let root = corpus_or_skip!();
+    let root = corpus_and_install_or_skip!();
     let mut s = open_bagnon(&root);
     let occupied = bagnon_button_for_slot(&s, 0, 1);
     let empty = bagnon_button_for_slot(&s, 0, 2);
@@ -944,4 +965,584 @@ fn the_whole_bagnon_window_survives_being_used() {
              built now, delete the entry"
         );
     }
+}
+
+/// Bagnon's window with a **stacked** item in the backpack — the count FontString only paints when
+/// the stack is >1 (`SetItemButtonCount`), so the plain [`open_bagnon`] fixture's single Small
+/// Brown Pouch can never exercise it.
+fn open_bagnon_stacked(root: &Path) -> UiScript {
+    let mut s = seat(root, Seat::BeforeAddons);
+    let mut slots = std::collections::HashMap::new();
+    slots.insert(
+        1,
+        ContainerSlot {
+            texture: Some("Interface\\Icons\\INV_Misc_Bag_08".into()),
+            count: 200,
+            item_id: 4496,
+            quality: Some(1),
+            link: Some("|cffffffff|Hitem:4496:0:0:0|h[Small Brown Pouch]|h|r".into()),
+            ..Default::default()
+        },
+    );
+    s.set_container(
+        0,
+        Some(ContainerState {
+            name: Some("Backpack".into()),
+            num_slots: 16,
+            slots,
+        }),
+    );
+    s.run("ToggleBackpack()").expect("ToggleBackpack");
+    for _ in 0..3 {
+        s.tick(0.1);
+    }
+    s.resolve();
+    s
+}
+
+/// The resolved `QuadContent::Text` for the one named FontString, or a panic naming what was found.
+fn text_quad(s: &mut UiScript, owner: &str) -> QuadContent {
+    s.resolve();
+    s.extract()
+        .iter()
+        .find(|q| {
+            matches!(&q.content, QuadContent::Text { text: Some(_), .. })
+                && s.target_owner_name(q.target).as_deref() == Some(owner)
+        })
+        .map(|q| q.content.clone())
+        .unwrap_or_else(|| panic!("no text quad owned by {owner}"))
+}
+
+/// **The director's report: "item stack size text is missing the black bg."**
+///
+/// Bagnon writes `<FontString name="$parentCount" font="NumberFontNormal">`
+/// (`Bagnon_Core/core/Item.xml:14`) — the `font=` attribute, which the reference resolves against
+/// the font-object registry BEFORE the filesystem (`0x783d15 call 0x783870(value, create = 0)`;
+/// see [`super::super::loader`]'s `apply_fontstring_font`). We read it as a path only, so the
+/// literal string `"NumberFontNormal"` became the face: no height, no colour, and no
+/// `outline="NORMAL"` — and the atlas fell back silently to Friz 12.
+///
+/// **The black is the OUTLINE, not a shadow.** `NumberFontNormal` carries no `<Shadow>` in 1.12
+/// (`Fonts.xml:226`, matching the install byte for byte), so `shadow: None` here is correct and is
+/// asserted as such — a future "fix" that adds one would be a divergence, not an improvement.
+#[test]
+fn a_stack_count_wears_the_font_object_its_font_attr_names() {
+    let root = corpus_or_skip!();
+    let mut s = open_bagnon_stacked(&root);
+
+    let QuadContent::Text {
+        text,
+        font,
+        font_height,
+        outline,
+        shadow,
+        color,
+        ..
+    } = text_quad(&mut s, "BagnonItem1")
+    else {
+        unreachable!("filtered to Text above")
+    };
+
+    assert_eq!(text.as_deref(), Some("200"), "the stack count is on screen");
+    // Every one of these was lost while `font=` was read as a path. The face is the assertion that
+    // the registry was consulted at all; the outline is the one the director can SEE.
+    assert_eq!(
+        font.as_deref(),
+        Some("Fonts\\ARIALN.TTF"),
+        "`font=\"NumberFontNormal\"` must resolve the font OBJECT, not become a font path"
+    );
+    assert_eq!(font_height, Some(14.0), "NumberFontNormal's height");
+    assert_eq!(
+        outline,
+        benilla_ui::script::Outline::Normal,
+        "the black ring around a stack count IS `outline=\"NORMAL\"` — this is the reported symptom"
+    );
+    assert_eq!(
+        color,
+        Some([1.0, 1.0, 1.0, 1.0]),
+        "NumberFontNormal's white"
+    );
+    assert_eq!(
+        shadow, None,
+        "and NO drop shadow: NumberFontNormal has no <Shadow> in 1.12 either (Fonts.xml:226). \
+         The readability is the outline; adding a shadow here would be a divergence"
+    );
+}
+
+/// **The director's report: the character dropdown draws as a solid WHITE box.**
+///
+/// `BagnonPopupFrame` (`Bagnon_Core/core/Frame.xml:23-36`) backs itself with
+/// `Interface\ChatFrame\ChatFrameBackground` — art that is white by design — and tints it
+/// black→dark-grey with a `<Gradient>`. The loader parsed `<Color>` and `<TexCoords>` but never
+/// `<Gradient>`, and dropped it in silence, so the white art rendered untinted.
+///
+/// `<Gradient>` survives beside a `file=` where `<Color>` does not, and that asymmetry is the
+/// point: they land in different fields (vertex colours `+0xb8` vs the texture `+0xcc` —
+/// wow-re `texture-color-composition.md` §1-2).
+#[test]
+fn a_texture_gradient_tints_the_art_it_sits_on() {
+    let root = corpus_or_skip!();
+    let mut s = open_bagnon_stacked(&root);
+    s.run("BagnonDBUI_ShowCharacterList(Bagnon)")
+        .expect("BagnonDBUI_ShowCharacterList");
+    for _ in 0..3 {
+        s.tick(0.1);
+    }
+    s.resolve();
+
+    let bg = s
+        .extract()
+        .iter()
+        .find(|q| {
+            matches!(&q.content, QuadContent::Texture { path: Some(p), .. }
+                     if p.contains("ChatFrameBackground"))
+                && s.target_owner_name(q.target).as_deref() == Some("BagnonDBUICharacterList")
+        })
+        .map(|q| q.content.clone())
+        .expect("the popup's background art reaches the render list");
+
+    let QuadContent::Texture { color, .. } = bg else {
+        unreachable!("filtered to Texture above")
+    };
+    // The two stops are (0,0,0,0.9) and (0.2,0.2,0.2,0.9); `RegionData::gradient` is folded to its
+    // midpoint by the paint, so this is 0.1 grey at the stops' shared alpha. `None` — or white —
+    // is the bug: untinted ChatFrameBackground is the white slab on the director's screen.
+    assert_eq!(
+        color,
+        Some([0.1, 0.1, 0.1, 0.9]),
+        "the <Gradient> must tint the art; untinted this is the reported white box"
+    );
+}
+
+/// **The director's report: "when I first open the bags with bagnon the gold numbers are all
+/// cramped up; if I close and open again it looks good."**
+///
+/// Bagnon's money display is `SmallMoneyFrameTemplate` — OUR `MoneyFrame.xml`. Its `ShowCoin` used
+/// to size each coin with `label:GetStringWidth()`, which is served from the measure round-trip and
+/// therefore reads **0 in the tick that set the text**: every coin came out at exactly one icon
+/// width and the digits overlapped. The second open looked right because the first open's measure
+/// had landed in the cache by then — the reopen was reading the previous open's numbers.
+///
+/// The fix sums `BENILLA_DIGIT_W`, the app's per-digit advance feed
+/// ([`benilla_ui::script::UiScript::set_digit_advances`]) — data pushed ahead, so the answer exists
+/// *in* the tick. That feed's own doc names this frame as what it was built for; only the merchant
+/// price had ever used it.
+///
+/// The assertion is the FIRST open, which is the half that was broken.
+#[test]
+fn a_money_frame_is_the_right_width_on_the_first_open() {
+    let root = corpus_or_skip!();
+    let mut s = seat(&root, Seat::BeforeAddons);
+
+    // 12345g 67s 89c — three denominations with different digit counts, so a width that ignored
+    // the digits (the bug) cannot coincide with one that counts them.
+    s.set_money(123_456_789);
+    // The app feeds this once per atlas scale, before any window opens. A flat 8px advance makes
+    // the expected widths exact arithmetic rather than a font-dependent number.
+    s.set_text_measurer(Box::new(super::FixedWidthFont(8.0)));
+
+    s.run("ToggleBackpack()").expect("ToggleBackpack");
+    for _ in 0..3 {
+        s.tick(0.1);
+    }
+    s.resolve();
+
+    let widths: Vec<f32> = s
+        .eval(
+            "local o = {} \
+             for _, n in ipairs({\"Gold\", \"Silver\", \"Copper\"}) do \
+               local b = getglobal(\"BagnonMoneyFrame\" .. n .. \"Button\") \
+               table.insert(o, b and b:GetWidth() or -1) \
+             end \
+             return o",
+        )
+        .expect("the three coin buttons");
+
+    // MONEY_ICON_WIDTH_SMALL is 13; the digits are 8px each. 12345 → 5, 67 → 2, 89 → 2.
+    assert_eq!(
+        widths,
+        vec![5.0 * 8.0 + 13.0, 2.0 * 8.0 + 13.0, 2.0 * 8.0 + 13.0],
+        "each coin must be its digits PLUS its icon on the first open. All three coming back at \
+         13.0 — the bare icon width — is the reported cramping: it means the width was taken from \
+         a text measure that had not landed yet"
+    );
+}
+
+/// The font a FontString/Button label actually resolved: `(path, height)`.
+fn resolved_font(s: &UiScript, lua_expr: &str) -> (String, String) {
+    let r: Vec<String> = s
+        .eval(&format!(
+            "local fs = {lua_expr} \
+             if not fs then return {{ \"MISSING\", \"MISSING\" }} end \
+             local p, h = fs:GetFont() \
+             return {{ tostring(p), tostring(h) }}"
+        ))
+        .expect("GetFont");
+    (r[0].clone(), r[1].clone())
+}
+
+/// **A Button's `<NormalFont>`/`<HighlightFont>`/`<DisabledFont>` take `font=` as well as
+/// `inherits=`** — they are `<Font>`-TYPED elements, routed by `CSimpleButton::LoadXML 0x7788c0`
+/// at `0x778bf4` into the same `0x783c30` a top-level `<Font>` uses, so `font=` gets the identical
+/// registry-first treatment (`0x783d15` → `0x783d22 call 0x770c60`).
+///
+/// We read only `inherits=`, so every corpus button declaring `font=` silently kept **no font
+/// object at all**. Bagnon does it at seven sites; `BagnonDBUINameBox` asks for
+/// `GameFontNormalLarge` (16px) and got nothing. Real FrameXML always writes `inherits=`, which is
+/// why nothing we ship ever noticed.
+///
+/// `style=` is deliberately not read — it does not exist in 1.12.1 (an isolated-token scan returns
+/// zero against nine controls each returning one); it is a later-client idiom.
+#[test]
+fn a_button_state_font_takes_the_font_attribute_not_just_inherits() {
+    let root = corpus_or_skip!();
+    let mut s = open_bagnon_stacked(&root);
+    s.run("BagnonDBUI_ShowCharacterList(Bagnon)")
+        .expect("BagnonDBUI_ShowCharacterList");
+    for _ in 0..3 {
+        s.tick(0.1);
+    }
+
+    assert_eq!(
+        resolved_font(
+            &s,
+            "getglobal(\"BagnonDBUICharacterList1\"):GetFontString()"
+        ),
+        ("Fonts\\FRIZQT__.TTF".into(), "16".into()),
+        "`<NormalFont font=\"GameFontNormalLarge\"/>` must link the font object — 16px, not the \
+         12px default, and emphatically not the nil this returned while only `inherits=` was read"
+    );
+}
+
+/// **A `<FontHeight>` with no `font=` beside it is dead XML**, and so is a bare `outline=`.
+///
+/// `CSimpleFontString::LoadXML`'s height/outline/monochrome block sits at `[0x77111e, 0x771254)`
+/// and its ONLY predecessor is the `font=`-names-a-file miss leg. With no `font=` at all,
+/// `0x7710f1`/`0x7710fa je 0x771254` jump straight past it: the attributes are never parsed. They
+/// have no independent existence — they are companions of a font FILE path, nothing more.
+///
+/// The reference's own FrameXML contains exactly one such site, and it is the proof: `ZoneText.xml`
+/// gives `AutoFollowStatusText` `inherits="GameFontNormal"` (12px) **and** a
+/// `<FontHeight val="20">`. The real client draws that line at 12 and Blizzard's 20 never does
+/// anything. We honoured it — one of the few places benilla was drawing text at a size the
+/// reference does not.
+#[test]
+fn a_fontheight_with_no_font_attr_beside_it_is_never_read() {
+    let root = corpus_or_skip!();
+    let s = open_bagnon_stacked(&root);
+    assert_eq!(
+        resolved_font(&s, "AutoFollowStatusText"),
+        ("Fonts\\FRIZQT__.TTF".into(), "12".into()),
+        "AutoFollowStatusText inherits GameFontNormal (12) and declares <FontHeight val=20> with \
+         no font= — the 20 is dead XML in the reference, so 20 here means we are reading an \
+         attribute the client never reaches"
+    );
+}
+
+/// A stand-in font engine for the fixture: every character `PER_CHAR` wide, one line tall. The
+/// *numbers* the real engine produces are pinned by `ui_text::atlas::metrics_tests` against the
+/// client's own fonts; what these tests are about is that an answer arrives **in the tick that
+/// asked**, which is exactly what a fixture with head-arithmetic widths shows clearly.
+struct BlockFont;
+
+const PER_CHAR: f32 = 7.0;
+
+impl benilla_ui::script::TextMeasure for BlockFont {
+    fn measure(&mut self, req: &benilla_ui::script::MeasureRequest) -> (f32, f32, f32) {
+        let w = req.text.chars().count() as f32 * PER_CHAR;
+        (w, 12.0, w)
+    }
+}
+
+/// **Bug 4 — the director's narrow dropdown.** `Bagnon_Forever/database/ui.lua:56-61` sizes its
+/// character list by setting each row's text and reading the row back in the same tick:
+///
+/// ```lua
+/// button:SetText(player)
+/// if button:GetTextWidth() + 40 > width then width = button:GetTextWidth() + 40 end
+/// ```
+///
+/// With `GetTextWidth` served only by the extract-time round-trip that read **0** for every row, so
+/// the frame took the `0 + 40` floor and drew 40px wide while seven full-width character names hung
+/// out of its right edge — the director's screenshot. The list must now be as wide as its widest
+/// name plus the addon's own 40px of checkbox and padding.
+#[test]
+fn the_character_dropdown_is_as_wide_as_the_names_in_it() {
+    let root = corpus_or_skip!();
+    let mut s = open_bagnon(&root);
+    s.set_text_measurer(Box::new(BlockFont));
+    // Three saved characters on this realm, the longest 10 letters — Bagnon_Forever's own store.
+    s.run(
+        "local realm = GetRealmName() \
+         BagnonForeverData[realm][\"Onewarrior\"] = { g = 100 } \
+         BagnonForeverData[realm][\"Onerogue\"] = { g = 200 }",
+    )
+    .expect("seed the character store");
+    s.run("BagnonDBUI_ShowCharacterList(Bagnon)")
+        .expect("BagnonDBUI_ShowCharacterList");
+    for _ in 0..3 {
+        s.tick(0.1);
+    }
+    s.resolve();
+
+    let widest = "Onewarrior".len() as f32 * PER_CHAR + 40.0;
+    assert_eq!(
+        s.eval::<f32>("return BagnonDBUICharacterList:GetWidth()")
+            .unwrap(),
+        widest,
+        "the list sizes itself from its rows' own text width, read in the tick that set it"
+    );
+    // …and the rows are really inside it: the addon's 6px left inset plus a name, not a 140px
+    // template button overhanging a 40px box.
+    let (list_r, row_r): (f32, f32) = s
+        .eval::<Vec<f32>>(
+            "local l = BagnonDBUICharacterList \
+             return { l:GetLeft() + l:GetWidth(), BagnonDBUICharacterList1:GetLeft() + \
+             BagnonDBUICharacterList1:GetTextWidth() + 24 }",
+        )
+        .map(|v| (v[0], v[1]))
+        .unwrap();
+    assert!(
+        row_r <= list_r,
+        "a row's text must end inside the list: text right edge {row_r} > list right edge {list_r}"
+    );
+}
+
+/// **Bug 5 — the director's stale offline bags.** Bagnon_Forever mirrors the live bags into
+/// `BagnonForeverData` (its saved variable) so the dropdown can show other characters' inventories
+/// offline. Its recorder does a full scan only on a character's FIRST login; afterwards it trusts
+/// `BAG_UPDATE(bagID)`, and `SaveBagData` **deletes** a bag's record whenever
+/// `GetContainerNumSlots(bag)` reads 0. The feed used to hand it exactly that: on the logout
+/// despawn frame the self store is gone, and diffing the absence as an all-empty snapshot fired a
+/// size-0 `BAG_UPDATE` for every bag — every record erased seconds before the saved-variables
+/// write, leaving each recently-logged-out character money-only ("g" has no delete path) and the
+/// offline view stale. Here: the login scan records the live backpack, and the record must still
+/// be intact after the absent-source frame and the logout events — what the shutdown write
+/// actually persists. The mechanism's own law is pinned beside the feed
+/// (`ui_items::feed::tests::an_absent_self_player_is_no_source_never_an_empty_bag_burst`).
+#[test]
+fn bagnon_forevers_records_survive_the_logout_boundary() {
+    let root = corpus_or_skip!();
+    let mut s = seat(&root, Seat::BeforeAddons);
+
+    // The first-login scan (PLAYER_LOGIN, inside `seat`) recorded the live backpack: 16 slots,
+    // the pouch in slot 1, in Bagnon_Forever's own short-link shape.
+    let record = "local r = BagnonForeverData[GetRealmName()][UnitName('player')] \
+                  return tostring(r[0] and r[0].s), tostring(r[0] and r[0][1])";
+    let (size, item) = s
+        .eval::<(String, String)>(record)
+        .expect("the record reads");
+    assert_eq!(
+        size, "16,0,",
+        "the login scan records the backpack's size row"
+    );
+    assert_eq!(
+        item, "4496",
+        "the login scan records the occupied slot's short link"
+    );
+
+    // An equipped bag arriving on the feed — inventory surface FIRST (the bag item in INV slot
+    // 20), then the container push and its `BAG_UPDATE`: the order the schedule guarantees
+    // (`feed_char.before(feed_containers)`, ui_char.rs). The recorder's size row asks the bag
+    // ITEM's own count and link (`GetInventoryItemLink("player", ContainerIDToInventoryID(1))`);
+    // raced the other way it recorded every equipped bag linkless — the `s = "8,0,"` rows in the
+    // director's data.
+    let mut inv: benilla_ui::script::InventorySlots = Default::default();
+    inv[20] = Some(benilla_ui::script::InvSlotView {
+        item_id: 4497,
+        count: 1,
+        quality: 1,
+        name: Some("Small Green Pouch".into()),
+        link: Some("|cffffffff|Hitem:4497:0:0:0|h[Small Green Pouch]|h|r".into()),
+        ..Default::default()
+    });
+    s.set_inventory_slots(inv);
+    s.set_container(
+        1,
+        Some(ContainerState {
+            name: Some("Small Green Pouch".into()),
+            num_slots: 6,
+            slots: Default::default(),
+        }),
+    );
+    s.fire_event("BAG_UPDATE", vec![benilla_ui::script::ScriptValue::Int(1)]);
+    let bag_row = s
+        .eval::<String>(
+            "return tostring(BagnonForeverData[GetRealmName()][UnitName('player')][1].s)",
+        )
+        .expect("the bag row reads");
+    assert_eq!(
+        bag_row, "6,1,4497",
+        "an equipped bag's size row carries its own count and short link"
+    );
+
+    // The logout boundary: the despawn frame (no self store) and then the shutdown's own events.
+    // The record the write persists must be the bags the player actually had.
+    let mut memory = crate::ui_items::feed::FeedMemory::default();
+    crate::ui_items::feed::apply_container_source(&mut s, &mut memory, None, Vec::new());
+    s.fire_event("PLAYER_LEAVING_WORLD", Vec::new());
+    s.fire_event("PLAYER_LOGOUT", Vec::new());
+    let (size, item) = s
+        .eval::<(String, String)>(record)
+        .expect("the record reads");
+    assert_eq!(
+        size, "16,0,",
+        "the logout boundary must not erase the size row"
+    );
+    assert_eq!(item, "4496", "the logout boundary must not erase the slot");
+}
+
+/// **Bug 6 — the director's "smaller bags open their own little bags".** Bagnon's whole
+/// interception model is the global override (`Bagnon_Core/core/Overrides.lua`: `ToggleBag = …`)
+/// plus a `SetScript("OnClick")` wrap on our bar buttons whose replacement calls the ORIGINAL
+/// handler back for a plain click. Both layers end at whatever the original OnClick does — and
+/// ours toggled `BenillaBagFrame<N>` directly instead of calling `ToggleBag`, so every slot-button
+/// click walked straight past both of Bagnon's hooks and opened the native window (the backpack
+/// button was fixed in an earlier pass; the four slots were not). The ref's own
+/// `BagSlotButton_OnClick` (MainMenuBarBagButtons.lua l.3-21) calls the GLOBAL `ToggleBag`, and
+/// its checked tail scans only the NATIVE ContainerFrames — so with Bagnon holding the bags a
+/// slot click toggles Bagnon's one window and the slot button stays unlit. Both halves pinned
+/// here with a real mouse click, an equipped bag in slot 2, and Bagnon fully hooked.
+#[test]
+fn a_bag_slot_click_toggles_bagnon_not_the_native_window() {
+    let root = corpus_or_skip!();
+    let mut s = open_bagnon(&root);
+
+    // An equipped bag behind CharacterBag1Slot (bagId 2): the inventory surface (the bag ITEM in
+    // inv slot 21) and its container — both fed before any click, the schedule's own order.
+    let mut inv: benilla_ui::script::InventorySlots = Default::default();
+    inv[21] = Some(benilla_ui::script::InvSlotView {
+        item_id: 4497,
+        count: 1,
+        quality: 1,
+        name: Some("Small Green Pouch".into()),
+        link: Some("|cffffffff|Hitem:4497:0:0:0|h[Small Green Pouch]|h|r".into()),
+        icon: Some("Interface\\Icons\\INV_Misc_Bag_10_Green".into()),
+        ..Default::default()
+    });
+    s.set_inventory_slots(inv);
+    s.set_container(
+        2,
+        Some(ContainerState {
+            name: Some("Small Green Pouch".into()),
+            num_slots: 6,
+            slots: Default::default(),
+        }),
+    );
+    s.fire_event("BAG_UPDATE", vec![benilla_ui::script::ScriptValue::Int(2)]);
+    s.resolve();
+
+    // Bagnon is open (the fixture); a REAL click on the slot button must CLOSE Bagnon — the
+    // toggle routed through the override — and must never show the native window.
+    // Both interception layers must be live, and the click exercises both: the SetScript wrap
+    // (Bagnon.lua's Bagnon_AddBagHooks — its replacement calls our CAPTURED original back with
+    // no args, so `self` inside the XML wrapper must still resolve on the re-entrant call) and
+    // the global ToggleBag override the original then reaches.
+    assert!(
+        s.eval::<bool>("return CharacterBag1Slot:GetScript('OnClick') == BagnonBlizBag_OnClick")
+            .unwrap_or(false),
+        "Bagnon's SetScript OnClick wrap must be in place on the slot button"
+    );
+    let (x, y) = centre_of(&mut s, "CharacterBag1Slot");
+    s.mouse_move(x, y);
+    s.mouse_button(x, y, "LeftButton", true);
+    s.mouse_button(x, y, "LeftButton", false);
+    assert!(
+        !s.eval::<bool>("return Bagnon:IsVisible() or false")
+            .unwrap(),
+        "the slot click must reach Bagnon's ToggleBag override and close its window"
+    );
+    assert!(
+        !s.eval::<bool>("return BenillaBagFrame2:IsVisible() or false")
+            .unwrap(),
+        "the native bag window must NOT open — the click belongs to the addon's override"
+    );
+
+    // Click again: Bagnon back open, native still shut, and the slot button unlit — the ref's
+    // checked tail reads only the native window (its ContainerFrame scan), which Bagnon never
+    // shows.
+    s.mouse_button(x, y, "LeftButton", true);
+    s.mouse_button(x, y, "LeftButton", false);
+    for _ in 0..2 {
+        s.tick(0.1);
+    }
+    assert!(
+        s.eval::<bool>("return Bagnon:IsVisible() or false")
+            .unwrap(),
+        "the second click re-opens Bagnon through the same override"
+    );
+    assert!(
+        !s.eval::<bool>("return BenillaBagFrame2:IsVisible() or false")
+            .unwrap(),
+        "the native window stays shut on the re-open too"
+    );
+    assert!(
+        !s.eval::<bool>("return CharacterBag1Slot:GetChecked() and true or false")
+            .unwrap(),
+        "the slot button stays unlit with an addon holding the bags (the ref scan is native-only)"
+    );
+    let raised = s.errors();
+    let unexplained: Vec<&String> = raised
+        .iter()
+        .filter(|e| !e.contains("PutItemIn") && !e.contains("PickupBagFromSlot"))
+        .collect();
+    assert!(
+        unexplained.is_empty(),
+        "the click round-trip raised: {unexplained:#?}"
+    );
+}
+
+/// **Bug 7 — the director's unlit backpack button.** Bagnon lights `MainMenuBarBackpackButton`
+/// from its window's OnShow/OnHide (`Bagnon.lua:33/39` — `SetChecked(1/0)`), and OnShow dispatch
+/// is synchronous (wow-re `onshow-onhide-dispatch-order.md`), so whoever writes checked AFTER the
+/// toggle wins. Two of our seats overwrote it: the button's old click tail re-derived checked
+/// from the NATIVE backpack window (the ref's own scan — which leaves the button unlit on the
+/// real client's click path too, a ref wart our stated divergence closes), and the `B` binding
+/// ran the BUTTON handler instead of the ref's bare `ToggleBackpack()` body, dragging that tail
+/// onto the one path the real client lights. Now: a real click on the button ends lit while
+/// Bagnon's window is open and unlit when it closes, and the bare-global path (the binding's
+/// body) does the same.
+#[test]
+fn the_backpack_button_lights_while_bagnon_holds_the_bags() {
+    let root = corpus_or_skip!();
+    let mut s = open_bagnon(&root);
+
+    // The fixture opened Bagnon through the bare global (the binding's own body): OnShow's
+    // SetChecked(1) must be standing — nothing runs after it on that path.
+    assert!(
+        s.eval::<bool>("return MainMenuBarBackpackButton:GetChecked() and true or false")
+            .unwrap(),
+        "the bare ToggleBackpack() path (the B binding) must leave the button lit"
+    );
+
+    // A REAL click on the button: auto-toggle flips, the wrapper's undo repairs it, Bagnon's
+    // OnHide writes the truth — closed and unlit.
+    let (x, y) = centre_of(&mut s, "MainMenuBarBackpackButton");
+    s.mouse_move(x, y);
+    s.mouse_button(x, y, "LeftButton", true);
+    s.mouse_button(x, y, "LeftButton", false);
+    assert!(
+        !s.eval::<bool>("return Bagnon:IsVisible() or false")
+            .unwrap(),
+        "the click must toggle Bagnon closed through its override"
+    );
+    assert!(
+        !s.eval::<bool>("return MainMenuBarBackpackButton:GetChecked() and true or false")
+            .unwrap(),
+        "closed ⇒ unlit (Bagnon's OnHide write is the last word)"
+    );
+
+    // And the second click: open again, lit again — the director's report, closed.
+    s.mouse_button(x, y, "LeftButton", true);
+    s.mouse_button(x, y, "LeftButton", false);
+    assert!(
+        s.eval::<bool>("return Bagnon:IsVisible() or false")
+            .unwrap(),
+        "the second click re-opens Bagnon"
+    );
+    assert!(
+        s.eval::<bool>("return MainMenuBarBackpackButton:GetChecked() and true or false")
+            .unwrap(),
+        "open ⇒ lit (Bagnon's OnShow write is the last word)"
+    );
 }

@@ -247,6 +247,86 @@ mod loader_tests {
         assert_eq!(s.eval::<f32>("return PinChild:GetHeight()").unwrap(), 200.0);
     }
 
+    /// **`<Include file="X.lua">` RUNS the file** — the client's `<Include>` is a recursion into
+    /// its load-one-file routine `0x6ede10`, whose first act is a case-insensitive `.lua` suffix
+    /// test on the resolved path. It never sniffs content; it never parses a `.lua` as XML.
+    ///
+    /// We parsed every target as FrameXML, so a `.lua` target died `unknown token at 1:1` and took
+    /// the whole library set with it. Three corpus addons load nothing but these lines —
+    /// FonzAppraiser, AckisRecipeList, FonzSummon — and `embeds.xml` is the whole of their Ace
+    /// dependency chain.
+    ///
+    /// The mixed document is the point: one `<Include>` of each kind, in one file, both landing.
+    #[test]
+    fn include_runs_a_lua_target_and_still_parses_an_xml_one() {
+        let s = UiScript::new().unwrap();
+        let provider = |path: &str| -> Option<Vec<u8>> {
+            match path {
+                "libs/Lib.lua" => Some(b"IncludedLua = 41 + 1".to_vec()),
+                // Case-insensitive, exactly as `0x64a4c0` compares it.
+                "libs/Shouty.LUA" => Some(b"ShoutyLua = true".to_vec()),
+                "Sub.xml" => Some(br#"<Ui><Frame name="FromXmlInclude"/></Ui>"#.to_vec()),
+                _ => None,
+            }
+        };
+        let doc = parse(
+            r#"<Ui>
+                <Include file="libs\Lib.lua"/>
+                <Include file="libs\Shouty.LUA"/>
+                <Include file="Sub.xml"/>
+                <Frame name="FromMain"/>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &provider);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            s.eval::<i64>("return IncludedLua").unwrap(),
+            42,
+            "a .lua Include must be executed as a chunk, not parsed as a document"
+        );
+        assert!(
+            s.eval::<bool>("return ShoutyLua").unwrap(),
+            "case-insensitive suffix"
+        );
+        // ...and the XML arm is untouched: both frames still exist.
+        assert_eq!(report.frames, 2);
+        assert!(s
+            .eval::<bool>("return FromXmlInclude ~= nil and FromMain ~= nil")
+            .unwrap());
+    }
+
+    /// A raise inside an `.lua` Include is reported and the enclosing document CONTINUES — the
+    /// reference logs at severity 2 and falls through (`0x6ee00d` -> `0x6ee012` is unconditional,
+    /// `eax` never read), so one bad library must not cost the frames declared after it.
+    #[test]
+    fn a_raising_lua_include_does_not_take_the_rest_of_the_document() {
+        let s = UiScript::new().unwrap();
+        let provider = |path: &str| -> Option<Vec<u8>> {
+            match path {
+                "Bad.lua" => Some(b"error('library exploded')".to_vec()),
+                _ => None,
+            }
+        };
+        let doc = parse(
+            r#"<Ui>
+                <Include file="Bad.lua"/>
+                <Frame name="AfterTheBadInclude"/>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &provider);
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "the raise is reported: {:?}",
+            report.errors
+        );
+        assert!(report.errors[0].contains("Bad.lua"));
+        assert!(
+            s.eval::<bool>("return AfterTheBadInclude ~= nil").unwrap(),
+            "the element after a failed Include must still be built"
+        );
+    }
+
     /// `<Include>` resolved through an in-memory provider closure.
     #[test]
     fn include_resolves_through_provider() {
@@ -381,18 +461,24 @@ mod loader_tests {
         assert!(s.eval::<bool>("return FineRan == true").unwrap());
     }
 
-    /// Unsupported handler names (e.g. the keyboard-focus handlers `OnKeyDown`/`OnChar`, not yet
-    /// modeled) are warn-once gaps, not hard errors, and don't stop the frame from building.
+    /// Unsupported handler names are warn-once gaps, not hard errors, and don't stop the frame
+    /// from building. The example is `OnCursorChanged` — caret geometry is host-side here, so its
+    /// four float args would all be zero, which is the silent-drop this warn exists to avoid.
+    /// (It used to be `OnKeyDown`: that one is *fired* since decision 1319 and now belongs to
+    /// `script::tests::keyboard`.)
     #[test]
     fn unsupported_script_name_is_a_warning() {
         let s = UiScript::new().unwrap();
         let doc = parse(
-            r#"<Ui><Frame name="Keyed"><Scripts><OnKeyDown>x = 1</OnKeyDown></Scripts></Frame></Ui>"#,
+            r#"<Ui><Frame name="Keyed"><Scripts><OnCursorChanged>x = 1</OnCursorChanged></Scripts></Frame></Ui>"#,
         );
         let report = load(&s, &doc, &no_files);
         assert_eq!(report.frames, 1);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(report.warnings.iter().any(|w| w.contains("OnKeyDown")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("OnCursorChanged")));
     }
 
     /// An unknown frame type is an error that drops that subtree but not the rest of the load.
@@ -500,6 +586,132 @@ mod loader_tests {
             (r.left, r.right, r.bottom, r.top),
             (0.0, 50.0, 0.0, 10.0),
             "defaultValue 50/100 fills half the 100px width"
+        );
+    }
+
+    /// The creation-path implicit anchor, XML half (decision 1310; wow-re
+    /// `region-implicit-anchor.md`, §5 VERIFIED): a `<Texture>` with zero anchors gets
+    /// SetAllPoints(parent) right after its LoadXML — two corner anchors that pin all four
+    /// edges, so an authored `<Size>` is structurally unread. This is B180's engine shape: the
+    /// reference stack-split plate authors a vestigial 256×32 and renders 172×96, the frame.
+    #[test]
+    fn sized_anchorless_layer_texture_fills_its_frame() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <Frame name="Plate">
+                    <Size><AbsDimension x="172" y="96"/></Size>
+                    <Anchors>
+                        <Anchor point="BOTTOMLEFT"><Offset><AbsDimension x="10" y="10"/></Offset></Anchor>
+                    </Anchors>
+                    <Layers><Layer level="BACKGROUND">
+                        <Texture file="Interface\Panel">
+                            <Size><AbsDimension x="256" y="32"/></Size>
+                        </Texture>
+                    </Layer></Layers>
+                </Frame>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        s.resolve();
+        let plate = s
+            .extract()
+            .into_iter()
+            .find(|q| {
+                matches!(&q.content,
+                    QuadContent::Texture { path: Some(p), .. } if p == "Interface\\Panel")
+            })
+            .expect("the plate draws");
+        let r = plate.rect.expect("the plate resolved");
+        assert_eq!(
+            (r.left, r.right, r.bottom, r.top),
+            (10.0, 182.0, 10.0, 106.0),
+            "implicit SetAllPoints fills the 172×96 frame; the 256×32 size is unread"
+        );
+    }
+
+    /// The FontString half of the same law: zero anchors ⇒ ONE middle-row SetPoint chosen by the
+    /// live justify word (`&7`: 1→LEFT, 4→RIGHT, else CENTER) — and the authored `<Size>` stays
+    /// LIVE (single anchor + W/H sizes the opposite edges), unlike the texture's.
+    #[test]
+    fn anchorless_fontstring_seats_at_its_justify_point() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <Frame name="Page">
+                    <Size><AbsDimension x="200" y="100"/></Size>
+                    <Anchors>
+                        <Anchor point="BOTTOMLEFT"><Offset><AbsDimension x="0" y="0"/></Offset></Anchor>
+                    </Anchors>
+                    <Layers><Layer level="ARTWORK">
+                        <FontString name="SeatLeft" justifyH="LEFT" text="body">
+                            <Size><AbsDimension x="80" y="20"/></Size>
+                        </FontString>
+                    </Layer></Layers>
+                </Frame>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        s.resolve();
+        // LEFT→LEFT at (0,0): left edge at the page's left, vertically on the page's centerline
+        // (middle-row point), 80×20 from the size. Page [0,0]..[200,100] → [0,40]..[80,60].
+        let (l, r, t, b) = s
+            .eval::<(f64, f64, f64, f64)>(
+                "return SeatLeft:GetLeft(), SeatLeft:GetRight(), SeatLeft:GetTop(), SeatLeft:GetBottom()",
+            )
+            .unwrap();
+        assert_eq!(
+            (l, r, b, t),
+            (0.0, 80.0, 40.0, 60.0),
+            "justifyH=LEFT seats the implicit single anchor at the page's LEFT, size live"
+        );
+    }
+
+    /// The XML state-texture ordering (decision 1310's loader half): an authored `<Anchors>` on a
+    /// `<NormalTexture>` wins outright — the materializing setter's implicit SetAllPoints is
+    /// cleared before the authored layout applies, so no implicit corner survives to weld the
+    /// region to the button (the merchant row's icon-scoped highlight is the live consumer).
+    #[test]
+    fn anchored_state_texture_keeps_its_authored_anchors() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <Button name="ScopedBtn">
+                    <Size><AbsDimension x="36" y="36"/></Size>
+                    <Anchors>
+                        <Anchor point="BOTTOMLEFT"><Offset><AbsDimension x="100" y="100"/></Offset></Anchor>
+                    </Anchors>
+                    <NormalTexture file="Interface\Scoped">
+                        <Size><AbsDimension x="24" y="24"/></Size>
+                        <Anchors>
+                            <Anchor point="TOPLEFT"><Offset><AbsDimension x="2" y="-2"/></Offset></Anchor>
+                        </Anchors>
+                    </NormalTexture>
+                </Button>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        s.resolve();
+        let scoped = s
+            .extract()
+            .into_iter()
+            .find(|q| {
+                matches!(&q.content,
+                    QuadContent::Texture { path: Some(p), .. } if p == "Interface\\Scoped")
+            })
+            .expect("the state texture draws");
+        let r = scoped.rect.expect("resolved");
+        // Button [100,100]..[136,136]; TOPLEFT+2,-2 with 24×24 → [102,110]..[126,134].
+        assert_eq!(
+            (r.left, r.right, r.bottom, r.top),
+            (102.0, 126.0, 110.0, 134.0),
+            "authored anchors + size hold; no implicit corner welds it to the button"
         );
     }
 
@@ -1082,6 +1294,110 @@ mod loader_tests {
             assert!(!is_global_string_key(no), "{no} is not key-shaped");
         }
     }
+
+    // ── <SimpleHTML> (the markup widget's XML element) ───────────────────────────────────────
+
+    /// **`<SimpleHTML>`'s `<FontString>` child is a font DECLARATION, not a region** — the shape
+    /// stock `ItemTextFrame.xml` uses, and the whole reason its `<H1>` renders at the `<P>` size.
+    ///
+    /// Four claims in one document: the element materializes as a real `SimpleHTML` frame with its
+    /// `<Size>`/`<Anchors>`/`<Scripts>` applied like any frame; the direct-child `<FontString
+    /// inherits=>` lands on `elementFont[0]` rather than creating a FontString region; a
+    /// `<FontStringHeader1>` lands on `elementFont[1]`; and `hyperlinkFormat=` reaches `+0x360`.
+    #[test]
+    fn simplehtml_xml_declares_element_fonts_not_regions() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <Font name="ItemTextFontNormal" font="Fonts\MORPHEUS.TTF" justifyH="LEFT">
+                    <FontHeight val="15"/>
+                    <Color r="0.18" g="0.12" b="0.06"/>
+                </Font>
+                <Font name="BookHeader" font="Fonts\SKURRI.TTF">
+                    <FontHeight val="24"/>
+                </Font>
+                <SimpleHTML name="PageText" hyperlinkFormat="|H%s|h[%s]|h">
+                    <Size><AbsDimension x="270" y="304"/></Size>
+                    <Anchors><Anchor point="TOPLEFT"/></Anchors>
+                    <FontString inherits="ItemTextFontNormal"/>
+                    <FontStringHeader1 inherits="BookHeader"/>
+                    <Scripts><OnLoad>LOADED = this:GetName()</OnLoad></Scripts>
+                </SimpleHTML>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+
+        assert_eq!(s.eval::<String>("return LOADED").unwrap(), "PageText");
+        assert_eq!(
+            s.eval::<String>("return PageText:GetObjectType()").unwrap(),
+            "SimpleHTML"
+        );
+        assert_eq!(
+            s.eval::<String>("return PageText:GetHyperlinkFormat()")
+                .unwrap(),
+            "|H%s|h[%s]|h"
+        );
+        // The two declarations landed on their own elements…
+        assert_eq!(
+            s.eval::<(String, f32)>("local p, h = PageText:GetFont(); return p, h")
+                .unwrap(),
+            ("Fonts\\MORPHEUS.TTF".to_string(), 15.0)
+        );
+        assert_eq!(
+            s.eval::<(String, f32)>("local p, h = PageText:GetFont(\"H1\"); return p, h")
+                .unwrap(),
+            ("Fonts\\SKURRI.TTF".to_string(), 24.0)
+        );
+        // …and NEITHER became a region. A `<FontString>` handled by the generic special-fontstring
+        // pass would leave an unanchored, textless string on the frame here.
+        let regions = {
+            let lua = s.lua();
+            let model = lua
+                .app_data_ref::<crate::script::Model>()
+                .expect("model app_data");
+            let fh = model.arena.lookup("PageText").expect("frame");
+            model.arena.frame(fh).expect("live").regions.len()
+        };
+        assert_eq!(regions, 0, "the font declarations created no regions");
+
+        // Now drive it: three blocks, the H1 in its OWN declared face, at the frame's width.
+        s.run(
+            r#"PageText:SetText("<HTML><BODY><H1>Title</H1><P align=\"center\">Body</P></BODY></HTML>")"#,
+        )
+        .unwrap();
+        let (kinds, fonts, widths) = {
+            let lua = s.lua();
+            let model = lua
+                .app_data_ref::<crate::script::Model>()
+                .expect("model app_data");
+            let fh = model.arena.lookup("PageText").expect("frame");
+            let blocks = &model.simple_html.get(&fh).expect("state").blocks;
+            (
+                blocks.len(),
+                blocks
+                    .iter()
+                    .map(|rh| model.region_data[rh].font_path.clone())
+                    .collect::<Vec<_>>(),
+                blocks
+                    .iter()
+                    .map(|rh| model.region_data[rh].size)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(kinds, 2);
+        assert_eq!(
+            fonts,
+            [
+                Some("Fonts\\SKURRI.TTF".to_string()),
+                Some("Fonts\\MORPHEUS.TTF".to_string())
+            ],
+            "a DECLARED header font wins; the P falls through to its own"
+        );
+        assert_eq!(widths, [Some((270.0, 0.0)); 2]);
+        assert!(s.errors().is_empty(), "{:?}", s.errors());
+    }
 }
 
 mod layer_blend_tests {
@@ -1234,6 +1550,93 @@ mod region_template_tests {
             report.warnings
         );
         assert_eq!(s.eval::<String>("return Label:GetText()").unwrap(), "hello");
+        // …and the font it inherited is READABLE BACK, which is the half this test did not ask.
+        // `EQL3_Options.lua:1086` is the corpus line that needs it: it reads the tracker line's
+        // font with `t1, _, t2 = EQL3_QuestWatchLine1:GetFont()` and feeds `t1` straight into
+        // `temp:SetFont(t1, height, t2)` — so a nil path there is not a cosmetic gap, it is our own
+        // faithful `Usage: <FontString>:SetFont(...)` raise firing on our own nil.
+        assert_eq!(
+            s.eval::<(String, f32)>("local f, h = Label:GetFont() return f, h")
+                .unwrap(),
+            ("Fonts\\FRIZQT__.TTF".to_string(), 12.0),
+            "a FontString that inherits a Font object reports that object's font"
+        );
+    }
+
+    /// **A font-object name resolves case-INSENSITIVELY**, because the client's font registry
+    /// compares its keys with `SStrCmpI` (`0x783870`/`0x7838c7`, wow-re
+    /// `font-object-lua-surface.md`: *"Font names are matched case-insensitively"*).
+    ///
+    /// `Recap/RecapOptions.xml:32` inherits `GameFontHighLightSmall`; the shipped font is
+    /// `GameFontHighlightSmall`, one letter's case apart. On the real client that resolves, and it
+    /// used to be a warn-once gap here — a NARROWING fix, like the unit-token fold (1247).
+    #[test]
+    fn a_font_object_inherits_resolves_whatever_its_case() {
+        let s = UiScript::new().unwrap();
+        let doc = parse(
+            r#"<Ui>
+                <Font name="GameFontHighlightSmall" font="Fonts\FRIZQT__.TTF" virtual="true">
+                    <FontHeight><AbsValue val="10"/></FontHeight>
+                </Font>
+                <Frame name="CaseHost">
+                    <Size><AbsDimension x="100" y="30"/></Size>
+                    <Anchors><Anchor point="TOPLEFT" relativePoint="TOPLEFT"/></Anchors>
+                    <Layers><Layer level="ARTWORK">
+                        <FontString name="CaseLabel" inherits="GameFontHighLightSmall" text="hi"/>
+                    </Layer></Layers>
+                </Frame>
+            </Ui>"#,
+        )
+        .unwrap();
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert!(
+            report.warnings.is_empty(),
+            "a differently-cased font name must resolve, not warn: {:?}",
+            report.warnings
+        );
+        assert_eq!(
+            s.eval::<(String, f32)>("local f, h = CaseLabel:GetFont() return f, h")
+                .unwrap(),
+            ("Fonts\\FRIZQT__.TTF".to_string(), 10.0),
+            "the mis-cased inherit found the shipped font"
+        );
+    }
+
+    /// **EQL3's actual shape: FontString -> virtual FontString TEMPLATE -> Font object.** One hop
+    /// works (above); this is the two-hop chain every "define a line template once, stamp it N
+    /// times" addon writes, and `EQL3_Tracker.xml:6/32` is the corpus instance —
+    /// `EQL3_QuestWatch_FontTemplate` inherits `GameFontHighlight`, and each
+    /// `EQL3_QuestWatchLine<i>` inherits the template.
+    #[test]
+    fn a_fontstring_template_carries_the_font_object_it_inherits() {
+        let s = UiScript::new().unwrap();
+        let doc = parse(
+            r#"<Ui>
+                <Font name="GameFontHighlight" font="Fonts\FRIZQT__.TTF" virtual="true">
+                    <FontHeight><AbsValue val="12"/></FontHeight>
+                </Font>
+                <FontString name="LineTemplate" inherits="GameFontHighlight" virtual="true"
+                            justifyH="LEFT"/>
+                <Frame name="Host3">
+                    <Size><AbsDimension x="100" y="30"/></Size>
+                    <Anchors><Anchor point="TOPLEFT" relativePoint="TOPLEFT"/></Anchors>
+                    <Layers><Layer level="ARTWORK">
+                        <FontString name="Line1" inherits="LineTemplate" text="one"/>
+                    </Layer></Layers>
+                </Frame>
+            </Ui>"#,
+        )
+        .unwrap();
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert_eq!(s.eval::<String>("return Line1:GetText()").unwrap(), "one");
+        assert_eq!(
+            s.eval::<(String, f32)>("local f, h = Line1:GetFont() return f, h")
+                .unwrap(),
+            ("Fonts\\FRIZQT__.TTF".to_string(), 12.0),
+            "the font survives BOTH hops — template inheritance must not drop it"
+        );
     }
 }
 

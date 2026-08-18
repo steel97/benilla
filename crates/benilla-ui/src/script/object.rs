@@ -28,10 +28,10 @@ use crate::widget::{FrameHandle, FrameKind};
 mod events_regions;
 mod frame_state;
 mod layout_methods;
-mod movable;
+pub(crate) mod movable;
 pub(crate) mod toplevel;
-pub(crate) use layout_methods::anchor_bits_eq;
-pub(crate) use movable::{advance_move, FrameMove};
+pub(crate) use layout_methods::{anchor_bits_eq, anchor_retarget_is_structural};
+pub(crate) use movable::{advance_move, advance_size, FrameMove, FrameSizing};
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // id ↔ lightuserdata
@@ -123,7 +123,10 @@ pub(super) fn point_from_str(s: &str) -> Option<Point> {
 }
 
 /// The inverse of [`point_from_str`] (the client's point-id table `0x811a38`, names back out).
-fn point_name(p: Point) -> &'static str {
+///
+/// `pub(super)` because the REGION cluster reports the same names from the same table — one
+/// spelling of the point set, not two (`region/layout.rs`'s `GetPoint`).
+pub(super) fn point_name(p: Point) -> &'static str {
     match p {
         Point::TopLeft => "TOPLEFT",
         Point::Top => "TOP",
@@ -323,6 +326,7 @@ fn kind_method_registries(lua: &Lua, this: &Table) -> &'static [&'static str] {
         // corpus's six method-class blockers) and made `SetInsertMode` unreachable.
         Some(FrameKind::MessageFrame) => &[super::messageframe::REG_MESSAGEFRAME_METHODS],
         Some(FrameKind::ScrollFrame) => &[super::scrollframe::REG_SCROLLFRAME_METHODS],
+        Some(FrameKind::SimpleHtml) => &[super::simplehtml::REG_SIMPLEHTML_METHODS],
         Some(FrameKind::Slider) => &[super::slider::REG_SLIDER_METHODS],
         Some(FrameKind::ColorSelect) => &[super::colorselect::REG_COLORSELECT_METHODS],
         Some(FrameKind::Button) => &[super::button::REG_BUTTON_METHODS],
@@ -347,8 +351,12 @@ fn kind_method_registries(lua: &Lua, this: &Table) -> &'static [&'static str] {
 /// `OnLoad` must be able to see the frame's real name, and `$parent` inside the template must
 /// resolve against **the caller's** name, not the template's.
 ///
-/// An unusable template (unknown, non-virtual, the wrong shape) is a warning on the model and a
-/// perfectly usable frame — never an error that takes the frame with it.
+/// An **unresolvable** template name raises `CreateFrame(): Couldn't find inherited node "%s"` and
+/// creates nothing — the reference's own behaviour, byte-verified (`0x7061dd` → `luaL_error`, which
+/// never returns). A template that resolves but is *unusable in some other way* — declared without
+/// `virtual="true"`, or of a shape that does not fit the kind asked for — is still a warning plus a
+/// working frame, because the registry lookup itself succeeded and that is the only thing the miss
+/// branch tests.
 fn create_frame(
     lua: &Lua,
     (kind, name, parent, inherits): (String, Option<Value>, Option<Value>, Option<Value>),
@@ -386,6 +394,39 @@ fn create_frame(
                 v.type_name(),
                 name.as_deref().unwrap_or("<unnamed>")
             ));
+        }
+    }
+
+    // ── THE TEMPLATE LOOKUP HAPPENS HERE — before anything is constructed or published ──────────
+    //
+    // `0x7061dd` calls the registry lookup `0x6ee6f0` and, on NULL, falls into
+    // `luaL_error(L, "CreateFrame(): Couldn't find inherited node \"%s\"")` at `0x7061ed`. That
+    // never returns — `luaG_errormsg`/`luaD_throw` contain no `ret` at all and end in `longjmp`, so
+    // the `xor eax,eax; ret` after the call is dead code. The frame is **not created**, no global
+    // is published, and the calling statement is abandoned; the error is ordinary Lua propagation
+    // and `pcall`-catchable, which is how the widget dispatcher (`0x704f10`, every handler under
+    // `lua_pcall`) turns it into one dead handler rather than a dead client.
+    //
+    // We used to warn and hand back a usable bare frame, and the doc above said the reference
+    // "creates the frame anyway". That claim is refuted at the bytes. It is the same class as 1249:
+    // a failure the client reports and we swallowed — and swallowing is the worse half, because the
+    // addon then runs on a frame with none of the art, regions or scripts it asked for and fails
+    // later, somewhere unrelated.
+    //
+    // Ordering is the carved part, not a detail: the miss branch precedes the synthetic-node build
+    // (`0x706208`) and the `name` store (`0x70622d`), so a miss leaves no partial widget and no
+    // orphan global behind. Doing this after construction would leave both.
+    if let Some(t) = template.as_deref().filter(|t| !t.is_empty()) {
+        let known = {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let templates = model.framexml_templates.borrow();
+            // One name, verbatim, folded — the law `framexml::expand` resolves under.
+            templates.contains_key(t) || templates.keys().any(|k| k.eq_ignore_ascii_case(t))
+        };
+        if !known {
+            return Err(mlua::Error::runtime(format!(
+                "CreateFrame(): Couldn't find inherited node \"{t}\""
+            )));
         }
     }
 

@@ -19,6 +19,7 @@ mod action_bar;
 mod area_trigger;
 mod attack;
 mod bank;
+mod binder;
 mod channel;
 mod chat;
 mod client;
@@ -28,6 +29,7 @@ mod duel;
 mod gameobject;
 mod gossip;
 mod group;
+mod guild;
 mod items;
 mod loot;
 mod mail;
@@ -43,6 +45,7 @@ mod pet;
 mod pose;
 mod progression;
 mod quest;
+mod reputation;
 mod roster;
 mod skills;
 mod social;
@@ -62,6 +65,7 @@ pub use attack::{attack_swing, AttackerState};
 pub use bank::{
     autobank_item, autostore_bank_item, bank_slot_result, banker_activate, buy_bank_slot,
 };
+pub use binder::{binder_activate, PlayerBound};
 pub use channel::{channel_notice, ChannelNoticeTail, ChannelNotify};
 pub use chat::{
     chat_tag, ChatMessage, CHAT_MSG_AFK, CHAT_MSG_BATTLEGROUND, CHAT_MSG_BATTLEGROUND_LEADER,
@@ -106,6 +110,16 @@ pub use group::{
     ready_check_start, request_party_member_stats, GroupLootInfo, GroupMemberEntry,
     PartyMemberStatsInfo, RaidTargetUpdate, ReadyCheck, GROUP_MEMBER_ASSISTANT,
 };
+pub use guild::{
+    guild_accept, guild_add_rank, guild_command, guild_command_error, guild_create, guild_decline,
+    guild_default_rank, guild_del_rank, guild_demote, guild_disband, guild_event, guild_info,
+    guild_info_text, guild_invite, guild_leader, guild_leave, guild_motd, guild_presence,
+    guild_promote, guild_query, guild_rank, guild_rank_right, guild_remove, guild_roster,
+    guild_set_officer_note, guild_set_public_note, GuildCommandResult, GuildEventNotice, GuildInfo,
+    GuildQueryResponse, GuildRoster, GuildRosterMember, GUILD_INFO_MAX_LENGTH,
+    GUILD_MOTD_MAX_LENGTH, GUILD_NAME_MAX_LENGTH, GUILD_NOTE_MAX_LENGTH, GUILD_RANKS_MAX_COUNT,
+    GUILD_RANKS_MIN_COUNT, GUILD_RANK_MAX_LENGTH, GUILD_RANK_RIGHT_ORDER,
+};
 pub use items::{
     auto_equip_item, auto_store_bag_item, destroy_item, item_query, open_item, set_ammo,
     split_item, swap_inv_item, swap_item, use_item, ItemDamage, ItemInfo, ItemSpellEntry,
@@ -149,6 +163,9 @@ pub use quest::{
     QuestDetails, QuestGiverList, QuestListEntry, QuestObjective, QuestOfferReward,
     QuestRequestItems, QuestRequiredItem, QuestRewardItem, QuestTemplate, QUEST_EMOTE_COUNT,
     QUEST_OBJECTIVES_COUNT, QUEST_REWARDS_COUNT, QUEST_REWARD_CHOICES_COUNT,
+};
+pub use reputation::{
+    set_faction_at_war, set_faction_inactive, set_watched_faction, WATCHED_FACTION_NONE,
 };
 pub use roster::{
     CharCreateReq, CharEnumItem, Character, CHARACTER_FLAG_GHOST, CHARACTER_FLAG_HIDE_CLOAK,

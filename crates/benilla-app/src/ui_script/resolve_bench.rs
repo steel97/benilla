@@ -9,8 +9,11 @@
 //! that actually change. That is what [`tooltip_change_costs_a_whole_ui_solve`] drives, and with it
 //! the cost reproduces headlessly and can be measured against a fix.
 //!
-//! Run with `cargo test --release -p benilla -- --ignored --nocapture resolve_bench`;
-//! `WOW_LAYOUT_PROF=1` adds the per-solve shape (rounds, graph size, frame-vs-region split).
+//! Run with `cargo test --release -p benilla-app --lib -- --ignored --nocapture resolve_bench`;
+//! `WOW_LAYOUT_PROF=1` adds the per-solve shape — and since decision 1350 its `solved=`/`swept=`
+//! columns are the ones to read: they are the SCOPE of the solve, and 1350's whole claim is that
+//! they stay a handful while `frames=`/`anchored=` grow without bound. A solve whose scope tracks
+//! the graph again is precisely the regression this file exists to catch.
 
 use std::time::Instant;
 
@@ -59,6 +62,19 @@ fn settled_default_ui() -> UiScript {
 
 /// One frame in the app's own order (`extract::drive_script`): measure FIRST, then resolve.
 fn app_frame(s: &mut UiScript) {
+    answer_measures(s);
+    s.resolve();
+}
+
+/// A frame that also **ticks the VM**, i.e. runs the shipped UI's own `OnUpdate` handlers, in
+/// `drive_script`'s real order (tick → measure → resolve).
+///
+/// [`app_frame`] deliberately models only the measure/resolve half, and the tooltip benches stand
+/// in for the handler by calling it themselves. That is fine when the test IS the driver — but a
+/// test asking "is anything in the shipped UI writing layout on its own?" has to let the shipped
+/// UI actually run, or it answers a question nobody asked (decision 1385).
+fn app_frame_ticked(s: &mut UiScript, dt: f32) {
+    s.tick(dt);
     answer_measures(s);
     s.resolve();
 }
@@ -136,6 +152,7 @@ fn a_tooltip_content_change_costs_exactly_one_layout_solve() {
         app_frame(&mut s);
     }
     let before = s.layout_solves();
+    let derives_before = s.layout_derivations();
     for _ in 0..10 {
         s.run("gate_change()").unwrap();
         app_frame(&mut s);
@@ -146,6 +163,19 @@ fn a_tooltip_content_change_costs_exactly_one_layout_solve() {
         "10 content changes must cost 10 solves — one each. Two per change means the measure \
          round-trip is running AFTER the resolve again (extract::drive_script's order)."
     );
+    // …and none of those ten may DERIVE the graph (decision 1388). This is the second shape of
+    // the same law `a_region_moving_every_frame_costs_no_graph_derivation_on_the_shipped_ui`
+    // guards, and it is worth asserting separately because it arrives by a different road: a
+    // hover sweep churns tooltip CONTENT, so its per-frame writes are measure answers and
+    // re-anchors of pooled line regions rather than one moving texture. The bag-hover re-enter
+    // loop is the most common interactive path in the client; a derivation per frame here is
+    // 1.48 ms every frame the cursor sits over a bag.
+    assert_eq!(
+        s.layout_derivations() - derives_before,
+        0,
+        "a settled tooltip whose CONTENT changes must not re-derive the layout graph — the line \
+         pool is already built, so nothing structural is happening (decision 1388)"
+    );
     // …and the measure answers must have landed in that one solve: a frame that resolved before
     // measuring leaves the fresh text unmeasured until the next frame, which is the visible half
     // of the same bug (a tooltip plate one frame behind its content).
@@ -153,5 +183,314 @@ fn a_tooltip_content_change_costs_exactly_one_layout_solve() {
         answer_measures(&mut s),
         0,
         "after a settled frame nothing may still be waiting to be measured"
+    );
+}
+
+/// **The idle law** (decision 1385): the settled shipped UI, with nothing happening, must cost
+/// **zero** gate walks per frame — not one cheap one, zero.
+///
+/// The other guards in this file pin what the ENGINE charges for a change. This one pins that
+/// nothing in the shipped UI is quietly making a change every frame in the first place, which is
+/// the half a law about the engine cannot see. It is the tripwire for a new always-on toucher
+/// being added to `assets/ui/` — the worst shape of this bug, because it costs on *every* frame of
+/// *every* session rather than only while something is animating. The sweep behind 1385 found real
+/// candidates for it (`TemporaryEnchantFrame`'s OnUpdate is resident for the whole session; the
+/// measure round-trip used to bump the epoch on every same-size re-measure), so the shape is not
+/// hypothetical.
+///
+/// A failure here does not name the culprit — `WOW_LAYOUT_TOUCH_TRACE=<secs>:<n>` does, by
+/// backtracing the touch sites on a live run.
+#[test]
+fn the_settled_shipped_ui_costs_no_gate_walk_on_a_quiet_frame() {
+    let mut s = settled_default_ui();
+    // Ticked frames, so the shipped UI's own OnUpdate handlers run — the whole point (see
+    // `app_frame_ticked`). A couple of frames of grace first: `settled_default_ui` stops as soon
+    // as the measure round-trip goes quiet, which is one edge earlier than the layout gate closing
+    // behind it, and the first ticked frames arm handlers that have never run.
+    for _ in 0..8 {
+        app_frame_ticked(&mut s, 1.0 / 60.0);
+    }
+    // POSITIVE CONTROL. "Zero walks" only means anything if the shipped UI's handlers actually
+    // ran — a tick that silently fired nothing would also read zero, and would make this test a
+    // green light for exactly the regression it exists to catch. `BuffFrameUpdateTime` is advanced
+    // by `BuffFrame_OnUpdate` on every frame (down by `elapsed`, or up by TOOLTIP_UPDATE_TIME when
+    // it crosses), so one tick must move it.
+    s.run("__probe_bfut = BuffFrameUpdateTime")
+        .expect("read the control");
+    app_frame_ticked(&mut s, 1.0 / 60.0);
+    s.run(
+        "if BuffFrameUpdateTime == __probe_bfut then \
+         error('the VM tick ran no shipped OnUpdate — this test proves nothing') end",
+    )
+    .expect("the shipped UI's OnUpdate handlers must run under app_frame_ticked");
+
+    let before = s.layout_gate_walks();
+    for _ in 0..20 {
+        app_frame_ticked(&mut s, 1.0 / 60.0);
+    }
+    assert_eq!(
+        s.layout_gate_walks() - before,
+        0,
+        "20 idle frames of the shipped UI cost {} whole-roster gate walks — something in \
+         assets/ui/ is writing a layout input every frame with nothing happening. Name it with \
+         WOW_LAYOUT_TOUCH_TRACE=<secs>:<n> on a live run (decision 1385).",
+        s.layout_gate_walks() - before
+    );
+}
+
+/// **The castbar law** (decision 1385, ledger B283), on the full shipped UI: a region that moves
+/// every frame must cost **one** whole-roster gate walk per frame.
+///
+/// This is the guard for the bug class 1383 named and the castbar then hit. `CastingBar.xml`'s
+/// OnUpdate slides `CastingBarSpark` one `SetPoint` per frame for the length of every cast — the
+/// reference's own architecture, and the classic addon idiom besides. Measured live at the
+/// Stormwind gates it cost **+4.2 ms of CPU per frame** on a default UI: three walks per frame at
+/// ~1.0–1.4 ms each (10,438 anchored regions re-hashed every walk), because the fingerprint was
+/// hashed over the 0294 seeds as well as the inputs and so no walk could ever close tier 1.
+///
+/// Three things make this the falsifier rather than a smoke check:
+/// * it runs on the **shipped** UI, so the whole-roster term is real — a synthetic two-frame model
+///   shows the same *counts* and none of the cost;
+/// * the Lua body ends in a frame getter, because that is what a live tick does. A later handler's
+///   `GetWidth` forces the synchronous mid-tick solve; modelling the frame as a lone `resolve()`
+///   hides two of the three walks;
+/// * it asserts on `layout_gate_walks`, not `layout_solves`. A walk that concludes "nothing moved"
+///   pays the identical preamble and never reaches the solve counter — one of the castbar's three
+///   walks was exactly that, so the old counter under-reported the bug by a third.
+#[test]
+fn a_region_moving_every_frame_costs_one_gate_walk_on_the_shipped_ui() {
+    let mut s = settled_default_ui();
+    s.run(
+        r#"
+        BenchBar = CreateFrame("Frame", "BenchBar", UIParent)
+        BenchBar:SetPoint("CENTER", 0, 0); BenchBar:SetWidth(195); BenchBar:SetHeight(13)
+        BenchSpark = BenchBar:CreateTexture(nil, "OVERLAY")
+        BenchSpark:SetWidth(32); BenchSpark:SetHeight(32)
+        BenchSpark:SetPoint("CENTER", BenchBar, "LEFT", 0, 2)
+        bench_spark_n = 0
+        -- CastingBarFrame_OnUpdate's body, reduced to what touches layout: ride the spark along
+        -- the bar's leading edge. The trailing getter stands in for any LATER handler in the same
+        -- tick reading a frame rect — the thing that forces the mid-tick synchronous solve.
+        function bench_spark_frame()
+            bench_spark_n = bench_spark_n + 1
+            BenchSpark:SetPoint("CENTER", BenchBar, "LEFT", bench_spark_n * 1.7, 2)
+            local _ = UIParent:GetWidth()
+        end
+        "#,
+    )
+    .unwrap();
+
+    // Settle the newly-created bar and spark — a birth is legitimately a wide, multi-walk solve.
+    for _ in 0..6 {
+        s.run("bench_spark_frame()").unwrap();
+        app_frame(&mut s);
+    }
+
+    let walks_before = s.layout_gate_walks();
+    let solves_before = s.layout_solves();
+    for step in 0..10 {
+        s.run("bench_spark_frame()").unwrap();
+        app_frame(&mut s);
+        let (frames, regions) = s.layout_last_scope();
+        assert!(
+            frames < 50 && regions < 200,
+            "step {step}: moving ONE region solved {frames} frames and swept {regions} regions — \
+             the scope is tracking the graph, not the change (decision 1350)"
+        );
+    }
+    let walks = s.layout_gate_walks() - walks_before;
+    let solves = s.layout_solves() - solves_before;
+    assert_eq!(
+        walks, 10,
+        "10 frames of one moving region must cost 10 whole-roster gate walks — one each. 30 \
+         means the fingerprint is hashing the 0294 seeds again, so every solve outgrows the value \
+         it stores and neither it nor the settling walk behind it can close tier 1 (decision \
+         1385). At the shipped roster each extra walk is ~1 ms of CPU on every frame of every cast."
+    );
+    assert_eq!(
+        solves, 10,
+        "and each of those walks must be a real solve, not a wasted one"
+    );
+}
+
+/// **The castbar law, part two** (decision 1388): those ten gate walks must cost **zero**
+/// derivations of the layout graph.
+///
+/// 1385 got the moving spark from three whole-roster walks per frame down to one, and the test
+/// above is its guard. It did nothing about what the surviving walk *costs*: measured at the
+/// Stormwind pin (3,218 frames, 10,438 anchored regions) the preamble ran 1.48 ms, 79% of it in two
+/// phases — re-hashing every anchored region (919 µs) and re-filtering every seed rect for liveness
+/// (255 µs) — to rediscover a graph whose SHAPE had not changed. At 144 fps that is a fifth of the
+/// frame, on every frame of every cast, and it is paid by anything that animates: floating combat
+/// text moves up to twenty strings a frame, and a frame getter inside an OnUpdate (`GetWidth` calls
+/// `settle`) buys another one each.
+///
+/// So the counter this asserts on is not `layout_gate_walks` but `layout_derivations`. A moving
+/// region names its node, the ledger vouches for the cached roster and edges, and the resolve
+/// re-hashes one node instead of 13,656. Zero is the whole claim: **one** derivation per frame
+/// would mean a write site somewhere fell back to the conservative `touch_layout` and the ledger
+/// is being poisoned every frame, which reads as a perfectly healthy walk count and costs the
+/// entire 1.48 ms.
+///
+/// The positive control is not optional here. "Zero derivations" is exactly what a permanently
+/// broken counter also reports, so the test first proves the counter can move — a frame BIRTH is
+/// structural by construction and must derive.
+///
+/// It ticks the VM (`app_frame_ticked`) rather than driving the resolve alone, so the shipped UI's
+/// own `OnUpdate` handlers run on every one of these frames. That is the difference between "one
+/// synthetic write can use the ledger" and "the ledger survives the real UI": a single handler
+/// anywhere in `assets/ui/` falling back to a conservative touch every frame would poison it for
+/// everything else, and only a ticked frame can see that.
+#[test]
+fn a_region_moving_every_frame_costs_no_graph_derivation_on_the_shipped_ui() {
+    let mut s = settled_default_ui();
+    s.run(
+        r#"
+        BenchBar2 = CreateFrame("Frame", "BenchBar2", UIParent)
+        BenchBar2:SetPoint("CENTER", 0, 0); BenchBar2:SetWidth(195); BenchBar2:SetHeight(13)
+        BenchSpark2 = BenchBar2:CreateTexture(nil, "OVERLAY")
+        BenchSpark2:SetWidth(32); BenchSpark2:SetHeight(32)
+        BenchSpark2:SetPoint("CENTER", BenchBar2, "LEFT", 0, 2)
+        bench_spark2_n = 0
+        function bench_spark2_frame()
+            bench_spark2_n = bench_spark2_n + 1
+            BenchSpark2:SetPoint("CENTER", BenchBar2, "LEFT", bench_spark2_n * 1.7, 2)
+            local _ = UIParent:GetWidth()
+        end
+        "#,
+    )
+    .unwrap();
+
+    // The positive control, taken across the birth above: a new frame and a new region move the
+    // roster, so they MUST derive. If this reads zero the counter is dead and the real assertion
+    // below proves nothing.
+    let born_at = s.layout_derivations();
+    for _ in 0..6 {
+        s.run("bench_spark2_frame()").unwrap();
+        app_frame_ticked(&mut s, 1.0 / 144.0);
+    }
+    assert!(
+        s.layout_derivations() > born_at,
+        "creating a frame and a texture must derive the graph — a birth moves the roster, which \
+         is the one thing the per-node ledger cannot describe. Reading zero here means \
+         `layout_derivations` never moves and the assertion below is vacuous."
+    );
+
+    let derives_before = s.layout_derivations();
+    let walks_before = s.layout_gate_walks();
+    for _ in 0..10 {
+        s.run("bench_spark2_frame()").unwrap();
+        app_frame_ticked(&mut s, 1.0 / 144.0);
+    }
+    let derives = s.layout_derivations() - derives_before;
+    let walks = s.layout_gate_walks() - walks_before;
+    assert!(
+        walks >= 10,
+        "the frames must still be reaching the gate at all — {walks} walks over 10 frames means \
+         this test stopped exercising the path it is guarding"
+    );
+    assert_eq!(
+        derives, 0,
+        "10 frames of one moving region derived the layout graph {derives} times. Each derivation \
+         is a walk of the WHOLE roster — every live frame's scale re-synced, every seed rect \
+         re-filtered for liveness, all 10,438 anchored regions re-hashed and their edges rebuilt: \
+         ~1.48 ms of CPU at the Stormwind pin, on every frame anything moves. A write site is \
+         falling back to the conservative `Model::touch_layout` where it could name its node \
+         (decision 1388)."
+    );
+}
+
+/// The perf half of decision 1350, asserted as a COUNT: a tooltip content change must cost a
+/// solve whose SCOPE is tooltip-sized, on a UI of 3,000 frames and 8,800 anchored regions.
+///
+/// Milliseconds are deliberately not the gate here. This exact cost has now been chased three
+/// times — 0735 (the measure cache), 0771 (the double solve), and this — and on two of those the
+/// ms column was contaminated by machine state (0713's stall class) while the work counts were
+/// clean. The bound is also what makes the regression *reportable*: 1350's pin found the sweep's
+/// cost tripling with no counter behind it, because `regions_swept` counted the entries the sweep
+/// skipped as well as the ones it resolved.
+#[test]
+fn a_tooltip_content_change_solves_a_tooltip_sized_scope() {
+    let mut s = settled_default_ui();
+    install_changing_tooltip(&s, "ScopeSizeOwner", "scope_size_change");
+
+    // Settle the newly-created owner and the tooltip's first content — a birth is legitimately a
+    // wide solve (a new node has no cached rect to trust).
+    for _ in 0..6 {
+        s.run("scope_size_change()").unwrap();
+        app_frame(&mut s);
+    }
+    for step in 0..10 {
+        s.run("scope_size_change()").unwrap();
+        app_frame(&mut s);
+        let (frames, regions) = s.layout_last_scope();
+        assert!(
+            frames < 100 && regions < 500,
+            "step {step}: a tooltip content change solved {frames} frames and swept {regions} \
+             regions — the scope is tracking the graph, not the change (measured at the time of \
+             writing: 5 frames, 67 regions, against 3,003 and 8,821 in the graph)"
+        );
+    }
+}
+
+/// The scoped resolve's falsifier (decision 1350): on the shipped UI, mid-sweep, a solve that
+/// touched only the dirty closure must produce **exactly** the rects a from-scratch whole-graph
+/// solve produces.
+///
+/// This is the gate for the whole change, and it is deliberately run on the frames that never
+/// settle — a hover sweep changes content every frame, so `WOW_LAYOUT_VERIFY`'s settled-frame
+/// comparison never fires there, and those are the only frames the scope was built for. The
+/// comparison is `extract()`, not an internal rect map: a stale rect that no quad carries is not a
+/// bug, and a stale rect that one does carry is the bug in the form the screen would show it.
+#[test]
+fn a_scoped_resolve_reproduces_the_whole_graph_solve() {
+    let mut s = settled_default_ui();
+    install_changing_tooltip(&s, "ScopeOwner", "scope_change");
+
+    for step in 0..12 {
+        // A content change, resolved the way the app resolves it — scoped.
+        s.run("scope_change()").unwrap();
+        app_frame(&mut s);
+        let scoped = s.extract();
+
+        // The same model, re-solved from nothing but its inputs.
+        s.force_full_layout_resolve();
+        app_frame(&mut s);
+        let full = s.extract();
+
+        assert!(
+            scoped == full,
+            "step {step}: the scoped resolve and the whole-graph resolve disagree — a node the \
+             scope judged clean did move. {} quads vs {}",
+            scoped.len(),
+            full.len(),
+        );
+    }
+}
+
+/// The steady-state cost of the per-frame measure sweep alone: the UI settled, every FontString
+/// measured, every key a cache hit — what does *asking* cost? It is paid on EVERY frame, quiet
+/// ones included, which made it a suspect on 1350's successor list — and this bench closed it:
+/// 0.046 ms/sweep on the full shipped UI in release (2026-08-15; the ~1.0 ms once quoted was a
+/// dev-build number). Kept as the lane's regression watch: if this climbs toward a milli-
+/// second, the sweep's per-row clones/hash grew or the cache stopped hitting.
+#[test]
+#[ignore]
+fn measure_sweep_steady_state_cost() {
+    let mut s = settled_default_ui();
+    // One more settle so the sweep below is provably pure cache hits.
+    let residual = answer_measures(&mut s);
+    let t = Instant::now();
+    let mut asked = 0usize;
+    const N: u32 = 200;
+    for _ in 0..N {
+        asked += s.fontstrings_needing_measure().len();
+    }
+    println!(
+        "measure sweep steady state: {:.4} ms/sweep ({} sweeps, {} residual requests, {} pre-settle)",
+        ms(t) / f64::from(N),
+        N,
+        asked,
+        residual,
     );
 }

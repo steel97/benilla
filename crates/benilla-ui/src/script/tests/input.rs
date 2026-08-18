@@ -598,10 +598,10 @@ fn the_unfired_script_kinds_still_raise_rather_than_silently_accepting() {
     s.run(r#"Raiser = CreateFrame("EditBox", "RaiserBox")"#)
         .unwrap();
     for name in [
-        // No keyboard index / `EnableKeyboard` yet (wow-re `scripts-auto-enable.md` kinds 0/1).
-        "OnKeyDown",
-        "OnKeyUp",
-        "OnChar",
+        // `OnKeyDown`/`OnKeyUp`/`OnChar` are NOT in this list any more: decision 1319 built the
+        // delivery walk, so they are fired and therefore accepted — the rule this test enforces,
+        // applied in the other direction. Their law lives in `script::tests::keyboard`.
+        //
         // Caret geometry is host-side; its four float args would all be zero.
         "OnCursorChanged",
         // 2.0's secure-frame system — no such slot exists in any 1.12 resolver.

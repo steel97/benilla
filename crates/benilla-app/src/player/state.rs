@@ -19,10 +19,20 @@ use bevy::prelude::*;
 /// ~36% shorter — no separate constant.
 pub(super) const RUN_BACK_RATIO: f32 = 4.5 / 7.0;
 
-/// Character turn rate (rad/s) — how fast A/D rotate the avatar's facing when not mouse-looking (the
-/// vanilla turn-vs-strafe model, VERIFIED wow-5875-re `0x7c4f30` heading integrate). It is the unit's
-/// 6th movement speed (`CMovement+0x9c`, the server-seeded `TURN_RATE`; vanilla default ≈π rad/s),
-/// reduced to 0.75× while also translating (the `flags & 0x200f` case). Decision 0050.
+/// Turn rate (rad/s) **fallback** — how fast A/D rotate the facing when not mouse-looking, used
+/// only until the mover's own sixth movement speed arrives.
+///
+/// The live rate is per-unit and server-authoritative: `CMovement+0x9c`, last of six consecutive
+/// speed floats on the **mover's own** `CMovement`, set by `0x7c6ff0` (which acks with
+/// `CMSG_FORCE_TURN_RATE_CHANGE_ACK`, `0x2df`) and read for held turns by `GetYawRate 0x7c5c50`.
+/// The base ctor `0x7c4850` *zeroes* all six, so the client keeps no default of its own — π is the
+/// vanilla server's value, and this constant stands in only for frames before a create block lands.
+/// VERIFIED wow-5875-re (`0x7c4f30` heading integrate; the speed block, decision 1278).
+///
+/// Because it lives on the mover, a possessed creature turns at **its** rate, not ours. Reduced to
+/// [`TURN_RATE_MOVING`] while translating **or falling** (`flags & 0x200f`), and the same cell is
+/// the held-*pitch* rate — that integrator's keys are default-unbound, so we never bind it.
+/// Decision 0050.
 pub(super) const TURN_RATE: f32 = std::f32::consts::PI;
 
 /// The mouselook swim-pitch clamp (radians) — **VERIFIED** ±89.0° = 1.5533431 (`0x8089d8` =
@@ -242,11 +252,14 @@ pub(super) const FALL_FAR_TIME: f32 = 0.5;
 /// Skin width (yd) kept between the capsule and geometry on casts.
 pub(super) const SKIN_WIDTH: f32 = 0.02;
 
-/// Max seconds to hold the avatar after a teleport while the world streams in (see [`Player::settling`]).
-/// Generous — a dense city's spawn + collider queue drains in a couple seconds; this only backstops a
-/// world that never becomes resident (missing data, a stalled stream) so we never hang forever. The
-/// release itself is the terrain streamer's (decision 0737), which also pushes the deadline while the
-/// resident world is still the departed map's (0710's fail-closed law).
+/// Seconds of **stalled** streaming before the post-snap hold gives up (see [`Player::settling`]).
+/// A *stall* budget, not a load budget: the deadline is pushed forward while the resident world is
+/// still the departed map's (0710's fail-closed law) **and while the destination is visibly still
+/// arriving** (any load-progress counter moved — B263, decision 1303). It can therefore only fire
+/// against a stream that has made no progress at all for this long — missing data, dead IO — never
+/// against a slow machine. As a fixed load budget it was measured 0.01 s from firing on a *fast*
+/// machine (a Stormwind arrival consumed 5.99 s of the 6.00 s), which is B263: on any slower
+/// machine it released gravity mid-stream and the body fell through the not-yet-collided city.
 pub(crate) const SETTLE_TIMEOUT: f32 = 6.0;
 
 /// The player body's collision capsule, built once at startup and swept by avian's `MoveAndSlide`
@@ -468,6 +481,64 @@ pub(crate) struct Player {
     pub(super) follow_forward: bool,
     /// Free-fly (`F`): the camera moves on its own and the avatar/server position is frozen.
     pub(crate) detached: bool,
+    /// **The body in our hands may not be moved** — `SMSG_CLIENT_CONTROL_UPDATE` with
+    /// `allowMove = 0` about whatever we are currently driving.
+    ///
+    /// Two cases, one meaning (decision 1279). The packet names **us** while somebody is
+    /// mind-controlling us (B211); it names **the creature we are possessing** when that creature
+    /// becomes feared or confused, which vmangos sends from the fear/flee movement generators
+    /// without ending the possession at all. Both say the same thing — the reins are still where
+    /// they were, and nothing may move — and the reference collapses them the same way, by zeroing
+    /// the mover global for whichever unit the packet names when it is the one already being
+    /// driven.
+    ///
+    /// So this is **not** "someone is controlling me"; reading it that way is what made the second
+    /// case clear [`Player::foreign_mover`] and walk our own body around under a creature's mover.
+    ///
+    /// This is the *whole* of what stops a mind-controlled player walking away, and that is a
+    /// verified property of the server rather than an assumption: vmangos never roots the victim,
+    /// sends it no speed change, its `StopMoving()` is a documented no-op for a possessed player,
+    /// and `HandleMovementOpcodes` carries no charm check — so it will accept and apply any
+    /// movement we choose to send. Nothing else is coming; if the client does not stop itself,
+    /// nothing stops.
+    ///
+    /// Deliberately **not** a [`MoveModes`] entry. That family is the four ack'd server modes
+    /// (decision 0866), each with its own SMSG/ack pair and its own movement-flag bit; this owes no
+    /// ack, carries no flag, and suppresses turning too — which root explicitly does not.
+    pub(crate) control_lost: bool,
+    /// **We hold somebody else's reins** — a unit the server handed us and we claimed as our mover
+    /// (mind-controlling a creature, Eye of Kilrogg). `None` whenever the mover is our own body.
+    ///
+    /// While this holds, the controller must not drive our own body onto the wire, and the reason
+    /// is sharper than tidiness: outbound `MSG_MOVE_*` carry **no guid** — the server attributes
+    /// them to whatever we last claimed — so streaming our body's pose under a claimed creature's
+    /// mover would teleport that creature onto us. Suppressing our body is also simply what
+    /// possession looks like: your own character stands still while you drive the other thing.
+    ///
+    /// While this holds, [`crate::net::Embodied`] sits on that unit's entity — or on nothing at
+    /// all until it streams — and the controller drives *it*. Our own body then simulates nothing,
+    /// animates from nothing, and sends nothing, which is both the fix and what possession looks
+    /// like from the outside (decision 1277).
+    pub(crate) foreign_mover: Option<u64>,
+    /// **The reins are between hands** — the body we drive has changed, and we drive *nothing*
+    /// until we have adopted its pose.
+    ///
+    /// Set when the mover guid changes (the control handshake in [`super::wire_in`], and
+    /// [`super::embody::maintain_embodiment`] when the marker follows it); cleared at the same
+    /// take-control edge that seizes our own body on login, once a streamed pose is actually there
+    /// to seize. Both halves matter:
+    ///
+    /// - **Adopt before driving** — the resource's `pos`/facing still describe the body we were
+    ///   driving a moment ago, so the first streamed frame would otherwise report the creature
+    ///   standing wherever we left our character.
+    /// - **Drive nothing while pending** — the handshake runs *inside* the controller, a frame
+    ///   ahead of the marker that follows it, and the claimed unit may not have streamed in at all.
+    ///   Either way there is a window where what we intend to drive and what carries the marker
+    ///   disagree, and driving during it means writing one body's pose onto another.
+    ///
+    /// A flag rather than a direct write because the pose lives on the entity and the seize needs
+    /// the camera too — both of which the controller already holds and the marker's owner does not.
+    pub(crate) reseat: bool,
     /// Feet position in **Bevy** coords (converted to raw WoW only when sending to the server).
     pub(crate) pos: Vec3,
     /// Vertical velocity (yd/s, Bevy +Y up) for gravity/jump/fall. Integrated each frame; zeroed while
@@ -512,8 +583,15 @@ pub(crate) struct Player {
     /// its own leak patch before 0737 deleted the class).
     pub(crate) settling: bool,
     /// `Time::elapsed_secs` deadline to give up settling and release (see [`Player::settling`]).
-    /// Pushed forward by the streamer while [`Player::world_stale`] (0710's fail-closed law).
+    /// Pushed forward by the streamer while [`Player::world_stale`] (0710's fail-closed law) and
+    /// while any load-progress counter is still moving (B263, decision 1303) — so it measures
+    /// *stall*, and a slow arrival can never exhaust it.
     pub(crate) settle_deadline: f32,
+    /// `Time::elapsed_secs` when the current settle hold began (the snap) — what the `sett` trace
+    /// reports the wait against. The deadline above stopped measuring this the moment it became a
+    /// stall budget: it is re-pushed all through a live stream, so "deadline minus timeout" names
+    /// the last push, not the arrival.
+    pub(crate) settle_since: f32,
     /// **The colliders under our feet may still belong to the map we just left.** Set at every
     /// snap, cleared by the terrain streamer once the destination's own world is resident.
     ///
@@ -534,6 +612,14 @@ pub(crate) struct Player {
     /// it drops the ride + spline without mirroring the stale flight pose over the snap (the
     /// 4-yd-hover + full-6s-settle landing bug, decision 0501) and owes no `CMSG_MOVE_SPLINE_DONE`.
     pub(super) ride_abort: bool,
+    /// **A `MSG_MOVE_WORLDPORT_ACK` is owed, payable at the settle release** (decision 1340).
+    /// The real client sends the worldport ack as the LAST act of its blocking destination load
+    /// (wow-re: `0x401bc0` sends `0xDC` at `0x401cae` only after `0x66fbe0`'s load returns) — our
+    /// async re-expression of "after the load" is the release. Safe to defer: vmangos has no load
+    /// timeout, drops every packet we'd send meanwhile (the player is out-of-world for the whole
+    /// window), and force-acks at logout. Set by the non-riding worldport snap; a riding crossing
+    /// (0455) never settles and acks immediately, as before.
+    pub(crate) owes_worldport_ack: bool,
     /// `Time::elapsed_secs` when we last sent a heartbeat.
     pub(super) last_heartbeat: f32,
     /// `Time::elapsed_secs` when the current airborne phase (jump or step-off) began, else `None` on the
@@ -602,7 +688,7 @@ pub(crate) struct Player {
     /// The **swim pitch** (radians, +up) — the client's persistent per-unit pitch (`CMovement+0x20`,
     /// the swim §5's TU-B): **held** when unsteered (an idle floater keeps its pitch — never
     /// auto-leveled; the only zeroing writer `0x7c6e80` fires from stop-swim/teleport, not mouse
-    /// release). Steered by mouselook as a **DIRECT set** of the camera aim pitch, clamped
+    /// release). ActiveMover by mouselook as a **DIRECT set** of the camera aim pitch, clamped
     /// [`MOUSELOOK_PITCH_CLAMP`] (±89°) — **VERIFIED** (the camera-pitch §5, wow-re
     /// `swim-camera-pitch.md`, decision 0492, refuting the earlier no-camera-coupling census):
     /// the ref's mouse-move event chain lands in `SetPitch 0x7c6f70`, an unconditional store
@@ -685,7 +771,7 @@ impl Player {
     /// the whole diagnosis of a fall-through report, so it goes through the `sett` trace either way.
     pub(crate) fn end_settle(&mut self, resident: bool, now: f32) {
         self.settling = false;
-        let waited = SETTLE_TIMEOUT - (self.settle_deadline - now);
+        let waited = now - self.settle_since;
         super::move_trace::settle(resident, waited, self.pos);
     }
 

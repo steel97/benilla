@@ -72,8 +72,19 @@ fn fixed(v: f32) -> i64 {
 
 /// The feed's change-tracking memory (the [`crate::ui_unit::UnitFeedState`] shape): the last
 /// snapshots pushed, so events fire on transitions only.
+///
+/// All of it is what-we-told-the-VM, so all of it lives behind a [`crate::ui_script::VmMemo`]: a
+/// memory about one VM is unreadable against the next (1290), so a `/reload` (1291) — which
+/// replaces the VM without despawning the avatar — re-pushes both snapshots and re-fires their
+/// events exactly as a fresh login does.
 #[derive(Resource, Default)]
 struct CharFeedState {
+    vm: crate::ui_script::VmMemo<CharFeedMemo>,
+}
+
+/// The per-VM half of [`CharFeedState`] — the transition-diff bases.
+#[derive(Default)]
+struct CharFeedMemo {
     last_stats: Option<UnitCombatStats>,
     last_inv: Option<InventorySlots>,
 }
@@ -87,7 +98,16 @@ impl Plugin for UiCharPlugin {
         app.init_resource::<CharFeedState>().add_systems(
             Update,
             (
-                feed_char.before(UiInput),
+                // `.before(feed_containers)`: the container feed's `BAG_UPDATE` handlers read the
+                // inventory surface synchronously — an addon mirroring a bag asks the bag ITEM's
+                // own row (`GetInventoryItemLink("player", ContainerIDToInventoryID(bag))`,
+                // Bagnon_Forever's size row) — so the inventory push must land first. Unordered,
+                // the first in-world burst raced it and recorded every equipped bag linkless
+                // (`s = "8,0,"` in the director's Bagnon_Forever data). The house "push before
+                // fire" rule, across the two feeds.
+                feed_char
+                    .before(crate::ui_items::feed::feed_containers)
+                    .before(UiInput),
                 watch_skill_ups.before(UiInput),
                 feed_skills.before(UiInput),
                 drain_skill_abandons.after(UiInput),
@@ -96,27 +116,49 @@ impl Plugin for UiCharPlugin {
     }
 }
 
-/// The client-generated skill-up feedback (decision 0437, landed with phase 2): the server sends
-/// NO skill-up message at all — skills mutate only as `PLAYER_SKILL_INFO` descriptor deltas
-/// (verified at the vmangos source: no chat send anywhere in `UpdateSkill*`/`SetSkill`) — so the
-/// client diff-watches its own skill block, prints the byte-exact 1.12 line
-/// (`SKILL_RANK_UP`, GlobalStrings.lua:3485: "Your skill in %s has increased to %d.") on the
-/// Skill chat channel, and fires `SKILL_LINES_CHANGED` on ANY block change (the skills pane's
-/// repaint event). The login fill (empty → populated) and a character switch (self guid change)
-/// re-seed silently — the event fires, the lines don't. INTERIM (pinned to the in-flight wow-re
-/// §5, 0437 TU-E): no `SKILL_FLAG_NO_SKILLUP_MESSAGE` gate yet, and the exact chat channel of the
-/// real emitter is unconfirmed (Skill is the `ChatTypeInfo` family's own key for it).
+/// The skill block [`watch_skill_ups`] last announced: the self guid it was read off, and that
+/// character's `skillId → value` map — the diff base for both the chat lines and the event.
+/// `None` = nothing announced yet.
+type SkillBlock = Option<(u64, std::collections::HashMap<u16, u16>)>;
+
+/// The client-generated skill-up feedback (decision 0437, landed with phase 2; gate corrected by
+/// 1309): the server sends NO skill-up message at all — skills mutate only as
+/// `PLAYER_SKILL_INFO` descriptor deltas (verified at the vmangos source: no chat send anywhere
+/// in `UpdateSkill*`/`SetSkill`) — so the client diff-watches its own skill block exactly as the
+/// real one does (the rank-field UpdateField watcher `0x5de180` → message facility `0x496720`,
+/// tokens `ERR_SKILL_UP_SI` / `ERR_SKILL_GAINED_S` — wow-re tradeskill TU-E, correcting 0437's
+/// "SKILL_RANK_UP" token guess), prints the GlobalStrings lines on the Skill chat channel, and
+/// fires `SKILL_LINES_CHANGED` on ANY block change (the skills pane's repaint event; TU-E: the
+/// real client fires it from a separate skill-manager TU on add/remove only — ours riding the
+/// same watcher is a benign coarsening, the pane just repaints). **The message gate** (B19/B245,
+/// decisions 1309/1314): both lines are skipped when the line's `SkillRaceClassInfo.flags`
+/// carries `0x402` (`SkillRaceClass::skill_up_silent`) — the class spec lines, racials,
+/// `GENERIC (DND)`, `Dual Wield` and the mount lines — **or when no row admits this race/class
+/// at all** (the resolve's own empty branch, `0x5de352`) — which is why a real 1.12 ding
+/// announces no skill at all (the level-up movers are all flagged) while weapon/profession
+/// skill-ups still print. The
+/// login fill (empty → populated) and a character switch (self guid change) re-seed silently —
+/// the event fires, the lines don't. Still open: the exact chat channel of the real emitter
+/// (TU-E left `0x496720`'s routing untraced; Skill is the `ChatTypeInfo` family's own key).
 fn watch_skill_ups(
     script: Option<NonSendMut<UiScript>>,
     self_guid: Res<crate::net::SelfGuid>,
     self_store: Query<&ObjectStore, With<SelfPlayer>>,
     skill_lines: Option<Res<crate::ui_spellbook::SkillLines>>,
     mut chat: ResMut<crate::ui_chat::ChatLog>,
-    mut prev: Local<Option<(u64, std::collections::HashMap<u16, u16>)>>,
+    mut prev: Local<crate::ui_script::VmMemo<SkillBlock>>,
 ) {
     let (Some(guid), Ok(store)) = (self_guid.0, self_store.single()) else {
         return;
     };
+    // The memo is about the VM — it gates `SKILL_LINES_CHANGED`, the pane's only repaint wire — so
+    // it re-seeds with the VM (decision 1290). With no VM there is nothing to announce to and
+    // nothing worth remembering: the diff would only queue chat lines for a VM that does not exist
+    // yet, which is a stale skill-up replayed at the next login. The next VM re-seeds silently.
+    let Some(mut script) = script else {
+        return;
+    };
+    let prev = prev.get(&script);
     let mut cur = std::collections::HashMap::new();
     for i in 0..PLAYER_SKILL_SLOTS {
         if let Some(s) = store.0.player_skill(i) {
@@ -131,37 +173,54 @@ fn watch_skill_ups(
             if cur.is_empty() {
                 return;
             }
-            if let Some(mut script) = script {
-                script.fire_event("SKILL_LINES_CHANGED", vec![]);
-            }
+            script.fire_event("SKILL_LINES_CHANGED", vec![]);
             *prev = Some((guid, cur));
         }
         Some((prev_guid, _)) if *prev_guid != guid => {
             // A different character logged in — re-seed, never diff across characters.
-            if let Some(mut script) = script {
-                script.fire_event("SKILL_LINES_CHANGED", vec![]);
-            }
+            script.fire_event("SKILL_LINES_CHANGED", vec![]);
             *prev = Some((guid, cur));
         }
         Some((_, prev_map)) => {
             if *prev_map == cur {
                 return;
             }
+            // The 0x402 message gate resolves through the player's own race/class row, the same
+            // lookup the pane's display law makes ([`skills_row`]).
+            let (race, class) = (
+                store.0.unit_race().unwrap_or(0),
+                store.0.unit_class().unwrap_or(0),
+            );
             for (&id, &value) in &cur {
+                let line_id = u32::from(id);
                 let name = || {
                     skill_lines
                         .as_ref()
-                        .and_then(|s| s.catalog.line(u32::from(id)))
+                        .and_then(|s| s.catalog.line(line_id))
                         .map(|l| l.name.clone())
+                };
+                // The fn doc's message gate; `false` with no catalog (nothing to name it by
+                // either — the line stays silent, as before the catalog loads).
+                let announces = || {
+                    skill_lines
+                        .as_ref()
+                        .is_some_and(|s| s.catalog.announces_skill_ups(line_id, race, class))
                 };
                 match prev_map.get(&id) {
                     // A rank-up: the ERR_SKILL_UP_SI line (GlobalStrings.lua:1838).
                     Some(&old) if value > old => {
                         if let Some(name) = name() {
-                            chat.push_event(crate::ui_chat::ChatEvent::text_only(
-                                crate::ui_chat::ChatEventKind::Skill,
-                                format!("Your skill in {name} has increased to {value}."),
-                            ));
+                            // Both verdicts are logged — the retest's instrument: a moved line
+                            // either announces or names the gate that held it.
+                            if announces() {
+                                debug!("chat: skill-up announced ({name} {old}→{value})");
+                                chat.push_event(crate::ui_chat::ChatEvent::text_only(
+                                    crate::ui_chat::ChatEventKind::Skill,
+                                    format!("Your skill in {name} has increased to {value}."),
+                                ));
+                            } else {
+                                debug!("chat: skill-up silenced ({name} {old}→{value}, the 0x402 gate)");
+                            }
                         }
                     }
                     // A NEW line: the ERR_SKILL_GAINED_S line (GlobalStrings.lua:1837) — the
@@ -169,18 +228,23 @@ fn watch_skill_ups(
                     // both, first-gain vs rank-up).
                     None => {
                         if let Some(name) = name() {
-                            chat.push_event(crate::ui_chat::ChatEvent::text_only(
-                                crate::ui_chat::ChatEventKind::Skill,
-                                format!("You have gained the {name} skill."),
-                            ));
+                            if announces() {
+                                debug!("chat: skill-gain announced ({name} at {value})");
+                                chat.push_event(crate::ui_chat::ChatEvent::text_only(
+                                    crate::ui_chat::ChatEventKind::Skill,
+                                    format!("You have gained the {name} skill."),
+                                ));
+                            } else {
+                                debug!(
+                                    "chat: skill-gain silenced ({name} at {value}, the 0x402 gate)"
+                                );
+                            }
                         }
                     }
                     _ => {}
                 }
             }
-            if let Some(mut script) = script {
-                script.fire_event("SKILL_LINES_CHANGED", vec![]);
-            }
+            script.fire_event("SKILL_LINES_CHANGED", vec![]);
             *prev = Some((guid, cur));
         }
     }
@@ -203,11 +267,12 @@ fn feed_skills(
     script: Option<NonSendMut<UiScript>>,
     self_store: Query<&ObjectStore, With<SelfPlayer>>,
     skill_lines: Option<Res<crate::ui_spellbook::SkillLines>>,
-    mut last: Local<Option<SkillsState>>,
+    mut last: Local<crate::ui_script::VmMemo<Option<SkillsState>>>,
 ) {
     let Some(mut script) = script else {
         return;
     };
+    let last = last.get(&script);
     let (Ok(store), Some(skill_lines)) = (self_store.single(), skill_lines.as_deref()) else {
         return;
     };
@@ -365,23 +430,25 @@ fn base_swing(streamed: Option<u32>) -> u32 {
 
 pub(crate) fn unit_combat_stats(store: &ObjectStore) -> UnitCombatStats {
     let f = &store.0;
-    let round = |v: Option<f32>| v.unwrap_or(0.0).round() as i32;
 
     let mut stats = [0i32; 5];
     let mut stat_pos = [0i32; 5];
     let mut stat_neg = [0i32; 5];
     for i in 0..5u8 {
         stats[usize::from(i)] = f.unit_stat(i).unwrap_or(0) as i32;
-        stat_pos[usize::from(i)] = round(f.player_posstat(i));
-        stat_neg[usize::from(i)] = round(f.player_negstat(i));
+        // The four buff-split arrays are INT on the wire (decision 1397) — they used to be read as
+        // f32 and rounded, which turned every real value into `0` and is why B165/B251's stats
+        // never went green.
+        stat_pos[usize::from(i)] = f.player_posstat(i).unwrap_or(0);
+        stat_neg[usize::from(i)] = f.player_negstat(i).unwrap_or(0);
     }
     let mut resistances = [0i32; 7];
     let mut resistance_pos = [0i32; 7];
     let mut resistance_neg = [0i32; 7];
     for i in 0..7u8 {
         resistances[usize::from(i)] = f.unit_resistance(i).unwrap_or(0);
-        resistance_pos[usize::from(i)] = round(f.player_resistance_buff_pos(i));
-        resistance_neg[usize::from(i)] = round(f.player_resistance_buff_neg(i));
+        resistance_pos[usize::from(i)] = f.player_resistance_buff_pos(i).unwrap_or(0);
+        resistance_neg[usize::from(i)] = f.player_resistance_buff_neg(i).unwrap_or(0);
     }
 
     let (ap_pos, ap_neg) = f.unit_attack_power_mods();
@@ -800,25 +867,34 @@ fn feed_char(
     // The pane's Model:SetRotation transcription owns the yaw; the booth mirrors it (0208 §5).
     booth.yaw = script.paperdoll_yaw();
 
+    // Resolved against THIS VM (1290/1291): a `/reload`'s replacement reads a fresh memo, so both
+    // snapshots below re-push and their events re-fire for it.
+    let memo = feed.vm.get(&script);
+
     let Some(store) = self_q.iter().next() else {
-        if feed.last_stats.is_some() || feed.last_inv.is_some() {
-            script.set_player_combat_stats(None);
-            script.set_inventory_slots(Default::default());
-            feed.last_stats = None;
-            feed.last_inv = None;
-        }
+        // The self store's absence is NO DATA, never "the player has nothing equipped". The one
+        // window this branch runs with a previously-fed VM is the logout despawn frames —
+        // `SMSG_LOGOUT_COMPLETE` despawns the entity a full Update before `OnExit(InWorld)` runs
+        // the shutdown, and the `PLAYER_LOGOUT` handlers that follow still read equipment
+        // (`GetInventoryItemLink("player", …)` at logout is a stock addon save pattern; the
+        // reference keeps it valid through its shutdown). The clear this branch used to push was
+        // a pre-1290 relic: one VM then lived across logouts and the next character must not see
+        // this one's inventory — now the VM dies with the session and a fresh one starts empty
+        // ([`crate::ui_script::end_ui_session`]), so the clear only ever fired into a VM about to
+        // run its logout handlers. Same law as the container feed
+        // (`ui_items::feed::apply_container_source`).
         return;
     };
 
     let stats = combat_stats(store, &mut items, &commands);
-    if feed.last_stats.as_ref() != Some(&stats) {
+    if memo.last_stats.as_ref() != Some(&stats) {
         // PUSH before firing: event dispatch runs the Lua handlers synchronously, so the snapshot
         // must already be in the VM when they repaint (the ui_unit rule — a fire-first ordering
         // paints the OLD values and, being transition-gated, never corrects itself).
-        let prev = feed.last_stats.take();
+        let prev = memo.last_stats.take();
         script.set_player_combat_stats(Some(stats.clone()));
         fire_stat_transitions(&mut script, "player", prev.as_ref(), &stats);
-        feed.last_stats = Some(stats);
+        memo.last_stats = Some(stats);
     }
 
     let inv = inventory_slots(
@@ -830,13 +906,13 @@ fn feed_char(
         &pending,
         &mut names,
     );
-    if feed.last_inv.as_ref() != Some(&inv) {
+    if memo.last_inv.as_ref() != Some(&inv) {
         script.set_inventory_slots(inv.clone());
         script.fire_event(
             "UNIT_INVENTORY_CHANGED",
             vec![ScriptValue::Str("player".to_string())],
         );
-        feed.last_inv = Some(inv);
+        memo.last_inv = Some(inv);
     }
 
     // `GetWeaponEnchantInfo`'s whole data path (the buff bar's TemporaryEnchantFrame row, plus 8

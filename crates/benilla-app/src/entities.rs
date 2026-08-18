@@ -131,6 +131,24 @@ pub(crate) const ATTACH_OVERHEAD_MOUNTED: u16 = 29;
 /// attachment anchors overhead content at `feet + scale × bbox_z × 1.25`.
 const OVERHEAD_FALLBACK_FACTOR: f32 = 1.25;
 
+/// The unit's **Stand-animation box height** (model-local, pre-scale) — the chat bubble's anchor,
+/// and *only* the chat bubble's (1406).
+///
+/// The reference's two overhead heights are two different mechanisms, and benilla had recorded them
+/// as one. The overhead NAME (and the floating combat text, and the V-plate) takes `0x608640`: the
+/// live posed PlayerName attachment, which tracks the pose. The chat bubble takes `0x711a20`, which
+/// wow-re's cross-check followed into the model layer and found reading the **MD20 header image** —
+/// file bytes, no bone matrix in the call tree — returning the Stand sequence CAaBox's Z extent,
+/// and the client caches it in the bubble at `+0x354` on a parity guard so it is queried **once per
+/// chat line**. The recorded claim that the two calls were equivalent ("both are the head-region
+/// attachment height, model-scaled", INFERRED) is refuted: they differ precisely on
+/// animated-vs-static.
+///
+/// So this is a constant per display, stamped at attach and never re-read — which is also why the
+/// bubble's height cannot acquire a pose-clock bug of the kind 1398 had to remove from the anchor.
+#[derive(Component)]
+pub(crate) struct StandBoxHeight(pub(crate) f32);
+
 /// The unit's model bbox z-extent (model-local, pre-scale) — stamped by the attach path for
 /// [`overhead_anchor`]'s fallback. `0.0` until the model loads (the fallback then anchors at
 /// feet — the same degenerate the client hits with no model).
@@ -143,10 +161,33 @@ pub(crate) struct OverheadFallback(pub(crate) f32);
 /// per-frame by the nameplate and snapshotted at spawn by the floating combat text. Generic over
 /// the joint-globals query filter so a caller that also mutates `GlobalTransform` elsewhere (the
 /// nameplate placer) can pass a disjoint query.
+///
+/// A pure position read: it computes through `RigPose::posed_point` — the composed pose × the
+/// rig root's frame — and never touches an anchor entity, so the overhead bone spawns nothing
+/// (decision 1355).
+///
+/// **The rig root's frame is taken from `tf`, not from its propagated `GlobalTransform`, whenever
+/// the rig root IS the unit** — which is the normal case (a mounted rider's root is the seat
+/// anchor, a conform-tilted model's is its conform node; those two still read the propagated
+/// frame and keep the lag below). Bevy propagates `GlobalTransform` in `PostUpdate`, so an
+/// `Update` reader like the V-plate or the chat bubble gets **last frame's** world frame while the
+/// unit's own `Transform` beside it — and the camera it projects through, and the model being
+/// drawn — are this frame's. Running, that seam is one frame of travel: measured on a Westfall run
+/// (1398), "head above feet" — a body constant — wobbled up to **11.7 px** per frame and 15.1 px
+/// across the leg, and collapsed to 0.02 px the moment the anchor was paired with the position it
+/// was actually computed from. That is the chat bubble sliding against the head the director
+/// reported as jitter, and 1341 cleared the same term for the plate by measuring a unit that was
+/// STANDING STILL, where it is identically zero.
+///
+/// Reading `tf` is exact here because a unit is a world-root entity — nothing in the world lane
+/// parents a `NetEntity` (the `ChildOf` sites are the portrait booth, the pipe-warm menagerie and
+/// the UI glue), so its global IS its local. A `PostUpdate` caller ([`crate::nameplates`], which
+/// moved there for this very lag) is unaffected: after propagation the two are the same value.
 pub(crate) fn overhead_anchor<F: bevy::ecs::query::QueryFilter>(
     entity: Entity,
     tf: &Transform,
     anchors: &Query<&BoneAttach>,
+    poses: &Query<&benilla_world::rig_anim::RigPose>,
     fallbacks: &Query<&OverheadFallback>,
     globals: &Query<&GlobalTransform, F>,
     mounts: &Query<(), With<mount::MountChild>>,
@@ -162,14 +203,33 @@ pub(crate) fn overhead_anchor<F: bevy::ecs::query::QueryFilter>(
                 ATTACH_OVERHEAD
             };
             let &(bone, offset) = a.points.get(&slot)?;
-            let joint = a.anchor(bone)?;
-            Some(globals.get(joint).ok()?.transform_point(offset))
+            let pose = poses.get(entity).ok()?;
+            let own;
+            let root = if pose.joints_root == entity {
+                own = GlobalTransform::from(*tf);
+                &own
+            } else {
+                globals.get(pose.joints_root).ok()?
+            };
+            pose.posed_point(root, bone, offset)
         })
         .unwrap_or_else(|| {
             let bbox_z = fallbacks.get(entity).map_or(0.0, |f| f.0);
             tf.translation + Vec3::Y * (tf.scale.y * bbox_z * OVERHEAD_FALLBACK_FACTOR)
         })
 }
+
+/// The child mesh spawned by the fallback-cube arm of [`attach::attach_entity_visuals`] — "this
+/// entity's display named no model we could load".
+///
+/// A marker, so the condition is **countable** rather than eyeballed: `WOW_UNIT_VISUALS`
+/// ([`crate::capture::probes::UnitVisualsPlugin`]) reports how many streamed entities are standing
+/// as cubes, and on which displays. Before decision 1403 a cube also stood for every invisible
+/// trigger creature, which is what B13 saw as a black slab — an unlit `StandardMaterial` catches no
+/// light in our scene, so the "red" NPC box renders pure black. The census is how that stays
+/// visible if the gate ever regresses.
+#[derive(Component)]
+pub(crate) struct FallbackCube;
 
 /// Shared fallback cube mesh + per-kind materials, used when an entity has no usable model. (No
 /// GameObject color: GameObjects render their model or nothing — a model-less GameObject is an
@@ -413,6 +473,28 @@ fn scope_entity_art(
     scope.apply(&mut composites.0, benilla_world::art_scope::ArtSlot::Skins);
 }
 
+/// **The armed idle's authored CAaBox for a built body**, model space — recorded by
+/// [`attach_entity_visuals`] where the display model is read, and restated onto
+/// [`WorldUnit::bound`](benilla_world::world_unit::WorldUnit::bound) by [`publish_world_units`].
+///
+/// Split from the field it feeds for the same reason `CollisionHeight` is: the attach knows the
+/// number, the reconciler owns the component, and one writer per component is decision 0025. Absent
+/// until a body's model resolves — and on a body that never gets one, absent for good.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct ModelBound(pub(crate) bevy::camera::primitives::Aabb);
+
+/// Everything [`publish_world_units`] reads to restate one body: its wire record, the two
+/// game-side components whose numbers it folds in, whether its `Visibility` is the transport
+/// tick's, and what it currently says.
+type WireBody = (
+    Entity,
+    &'static NetEntity,
+    Option<&'static collision_height::CollisionHeight>,
+    Option<&'static ModelBound>,
+    Has<crate::transport::TransportAnchor>,
+    Option<&'static benilla_world::world_unit::WorldUnit>,
+);
+
 /// **Restate every wire body as a [`WorldUnit`](benilla_world::world_unit::WorldUnit)** — the game's half
 /// of the unit inversion (see that module).
 ///
@@ -423,19 +505,14 @@ fn scope_entity_art(
 /// visible to the world this frame.
 fn publish_world_units(
     mut commands: Commands,
-    bodies: Query<(
-        Entity,
-        &NetEntity,
-        Option<&collision_height::CollisionHeight>,
-        Option<&benilla_world::world_unit::WorldUnit>,
-    )>,
+    bodies: Query<WireBody>,
     viewers: Query<(
         Entity,
-        Has<crate::net::SelfPlayer>,
+        Has<crate::net::Embodied>,
         Has<benilla_world::world_unit::ViewerUnit>,
     )>,
 ) {
-    for (entity, net, height, current) in &bodies {
+    for (entity, net, height, bound, anchored, current) in &bodies {
         let want = benilla_world::world_unit::WorldUnit {
             // The wire kind is answered HERE and never handed over (1177): the engine asks "does
             // this body displace water", and translating its own vocabulary into that answer is
@@ -448,11 +525,32 @@ fn publish_world_units(
             // swims on dry land". A body whose display has not resolved yet must read as a
             // default-sized body, which is what the foam site did before this component existed.
             height: height.copied().unwrap_or_default().0,
+            // The box the exterior cull may elect this body by (decision 1270). **A transport
+            // answers `None` on purpose**: `transport::tick_transports` writes that root's
+            // `Visibility` every frame off its own timetable, and a second writer there is the
+            // fight decision 0025 exists to prevent — so the world is told not to decide, rather
+            // than told a box and left to race.
+            //
+            // Every other body is elected from its FIRST frame, with a degenerate box at its own
+            // origin until its model resolves. Waiting for the extent looks conservative and is
+            // not: the bound reaches this reconciler only after `attach_entity_visuals` has already
+            // spawned the visual, so "no box yet ⇒ admit" drew every streaming mob for one whole
+            // frame through a sealed ceiling — and a cavern runs slowly enough that one frame is
+            // most of a second. The origin is the server's own position, exact from the start.
+            bound: (!anchored).then(|| {
+                bound.map_or_else(
+                    || bevy::camera::primitives::Aabb::from_min_max(Vec3::ZERO, Vec3::ZERO),
+                    |b| b.0,
+                )
+            }),
         };
         // Only write on a real change: the component is change-detected downstream, and a
         // per-frame rewrite would mark every body dirty for every reader every frame.
         let same = current.is_some_and(|c| {
-            c.wades == want.wades && c.scale == want.scale && c.height == want.height
+            c.wades == want.wades
+                && c.scale == want.scale
+                && c.height == want.height
+                && c.bound == want.bound
         });
         if !same {
             commands.entity(entity).insert(want);
@@ -1079,7 +1177,7 @@ mod world_unit_tests {
             .world_mut()
             .spawn((
                 net(EntityKind::Player, 1.0),
-                crate::net::SelfPlayer,
+                crate::net::Embodied,
                 collision_height::CollisionHeight(2.5),
             ))
             .id();
@@ -1126,14 +1224,14 @@ mod world_unit_tests {
         );
     }
 
-    /// The viewer marker is reconciled, not stamped once: a `/logout` takes `SelfPlayer` away and
+    /// The viewer marker is reconciled, not stamped once: a `/logout` takes `Embodied` away and
     /// the marker has to go with it, or the next character is feathered as someone else's avatar.
     #[test]
     fn the_viewer_marker_follows_self_player_off_as_well_as_on() {
         let mut app = App::new();
         let me = app
             .world_mut()
-            .spawn((net(EntityKind::Player, 1.0), crate::net::SelfPlayer))
+            .spawn((net(EntityKind::Player, 1.0), crate::net::Embodied))
             .id();
         app.world_mut()
             .run_system_once(publish_world_units)
@@ -1145,7 +1243,7 @@ mod world_unit_tests {
 
         app.world_mut()
             .entity_mut(me)
-            .remove::<crate::net::SelfPlayer>();
+            .remove::<crate::net::Embodied>();
         app.world_mut()
             .run_system_once(publish_world_units)
             .expect("reconciler runs");

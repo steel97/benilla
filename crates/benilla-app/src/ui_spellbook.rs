@@ -31,7 +31,7 @@
 //! and the rank tie-break falling to the rank *string* only when the parsed number is 0 (the
 //! client's `SpellLevel` fallback for a digit-less rank is unmodeled — we have no `SpellLevel`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::prelude::*;
 
@@ -131,11 +131,12 @@ fn feed_spellbook(
     commands: Res<NetCommands>,
     cooldowns: Res<crate::cooldowns::Cooldowns>,
     clock: Res<crate::ui_script::UiClock>,
-    mut memory: Local<FeedMemory>,
+    mut memory: Local<crate::ui_script::VmMemo<FeedMemory>>,
 ) {
     let Some(mut script) = script else {
         return;
     };
+    let memory = memory.get(&script);
     // Nothing to resolve a name/icon/passive from yet — try again once Spell.dbc lands.
     let Some(spells) = spells.as_deref() else {
         return;
@@ -230,7 +231,7 @@ fn feed_spellbook(
 /// Build the whole book (module doc): the app's own resolve — the engine holds no spell
 /// knowledge, only what's pushed here.
 fn build_book(
-    known: &HashSet<u32>,
+    known: &BTreeSet<u32>,
     catalog: &SpellCatalog,
     skill_lines: Option<&SkillLineCatalog>,
     race: u8,
@@ -457,7 +458,7 @@ mod tests {
         map.insert(668, spell("Language: Common", None, 0x80)); // DO_NOT_DISPLAY → hidden
         map.insert(818, spell("Cooking", None, 0x20)); // IS_TRADESKILL → hidden
         let catalog = SpellCatalog::from_displays(map);
-        let known: HashSet<u32> = [133, 145, 2136, 668, 818].into_iter().collect();
+        let known: BTreeSet<u32> = [133, 145, 2136, 668, 818].into_iter().collect();
 
         // No skill-line catalog → every shown spell lands in General (race/class irrelevant).
         let book = build_book(&known, &catalog, None, 1, 1, None, None);
@@ -494,7 +495,7 @@ mod tests {
         attack.icon = Some("Interface\\Icons\\Temp".into()); // the real DBC placeholder
         attack.effects[0] = 78; // SPELL_EFFECT_ATTACK — makes it the melee auto-attack
         let catalog = SpellCatalog::from_displays(HashMap::from([(ATTACK, attack)]));
-        let known: HashSet<u32> = [ATTACK].into_iter().collect();
+        let known: BTreeSet<u32> = [ATTACK].into_iter().collect();
 
         // The feed's resolved icon (armed → the weapon, unarmed → Spell-Reset) wins over Temp.
         for resolved in [
@@ -530,7 +531,7 @@ mod tests {
         throw.icon = Some("Interface\\Icons\\Ability_Throw".into());
         let catalog =
             SpellCatalog::from_displays(HashMap::from([(AUTO_SHOT, auto_shot), (THROW, throw)]));
-        let known: HashSet<u32> = [AUTO_SHOT, THROW].into_iter().collect();
+        let known: BTreeSet<u32> = [AUTO_SHOT, THROW].into_iter().collect();
 
         let bow = "Interface\\Icons\\INV_Weapon_Bow_02";
         let book = build_book(&known, &catalog, None, 1, 1, None, Some(bow.into()));

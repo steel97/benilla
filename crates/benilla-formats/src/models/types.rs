@@ -4,6 +4,7 @@
 //! ([`BoneScaleAnim`]). No parsing lives here — just the shapes [`m2_batches`](super::m2_batches) and
 //! [`wmo`](super::wmo) both build.
 
+use super::key_anim::SeqLoops;
 use super::mat_anim::{AlphaAnim, RgbAnim};
 use super::tex_anim::UvAnim;
 
@@ -196,6 +197,114 @@ impl BoneScaleAnim {
     }
 }
 
+/// A bone that **spins rigidly**: a parentless bone whose armed sequence keys ROTATION only, so every
+/// vertex weighted wholly to it moves as a rigid body about the pivot — `T(pivot) · R(t) · T(−pivot)`
+/// — with no skinning palette and no joint hierarchy involved.
+///
+/// This is the same "rigidly separable bone ⇒ per-batch transform" reading the billboard card split
+/// already makes ([`Billboard`], and `separable_billboard_bones`' two conditions), applied to an
+/// authored rotation instead of a camera-facing one. It is a **narrow** claim on purpose, and every
+/// clause is load-bearing:
+///
+/// - **Parentless.** With a parent, the bone's world motion is its parent's chain composed with its
+///   own, which is not a single rigid transform unless the whole chain is static. A parented bone is
+///   simply not collected — it holds its bind pose, the conservative failure.
+/// - **Rotation only.** A translation or scale track on the same bone would still be rigid, but the
+///   pivot-conjugated form below would be wrong, so those bones are not collected either.
+/// - **Wholly-weighted geometry** is the caller's half: a vertex split between this bone and another
+///   is half a rigid body's worth of motion, which no rigid transform can produce.
+///
+/// The population this exists for: `CavernsOfTimeSky.m2`'s three asteroid belts (bones 1/2/3, each
+/// parentless, each keying rotation alone over one 66.667 s loop — 25°, 90° and a full 360°), whose
+/// four batches are each `[bone@1.00]` across every vertex (`benilla-extract m2batch`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoneSpin {
+    /// The bone's pivot, model space (WoW axes) — the rotation centre.
+    pub pivot: [f32; 3],
+    /// The armed sequence's duration (**seconds**). Sampling wraps at this period.
+    pub duration: f32,
+    /// Linear interpolation between keys; `false` = step (the track's `interp_type == 0`). Read from
+    /// the rotation track's own header word because [`BoneKeys`] — this collector's source for the
+    /// keys themselves — deliberately drops it, and a step track lerped is a real divergence
+    /// (`benilla-extract bonescan`'s recorded residual). There is no reason to reproduce that here.
+    pub interp: bool,
+    /// `(seconds, [x, y, z, w])` keyframes, rebased to the sequence start, time-ascending. The
+    /// quaternion is raw WoW model space — conjugate it into the render basis at the use site.
+    pub keys: Vec<(f32, [f32; 4])>,
+}
+
+impl BoneSpin {
+    /// Sample the rotation at `time` seconds (wrapped into `[0, duration)`), **slerping** between the
+    /// bracketing keys — the rotation analogue of [`BoneScaleAnim::sample`], with the same search,
+    /// the same step leg, and the same clamp past the final key.
+    ///
+    /// Clamping rather than wrapping around to key 0 is what the track actually says: an M2 track's
+    /// keys live inside the sequence band and the client interpolates within it, so a loop whose last
+    /// key is not its first snaps at the wrap. That is authored — `CavernsOfTimeSky` bone 1 runs 0° →
+    /// 25° and snaps back — and inventing a wrap-around segment would be us animating, not the file.
+    pub fn sample(&self, time: f32) -> [f32; 4] {
+        const IDENTITY: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+        let n = self.keys.len();
+        if n == 0 {
+            return IDENTITY;
+        }
+        // `rem_euclid` rather than `%`: a negative cursor (a clock read before the anchor) must land
+        // inside the loop, not mirror onto its first key.
+        let t = if self.duration > 0.0 {
+            time.rem_euclid(self.duration)
+        } else {
+            0.0
+        };
+        if t <= self.keys[0].0 {
+            return self.keys[0].1;
+        }
+        let mut k = 0;
+        while k + 1 < n && self.keys[k + 1].0 <= t {
+            k += 1;
+        }
+        if !self.interp || k + 1 >= n {
+            return self.keys[k].1; // step, or clamp past the final key
+        }
+        let (t0, q0) = self.keys[k];
+        let (t1, q1) = self.keys[k + 1];
+        let frac = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+        slerp(q0, q1, frac)
+    }
+}
+
+/// Shortest-arc spherical interpolation of two quaternions, on plain arrays.
+///
+/// Hand-rolled because `benilla-formats` deliberately carries no math crate — the render basis (and
+/// with it `glam`) starts at `benilla-assets`. Two guards earn their place: negating `b` when the dot
+/// is negative takes the SHORT way round (without it a 360° track's second half spins backwards), and
+/// falling back to a normalised lerp for near-parallel keys avoids `acos`'s vanishing `sin` denominator.
+fn slerp(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    let mut dot = (0..4).map(|i| a[i] * b[i]).sum::<f32>();
+    let mut b = b;
+    if dot < 0.0 {
+        b = [-b[0], -b[1], -b[2], -b[3]];
+        dot = -dot;
+    }
+    let (w0, w1) = if dot > 0.9995 {
+        (1.0 - t, t) // near-parallel: lerp, then renormalise below
+    } else {
+        let theta = dot.clamp(-1.0, 1.0).acos();
+        let sin = theta.sin();
+        (((1.0 - t) * theta).sin() / sin, (t * theta).sin() / sin)
+    };
+    let mut q = [0.0f32; 4];
+    for i in 0..4 {
+        q[i] = a[i] * w0 + b[i] * w1;
+    }
+    let len = q.iter().map(|c| c * c).sum::<f32>().sqrt();
+    if len > 0.0 {
+        for c in &mut q {
+            *c /= len;
+        }
+    }
+    q
+}
+
 /// A batch attached to an M2 **billboard bone**: the real client re-orients the bone to the camera
 /// every frame (so the card is visible from all sides and tracks the viewer). `pivot` is the bone's
 /// pivot in model space (WoW axes) — the point the card rotates about.
@@ -371,6 +480,13 @@ pub struct RenderSubmesh {
     /// translation track baked by [`tex_anim`](super::tex_anim) — the raw `(x, y)` offset over the loop
     /// clock. `None` for the ~98.6% of models with no texture transform, and for all WMO batches.
     pub uv_anim: Option<UvAnim>,
+    /// The batch's UV loop **per file sequence slot**, carried ONLY when the slots disagree — i.e.
+    /// when [`Self::uv_anim`]'s single loop cannot be right for every instance, because which loop
+    /// applies depends on which sequence that instance is playing (decision 1408, bug B98: the BRM
+    /// lava bubbles key their whole flipbook inside the 50 %-weighted variation 1, so slot 0 — the
+    /// only slot the shared-material registry can read — is a dead hold). `None` for every batch
+    /// whose slots agree, which is the shared lane unchanged.
+    pub uv_seq: Option<SeqLoops<[f32; 2]>>,
     /// The batch's **animated RGB tint** (the M2Color colour track, time-varying only — a spell
     /// effect's white-hot flash cooling to red): baked by [`mat_anim`](super::mat_anim). When
     /// `Some`, the static vertex-colour tint is **skipped** for this batch (the two would
@@ -378,6 +494,8 @@ pub struct RenderSubmesh {
     /// key and animated where the lane runs material animation. `None` for constant/keyless tints
     /// (the static vertex bake, decision 0029) — the overwhelming majority.
     pub rgb_anim: Option<RgbAnim>,
+    /// The tint twin of [`Self::uv_seq`], on the same rule and for the same reason.
+    pub rgb_seq: Option<SeqLoops<[f32; 3]>>,
     /// The batch's MOBA section for WMO group batches ([`WmoBatchClass`] — TRANS / INT / EXT, the
     /// per-class lighting law of an interior group). `None` for every M2 batch.
     pub wmo_batch: Option<WmoBatchClass>,
@@ -478,7 +596,9 @@ impl Default for RenderSubmesh {
             welded_billboard: false,
             alpha_anim: None,
             uv_anim: None,
+            uv_seq: None,
             rgb_anim: None,
+            rgb_seq: None,
             wmo_batch: None,
             env_map: false,
         }

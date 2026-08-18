@@ -199,7 +199,7 @@ impl UiScript {
                             } else {
                                 bs.normal_font.as_ref()
                             };
-                            state_font = name.and_then(|n| model.font_objects.get(n));
+                            state_font = name.and_then(|n| model.font_object(n));
                             button_font = bs.font.as_ref();
                             // The per-state color override (Button:Set*TextColor) — hover falls
                             // back to the normal color, mirroring the font fallback above.
@@ -211,6 +211,15 @@ impl UiScript {
                                 bs.normal_color
                             };
                         }
+                    }
+                    // A TITLE REGION NEVER DRAWS. It is a hit rectangle, not a visual: wow-re
+                    // carves it as a plain Region with no textures at all
+                    // (`widget-api-batch-benilla.md` Q6). Falling through here would emit the
+                    // texture quad the `else` branch below builds — invisible on screen, but the
+                    // render report counts quads, so every addon that makes one would read as
+                    // "drew something" (1246's lesson about what an instrument is told).
+                    if region.map(|r| r.kind) == Some(crate::widget::RegionKind::Title) {
+                        continue;
                     }
                     let mut data = model.region_data.get(&rh).cloned().unwrap_or_default();
                     // Region-level Hide (the VisibleRegion bit): no quad at all.
@@ -250,10 +259,10 @@ impl UiScript {
                         // The object's own justify (`<NormalFont inherits=… justifyH="LEFT"/>` —
                         // how the ref left-aligns a ButtonText).
                         if let Some(j) = fo.justify_h {
-                            data.justify_h = j;
+                            data.justify.set_h(j);
                         }
                         if let Some(j) = fo.justify_v {
-                            data.justify_v = j;
+                            data.justify.set_v(j);
                         }
                     }
                     // `Button:SetFont` sits BETWEEN the two: it is a local set on the button's own
@@ -278,11 +287,16 @@ impl UiScript {
                     if let Some(c) = state_color {
                         data.vertex_color = Some(c);
                     }
-                    // Region-rect precedence (decision 0068 v1): anchored regions resolved in
-                    // [`resolve`] → their owner-relative rect; else an explicitly-sized region draws
-                    // *centered* on its owner (the state-texture overhang); else it fills the owner
-                    // (`rect` already = owner). The bar-fill region keeps its fraction geometry.
-                    // The fill CROPS its texture (wow-re `nameplate-vkey.md`, VERIFIED): every
+                    // A region draws at its RESOLVED rect, and nothing else (decision 1310,
+                    // superseding 0068 v1's centered/fill-the-owner fallbacks): every drawable
+                    // region carries real anchors — authored, or the creation-path implicit anchor
+                    // (`region::implicit_creation_anchor`) — and the real resolver has no
+                    // zero-anchor fallback (a failed resolve latches unresolvable, `0x768d55`). A
+                    // region with no rect here is a templateless Lua region nobody anchored, and
+                    // the reference draws it nowhere. The bar-fill/thumb regions keep their own
+                    // fraction geometry (computed off the owner rect above) — they never carry
+                    // anchors and skip the resolver entirely, like the reference's own bar path.
+                    // The bar-fill CROPS its texture (wow-re `nameplate-vkey.md`, VERIFIED): every
                     // `SetValue` rewrites the region's 4-corner UV block with `u1 = fraction` and
                     // recomputes the quad as `right = left + frac·width`. So the art is sliced, never
                     // squeezed — a bar texture with a horizontal ramp (`UI-StatusBar` brightens 124→166
@@ -291,17 +305,7 @@ impl UiScript {
                         data.tex_coords = Some(bar_fill_uv(data.tex_coords, sb));
                     }
                     if bar_fill.is_none() && !thumb_fill {
-                        if let Some(rr) = model.region_resolved.get(&rh) {
-                            rect = Some(*rr);
-                        } else if let (Some((w, h)), Some(r)) = (data.size, rect) {
-                            let (cx, cy) = ((r.left + r.right) * 0.5, (r.bottom + r.top) * 0.5);
-                            rect = Some(Rect::new(
-                                cy - h * 0.5,
-                                cx - w * 0.5,
-                                cy + h * 0.5,
-                                cx + w * 0.5,
-                            ));
-                        }
+                        rect = model.region_resolved.get(&rh).copied();
                     }
                     let is_text = matches!(
                         region.map(|r| r.kind),
@@ -311,8 +315,10 @@ impl UiScript {
                         QuadContent::Text {
                             text: data.text,
                             color: data.vertex_color,
-                            justify_h: data.justify_h,
-                            justify_v: data.justify_v,
+                            // The gx translator's answer, not the getter's: a cleared axis draws
+                            // CENTER/MIDDLE (`0x44d420`), where `GetJustifyH` says "UNKNOWN".
+                            justify_h: data.justify.paint_h(),
+                            justify_v: data.justify.paint_v(),
                             font: data.font_path,
                             font_height: data.font_height,
                             text_height: data.text_height,
@@ -336,7 +342,8 @@ impl UiScript {
                         // API change. The approximation is visible, and it is stated there and here
                         // rather than discovered later.
                         let fill = data.fill.or_else(|| data.gradient.map(|g| g.midpoint()));
-                        let has_texture = data.texture.is_some() || fill.is_some();
+                        let has_path = data.texture.is_some();
+                        let has_texture = has_path || fill.is_some();
                         QuadContent::Texture {
                             path: data.texture,
                             color: has_texture
@@ -347,6 +354,13 @@ impl UiScript {
                             circular: data.circular,
                             portrait_unit: data.portrait_unit,
                             rotation: data.rotation,
+                            // Only ever set against real ART. A pathless solid has its colour
+                            // FOLDED into `color` two lines up (the renderer draws it as a tint on
+                            // a 1x1 white texel), so a shader that greys the *texel* would grey
+                            // white and change nothing — the flag would read as honoured while
+                            // doing nothing at all. No reference consumer desaturates a solid;
+                            // every one of them is an icon. Stated here rather than discovered.
+                            desaturated: data.desaturated && has_path,
                         }
                     };
                     // A region draws at its owner's scale — same single hop as alpha (a region
@@ -396,6 +410,13 @@ impl UiScript {
 /// The single colour a Texture region draws with: **`texel × vertexColour`**, per channel and
 /// **alpha included** (wow-re `system/ui/scratch/texture-color-composition.md`, VERIFIED — the
 /// stage-0 combine's `MODULATE(TEXTURE, DIFFUSE)` for both colour and alpha).
+///
+/// **That law is scoped to a region with no pixel shader bound** (`+0x128 == 0` — wow-re
+/// `texture-desaturate-law.md` §6.1's correction to that note). A DESATURATED region takes the
+/// fragment program instead, which supersedes the whole stage chain and reads the vertex colour's
+/// ALPHA only; its RGB never reaches the pixel. The colour computed here still travels — the
+/// renderer needs the alpha, and the RGB is simply unread on that branch (`ui_quad.wgsl`) — so
+/// nothing changes here, but the note this cites no longer says what it used to.
 ///
 /// `fill` is the region's own solid-colour texture ([`RegionData::fill`] — the client generates a
 /// real 8×8 texel block from it), so where it is set it IS the texel and the product is the drawn

@@ -85,10 +85,30 @@ pub(crate) struct CombatTextEvent {
     pub(crate) extra: Option<String>,
 }
 
-/// The feed's change-tracking memory: what we last told the VM, so we only fire events on transitions.
+/// The feed's change-tracking memory: what we last told the VM, plus one server-side log-once.
+///
+/// The VM half lives behind a [`crate::ui_script::VmMemo`], **inside the resource** — the same
+/// law 1290 wrote for `Local` memos, reached the way a `ResMut` system has to reach it: a memory
+/// about what THIS VM was told is unreadable against the next VM, so a `/reload` (1291) — which
+/// replaces the VM without despawning the world — re-fires `PLAYER_ENTERING_WORLD` and re-runs
+/// every transition diff exactly as a fresh login does. Before this, every one of these fields
+/// survived the reload and the new VM never heard the events (the logout path re-armed off the
+/// self descriptor despawning, which a reload never does).
 #[derive(Resource, Default)]
 struct UnitFeedState {
-    /// Whether `PLAYER_ENTERING_WORLD` has been fired (once at startup).
+    /// What we last told the VM — dies with the VM it was told to.
+    vm: crate::ui_script::VmMemo<UnitFeedMemo>,
+    /// Whether we have already warned that our own faction template names no side (decision 0657).
+    /// Re-arms when a side resolves again, so a `.gm on` / `.gm off` cycle logs once each way.
+    /// **Server memory, not VM memory** — deliberately outside the memo: a `/reload` must not
+    /// re-log the GM-mode warning.
+    warned_sideless: bool,
+}
+
+/// The per-VM half of [`UnitFeedState`] — the event-trigger diffs.
+#[derive(Default)]
+struct UnitFeedMemo {
+    /// Whether `PLAYER_ENTERING_WORLD` has been fired (once per world entry, once per VM).
     entered_world: bool,
     /// Per token, the last snapshot we pushed — the per-field event triggers diff against it.
     last: HashMap<String, UnitState>,
@@ -118,9 +138,6 @@ struct UnitFeedState {
     /// (decision 0652). `None` until first seen: the reference reacts to a *changed*-bits mask, so
     /// the descriptor that first carries the flag at login announces nothing.
     pvp_desired: Option<bool>,
-    /// Whether we have already warned that our own faction template names no side (decision 0657).
-    /// Re-arms when a side resolves again, so a `.gm on` / `.gm off` cycle logs once each way.
-    warned_sideless: bool,
 }
 
 /// Adds the per-frame unit feed. The `Unit*` bindings themselves live in `benilla-ui`; this only
@@ -131,7 +148,15 @@ impl Plugin for UiUnitPlugin {
     fn build(&self, app: &mut App) {
         app.configure_sets(
             Update,
-            UnitFeed.after(benilla_world::schedule::WorldStage::Net), // the set's own doc: the why
+            UnitFeed
+                .after(benilla_world::schedule::WorldStage::Net) // the set's own doc: the why
+                // …and never before the in-game UI exists (1348). The whole SET, not just
+                // `feed_units`: every feed in it either fires a login one-shot or latches a
+                // per-VM memo, and both are lost forever against the boot VM. The window and
+                // the reference's own ordering: `ui_script::ingame_ui_pending`.
+                .run_if(bevy::ecs::schedule::common_conditions::not(
+                    crate::ui_script::ingame_ui_pending,
+                )),
         )
         .init_resource::<UnitFeedState>()
         .add_message::<UnitCombatFeedback>()
@@ -150,7 +175,10 @@ impl Plugin for UiUnitPlugin {
         )
         .add_systems(Update, drain_pvp_toggles.after(UiInput))
         .add_systems(Update, feed_default_language.in_set(UnitFeed))
-        .add_systems(PostStartup, (load_exhaustion_rows, load_default_languages));
+        // `load_exhaustion_rows` pushes into the VM, so it runs per VM in `Update` (1290);
+        // `load_default_languages` only builds a Bevy resource and stays a one-shot.
+        .add_systems(Update, load_exhaustion_rows)
+        .add_systems(PostStartup, load_default_languages);
     }
 }
 
@@ -194,11 +222,12 @@ fn feed_default_language(
     script: Option<NonSendMut<UiScript>>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     langs: Option<Res<DefaultLanguagesRes>>,
-    mut pushed: Local<Option<Option<String>>>,
+    mut pushed: Local<crate::ui_script::VmMemo<Option<Option<String>>>>,
 ) {
     let Some(mut script) = script else {
         return;
     };
+    let pushed = pushed.get(&script);
     let name = self_q
         .iter()
         .next()
@@ -212,17 +241,25 @@ fn feed_default_language(
     }
 }
 
-/// Seed the VM's Exhaustion.dbc table once at startup — the rest bindings' data
+/// Seed the VM's Exhaustion.dbc table once per VM — the rest bindings' data
 /// ([`benilla_ui::script::UiScript::set_exhaustion_rows`]; the ui_macro icon-catalog shape).
 /// A failed load keeps the model's shipped-table fallback, so the rest surface still behaves
 /// like the shipped enUS client rather than going dark.
+///
+/// Per VM rather than per process (1290) for the reason every seed here is: a login builds a fresh
+/// VM, and this one degrades quietly — the fallback table is close enough that nobody would notice
+/// it had stopped being seeded.
 fn load_exhaustion_rows(
     script: Option<NonSendMut<UiScript>>,
     assets: Option<Res<benilla_assets::WorldAssets>>,
+    mut seeded: Local<crate::ui_script::VmMemo<bool>>,
 ) {
     let (Some(mut script), Some(assets)) = (script, assets) else {
         return;
     };
+    if !seeded.claim(&script) {
+        return;
+    }
     let loaded = {
         use benilla_assets::LockRecover;
         let mut chain = assets.chain.lock_recover();
@@ -479,6 +516,9 @@ pub(crate) fn snapshot(store: &ObjectStore, name: Option<String>, reaction: u8) 
         // The released-ghost predicate (decision 0308 §1): PLAYER_FLAGS bit 0x10 — a ghost's
         // health is 1, so `dead` above is false for it. Zero/absent on creatures.
         ghost: store.0.player_is_ghost(),
+        // `UnitIsCharmed 0x516cf0` — `UNIT_FIELD_CHARMEDBY != 0`, the same field `ui_aura`'s
+        // charmed-unit buff leg already reads, so the two cannot disagree about who is charmed.
+        charmed: store.0.unit_charmed_by().is_some(),
         reaction,
         race: race.map(|(n, _)| n.to_string()),
         race_file: race.map(|(_, f)| f.to_string()),
@@ -568,7 +608,7 @@ pub(crate) fn enrich_unit(
 /// caller the reference has (`SlashCmdList["PVP"]`), and the only one we have.
 ///
 /// This rides the unit feed's plugin rather than a `ui_pvp` of its own: the family's whole client
-/// state is one remembered bit ([`UnitFeedState::pvp_desired`]), which lives with the feed's other
+/// state is one remembered bit ([`UnitFeedMemo::pvp_desired`]), which lives with the feed's other
 /// self-flag edge (`in_combat`) rather than in a plugin of its own.
 fn drain_pvp_toggles(script: Option<NonSendMut<UiScript>>, commands: Res<NetCommands>) {
     let Some(mut script) = script else {
@@ -664,7 +704,15 @@ fn creature_type_word(t: u32) -> Option<&'static str> {
         7 => "Humanoid",
         8 => "Critter",
         9 => "Mechanical",
-        _ => return None, // 10 "Not specified" shows nothing
+        // The shipped `CreatureType.dbc` is **1..11 dense**, not 1..9 — this table stopped two
+        // rows early. 11 is reachable and wow-re's own nameplate filter tests for it
+        // (`0x605570 == 0xb`).
+        11 => "Totem",
+        // 10 is "Not specified" in the DBC. Deliberately still None: this word is the tooltip's
+        // level-line class slot and a literal "Not specified" there is noise. The cost is named
+        // rather than hidden — `UnitCreatureType` shares this field, so it answers nil for a
+        // type-10 unit where the reference answers the DBC word.
+        _ => return None,
     })
 }
 
@@ -734,6 +782,10 @@ fn feed_units(
     reputations: Res<Reputations>,
     group: Res<crate::ui_party::GroupState>,
     mut chat: ResMut<ChatLog>,
+    // The guild-identity cache `GetGuildInfo(unit)` reads — `ResMut` because it is a LAZY cache
+    // (decision 1257): a lookup that misses is what sends the `CMSG_GUILD_QUERY`, exactly as a
+    // `NameCache::resolve` miss sends the name query above.
+    mut guild: ResMut<crate::ui_guild::GuildState>,
 ) {
     let Some(mut script) = script else {
         return;
@@ -751,6 +803,11 @@ fn feed_units(
         s.guid = guid.0;
         s.raid_target = group.raid_target_index(guid.0);
         s.faction_group = faction_group(store, factions.as_deref());
+        // `GetGuildInfo("player")` — the unit's own PUBLIC descriptor fields (191/192) joined
+        // against the app's guild-identity cache, which the miss also asks for (decision 1257).
+        // Filled here rather than in `snapshot` for the reason `faction_group` and `can_attack`
+        // are: it needs a resource, and `snapshot`'s other six call sites hold none.
+        s.guild = crate::ui_guild::unit_guild(&store.0, &mut guild, &commands);
         s
     });
     // The GM-mode confound, made audible (decision 0657). A self player whose faction template
@@ -771,6 +828,10 @@ fn feed_units(
         }
         feed.warned_sideless = sideless;
     }
+    // The VM half — resolved against THIS VM, so a `/reload`'s fresh state reads a fresh memo and
+    // every event below re-fires for it (1291). Taken after the `warned_sideless` writes above:
+    // that field is server memory and must NOT expire with the VM.
+    let memo = feed.vm.get(&script);
     let target = selection.target.zip(selection.guid).and_then(|(e, guid)| {
         let store = stores.get(e).ok()?;
         let name = names.resolve(guid, &commands).map(str::to_string);
@@ -797,6 +858,9 @@ fn feed_units(
             &reputations,
             self_pair.map(|(s, _)| s),
         );
+        // `GetGuildInfo("target")` — see the player leg. PLAYER_GUILDID/RANK are PUBLIC, which is
+        // the whole reason the binding is per-unit rather than per-player.
+        s.guild = crate::ui_guild::unit_guild(&store.0, &mut guild, &commands);
         enrich_unit(
             &mut s,
             guid,
@@ -808,7 +872,17 @@ fn feed_units(
         Some(s)
     });
 
-    script.set_unit("player", player.clone());
+    // `"player"` is pushed only while the descriptor EXISTS: its absence is "no data source",
+    // never "the player stopped existing". The two absent windows are pre-arrival at login —
+    // where a `None` push would erase the roster seat (`seat_from_roster`) that addon file scopes
+    // and the loading-screen UI read — and the logout despawn frames, where `PLAYER_LOGOUT`
+    // handlers still key their saved state by `UnitName("player")` (the reference keeps the unit
+    // valid through its shutdown; a fresh VM starts with no `"player"` anyway, so nothing needs
+    // the clear). `"target"` keeps the unconditional push: a selection's absence IS data — the
+    // deselect/despawn transition the real client also reports.
+    if player.is_some() {
+        script.set_unit("player", player.clone());
+    }
     script.set_unit("target", target.clone());
 
     // The XP bar's feed: push our own avatar's PLAYER_XP / PLAYER_NEXT_LEVEL_XP (both PRIVATE, only
@@ -819,8 +893,8 @@ fn feed_units(
     if let Some((store, _)) = self_q.iter().next() {
         let xp = store.0.player_xp().unwrap_or(0);
         let next = store.0.player_next_level_xp().unwrap_or(0);
-        if feed.last_xp != Some((xp, next)) {
-            feed.last_xp = Some((xp, next));
+        if memo.last_xp != Some((xp, next)) {
+            memo.last_xp = Some((xp, next));
             script.set_player_xp(xp, next);
             script.fire_event("PLAYER_XP_UPDATE", vec![]);
         }
@@ -842,9 +916,9 @@ fn feed_units(
             store.0.player_rest_state_experience().unwrap_or(0),
             store.0.player_flags(),
         );
-        if feed.last_rest != Some(rest) {
-            let prev = feed.last_rest;
-            feed.last_rest = Some(rest);
+        if memo.last_rest != Some(rest) {
+            let prev = memo.last_rest;
+            memo.last_rest = Some(rest);
             script.set_rest_state(rest.0, rest.1, rest.2 & PLAYER_FLAGS_RESTING != 0);
             if prev.map(|p| (p.0, p.1)) != Some((rest.0, rest.1)) {
                 script.fire_event("UPDATE_EXHAUSTION", vec![]);
@@ -881,7 +955,7 @@ fn feed_units(
     // args wait for a consumer.
     if let Some((store, _)) = self_q.iter().next() {
         if let Some(level) = store.0.unit_level() {
-            let prev = feed.last_level.replace(level);
+            let prev = memo.last_level.replace(level);
             if prev.is_some_and(|p| level != p) {
                 script.fire_event("PLAYER_LEVEL_UP", vec![ScriptValue::Int(i64::from(level))]);
             }
@@ -898,48 +972,48 @@ fn feed_units(
     // is structural for every consumer.
     //
     // The absent arm is the world-EXIT edge (logout / char switch — the self entity despawns
-    // with the streamed world): the real client fires this event on *every* world entry (it
-    // tears the whole UI down between them; the once-per-process frame tree is our documented
-    // interim, `IngameUiLoaded`), so re-arm the fire and forget the player-global diff
+    // with the streamed world): the real client fires this event on *every* world entry, and
+    // since 1290 so do we — the frame tree is torn down and rebuilt across that edge, the way
+    // the reference does it. So re-arm the fire and forget the player-global diff
     // memories. Forgetting them makes every next-login first sighting re-seed SILENTLY — the
     // byte-verified fresh-CREATE notify silence (1098 §4), now holding per entry: without it a
     // 60→1 char switch latched the max-level rail shown over a level-1 body (1106's live
     // repro), and a normal→rested char switch would misfire "You feel rested." at login.
     if self_pair.is_some() {
-        if !feed.entered_world {
+        if !memo.entered_world {
             script.fire_event("PLAYER_ENTERING_WORLD", vec![]);
-            feed.entered_world = true;
+            memo.entered_world = true;
         }
-    } else if feed.entered_world {
-        feed.entered_world = false;
-        feed.last_xp = None;
-        feed.last_rest = None;
-        feed.last_level = None;
-        feed.last_combo = None;
-        feed.in_combat = None;
-        feed.pvp_desired = None;
+    } else if memo.entered_world {
+        memo.entered_world = false;
+        memo.last_xp = None;
+        memo.last_rest = None;
+        memo.last_level = None;
+        memo.last_combo = None;
+        memo.in_combat = None;
+        memo.pvp_desired = None;
     }
 
     for (token, snap) in [("player", &player), ("target", &target)] {
         match snap {
             Some(cur) => {
-                let prev = feed.last.get(token);
+                let prev = memo.last.get(token);
                 if prev != Some(cur) {
                     fire_transitions(&mut script, token, prev, cur);
-                    feed.last.insert(token.to_string(), cur.clone());
+                    memo.last.insert(token.to_string(), cur.clone());
                 }
             }
             None => {
                 // Clearing a token isn't a UNIT_* event; the target frame reacts to
                 // PLAYER_TARGET_CHANGED below.
-                feed.last.remove(token);
+                memo.last.remove(token);
             }
         }
     }
 
     // PLAYER_TARGET_CHANGED (no args, real WoW's shape) when the selection changes.
-    if selection.guid != feed.target_guid {
-        feed.target_guid = selection.guid;
+    if selection.guid != memo.target_guid {
+        memo.target_guid = selection.guid;
         script.fire_event("PLAYER_TARGET_CHANGED", vec![]);
     }
 
@@ -949,9 +1023,9 @@ fn feed_units(
     // the COMBAT_TEXT_UPDATE emission pin).
     if let Some((store, _)) = self_pair {
         let in_combat = store.0.unit_flags() & 0x0008_0000 != 0;
-        if feed.in_combat != Some(in_combat) {
-            let first_sight = feed.in_combat.is_none();
-            feed.in_combat = Some(in_combat);
+        if memo.in_combat != Some(in_combat) {
+            let first_sight = memo.in_combat.is_none();
+            memo.in_combat = Some(in_combat);
             if !first_sight || in_combat {
                 script.fire_event(
                     if in_combat {
@@ -974,14 +1048,14 @@ fn feed_units(
     // guid == localPlayer gate) and only on a change, never on the descriptor that first carries it.
     if let Some((store, _)) = self_pair {
         let desired = store.0.player_flags() & PLAYER_FLAGS_PVP_DESIRED != 0;
-        if let Some((toast, verbose)) = pvp_announcement(feed.pvp_desired, desired) {
+        if let Some((toast, verbose)) = pvp_announcement(memo.pvp_desired, desired) {
             script.fire_event("UI_INFO_MESSAGE", vec![ScriptValue::Str(toast.to_string())]);
             chat.push_event(ChatEvent::text_only(
                 ChatEventKind::System,
                 verbose.to_string(),
             ));
         }
-        feed.pvp_desired = Some(desired);
+        memo.pvp_desired = Some(desired);
     }
 
     // The combo-point feed: `PLAYER_FIELD_BYTES` byte 1 and the `PLAYER_FIELD_COMBO_TARGET` GUID
@@ -1003,8 +1077,8 @@ fn feed_units(
             store.0.player_combo_points().unwrap_or(0),
             store.0.player_combo_target(),
         );
-        if let Some(fire) = combo_edge(feed.last_combo, banked) {
-            feed.last_combo = Some(banked);
+        if let Some(fire) = combo_edge(memo.last_combo, banked) {
+            memo.last_combo = Some(banked);
             script.set_combo_points(banked.0, banked.1);
             if fire {
                 script.fire_event("PLAYER_COMBO_POINTS", vec![]);

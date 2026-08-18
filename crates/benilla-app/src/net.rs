@@ -40,7 +40,9 @@ use motion::{
     drain_pending_moves, extrapolate_remote_units, face_target, ground_clamp_creatures,
     mark_swimming_creatures, sample_splines,
 };
-pub(crate) use motion::{jump_seed, CreatureSwimming, FacingStep, RemoteMotion, Spline};
+pub(crate) use motion::{
+    jump_seed, CreatureSwimming, FacingStep, GroundClamped, RemoteMotion, Spline, SplineStopped,
+};
 
 /// The net subsystem: spawns the background IO threads and drives the per-frame event drain.
 pub(crate) struct NetPlugin {
@@ -88,6 +90,7 @@ impl Plugin for NetPlugin {
             .init_resource::<ServerWallClock>()
             .init_resource::<Reputations>()
             .init_resource::<HomeBind>()
+            .init_resource::<PlayedTimeAnswer>()
             .init_resource::<Proficiencies>()
             .init_resource::<crate::names::NameCache>()
             .init_resource::<crate::go_templates::GameObjectTemplates>()
@@ -96,6 +99,7 @@ impl Plugin for NetPlugin {
             .add_message::<TeleportMessage>()
             .add_message::<SelfMoveMessage>()
             .add_message::<SpeedChangeMessage>()
+            .add_message::<ClientControlMessage>()
             .add_message::<MoveModeMessage>()
             .add_message::<ServerSoundMessage>()
             .add_message::<EmoteMessage>()
@@ -134,8 +138,27 @@ impl Plugin for NetPlugin {
                     .in_set(WorldStage::Net),
             )
             // Not part of the movement chain above: one send on the world-enter message.
-            .add_systems(Update, send_query_time.in_set(WorldStage::Net));
+            .add_systems(Update, send_query_time.in_set(WorldStage::Net))
+            .add_systems(Update, population_pulse.in_set(WorldStage::Net));
     }
+}
+
+/// The population pulse (`WOW_MOVE_TRACE_TAGS=pop`): once a second, one trace line with the count
+/// of net entities resident in the object index. The "did the world arrive" instrument, born as
+/// decision 1340's retest: a teleport's visibility refresh (the release-time position report)
+/// reads as the count climbing within a couple of seconds of the `sett` release, while the ~20 s
+/// lazy-relocation pop-in the report guards against reads as the count sitting still until the
+/// server's own timer fires. Free when the tag is off.
+fn population_pulse(index: Res<GuidIndex>, time: Res<Time>, mut last: Local<f32>) {
+    if !benilla_assets::trace::enabled_for("pop") {
+        return;
+    }
+    let now = time.elapsed_secs();
+    if now - *last < 1.0 {
+        return;
+    }
+    *last = now;
+    benilla_assets::trace::line("pop", &format!("net entities={}", index.0.len()));
 }
 
 // ── ECS state: components ────────────────────────────────────────────────────────────────────────
@@ -180,10 +203,56 @@ pub(crate) struct UnitSpeeds(pub(crate) MoveSpeeds);
 #[derive(Component, Clone, Default)]
 pub(crate) struct ObjectStore(pub(crate) ObjectFields);
 
-/// Marks our own player's streamed entity (guid == [`SelfGuid`]). The renderer skips it — the player
-/// controller owns our avatar — but the controller reads its [`Transform`] to take control on login.
+/// Marks our own player's streamed entity (guid == [`SelfGuid`]). This is **identity** — "my
+/// character", the thing whose bags, auras, quest log and paper doll are mine. It is deliberately
+/// *not* "the thing I steer": that is [`Embodied`], which normally sits on the same entity and
+/// leaves it while you drive something else.
 #[derive(Component)]
 pub(crate) struct SelfPlayer;
+
+/// **The body this client is attached to** — where the camera is, whose feet make the footsteps,
+/// whose height the water lines are measured against, whose server-authored spline is ours to ride.
+/// The reference's **camera anchor** (`camera+0x88`), which has exactly three writers — the
+/// constructor and `SetTarget 0x50d0f0`'s two legs — and is *not* touched by a control update
+/// (wow-re `control-loss-and-restore.md` §3).
+///
+/// Normally our own body, so it rides alongside [`SelfPlayer`]. While we hold somebody else's reins
+/// — mind-controlling a creature, an Eye of Kilrogg — it moves to *that* entity and our own body
+/// keeps none of it, exactly as `GetCamera().SetView(target)` moves the anchor at possession. That
+/// is decision 0092's separation carried one step further: possession moves what you *inhabit*
+/// without moving who you *are*.
+///
+/// **Attached is not the same as allowed to move**, and the second is [`ActiveMover`]'s job, not
+/// this marker's (decision 1281). A feared player is still attached to their own body — the
+/// reference keeps the anchor on it and keeps following it, merely smoothed — while the server, not
+/// their input, says where it goes.
+///
+/// Exactly one entity carries it, and possibly none — a claimed mover whose object has not streamed
+/// in yet is nobody, never a silent fallback to our own body. That distinction is load-bearing:
+/// outbound `MSG_MOVE_*` carry no guid, so driving our body under a claimed creature's mover writes
+/// our pose onto the creature. [`crate::player`] owns the placement.
+#[derive(Component)]
+pub(crate) struct Embodied;
+
+/// **The one unit this client authors motion for** — the reference's active-mover global
+/// (`ds:0xc4da98`/`0xc4da9c`, written only by `SetActiveMover 0x6006e0`), as a marker on the entity
+/// that global names.
+///
+/// [`Embodied`] narrowed to the frames the body is ours to move. The narrowing is the reference's
+/// own: `0x5fa600` **zeroes the mover globals** when a control update forbids the unit they name,
+/// and with them zero the input applier (`0x514640` skips the whole tick when the mover does not
+/// resolve) and every plain movement report — `0x600860`'s mover check kills the lot, heartbeat
+/// included (wow-re `control-loss-and-restore.md` §2/§6). There is no separate "may not move" flag
+/// in the movement path; the zeroed global *is* the immobility.
+///
+/// Here it also answers the ECS's version of that question — *may the ordinary server-replay path
+/// move this unit?* A body we are attached to but may not move must answer **yes**, which is how a
+/// mind-controlled player sees their own character walk where their captor drives it. A body we are
+/// driving must answer **no**, or the server's echo of our own movement fights the controller. So
+/// the replay lanes filter `Without<ActiveMover>`, not `Without<Embodied>`: the two differ only
+/// while control is lost, which is precisely the window where the difference is the whole point.
+#[derive(Component)]
+pub(crate) struct ActiveMover;
 
 // ── ECS state: resources ─────────────────────────────────────────────────────────────────────────
 
@@ -456,10 +525,15 @@ fn send_query_time(
     }
 }
 
-/// Our player's reputation store (`SMSG_INITIALIZE_FACTIONS`, once at login): `(flags, standing)`
-/// per reputation-list slot, indexed by `Faction.dbc`'s `reputationIndex`. The standing excludes the
-/// DBC race/class base. Read by the reaction decode (targeting): a reputation faction's NPCs colour
-/// by our rank with them, before any faction-template comparison. Empty until the packet lands.
+/// Our player's reputation store: `(flags, standing)` per reputation-list slot, indexed by
+/// `Faction.dbc`'s `reputationIndex`. The standing excludes the DBC race/class base — consumers add
+/// it before ranking. Empty until `SMSG_INITIALIZE_FACTIONS` lands at login; kept current after that
+/// by `SMSG_SET_FACTION_STANDING` (which also auto-reveals) and `SMSG_SET_FACTION_VISIBLE`.
+///
+/// Two consumers, and they read different halves. The **reaction decode** (targeting) reads the
+/// standing: a reputation faction's NPCs colour by our rank with them, before any faction-template
+/// comparison. The **reputation pane** ([`crate::ui_reputation`]) reads the flag byte as well — the
+/// visible bit decides which rows exist at all, and bit `0x08` marks the pane's headers.
 #[derive(Resource, Default)]
 pub(crate) struct Reputations(pub(crate) Vec<(u8, i32)>);
 
@@ -468,6 +542,15 @@ pub(crate) struct Reputations(pub(crate) Vec<(u8, i32)>);
 /// `None` until the packet lands.
 #[derive(Resource, Default)]
 pub(crate) struct HomeBind(pub(crate) Option<u32>);
+
+/// The `/played` answer awaiting delivery to the VM (`SMSG_PLAYED_TIME`): total seconds played and
+/// seconds since the last level-up.
+///
+/// A one-slot mailbox rather than a queue: the reply answers a request, the server sends one per
+/// request, and a second landing before the first is drained would mean the first is already stale.
+/// `None` whenever there is nothing undelivered.
+#[derive(Resource, Default)]
+pub(crate) struct PlayedTimeAnswer(pub(crate) Option<(u32, u32)>);
 
 /// The player's equip proficiencies (`SMSG_SET_PROFICIENCY`, at login + on train): item class
 /// (2 weapons / 4 armor) → allowed-subclass bitmask — the client's `0xc4d4a0[class]` store.
@@ -579,6 +662,26 @@ impl MoveKind {
     }
 }
 
+/// The wire `ChatMsg` type byte an addon broadcast rides (decision 1235) — the client's own
+/// four-lane whitelist at `0x49fa3f`-`0x49fa4e`, VERIFIED in `WoW.exe` (5875), wow-re
+/// `system/ui/scratch/addon-chat-law.md` §5.
+///
+/// A **total** map from a closed enum, and a named function rather than an inline `match` in
+/// [`io`]'s dispatch so that it is assertable: this is the one place a distribution becomes a wire
+/// byte, and getting it wrong sends an addon's payload down a lane nobody is listening on. There
+/// is no fallback arm and none can be added — that is the whole reason the distribution crosses
+/// the crate boundary as an enum instead of a token string.
+pub(crate) fn addon_wire_chat_type(distribution: benilla_ui::script::AddonDistribution) -> u32 {
+    use benilla_protocol::messages as m;
+    use benilla_ui::script::AddonDistribution as D;
+    match distribution {
+        D::Party => m::CHAT_TYPE_PARTY,
+        D::Raid => m::CHAT_TYPE_RAID,
+        D::Guild => m::CHAT_TYPE_GUILD,
+        D::Battleground => m::CHAT_TYPE_BATTLEGROUND,
+    }
+}
+
 /// The wire `ChatMsg` type a chat-bar line sends as — the FULL sendable set (decision 0288 P5;
 /// vmangos `HandleChatMessageOpcode`'s switch). Each maps to its `WorldWriter` sender in [`io`]'s
 /// dispatch; `Whisper` carries its target and `Channel` its channel name through
@@ -614,6 +717,7 @@ pub(crate) static CAST_TRACE: std::sync::LazyLock<bool> =
 
 /// A message the ECS sends to the server through the write thread. Carries the player's pose so the
 /// writer thread needs no shared state.
+#[derive(Debug)]
 pub(crate) enum ClientCommand {
     /// A self-movement packet: the [`MoveKind`] opcode + the live CMovement `flags` + our pose, plus the
     /// airborne clock (`fall_time`, ms) and ballistic launch tail (`jump`) while jumping/falling. The
@@ -661,6 +765,23 @@ pub(crate) enum ClientCommand {
         jump: Option<JumpInfo>,
         transport: Option<TransportPose>,
     },
+    /// Claim `guid` as our mover (`CMSG_SET_ACTIVE_MOVER`). Login sends it for our own body; a
+    /// possession handoff re-sends it for the unit we were handed, because the server drops every
+    /// `MSG_MOVE_*` for a mover it has not confirmed.
+    SetActiveMover { guid: u64 },
+    /// Release `guid` as our mover (`CMSG_MOVE_NOT_ACTIVE_MOVER`) at the pose it is parting on —
+    /// the server re-broadcasts a stop under that guid from this payload, so observers do not keep
+    /// the unit sliding.
+    NotActiveMover {
+        guid: u64,
+        flags: u32,
+        pos: [f32; 3],
+        orientation: f32,
+        fall_time: u32,
+    },
+    /// Vote on the far-sight view (`CMSG_FAR_SIGHT`): `true` as it attaches, `false` as it
+    /// releases. The reference sends both; neither names an object.
+    FarSight { engage: bool },
     /// Echo a same-map teleport ack (`MSG_MOVE_TELEPORT_ACK_Client`) — without it the server freezes
     /// our movement until relog.
     TeleportAck { guid: u64, counter: u32 },
@@ -676,6 +797,23 @@ pub(crate) enum ClientCommand {
     Chat {
         kind: ChatKind,
         target: Option<String>,
+        text: String,
+    },
+    /// **An addon broadcast** (`SendAddonMessage`, decision 1235) — a `CMSG_MESSAGECHAT` carrying
+    /// `LANG_ADDON` in the language field instead of the speaker's tongue, which is the entire
+    /// difference between addon data and speech (1.12.1 has no addon opcode).
+    ///
+    /// Deliberately **not** a flag on [`Self::Chat`]: that command's whole family speaks
+    /// `WorldWriter::chat_language`, and a language field bolted onto it would be a `None` that
+    /// fourteen arms have to remember to honour. This one carries no target (1.12's
+    /// `SendAddonMessage` has no fourth argument, so there is no whispered addon message) and no
+    /// language dial (there is exactly one legal value).
+    ///
+    /// `distribution` is the client's own four-value whitelist, already resolved and already
+    /// downgraded for the outside-a-raid case by the binding
+    /// ([`benilla_ui::script::AddonDistribution`]); `text` is the composed `prefix` TAB `message`.
+    AddonMessage {
+        distribution: benilla_ui::script::AddonDistribution,
         text: String,
     },
     /// Ask a player character's name (`CMSG_NAME_QUERY`); answered by a `PlayerName` event into the
@@ -915,6 +1053,12 @@ pub(crate) enum ClientCommand {
     /// else the one item. Success is durability rising + coinage falling via `UPDATE_OBJECT`
     /// (no dedicated answer packet).
     RepairItem { vendor: u64, item_guid: u64 },
+    /// Accept an innkeeper's bind offer (`CMSG_BINDER_ACTIVATE`, decision 1331): the
+    /// `CONFIRM_BINDER` dialog's Accept, carrying the guid `SMSG_BINDER_CONFIRM` asked with. This
+    /// is the ONLY packet in the flow that binds anything — selecting the gossip line just raises
+    /// the question. Answered by `SMSG_BINDPOINTUPDATE` + `SMSG_PLAYERBOUND` once the innkeeper's
+    /// Bind cast lands; declining sends nothing.
+    BinderActivate { binder: u64 },
     /// Open the bank (`CMSG_BANKER_ACTIVATE`, decision 0604): the direct opener a right-click on
     /// a pure banker (bit 8 the lowest service bit) uses — a gossip-flagged banker routes through
     /// the gossip menu instead, whose bank option makes the server volunteer the same answer.
@@ -954,6 +1098,18 @@ pub(crate) enum ClientCommand {
     /// server's `SetSkill(id, 0, 0)` returns as a `PLAYER_SKILL_INFO` field update, which the
     /// skills feed re-pushes (the engine never removes the line locally).
     UnlearnSkill { skill_id: u32 },
+    /// Declare or withdraw war on a faction (`CMSG_SET_FACTION_ATWAR`): the reputation pane's
+    /// crossed-swords box. Addressed by reputation-list slot. No ack — the engine already flipped
+    /// its own flag copy ([`crate::ui_reputation`]), and vmangos DROPS the request outright while
+    /// the player is in combat.
+    SetFactionAtWar { rep_list_id: u32, at_war: bool },
+    /// Move a faction into or out of the pane's inactive bucket (`CMSG_SET_FACTION_INACTIVE`).
+    /// Same slot addressing and same no-ack rule as [`Self::SetFactionAtWar`].
+    SetFactionInactive { rep_list_id: u32, inactive: bool },
+    /// Watch a faction's bar on the main menu bar (`CMSG_SET_WATCHED_FACTION`). **Signed**, and
+    /// `-1` — not `0` — is "watch nothing": slot 0 is the Bloodsail Buccaneers. The answer returns
+    /// as a `PLAYER_FIELD_WATCHED_FACTION_INDEX` descriptor update.
+    SetWatchedFaction { rep_list_id: i32 },
     /// Use a world GameObject (`CMSG_GAMEOBJ_USE`, decision 0236): a full guid naming the
     /// chest/door/quest-object/lever under the cursor. Sent by the right-click route
     /// ([`crate::target`]) when the nearest hovered CGObject is a usable GameObject. The server fans
@@ -1231,6 +1387,76 @@ pub(crate) enum ClientCommand {
     /// the unit popup's PvP row, both through the VM's intent queue. Nothing local changes; the
     /// answer is the descriptor's PvP bit (and flagging *off* waits out the server's 300 s timer).
     TogglePvp,
+    // ── The guild family (writer bodies in benilla-protocol `world/writer/guild.rs`) ──────────
+    //
+    //    Three things shape every caller of this band. **Members are addressed by NAME**, not by
+    //    guid as the friend list is. **Rank ids are 0-based with 0 = guild master**, and authority
+    //    falls as the id rises (promote = `rank - 1`). And **almost nothing is acked
+    //    individually**: the mutating verbs answer with a whole fresh `SMSG_GUILD_ROSTER` (plus an
+    //    `SMSG_GUILD_QUERY_RESPONSE` for the rank verbs), so the model updates when that snapshot
+    //    lands, never optimistically at the send; a refusal arrives separately as
+    //    `SMSG_GUILD_COMMAND_RESULT`.
+    //
+    //    Every one of these is sent by `crate::ui_guild` (decision 1257) except `GuildCreate`,
+    //    which keeps its `#[allow(dead_code)]`: *founding* a guild is the charter/petition flow,
+    //    deliberately out of the membership slice, and vmangos registers the opcode `STATUS_NEVER`
+    //    so nothing would answer it anyway.
+    /// Ask a guild's public identity by id (`CMSG_GUILD_QUERY`) — the ask-once cache fill behind
+    /// every "which guild is that?" (a roster row, a `/who` hit, a guild chat line).
+    GuildQuery { guild_id: u32 },
+    /// Found a guild by name (`CMSG_GUILD_CREATE`). vmangos registers the opcode `STATUS_NEVER` —
+    /// at 1.12 founding runs through the charter flow — so this draws no reply.
+    #[allow(dead_code)]
+    GuildCreate { name: String },
+    /// Invite a character into our guild (`CMSG_GUILD_INVITE`).
+    GuildInvite { name: String },
+    /// Accept the guild invitation we are holding (`CMSG_GUILD_ACCEPT`, empty body) — which one is
+    /// the server's pending state, not a field.
+    GuildAccept,
+    /// Turn it down (`CMSG_GUILD_DECLINE`, empty body); the inviter hears about it, we don't.
+    GuildDecline,
+    /// Ask our guild's founding date + member/account counts (`CMSG_GUILD_INFO`, empty body).
+    GuildInfoRequest,
+    /// Refresh the guild roster (`CMSG_GUILD_ROSTER`, empty body) — the guild pane's opener. The
+    /// server also pushes the roster unasked after every change, so this is never the only path.
+    GuildRosterRequest,
+    /// Promote a member one rank (`CMSG_GUILD_PROMOTE`) — towards guild master.
+    GuildPromote { name: String },
+    /// Demote a member one rank (`CMSG_GUILD_DEMOTE`).
+    GuildDemote { name: String },
+    /// Leave our guild (`CMSG_GUILD_LEAVE`, empty body). Refused while we are the guild master and
+    /// anyone else remains.
+    GuildLeave,
+    /// Kick a member by name (`CMSG_GUILD_REMOVE`).
+    GuildRemove { name: String },
+    /// Disband the guild (`CMSG_GUILD_DISBAND`, empty body) — guild master only, irreversible.
+    GuildDisband,
+    /// Hand the guild to another member (`CMSG_GUILD_LEADER`).
+    GuildLeader { name: String },
+    /// Set the message of the day (`CMSG_GUILD_MOTD`); `""` clears it.
+    GuildMotd { motd: String },
+    /// Rewrite one rank's name **and** rights together (`CMSG_GUILD_RANK`) — there is no partial
+    /// form, so a caller changing one must resend the other's current value. Rank 0's rights are
+    /// ignored and forced to "all"; an over-long name gets the session kicked, so cap it at
+    /// `messages::GUILD_RANK_MAX_LENGTH`.
+    GuildRank {
+        rank_id: u32,
+        rights: u32,
+        name: String,
+    },
+    /// Append a rank at the bottom of the ladder (`CMSG_GUILD_ADD_RANK`).
+    GuildAddRank { name: String },
+    /// Delete the **lowest** rank (`CMSG_GUILD_DEL_RANK`, empty body) — there is no rank id on the
+    /// wire, it is always the last one.
+    GuildDelRank,
+    /// Set a member's public note (`CMSG_GUILD_SET_PUBLIC_NOTE`).
+    GuildSetPublicNote { name: String, note: String },
+    /// Set a member's officer note (`CMSG_GUILD_SET_OFFICER_NOTE`). Editing and *viewing* officer
+    /// notes are separate rights — an all-empty officer column may mean we cannot see them.
+    GuildSetOfficerNote { name: String, note: String },
+    /// Set the guild information text (`CMSG_GUILD_INFO_TEXT`) — the long free-text pane, which
+    /// rides back as the roster's `info` field.
+    GuildInfoText { text: String },
     // ── The taxi/flight-master family (decision 0484 phase 1; writer bodies in
     //    benilla-protocol `messages::taxi`) ──────────────────────────────────────────────────
     /// Ask a nearby flight master's known status (`CMSG_TAXINODE_STATUS_QUERY`): the guid of the
@@ -1319,11 +1545,41 @@ pub(crate) struct LoginStageMessage {
 
 /// The session ended (socket death, logout's teardown edge) — bridged from the Net drain's
 /// `Disconnected` arm. [`crate::login`]'s policy reads it as "the IO thread is back at its
-/// pre-logon park": with pending credentials it schedules the silent re-auth (decision 0539 §3 —
-/// 0065's seamless reconnect, paced app-side).
+/// pre-logon park"; whether anything re-authenticates is [`Self::ends_the_session`]'s answer.
 #[derive(Message, Clone)]
 pub(crate) struct DisconnectedMessage {
     pub(crate) reason: String,
+    /// How it ended — the fact the whole post-session behaviour turns on (decision 1262).
+    pub(crate) end: benilla_protocol::SessionEnd,
+    /// **Is this the reference's `DISCONNECTED_FROM_SERVER`** — the session over, the client back
+    /// at the account screen behind a "Disconnected from server" dialog, and nothing retried?
+    ///
+    /// Decided **once**, by [`Self::new`], at the one edge where the event enters the app
+    /// (decision 1262). Four readers act on it — the world teardown, the screen flip, the black
+    /// cover, the credential policy — and they may not disagree: a teardown that keeps the avatar
+    /// for a reconnect that never comes is exactly the avatar-less free camera the report
+    /// described. Carrying the verdict rather than re-deriving it four times is what makes that
+    /// structural instead of conventional.
+    pub(crate) session_over: bool,
+}
+
+impl DisconnectedMessage {
+    /// The session-end event as the app sees it, with [`Self::session_over`] settled here and
+    /// nowhere else.
+    ///
+    /// It is `false` twice over. A [`SessionEnd::LoggedOut`](benilla_protocol::SessionEnd::LoggedOut)
+    /// teardown is the relist *inside* one session — the roster that follows IS the character
+    /// select the player asked for. And an unattended run ([`crate::run_mode::unattended_login`])
+    /// keeps 0065's seamless reconnect: a probe has nobody to press Okay.
+    pub(crate) fn new(reason: String, end: benilla_protocol::SessionEnd) -> Self {
+        let session_over =
+            end == benilla_protocol::SessionEnd::Lost && !crate::run_mode::unattended_login();
+        Self {
+            reason,
+            end,
+            session_over,
+        }
+    }
 }
 
 /// A login attempt failed before the roster (decision 0539): `code` is the server's auth result
@@ -1371,6 +1627,20 @@ pub(crate) struct SelfMoveMessage {
     pub(crate) pitch: f32,
     pub(crate) fall_time: u32,
     pub(crate) jump: Option<benilla_protocol::JumpInfo>,
+}
+
+/// The server granted or revoked control of a unit (`SMSG_CLIENT_CONTROL_UPDATE`). Written by
+/// [`apply_net_updates`] verbatim — the *decision* is the controller's, because only it knows the
+/// live pose it would have to park, so the drain deliberately interprets nothing.
+///
+/// **`mover` is the unit spoken about, not a new subject.** The server revokes by naming *us*
+/// (`mover == self guid`, `allow_move = false`), which is what a mind-controlled player receives
+/// about themselves, and grants by naming somebody else. Reading it as "the new mover" gets the
+/// victim's case exactly backwards — it would hand us control of ourselves at the moment we lost it.
+#[derive(Message, Clone, Copy)]
+pub(crate) struct ClientControlMessage {
+    pub(crate) mover: u64,
+    pub(crate) allow_move: bool,
 }
 
 /// The server changed one of our own mover's speeds (`SMSG_FORCE_*_SPEED_CHANGE` — aura, mount, GM
@@ -1478,4 +1748,54 @@ pub(crate) enum EmoteKind {
 pub(crate) struct AiReactionMessage {
     pub(crate) unit: Entity,
     pub(crate) hostile: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The addon lane's four wire bytes** (decision 1235) — the client's own whitelist at
+    /// `0x49fa3f`-`0x49fa4e`, and the last link in the chain between an addon's Lua call and the
+    /// bytes `benilla-protocol`'s `addon_message_bodies_golden` pins. Wrong here and the payload
+    /// goes down a lane nobody listens on, which is silent at both ends.
+    ///
+    /// `RAID_LEADER`/`RAID_WARNING`/`OFFICER`/`BATTLEGROUND_LEADER`/`CHANNEL` are asserted absent
+    /// from the map's *image*: vmangos would accept `LANG_ADDON` on all five, and the client sends
+    /// on none of them, so a future widening has to fail a test rather than pass unnoticed.
+    #[test]
+    fn addon_distributions_map_to_the_clients_own_four_wire_types() {
+        use benilla_protocol::messages as m;
+        use benilla_ui::script::AddonDistribution as D;
+
+        assert_eq!(addon_wire_chat_type(D::Party), 0x01, "CHAT_MSG_PARTY");
+        assert_eq!(addon_wire_chat_type(D::Raid), 0x02, "CHAT_MSG_RAID");
+        assert_eq!(addon_wire_chat_type(D::Guild), 0x03, "CHAT_MSG_GUILD");
+        assert_eq!(
+            addon_wire_chat_type(D::Battleground),
+            0x5C,
+            "CHAT_MSG_BATTLEGROUND"
+        );
+
+        // The image is exactly those four — no distribution reaches a lane the reference refuses.
+        let image: Vec<u32> = [D::Party, D::Raid, D::Guild, D::Battleground]
+            .into_iter()
+            .map(addon_wire_chat_type)
+            .collect();
+        for refused in [
+            m::CHAT_TYPE_SAY,
+            m::CHAT_TYPE_YELL,
+            m::CHAT_TYPE_WHISPER,
+            m::CHAT_TYPE_EMOTE,
+            m::CHAT_TYPE_OFFICER,
+            m::CHAT_TYPE_CHANNEL,
+            m::CHAT_TYPE_RAID_LEADER,
+            m::CHAT_TYPE_RAID_WARNING,
+            m::CHAT_TYPE_BATTLEGROUND_LEADER,
+        ] {
+            assert!(
+                !image.contains(&refused),
+                "{refused:#04x} is a lane the client never sends addon data on"
+            );
+        }
+    }
 }

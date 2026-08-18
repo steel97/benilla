@@ -1,14 +1,15 @@
 <Ui>
     <!--
-        benilla's Skills tab (decision 0437 phase 4): the 1.12 `SkillFrame`, transcribed from the
+        benilla's Skills tab (decision 0437 phase 4): the 1.12 `SkillFrame`, re-expressed from the
         reference FrameXML `SkillFrame.{xml,lua}` (session scratchpad `ref-ui/`, decision 0246
         discipline — never committed) onto our own engine/feeds. Geometry/art-paths below are QUOTED
         from the ref (line citations inline, into that same `SkillFrame.xml`/`.lua`); the Lua is
-        transcribed logic turned onto benilla's Era API (`GetNumSkillLines`/`GetSkillLineInfo`/
+        the ref's logic turned onto benilla's Era API (`GetNumSkillLines`/`GetSkillLineInfo`/
         `Expand`/`CollapseSkillHeader`/`SetSelectedSkill`/`GetSelectedSkill`, decision 0437's skills
         seam, `crates/benilla-ui/src/script/skills.rs`, built alongside this file).
 
-        A CHILD PAGE of `CharacterFrame` (ref: `parent="CharacterFrame"`, `id="4"`), shown/
+        A CHILD PAGE of `CharacterFrame` (ref: `parent="CharacterFrame"`, `id="4"` — ours too, since
+        the Reputation page landed and took slot 3 back), shown/
         hidden by `CharacterFrame_ShowSubFrame` exactly like `PaperDollFrame` — but NOT a
         physically nested `<Frame>` the way PaperDollFrame is: PaperDollFrame is declared INSIDE
         CharacterFrame.xml's own `<Frames>` tree (a real engine parent/child), while this page is a
@@ -159,8 +160,8 @@
                 bgTexture:SetVertexColor(0.0, 0.0, 0.75, 0.5)
                 bar:SetMinMaxValues(0, skillMaxRank)
                 bar:SetValue(skillRank)
-                -- ref SkillFrame.lua:178-186, transcribed byte-exact (this file's header comment,
-                -- deviation 4).
+                -- the ref's rank-text law (SkillFrame.lua:178-186), re-expressed here (this file's
+                -- header comment, deviation 4).
                 if skillModifier == 0 then
                     rankText:SetText(skillRank .. "/" .. skillMaxRank)
                 else
@@ -396,7 +397,12 @@
             -- The description body hangs under the detail bar — anchored here, not in XML,
             -- because the bar is a child frame declared after the page's layers and anchors
             -- resolve at SetPoint time (an XML forward reference silently lands on the page;
-            -- the MailFrame error-text OnLoad precedent, ref MailFrame.xml l.1040).
+            -- the MailFrame error-text OnLoad precedent, ref MailFrame.xml l.1040). Cleared
+            -- first: the load-time implicit anchor (decision 1310) seated this justifyH="LEFT"
+            -- string at the page's LEFT, and SetPoint replaces only its own point -- without the
+            -- clear both anchors stand and the left/center edges resolve off the page, not the
+            -- bar. (The ref needs no clear on ITS file only because its XML anchors the string.)
+            SkillDetailDescriptionText:ClearAllPoints()
             SkillDetailDescriptionText:SetPoint("TOPLEFT", "SkillDetailBar", "BOTTOMLEFT", -2, -10)
         end
 
@@ -467,12 +473,13 @@
         <NormalFont inherits="GameFontHighlight" justifyH="LEFT"/>
     </Button>
 
-    <!-- id=3, NOT the ref's 4: a page's id is the slot it occupies in the WINDOW'S OWN tab row, and
-         ToggleCharacter selects the tab from it (ref CharacterFrame.lua:11). Ours is 3rd because
-         Reputation (the ref's 3) is not built — the same deviation CharacterFrame.xml's tab row
-         already flags. `character_tests.rs` pins every page's id against its slot in
-         BENILLA_CHARACTERFRAME_SUBFRAMES, so the day Reputation lands this is loud, not silent. -->
-    <Frame name="SkillFrame" enableMouse="true" parent="CharacterFrame" hidden="true" id="3">
+    <!-- id=4, the ref's own: a page's id is the slot it occupies in the WINDOW'S OWN tab row, and
+         ToggleCharacter selects the tab from it (ref CharacterFrame.lua:11). This was 3 while
+         Reputation (the ref's 3) was not built; ReputationFrame.xml landed and took that slot, so
+         Skills is back on the reference's number. `character_tests.rs` pins every page's id against
+         its slot in BENILLA_CHARACTERFRAME_SUBFRAMES, which is what made the renumber loud rather
+         than silent — exactly as this comment predicted. -->
+    <Frame name="SkillFrame" enableMouse="true" parent="CharacterFrame" hidden="true" id="4">
         <!-- The real 384×512 page. No <Anchors relativeTo> substitute for true parenting exists
              (this file's header comment) — pinned to CharacterFrame's own TOPLEFT by name. -->
         <Size><AbsDimension x="384" y="512"/></Size>

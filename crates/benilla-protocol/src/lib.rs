@@ -13,7 +13,9 @@ pub mod messages;
 pub mod wire;
 pub mod world;
 pub use auth::AuthReject;
-pub use events::{decode, CharAction, EntityKind, LoginStage, MoveSpeeds, Poll, SessionEvent};
+pub use events::{
+    decode, CharAction, EntityKind, LoginStage, MoveSpeeds, Poll, SessionEnd, SessionEvent,
+};
 pub use messages::{
     CharCreateReq, CharEnumItem, Character, CreateSpline, ItemInfo, JumpInfo, MonsterMoveFacing,
     MoveMode, ObjectFields, OwnerFallback, ServerPacket, SpeedKind, TransportPose,
@@ -128,6 +130,7 @@ pub fn logon(host: &str, username: &str, password: &str) -> Result<Logon> {
         &mut stream,
         challenge.client_public_key(),
         challenge.client_proof(),
+        &reply.crc_salt,
     )
     .context("sending logon proof")?;
 

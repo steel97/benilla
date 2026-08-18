@@ -82,6 +82,8 @@ mod live_shot;
 mod phase_probe;
 mod pick_probe;
 mod probe_bank;
+mod probe_binder;
+mod probe_book;
 mod probe_castcancel;
 mod probe_charcreate;
 mod probe_crossing;
@@ -99,6 +101,8 @@ pub(crate) use live_shot::LiveShotPlugin;
 pub(crate) use phase_probe::PhaseProbePlugin;
 pub(crate) use pick_probe::PickProbePlugin;
 pub(crate) use probe_bank::ProbeBankPlugin;
+pub(crate) use probe_binder::ProbeBinderPlugin;
+pub(crate) use probe_book::ProbeBookPlugin;
 pub(crate) use probe_castcancel::ProbeCastCancelPlugin;
 pub(crate) use probe_charcreate::ProbeCharCreatePlugin;
 pub(crate) use probe_crossing::ProbeCrossingPlugin;
@@ -108,9 +112,9 @@ pub(crate) use probe_partner::ProbePartnerPlugin;
 pub(crate) use probe_rig::ProbeRigPlugin;
 pub(crate) use probe_taxi::ProbeTaxiPlugin;
 pub(crate) use probes::{
-    fx_draw_census_plugin, EntityCensusPlugin, LiveFpsPlugin, NodeProbePlugin,
+    fx_draw_census_plugin, EntityCensusPlugin, GroundCensusPlugin, LiveFpsPlugin, NodeProbePlugin,
     ParticleCensusPlugin, ProbeChatPlugin, ProbeClock, ProbeExitPlugin, ProbeFocusPlugin,
-    ProbeKeyPlugin, ProbeLuaPlugin, ProbeResizePlugin,
+    ProbeKeyPlugin, ProbeLuaPlugin, ProbeResizePlugin, UnitVisualsPlugin,
 };
 use scenarios::GlueScreen;
 use scenarios::{Scenario, SubjectKind, UiFixture, GLUE_SCENARIOS, GROUND_EYE, SCENARIOS};
@@ -856,6 +860,23 @@ fn drive_capture(
                     n + 1,
                     watch.stable,
                 );
+            }
+            // The emptiness tripwire (1373): stability proves the image stopped changing, not
+            // that it contains anything — a lane that renders nothing is perfectly stable, and
+            // the 1371 black era sailed through this gate without a word. The bytes are already
+            // in hand; color channels only, since alpha is opaque even on a black frame.
+            if watch.stable >= stable_frames() || capped {
+                if let Some(px) = watch.prev.as_deref() {
+                    if px
+                        .chunks_exact(4)
+                        .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
+                    {
+                        error!(
+                            "capture: settled image is EMPTY — every color channel is zero; the \
+                             scene rendered nothing (1373)"
+                        );
+                    }
+                }
             }
             if watch.stable < stable_frames() && !capped {
                 Phase::Building(n + 1)

@@ -29,14 +29,103 @@ fn ui_cost_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("WOW_UI_COST").as_deref() == Ok("1"))
 }
 
+/// `WOW_UI_GATE=1` — the extract gate's miss reporter ([`report_gate_miss`]). Off by default and
+/// read once, the `[ui-cost]` meter's posture.
+fn gate_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("WOW_UI_GATE").as_deref() == Ok("1"))
+}
+
+/// `WOW_UI_DIFF=1` — the base-lane rebuild-trigger probe (`ui_pass`' twin). Read once; it also
+/// pins the conversion to the FULL path (the probe's job is naming the first differing quad of a
+/// whole-list diff, which the per-entry splice below deliberately never computes).
+fn ui_diff_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WOW_UI_DIFF").is_some())
+}
+
+/// One line naming why the extract gate did not skip this frame — the input that differed, and for
+/// the render list the first entry that moved. A settled UI is what makes the paint pass free; when
+/// it is never settled, this says what is moving.
+fn report_gate_miss(
+    script: &UiScript,
+    now: &[benilla_ui::script::ExtractedQuad],
+    prev: &[benilla_ui::script::ExtractedQuad],
+    dims_eq: bool,
+    generation_eq: bool,
+    text_ui_eq: bool,
+    portraits_eq: bool,
+) {
+    if !dims_eq {
+        eprintln!("[ui-gate] miss: window size / seam scale / DPI changed");
+        return;
+    }
+    if !generation_eq {
+        // Named, because it is the one miss with no visible cause at all: the glyph sheet filled
+        // and was repacked from empty, so every held quad's UV moved. It should be very rare —
+        // `WOW_GLYPH_CACHE=1` reports the occupancy that led here (decision 1342).
+        eprintln!("[ui-gate] miss: the glyph sheet reset");
+        return;
+    }
+    if !text_ui_eq {
+        eprintln!("[ui-gate] miss: focused editbox text-UI changed");
+        return;
+    }
+    if !portraits_eq {
+        eprintln!("[ui-gate] miss: portrait sources changed");
+        return;
+    }
+    if now.len() != prev.len() {
+        eprintln!(
+            "[ui-gate] miss: render list {} -> {} entries",
+            prev.len(),
+            now.len()
+        );
+        return;
+    }
+    match now.iter().zip(prev).position(|(a, b)| a != b) {
+        Some(i) => {
+            let (a, b) = (&now[i], &prev[i]);
+            let (was, now_s) = (format!("{b:?}"), format!("{a:?}"));
+            let owner = match a.target {
+                benilla_ui::order::ZTarget::Frame(fh) => script.frame_name(fh),
+                benilla_ui::order::ZTarget::Region(_) => None,
+            };
+            eprintln!(
+                "[ui-gate] miss: entry {i}/{} target={:?} name={owner:?}\n           was {}\n           now {}",
+                now.len(),
+                a.target,
+                &was[..was.len().min(280)],
+                &now_s[..now_s.len().min(280)],
+            );
+        }
+        // Nothing in this pass's own inputs moved — the miss came from the capture-mode arm.
+        None => eprintln!("[ui-gate] miss: capture mode (the gate never skips under a capture)"),
+    }
+}
+
 /// Last frame's extract-gate inputs (decision 0740), held together as one `Local` — the gate
-/// compares all four or none, and a Bevy system has a hard param budget this was eating.
+/// compares all of them or none, and a Bevy system has a hard param budget this was eating.
 #[derive(Default)]
 pub(super) struct GateInputs {
     extracted: Vec<benilla_ui::script::ExtractedQuad>,
     text_ui: Option<benilla_ui::script::EditBoxTextUi>,
-    dims: Option<(u32, u32, u32)>,
+    dims: Option<(u32, u32, u32, u32)>,
     portraits: std::collections::HashMap<String, crate::portrait::PortraitSource>,
+    /// The `UiFontAtlas::generation` the held quads' glyph UVs came from — see the gate's own
+    /// note below. Moves only when the glyph sheet resets (decisions 1339, 1342).
+    generation: Option<u64>,
+    /// Per-entry prefix ends into the conversion's output: entry `i`'s quads occupy
+    /// `spans[i-1]..spans[i]` of `UiQuads::quads` (0 for `i = 0`). Recorded by the full
+    /// conversion, kept current by the splice — this is what lets a one-entry change (the resting
+    /// blink) re-convert one entry instead of the whole interface.
+    spans: Vec<u32>,
+}
+
+/// Entry `i`'s quad range under `spans` (the [`GateInputs::spans`] encoding).
+fn span_bounds(spans: &[u32], i: usize) -> (usize, usize) {
+    let a = if i == 0 { 0 } else { spans[i - 1] as usize };
+    (a, spans[i] as usize)
 }
 
 /// Per frame: screen size → `tick` (OnUpdate) → `resolve` → `extract` → [`UiQuads`]. Script errors
@@ -71,25 +160,54 @@ pub(super) fn drive_script(
         Option<Res<crate::run_mode::CaptureMode>>,
         Res<super::UiCostWanted>,
     ),
-    // This frame's `<Minimap>` widget slot, parked for `minimap::emit_minimap` (the UiQuadAppend
-    // producer that fills the hole with tile/arrow quads — decision 0203 phase 1).
-    mut minimap_widget: ResMut<crate::minimap::MinimapWidget>,
-    // Whether the digit-advance feed has run (once per raster environment: on the first frame
-    // the atlas exists, and again after every seam-scale change — `last_seam` below re-arms it).
-    mut digits_fed: Local<bool>,
+    // The append-lane holes this pass parks for their UiQuadAppend producers, tupled for the
+    // same param-budget squeeze as `run`:
+    // · the `<Minimap>` widget slot (`minimap::emit_minimap` fills it with tile/arrow quads —
+    //   decision 0203 phase 1);
+    // · the autocast shine sites (`autocast_shine::emit_shine` draws the spark trails there —
+    //   decision 1383, B282).
+    mut parked: (
+        ResMut<crate::minimap::MinimapWidget>,
+        ResMut<crate::autocast_shine::ShineSites>,
+    ),
     // The seam scale the engine's text-metric caches were answered under. When `s` moves (window
     // resize / fullscreen toggle / uiScale change), every cached measure is stale — see the
     // invalidation below.
+    //
+    // Deliberately NOT a `VmMemo` (decision 1290's sweep): this is a fact about the RASTER, not
+    // about what the VM has been told, and it stays true across the VM's death and rebirth. A fresh
+    // VM has no cached measures to invalidate and no measurer at all, and the re-seat below already
+    // catches that on its own test (`!script.has_text_measurer()`).
     mut last_seam: Local<f32>,
+    // The `scale_factor` this pass last answered measures under — the other half of the same
+    // staleness edge (decision 1342). `0.0` until the first frame, which is also a real edge.
+    mut last_dpi: Local<f32>,
     // The uiScale dial folded into the seam scale (decision 0584).
     ui_scale: Res<super::UiScaleCvar>,
     // ── The extract gate's memory (decision 0740): last frame's conversion inputs ─────────────
-    // The conversion loop below is a pure function of (extracted, text_ui, window dims × seam
-    // scale, the portrait token map) — the glyph atlas bakes once at Startup and the sprite
-    // caches are monotone path→handle, so equal inputs reproduce the same `UiQuads` the diff
-    // would then discard. Capture mode never skips (the harness wants exact per-frame output,
-    // including the cursor-icon quad's live mouse position).
-    mut prev: Local<GateInputs>,
+    // The conversion loop below is a pure function of (extracted, text_ui, the RASTER
+    // ENVIRONMENT, the portrait token map, the glyph-sheet generation) — the sprite caches are
+    // monotone path→handle, so equal inputs reproduce the same `UiQuads` the diff would then
+    // discard. Capture mode never skips (the harness wants exact per-frame output, including the
+    // cursor-icon quad's live mouse position).
+    //
+    // The raster environment is window size × seam scale × **`scale_factor`**, and that last term
+    // is decision 1342's correction. A monitor hop at an unchanged window size moves nothing else
+    // in this list, but it changes the integer device-pixel size every glyph rasterizes at
+    // (`TextEngine::ppem`) — so the quads held from last frame are the wrong size and the gate
+    // must miss. (1339 caught the same hole through an atlas-bake counter, which was the right
+    // fix for a design where the atlas re-baked; there is nothing to re-bake now, so the term that
+    // survives is the one that actually moved.)
+    //
+    // The generation term is the glyph sheet RESETTING — the one event that moves a cached cell's
+    // UV, which happens when the sheet fills and is repacked from empty. Held quads carry the old
+    // UVs and would draw letters as fragments of other letters.
+    //
+    // A [`crate::ui_script::VmMemo`] because a skip is not only a quad-conversion skip: it also skips
+    // `set_link_spans` and the minimap-slot / booth-pane refills, which are pushes INTO the VM. The
+    // VM lives for one login (decision 1290), so a fresh VM must never be gated on what the previous
+    // one extracted — its first frame is always a real conversion.
+    mut prev: Local<crate::ui_script::VmMemo<GateInputs>>,
     // This frame's phase split, published for whoever asked (the `[ui-cost]` line, `hover_log`).
     mut ui_cost: ResMut<super::UiFrameCost>,
 ) {
@@ -97,6 +215,7 @@ pub(super) fn drive_script(
     let Some(mut script) = script else {
         return;
     };
+    let prev = prev.get(&script);
     let Ok(window) = window.single() else {
         return;
     };
@@ -116,12 +235,38 @@ pub(super) fn drive_script(
     // percent — enough that a boot-size measure fails the fullscreen fit test and the ellipsis
     // eats fitting text: the director's "Contr..." rows, reproduced by `WOW_RESIZE`). Declare the
     // staleness at the seam and let every round-trip re-answer under the new `s`.
-    if *last_seam != s {
+    //
+    // **The DPI is the other half of the same edge** (decision 1342). A logical height becomes an
+    // integer DEVICE-pixel raster size, so a monitor hop at an unchanged window size leaves `s`
+    // exactly where it was and still moves every measured width. (1296/1339 caught this through
+    // the atlas's bake generation, which followed the same two terms; with nothing to re-bake, the
+    // honest thing to watch is the term itself.)
+    let dpi = window.scale_factor();
+    let generation = font_atlas.as_deref().map(|a| a.generation);
+    let seam_moved = *last_seam != s || *last_dpi != dpi;
+    if seam_moved {
         if *last_seam != 0.0 {
             script.invalidate_text_measures();
-            *digits_fed = false;
         }
         *last_seam = s;
+        *last_dpi = dpi;
+    }
+    // …and re-seat the VM's own font engine at the same edge, for the same reason: an
+    // [`crate::ui_text::AtlasMeasurer`] answers only for the seam it was built under. This is what
+    // makes a `SetText` → `GetStringWidth` pair *inside one Lua update* return a real number
+    // instead of 0 — the reference answers that getter inline (`0x79e510` → `0x772890`), and the
+    // corpus writes it that way (`Bagnon_Forever/database/ui.lua:58-59`).
+    //
+    // Seated BEFORE the tick below, so the first update that runs already has it, and rebuilt only
+    // on the seam edge or the frame the atlas first exists — an `Arc` clone and an `f32`, never a
+    // per-frame cost.
+    if let Some(atlas) = font_atlas.as_deref() {
+        if seam_moved || !script.has_text_measurer() {
+            script.set_text_measurer(Box::new(crate::ui_text::AtlasMeasurer::new(
+                atlas.engine(),
+                s,
+            )));
+        }
     }
     // Phase spans (visible under `bevy/trace_chrome`): this system is the biggest flat CPU cost
     // on an idle frame, and the ledger can only rank what has a name — tick (Lua OnUpdate),
@@ -197,37 +342,6 @@ pub(super) fn drive_script(
     }
     let us_resolve = lap();
     let measure_span = bevy::log::info_span!("ui_script: measure").entered();
-    // The digit-advance feed (the synchronous half of the money layout's metrics): measure
-    // NumberFontNormal's '0'..'9' once per atlas scale and push them as `BENILLA_DIGIT_W`, so
-    // `BenillaMoney_Set` can size its coin slots to their numbers *inside* one update — the real
-    // SmallMoneyFrame's GetTextWidth-mid-update shrink (MoneyFrame.lua l.202-269), which the
-    // frame-late GetStringWidth round-trip below can't serve. The font pairing comes from the
-    // registered font object (Fonts.xml stays the single source of truth).
-    if let Some(atlas) = font_atlas.as_deref_mut() {
-        if !*digits_fed {
-            if let Some(number_font) = script.font_object("NumberFontNormal") {
-                let adv = crate::ui_text::digit_advances(
-                    atlas,
-                    crate::ui_text::FontSpec {
-                        path: number_font.font.as_deref(),
-                        // The one-to-one drawn px (cap inert at NumberFontNormal's 14) × the
-                        // virtual scale; the widths divide back to UI units below.
-                        height: crate::ui_text::drawn_px(number_font.height, None, s),
-                        // The TRUE outline (NumberFontNormal is NORMAL-outlined): it selects the
-                        // baked ring cell; only a THICK outline also biases the step law
-                        // (`outline-bake-tint.md`) — either way the fed digit widths match what
-                        // the render pass actually lays.
-                        outline: number_font.outline,
-                        paint_halo: true,
-                        alpha_gradient: None,
-                    },
-                );
-                let adv = adv.map(|a| a / s);
-                script.set_digit_advances(&adv);
-                *digits_fed = true;
-            }
-        }
-    }
     // The message-line half of the round-trip: chat ring lines ask for their wrapped ROW COUNT at
     // the frame's resolved width, so the emit pass can stack real content heights (a long line
     // pushes older lines up instead of overlapping them). Same-frame like the FontString half, but
@@ -239,7 +353,7 @@ pub(super) fn drive_script(
                 .iter()
                 .map(|r| {
                     let n = crate::ui_text::measure_wrapped_rows(
-                        atlas,
+                        &mut atlas.lock(),
                         &r.text,
                         // wrap_width is the RESOLVED frame width (scale already in it) — ×s only;
                         // the font height is frame-local — ×s × the frame's scale, the drawn size.
@@ -249,7 +363,6 @@ pub(super) fn drive_script(
                             // The band's own drawn px (one-to-one regime; inert ≤ 32).
                             height: crate::ui_text::drawn_px(r.height, None, s * r.scale),
                             outline: r.outline, // step-law width bias, as in the measures above
-                            paint_halo: true,   // measure never paints; irrelevant here
                             alpha_gradient: None,
                         },
                     );
@@ -261,6 +374,12 @@ pub(super) fn drive_script(
     }
     drop(measure_span);
     let us_measure = lap();
+    // The player's half of the error contract before the host's (decision 1305): every caught
+    // script error goes to the Lua error handler — `_ERRORMESSAGE` → the ScriptErrors dialog
+    // since BasicControls installs it, an addon's own handler if it chose one — and then the
+    // same errors drain to the log as always. Dispatch first so a handler that itself fails
+    // lands in this frame's drain, not the next one's.
+    script.dispatch_script_errors_to_handler();
     for err in script.take_errors() {
         warn!("ui_script: {err}");
     }
@@ -272,6 +391,9 @@ pub(super) fn drive_script(
     let mut out = Vec::new();
     let mut assets = world_assets;
     let mut minimap_slot = None;
+    // This frame's autocast shine sites (decision 1383) — refilled by the loop below like the
+    // minimap slot; the settled and spliced paths above keep last conversion's set.
+    let mut shine_sites: Vec<crate::autocast_shine::ShineSite> = Vec::new();
     // Hyperlink spans collected while rasterizing message-line Text quads (frame-targeted only —
     // chat lines; FontString-region links are a later arc), fed back to the engine's click
     // hit-test after the loop. Rects flip back to the engine's y-up space.
@@ -296,10 +418,9 @@ pub(super) fn drive_script(
                 // request's `scale` doc).
                 height: crate::ui_text::drawn_px(req.height, None, s * req.scale),
                 outline: req.outline,
-                paint_halo: true,     // measure never paints
                 alpha_gradient: None, // alpha never changes metrics
             };
-            let cum: Vec<f32> = crate::ui_text::line_advances(atlas, &req.text, spec)
+            let cum: Vec<f32> = crate::ui_text::line_advances(&mut atlas.lock(), &req.text, spec)
                 .iter()
                 .map(|a| a / s)
                 .collect();
@@ -308,7 +429,7 @@ pub(super) fn drive_script(
             // Advances/pitch return in UI units (÷s): the engine's click→index and row math
             // compare them against the ÷s mouse feed.
             let (rows, cell_h) = match req.wrap_width {
-                Some(w) => crate::ui_text::line_rows(atlas, &req.text, w * s, spec),
+                Some(w) => crate::ui_text::line_rows(&mut atlas.lock(), &req.text, w * s, spec),
                 None => (vec![0], 0.0),
             };
             script.set_editbox_advances(req.id, req.key, cum, rows, cell_h / s);
@@ -327,11 +448,13 @@ pub(super) fn drive_script(
     // Every input the conversion below reads, compared against last frame's. Equal inputs make
     // the loop a pure re-derivation of `UiQuads` the diff at the bottom would discard — at the
     // LBRS pin that was every single settled frame, ~0.3 ms/frame of glyph re-rasterization for
-    // an identical `Vec`. On a skip, `quads`/`minimap_widget`/the engine's link spans all keep
-    // last frame's values, which the equal inputs prove are this frame's values too.
-    let dims = (w.to_bits(), h.to_bits(), s.to_bits());
+    // an identical `Vec`. On a skip, `quads`/the parked minimap slot and shine sites/the
+    // engine's link spans all keep last frame's values, which the equal inputs prove are this
+    // frame's values too.
+    let dims = (w.to_bits(), h.to_bits(), s.to_bits(), dpi.to_bits());
     let settled = capture.is_none()
         && prev.dims == Some(dims)
+        && prev.generation == generation
         && text_ui == prev.text_ui
         && booths.images.0 == prev.portraits
         && extracted == prev.extracted;
@@ -352,6 +475,7 @@ pub(super) fn drive_script(
                 quads: quads.quads.len(),
                 solves,
                 skipped: true,
+                spliced: 0,
             };
         }
         if printing {
@@ -365,7 +489,192 @@ pub(super) fn drive_script(
         }
         return;
     }
+    // `WOW_UI_GATE=1` — why the gate MISSED. A skip is worth the whole conversion, so the
+    // question "what moved?" is where a per-frame cost always ends, and a `Vec` inequality does
+    // not answer it. Off by default, like the `[ui-cost]` meter beside it.
+    if gate_log_enabled() {
+        report_gate_miss(
+            &script,
+            &extracted,
+            &prev.extracted,
+            prev.dims == Some(dims),
+            prev.generation == generation,
+            text_ui == prev.text_ui,
+            booths.images.0 == prev.portraits,
+        );
+    }
+    // ── The per-entry splice: 1361's shape one layer up ──────────────────────────────────────
+    // The gate above is all-or-nothing, so ONE animating entry (the resting blink, a sweeping
+    // cooldown) used to re-convert the whole interface every frame. When the only input that
+    // moved is the extracted list itself, the lists are index-aligned (same length — the
+    // traversal is stable when nothing was created/destroyed/restacked), few entries differ,
+    // and every differing entry converts to nothing but quads (no link spans, no minimap slot,
+    // no booth panes), the changed entries re-convert alone — through the same [`convert_entry`]
+    // body, which is what makes the spliced output equal the full path's by construction — and
+    // stitch into last frame's `UiQuads` at the ranges `prev.spans` remembers. Everything else
+    // (the side channels, the panes map, the engine's link spans) keeps last frame's values,
+    // which the unchanged entries prove are this frame's too: the settled path's own argument,
+    // applied per entry.
+    'splice: {
+        if capture.is_some()
+            || ui_diff_enabled()
+            || prev.dims != Some(dims)
+            || prev.generation != generation
+            || text_ui != prev.text_ui
+            || booths.images.0 != prev.portraits
+            || prev.extracted.len() != extracted.len()
+            || prev.spans.len() != extracted.len()
+            // spans describe `quads.quads` — if any future writer replaces the base lane out
+            // from under this pass, degrade to the full conversion instead of mis-stitching.
+            || prev.spans.last().copied().unwrap_or(0) as usize != quads.quads.len()
+        {
+            break 'splice;
+        }
+        // The changed entry set, bounded: a real UI transition (a window opening) moves many
+        // entries, and the full conversion is the right tool there anyway.
+        const SPLICE_MAX: usize = 8;
+        let mut changed: Vec<usize> = Vec::with_capacity(SPLICE_MAX);
+        for (i, (now, was)) in extracted.iter().zip(&prev.extracted).enumerate() {
+            if now != was {
+                if changed.len() == SPLICE_MAX {
+                    break 'splice;
+                }
+                changed.push(i);
+            }
+        }
+        // The all-equal case belongs to the settled gate above; reaching here empty means a
+        // comparison razor slipped — take the full path rather than risk skipping a change.
+        if changed.is_empty() {
+            break 'splice;
+        }
+        // Only entries whose conversion writes quads alone are spliceable — old AND new: an
+        // entry morphing into a side-channel kind must reach the full path's plumbing. The
+        // autocast-shine token (decision 1383) is a side-channel kind wearing a Texture's
+        // clothes, so it is excluded by path.
+        let simple = |eq: &benilla_ui::script::ExtractedQuad| match &eq.content {
+            QuadContent::Frame | QuadContent::Cooldown { .. } | QuadContent::Backdrop { .. } => {
+                true
+            }
+            QuadContent::Texture {
+                portrait_unit: None,
+                path,
+                ..
+            } => !path
+                .as_deref()
+                .is_some_and(|p| crate::autocast_shine::token_model_scale(p).is_some()),
+            _ => false,
+        };
+        if !changed
+            .iter()
+            .all(|&i| simple(&extracted[i]) && simple(&prev.extracted[i]))
+        {
+            break 'splice;
+        }
+        // Re-convert just the changed entries. The scratch side channels are a tripwire:
+        // `simple` makes them unreachable today, and if an arm ever grows a new side effect
+        // the full path is the only safe answer.
+        let mut scratch: Vec<UiQuad> = Vec::new();
+        let mut scratch_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(changed.len());
+        let mut scratch_links = Vec::new();
+        let mut scratch_slot = None;
+        let mut scratch_shine = Vec::new();
+        for &i in &changed {
+            let at = scratch.len();
+            convert_entry(
+                extracted[i].clone(),
+                s,
+                w,
+                h,
+                &mut assets,
+                &mut images,
+                &mut font_atlas,
+                &mut booths,
+                text_ui.as_ref(),
+                false,
+                &mut scratch,
+                &mut scratch_links,
+                &mut scratch_slot,
+                &mut scratch_shine,
+            );
+            scratch_ranges.push(at..scratch.len());
+        }
+        if !scratch_links.is_empty() || scratch_slot.is_some() || !scratch_shine.is_empty() {
+            break 'splice;
+        }
+        let counts_stable = changed.iter().zip(&scratch_ranges).all(|(&i, r)| {
+            let (a, b) = span_bounds(&prev.spans, i);
+            b - a == r.len()
+        });
+        let mut dirtied = false;
+        if counts_stable {
+            // The blink's shape — same quad count, new bytes: write the spans in place.
+            for (&i, r) in changed.iter().zip(&scratch_ranges) {
+                let (a, b) = span_bounds(&prev.spans, i);
+                if quads.quads[a..b] != scratch[r.clone()] {
+                    quads.quads[a..b].clone_from_slice(&scratch[r.clone()]);
+                    dirtied = true;
+                }
+            }
+        } else {
+            // An entry's quad count moved: stitch a fresh list from the kept spans plus the
+            // re-converted ones, and re-derive the span table.
+            let mut new_out: Vec<UiQuad> = Vec::with_capacity(quads.quads.len() + scratch.len());
+            let mut new_spans: Vec<u32> = Vec::with_capacity(prev.spans.len());
+            let mut ci = 0;
+            for i in 0..extracted.len() {
+                if ci < changed.len() && changed[ci] == i {
+                    new_out.extend_from_slice(&scratch[scratch_ranges[ci].clone()]);
+                    ci += 1;
+                } else {
+                    let (a, b) = span_bounds(&prev.spans, i);
+                    new_out.extend_from_slice(&quads.quads[a..b]);
+                }
+                new_spans.push(new_out.len() as u32);
+            }
+            prev.spans = new_spans;
+            quads.quads = new_out;
+            dirtied = true;
+        }
+        if dirtied {
+            quads.dirty = true;
+        }
+        for &i in &changed {
+            prev.extracted[i] = extracted[i].clone();
+        }
+        drop(extract_span);
+        let us_spl = lap();
+        if cost_on {
+            let solves = script.layout_solves() - solves_before.unwrap_or(0);
+            *ui_cost = super::UiFrameCost {
+                measured: ui_cost.measured,
+                measured_texts: std::mem::take(&mut ui_cost.measured_texts),
+                tick: us_tick,
+                resolve: us_resolve,
+                measure: us_measure,
+                extract: us_exm,
+                convert: us_spl,
+                diff: 0,
+                quads: quads.quads.len(),
+                solves,
+                skipped: false,
+                spliced: changed.len(),
+            };
+        }
+        if printing {
+            let solves = script.layout_solves() - solves_before.unwrap_or(0);
+            eprintln!(
+                "[ui-cost] tick={us_tick} resolve={us_resolve} measure={us_measure} \
+                 exm={us_exm} exa={us_spl} diff=0 eq={n_extracted} quads={} \
+                 solves={solves} changed={} skip=0 spliced={}",
+                quads.quads.len(),
+                u8::from(dirtied),
+                changed.len()
+            );
+        }
+        return;
+    }
     prev.dims = Some(dims);
+    prev.generation = generation;
     prev.text_ui = text_ui.clone();
     prev.portraits = booths.images.0.clone();
     prev.extracted = extracted.clone();
@@ -374,262 +683,27 @@ pub(super) fn drive_script(
     // is still this frame's truth — clearing it above the gate would make every quiet frame put the
     // body panes' cameras to sleep and freeze their animation.
     booths.panes.0.clear();
+    let mut spans: Vec<u32> = Vec::with_capacity(prev.extracted.len());
     for eq in extracted {
-        let Some(r) = eq.rect else { continue };
-        // WoW UI space is y-up from the bottom-left in 768-virtual units; the quad pass is
-        // y-down window px from the top-left — scale ×s, then flip through the window height.
-        let rect = Rect::new(r.left * s, h - r.top * s, r.right * s, h - r.bottom * s);
-        // The ScrollFrame clip (decision 0112), through the same conversion as `rect` —
-        // `UiQuad::clip` is the CPU-clip stand-in `ui_pass` already applies uniformly to
-        // every quad (texture, backdrop, and glyph alike), so this is the entire app-side plumb.
-        let clip = eq
-            .clip
-            .map(|c| Rect::new(c.left * s, h - c.top * s, c.right * s, h - c.bottom * s));
-        match eq.content {
-            // Frames draw nothing themselves in v1 (regions carry the visuals).
-            QuadContent::Frame => continue,
-            // The `<Minimap>` widget's content hole: parked for the minimap renderer (an
-            // UiQuadAppend producer), which fills it at this exact z — the widget slot itself
-            // emits nothing here (decision 0203 phase 1).
-            QuadContent::Minimap { zoom, inside_zoom } => {
-                minimap_slot = Some(crate::minimap::MinimapSlot {
-                    rect,
-                    z: eq.z,
-                    zoom,
-                    inside_zoom,
-                    alpha: eq.alpha,
-                });
-                continue;
-            }
-            // The Cooldown widget's pie wipe + finish flash (decision 0137 phase 4) — the
-            // byte-pinned look of `UI-Cooldown-Indicator.m2`, rebuilt natively (see
-            // [`cooldown_quads`]).
-            QuadContent::Cooldown { fraction, flash } => {
-                cooldown_quads(
-                    rect,
-                    eq.z,
-                    eq.alpha,
-                    fraction,
-                    flash,
-                    clip,
-                    &mut assets,
-                    &mut images,
-                    &mut out,
-                );
-                continue;
-            }
-            QuadContent::Texture {
-                path,
-                color,
-                additive,
-                tex_coords,
-                circular,
-                portrait_unit,
-                rotation,
-            } => {
-                // A live unit portrait (`SetPortraitTexture(region, unit)`): sample this token's
-                // source ([`crate::portrait::PortraitImages`]) — the off-screen model bake, or the
-                // ref's 2D TemporaryPortrait stand-in while the model streams in. Absent entry (no
-                // booth yet) draws nothing rather than the run-splitter's white default.
-                if let Some(token) = &portrait_unit {
-                    use crate::portrait::PortraitSource;
-                    // A **square** binding is a booth pane (`BenillaSetBoothTexture`, decision
-                    // 0208 §5), not a round unit portrait: publish the rect's aspect so the booth
-                    // can bake at the shape it will be stretched into, and know it is on screen at
-                    // all (decision 1069). Recorded before the readiness `continue` below — a pane
-                    // whose bake hasn't landed yet is still a pane being drawn. The region's rect
-                    // is the whole answer because no pane crops its bake; a pane that grew
-                    // `<TexCoords>` would have to fold that UV window in here too.
-                    if !circular && rect.height() > 0.0 {
-                        booths
-                            .panes
-                            .0
-                            .insert(token.clone(), rect.width() / rect.height());
-                    }
-                    let handle = match booths.images.0.get(token) {
-                        Some(PortraitSource::Live(h)) => Some(h.clone()),
-                        Some(PortraitSource::File(p)) => assets
-                            .as_mut()
-                            .and_then(|a| a.sprite_texture(p, &mut images)),
-                        None => None,
-                    };
-                    let Some(handle) = handle else {
-                        continue;
-                    };
-                    out.push(UiQuad {
-                        rect,
-                        z_key: eq.z,
-                        texture: Some(handle),
-                        // A portrait binding honours `<TexCoords>`/`SetTexCoord` like any other
-                        // texture region — the bake is just the sampled image. The ref crops one
-                        // this way: the character micro button samples the same portrait slot as
-                        // the unit frame through a narrow (0.2..0.8, 0.0666..0.9) window, and
-                        // swaps that window when the button is pushed. This branch used to pin
-                        // UvRect::FULL, which silently squashed the whole square bake into
-                        // whatever rect the region had.
-                        uv: match tex_coords {
-                            Some(TexCoords::Rect(edges)) => UvRect::from_tex_coords(edges),
-                            Some(TexCoords::Corners(corners)) => UvRect::from_corners(corners),
-                            None => UvRect::FULL,
-                        },
-                        color: [1.0, 1.0, 1.0, eq.alpha],
-                        // The binding's mask flag: `SetPortraitTexture` regions cut the inscribed
-                        // circle (the ref stamps the same shape into its 64² bake's alpha — and
-                        // rounds the square stand-in art the same way); `BenillaSetBoothTexture`
-                        // (the paper-doll model pane, decision 0208 §5) samples the bake square.
-                        circular,
-                        clip,
-                        ..default()
-                    });
-                    continue;
-                }
-                // An unset texture region (no file, no color — e.g. a cleared icon) draws nothing;
-                // defaulting it to white would paint phantom quads.
-                if path.is_none() && color.is_none() {
-                    continue;
-                }
-                // A portrait region samples the circular-masked variant so the square icon/model
-                // doesn't poke past the frame ring's thin band (SetPortraitToTexture, decision 0084).
-                //
-                // A path the archives don't have draws **nothing** — never a white slab. This arm
-                // used to fall through to `color.unwrap_or(WHITE)` with a `None` texture, which
-                // `ui_pass` renders as the shared 1×1 white image tinted white: an opaque white
-                // rectangle at the region's rect, which is how B221's macro icons reached the
-                // director's screen. wow-re settles what the reference does: `TextureCreate` does
-                // build an 8×8 placeholder, but `CSimpleTexture::SetTexture` (`0x770200`) checks the
-                // status severity and at ≥2 releases it and returns **without touching the widget's
-                // texture** — the widget keeps what it had, and Lua gets `nil`. Nothing goes white.
-                // We can't keep the *previous* art (a path is re-resolved per frame at extract, not
-                // latched at `SetTexture`), so the faithful-enough result is an empty cell; what
-                // matters is that it is never a phantom quad. The `Backdrop` and live-portrait arms
-                // already guard exactly this way.
-                //
-                // `assets` missing ENTIRELY is a data-less run (the headless UI tests), not a bad
-                // path — those keep the old behaviour rather than blanking every textured quad.
-                let handle = match (path.as_deref(), assets.as_mut()) {
-                    (Some(p), Some(a)) => {
-                        let resolved = if circular {
-                            a.portrait_texture(p, &mut images)
-                        } else {
-                            a.sprite_texture(p, &mut images)
-                        };
-                        if resolved.is_none() {
-                            continue;
-                        }
-                        resolved
-                    }
-                    _ => None,
-                };
-                // A pathless Texture region is a solid color; a textured one tints by it.
-                let mut color = color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
-                color[3] *= eq.alpha;
-                // `<TexCoords>`/`SetTexCoord` slices the sampled sub-rect. The 4-edge form
-                // `[left,right,top,bottom]` maps to raw UV corners (`left→u0, right→u1, top→v0,
-                // bottom→v1`) — carried through [`UvRect`] rather than a normalized `Rect` so a
-                // mirrored slice (`left>right`, e.g. PlayerFrameTexture) keeps its flip to the
-                // vertex buffer. The 8-arg affine form is already per-corner in the `push_quad`
-                // winding (the route-line quads). Absent = the full texture.
-                let uv = match tex_coords {
-                    Some(TexCoords::Rect(edges)) => UvRect::from_tex_coords(edges),
-                    Some(TexCoords::Corners(corners)) => UvRect::from_corners(corners),
-                    None => UvRect::FULL,
-                };
-                out.push(UiQuad {
-                    rect,
-                    z_key: eq.z,
-                    texture: handle,
-                    uv,
-                    color,
-                    additive,
-                    clip,
-                    // The engine's SetRotation is counterclockwise-positive; the quad pass spins
-                    // clockwise-on-screen (`UiQuad::rotation`) — negate to convert.
-                    rotation: -rotation,
-                    ..default()
-                });
-            }
-            QuadContent::Backdrop {
-                path,
-                color,
-                uvs,
-                tile,
-            } => {
-                // A frame Backdrop piece (bg or one of the 8 border pieces). Repeat-sampled when
-                // `tile` (edges tile past UV 1; a tiled bg wraps) — its own GPU image + cache
-                // (`sprite_texture_tiled`) since clamp/repeat bake into the `Image`. The four UVs are
-                // explicit per-corner (the rotated TOP/BOTTOM edges), so they go straight to `UvRect`.
-                let handle = assets.as_mut().and_then(|a| {
-                    if tile {
-                        a.sprite_texture_tiled(&path, &mut images)
-                    } else {
-                        a.sprite_texture(&path, &mut images)
-                    }
-                });
-                // No texture (missing BLP) ⇒ draw nothing rather than a phantom solid quad.
-                let Some(handle) = handle else { continue };
-                let mut color = color;
-                color[3] *= eq.alpha;
-                out.push(UiQuad {
-                    rect,
-                    z_key: eq.z,
-                    texture: Some(handle),
-                    uv: UvRect::from_corners(uvs),
-                    color,
-                    clip,
-                    ..default()
-                });
-            }
-            QuadContent::Text {
-                text,
-                color,
-                justify_h,
-                justify_v,
-                font,
-                font_height,
-                text_height,
-                shadow,
-                outline,
-                alpha_gradient,
-            } => {
-                // No atlas (no client data / Friz Quadrata unreadable — see `ui_text`'s startup
-                // system) means text simply doesn't render, same graceful-absence posture as a
-                // missing `WorldAssets`. The rasterization itself (editbox window, ellipsis,
-                // shadow, links, caret) lives in `text::emit`.
-                let (Some(atlas), Some(text)) = (font_atlas.as_deref_mut(), text) else {
-                    continue;
-                };
-                text::emit(
-                    atlas,
-                    &text,
-                    text::TextStyle {
-                        color,
-                        justify_h,
-                        justify_v,
-                        font,
-                        font_height,
-                        text_height,
-                        shadow,
-                        outline,
-                        alpha_gradient,
-                    },
-                    text::TextHost {
-                        z: eq.z,
-                        alpha: eq.alpha,
-                        target: eq.target,
-                        rect,
-                        clip,
-                        ebox: text_ui.as_ref(),
-                        screen_h: h,
-                        scale: s,
-                        font_scale: eq.scale,
-                        caret_pinned: capture.is_some(),
-                    },
-                    &mut out,
-                    &mut link_spans,
-                );
-            }
-        }
+        convert_entry(
+            eq,
+            s,
+            w,
+            h,
+            &mut assets,
+            &mut images,
+            &mut font_atlas,
+            &mut booths,
+            text_ui.as_ref(),
+            capture.is_some(),
+            &mut out,
+            &mut link_spans,
+            &mut minimap_slot,
+            &mut shine_sites,
+        );
+        spans.push(out.len() as u32);
     }
+    prev.spans = spans;
     // The payload held on the cursor draws last (a 32×32 icon at the mouse, over the whole UI) —
     // but ONLY in capture mode (decision 0216 §5): a normal run shows it as the hardware cursor
     // instead (`crate::cursor`), which can't appear in a screenshot's pixels, so the quad is the
@@ -659,9 +733,11 @@ pub(super) fn drive_script(
     // (`OnHyperlinkClick`) hit-tests against exactly what is on screen.
     script.set_link_spans(link_spans);
 
-    // Park this frame's Minimap widget slot (or clear it — a hidden cluster extracts nothing);
-    // `minimap::emit_minimap` runs later in the frame (UiQuadAppend) and fills the hole.
-    minimap_widget.0 = minimap_slot;
+    // Park this frame's Minimap widget slot and autocast shine sites (or clear them — a hidden
+    // cluster extracts nothing); `minimap::emit_minimap` / `autocast_shine::emit_shine` run
+    // later in the frame (UiQuadAppend) and fill the holes.
+    parked.0 .0 = minimap_slot;
+    parked.1 .0 = shine_sites;
     drop(extract_span);
     let us_exa = lap();
 
@@ -669,6 +745,28 @@ pub(super) fn drive_script(
     let n_quads = out.len();
     let changed = quads.quads != out;
     if changed {
+        // `WOW_UI_DIFF=1` — the base-lane half of the rebuild-trigger probe (`ui_pass`' twin):
+        // names the first Lua-UI quad that differs from last frame's extraction.
+        if ui_diff_enabled() {
+            match quads.quads.iter().zip(&out).position(|(a, b)| a != b) {
+                Some(i) => {
+                    let (b, a) = (&quads.quads[i], &out[i]);
+                    eprintln!(
+                        "[ui-diff-base] quad {i}/{n_quads}: tex={:?} rect {:?} -> {:?} uv_changed={} color_changed={}",
+                        a.texture.as_ref().and_then(|t| t.path()),
+                        b.rect,
+                        a.rect,
+                        a.uv != b.uv,
+                        a.color != b.color,
+                    );
+                }
+                None => eprintln!(
+                    "[ui-diff-base] quad COUNT changed: {} -> {}",
+                    quads.quads.len(),
+                    out.len()
+                ),
+            }
+        }
         quads.quads = out;
         quads.dirty = true;
     }
@@ -687,6 +785,7 @@ pub(super) fn drive_script(
             quads: n_quads,
             solves,
             skipped: false,
+            spliced: 0,
         };
         if printing {
             eprintln!(
@@ -694,6 +793,333 @@ pub(super) fn drive_script(
                  exm={us_exm} exa={us_exa} diff={us_diff} eq={n_extracted} quads={n_quads} \
                  solves={solves} changed={} skip=0",
                 u8::from(changed)
+            );
+        }
+    }
+}
+
+/// One extracted entry converted to its screen quads, pushed onto `out` — with the side channels
+/// some arms carry: chat link spans (Text), the minimap widget slot (Minimap), the booth pane
+/// aspects (portrait-bound Texture), the autocast shine sites (the token-path Texture, decision
+/// 1383). The ONE conversion body: the full pass and the per-entry
+/// splice both call this, which is what makes the splice's output equal the full path's by
+/// construction. An arm is splice-eligible only if it writes nothing but `out` — keep
+/// [`splice_simple`] in agreement when an arm's side effects change.
+#[allow(clippy::too_many_arguments)] // the conversion's whole environment, threaded explicitly
+fn convert_entry(
+    eq: benilla_ui::script::ExtractedQuad,
+    s: f32,
+    // The window, logical px. `h` flips y-up WoW space into the y-down quad pass; `w` is here for
+    // the one producer whose law is in SCREEN pixels rather than FrameXML units — the autocast
+    // shine's particle size, which the reference projects by the screen diagonal (decision 1390).
+    w: f32,
+    h: f32,
+    assets: &mut Option<ResMut<WorldAssets>>,
+    images: &mut Assets<Image>,
+    font_atlas: &mut Option<ResMut<UiFontAtlas>>,
+    booths: &mut crate::portrait::BoothBridge,
+    text_ui: Option<&benilla_ui::script::EditBoxTextUi>,
+    caret_pinned: bool,
+    out: &mut Vec<UiQuad>,
+    link_spans: &mut Vec<(
+        benilla_ui::widget::FrameHandle,
+        benilla_ui::layout::Rect,
+        String,
+        String,
+    )>,
+    minimap_slot: &mut Option<crate::minimap::MinimapSlot>,
+    shine_sites: &mut Vec<crate::autocast_shine::ShineSite>,
+) {
+    let Some(r) = eq.rect else { return };
+    // WoW UI space is y-up from the bottom-left in 768-virtual units; the quad pass is
+    // y-down window px from the top-left — scale ×s, then flip through the window height.
+    let rect = Rect::new(r.left * s, h - r.top * s, r.right * s, h - r.bottom * s);
+    // The ScrollFrame clip (decision 0112), through the same conversion as `rect` —
+    // `UiQuad::clip` is the CPU-clip stand-in `ui_pass` already applies uniformly to
+    // every quad (texture, backdrop, and glyph alike), so this is the entire app-side plumb.
+    let clip = eq
+        .clip
+        .map(|c| Rect::new(c.left * s, h - c.top * s, c.right * s, h - c.bottom * s));
+    match eq.content {
+        // Frames draw nothing themselves in v1 (regions carry the visuals).
+        QuadContent::Frame => {}
+        // The `<Minimap>` widget's content hole: parked for the minimap renderer (an
+        // UiQuadAppend producer), which fills it at this exact z — the widget slot itself
+        // emits nothing here (decision 0203 phase 1).
+        QuadContent::Minimap { zoom, inside_zoom } => {
+            *minimap_slot = Some(crate::minimap::MinimapSlot {
+                rect,
+                z: eq.z,
+                zoom,
+                inside_zoom,
+                alpha: eq.alpha,
+            });
+        }
+        // The Cooldown widget's pie wipe + finish flash (decision 0137 phase 4) — the
+        // byte-pinned look of `UI-Cooldown-Indicator.m2`, rebuilt natively (see
+        // [`cooldown_quads`]).
+        QuadContent::Cooldown { fraction, flash } => {
+            cooldown_quads(
+                rect, eq.z, eq.alpha, fraction, flash, clip, assets, images, out,
+            );
+        }
+        QuadContent::Texture {
+            path,
+            color,
+            additive,
+            tex_coords,
+            circular,
+            portrait_unit,
+            rotation,
+            desaturated,
+        } => {
+            // The autocast-shine token (decision 1383, B282): a shown marker registers WHERE the
+            // shine plays — rect, paint order, clip, alpha, and the star art resolved through
+            // the same resolver as any texture — and draws nothing itself;
+            // `autocast_shine::emit_shine` (UiQuadAppend) animates the sparks there with zero
+            // per-frame script-layout traffic. A side-channel arm, so deliberately NOT
+            // splice-simple (the `simple` predicate above excludes the token by path).
+            if let Some(model_scale) = path
+                .as_deref()
+                .and_then(crate::autocast_shine::token_model_scale)
+            {
+                // A no-assets context (the extract test harness; a capture booted without the
+                // archive) records the site with the default handle — the site's GEOMETRY is
+                // the registration, and the live app always has the resolver.
+                let star = assets
+                    .as_mut()
+                    .and_then(|a| a.sprite_texture(crate::autocast_shine::STAR_TEXTURE, images))
+                    .unwrap_or_default();
+                shine_sites.push(crate::autocast_shine::ShineSite {
+                    rect,
+                    z: eq.z,
+                    clip,
+                    alpha: eq.alpha,
+                    scale: s,
+                    model_scale,
+                    diag: (w * w + h * h).sqrt(),
+                    texture: star,
+                });
+                return;
+            }
+            // A live unit portrait (`SetPortraitTexture(region, unit)`): sample this token's
+            // source ([`crate::portrait::PortraitImages`]) — the off-screen model bake, or the
+            // ref's 2D TemporaryPortrait stand-in while the model streams in. Absent entry (no
+            // booth yet) draws nothing rather than the run-splitter's white default.
+            if let Some(token) = &portrait_unit {
+                use crate::portrait::PortraitSource;
+                // A **square** binding is a booth pane (`BenillaSetBoothTexture`, decision
+                // 0208 §5), not a round unit portrait: publish the rect's aspect so the booth
+                // can bake at the shape it will be stretched into, and know it is on screen at
+                // all (decision 1069). Recorded before the readiness `continue` below — a pane
+                // whose bake hasn't landed yet is still a pane being drawn. The region's rect
+                // is the whole answer because no pane crops its bake; a pane that grew
+                // `<TexCoords>` would have to fold that UV window in here too.
+                if !circular && rect.height() > 0.0 {
+                    booths
+                        .panes
+                        .0
+                        .insert(token.clone(), rect.width() / rect.height());
+                }
+                // The bake is a render target and carries PREMULTIPLIED colour; the 2D stand-in
+                // is an ordinary straight-alpha BLP. The quad pass has to be told which, or it
+                // premultiplies the bake a second time and erases every effect the pane draws
+                // over empty space (see [`crate::ui_pass::UiQuad::premultiplied`]).
+                let (handle, premultiplied) = match booths.images.0.get(token) {
+                    Some(PortraitSource::Live(h)) => (Some(h.clone()), true),
+                    Some(PortraitSource::File(p)) => (
+                        assets.as_mut().and_then(|a| a.sprite_texture(p, images)),
+                        false,
+                    ),
+                    None => (None, false),
+                };
+                let Some(handle) = handle else {
+                    return;
+                };
+                out.push(UiQuad {
+                    rect,
+                    z_key: eq.z,
+                    texture: Some(handle),
+                    // A portrait binding honours `<TexCoords>`/`SetTexCoord` like any other
+                    // texture region — the bake is just the sampled image. The ref crops one
+                    // this way: the character micro button samples the same portrait slot as
+                    // the unit frame through a narrow (0.2..0.8, 0.0666..0.9) window, and
+                    // swaps that window when the button is pushed. This branch used to pin
+                    // UvRect::FULL, which silently squashed the whole square bake into
+                    // whatever rect the region had.
+                    uv: match tex_coords {
+                        Some(TexCoords::Rect(edges)) => UvRect::from_tex_coords(edges),
+                        Some(TexCoords::Corners(corners)) => UvRect::from_corners(corners),
+                        None => UvRect::FULL,
+                    },
+                    color: [1.0, 1.0, 1.0, eq.alpha],
+                    // The binding's mask flag: `SetPortraitTexture` regions cut the inscribed
+                    // circle (the ref stamps the same shape into its 64² bake's alpha — and
+                    // rounds the square stand-in art the same way); `BenillaSetBoothTexture`
+                    // (the paper-doll model pane, decision 0208 §5) samples the bake square.
+                    circular,
+                    premultiplied,
+                    clip,
+                    ..default()
+                });
+                return;
+            }
+            // An unset texture region (no file, no color — e.g. a cleared icon) draws nothing;
+            // defaulting it to white would paint phantom quads.
+            if path.is_none() && color.is_none() {
+                return;
+            }
+            // A portrait region samples the circular-masked variant so the square icon/model
+            // doesn't poke past the frame ring's thin band (SetPortraitToTexture, decision 0084).
+            //
+            // A path the archives don't have draws **nothing** — never a white slab. This arm
+            // used to fall through to `color.unwrap_or(WHITE)` with a `None` texture, which
+            // `ui_pass` renders as the shared 1×1 white image tinted white: an opaque white
+            // rectangle at the region's rect, which is how B221's macro icons reached the
+            // director's screen. wow-re settles what the reference does: `TextureCreate` does
+            // build an 8×8 placeholder, but `CSimpleTexture::SetTexture` (`0x770200`) checks the
+            // status severity and at ≥2 releases it and returns **without touching the widget's
+            // texture** — the widget keeps what it had, and Lua gets `nil`. Nothing goes white.
+            // We can't keep the *previous* art (a path is re-resolved per frame at extract, not
+            // latched at `SetTexture`), so the faithful-enough result is an empty cell; what
+            // matters is that it is never a phantom quad. The `Backdrop` and live-portrait arms
+            // already guard exactly this way.
+            //
+            // `assets` missing ENTIRELY is a data-less run (the headless UI tests), not a bad
+            // path — those keep the old behaviour rather than blanking every textured quad.
+            let handle = match (path.as_deref(), assets.as_mut()) {
+                (Some(p), Some(a)) => {
+                    let resolved = if circular {
+                        a.portrait_texture(p, images)
+                    } else {
+                        a.sprite_texture(p, images)
+                    };
+                    if resolved.is_none() {
+                        return;
+                    }
+                    resolved
+                }
+                _ => None,
+            };
+            // A pathless Texture region is a solid color; a textured one tints by it.
+            let mut color = color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            color[3] *= eq.alpha;
+            // `<TexCoords>`/`SetTexCoord` slices the sampled sub-rect. The 4-edge form
+            // `[left,right,top,bottom]` maps to raw UV corners (`left→u0, right→u1, top→v0,
+            // bottom→v1`) — carried through [`UvRect`] rather than a normalized `Rect` so a
+            // mirrored slice (`left>right`, e.g. PlayerFrameTexture) keeps its flip to the
+            // vertex buffer. The 8-arg affine form is already per-corner in the `push_quad`
+            // winding (the route-line quads). Absent = the full texture.
+            let uv = match tex_coords {
+                Some(TexCoords::Rect(edges)) => UvRect::from_tex_coords(edges),
+                Some(TexCoords::Corners(corners)) => UvRect::from_corners(corners),
+                None => UvRect::FULL,
+            };
+            out.push(UiQuad {
+                rect,
+                z_key: eq.z,
+                texture: handle,
+                uv,
+                color,
+                additive,
+                clip,
+                // The engine's SetRotation is counterclockwise-positive; the quad pass spins
+                // clockwise-on-screen (`UiQuad::rotation`) — negate to convert.
+                rotation: -rotation,
+                desaturated,
+                ..default()
+            });
+        }
+        QuadContent::Backdrop {
+            path,
+            color,
+            uvs,
+            tile,
+        } => {
+            // A frame Backdrop piece (bg or one of the 8 border pieces). Repeat-sampled when
+            // `tile` (edges tile past UV 1; a tiled bg wraps) — its own GPU image + cache
+            // (`sprite_texture_tiled`) since clamp/repeat bake into the `Image`. The four UVs are
+            // explicit per-corner (the rotated TOP/BOTTOM edges), so they go straight to `UvRect`.
+            let handle = assets.as_mut().and_then(|a| {
+                if tile {
+                    a.sprite_texture_tiled(&path, images)
+                } else {
+                    a.sprite_texture(&path, images)
+                }
+            });
+            // No texture (missing BLP) ⇒ draw nothing rather than a phantom solid quad.
+            let Some(handle) = handle else { return };
+            // The 8 border pieces share one atlas, so bilinear at a piece's own edge blends in the
+            // NEIGHBOURING piece's first column unless the UVs are pulled half a texel inward
+            // (1402). `tile` is exactly the border-piece predicate here — every one of the 8 sets
+            // it, and a stretched bg (the only `tile: false` piece) is a whole texture, not a
+            // slice of one, so it is left alone.
+            let uvs = match images.get(&handle) {
+                Some(img) if tile => {
+                    let sz = img.texture_descriptor.size;
+                    benilla_ui::script::inset_atlas_bleed(uvs, sz.width as f32, sz.height as f32)
+                }
+                _ => uvs,
+            };
+            let mut color = color;
+            color[3] *= eq.alpha;
+            out.push(UiQuad {
+                rect,
+                z_key: eq.z,
+                texture: Some(handle),
+                uv: UvRect::from_corners(uvs),
+                color,
+                clip,
+                ..default()
+            });
+        }
+        QuadContent::Text {
+            text,
+            color,
+            justify_h,
+            justify_v,
+            font,
+            font_height,
+            text_height,
+            shadow,
+            outline,
+            alpha_gradient,
+        } => {
+            // No atlas (no client data / Friz Quadrata unreadable — see `ui_text`'s startup
+            // system) means text simply doesn't render, same graceful-absence posture as a
+            // missing `WorldAssets`. The rasterization itself (editbox window, ellipsis,
+            // shadow, links, caret) lives in `text::emit`.
+            let (Some(atlas), Some(text)) = (font_atlas.as_deref_mut(), text) else {
+                return;
+            };
+            text::emit(
+                atlas,
+                &text,
+                text::TextStyle {
+                    color,
+                    justify_h,
+                    justify_v,
+                    font,
+                    font_height,
+                    text_height,
+                    shadow,
+                    outline,
+                    alpha_gradient,
+                },
+                text::TextHost {
+                    z: eq.z,
+                    alpha: eq.alpha,
+                    target: eq.target,
+                    rect,
+                    clip,
+                    ebox: text_ui,
+                    screen_h: h,
+                    scale: s,
+                    font_scale: eq.scale,
+                    caret_pinned,
+                },
+                out,
+                link_spans,
             );
         }
     }
@@ -727,39 +1153,14 @@ fn measure_fontstrings(
     if requests.is_empty() {
         return false;
     }
+    // Every answer goes through the ONE measure body ([`crate::ui_text::measure_request`]) the VM's
+    // own synchronous measurer calls, against the same shared engine — so a string measured here
+    // and the same string measured mid-tick are not two computations that agree, they are one.
     let measures: Vec<(u32, f32, f32, f32, u64)> = requests
         .iter()
         .map(|r| {
-            // The full raster scale: seam × the owner frame's effective_scale. Measure at the
-            // exact drawn size and divide the whole product back out, so the frame-LOCAL answer
-            // times the layout's scale lands on the drawn glyphs to the pixel (integer-stepped
-            // advances don't commute with scaling — the request's `scale` doc).
-            let rs = s * r.scale;
-            let spec = |()| crate::ui_text::FontSpec {
-                path: r.font.as_deref(),
-                // The render pass's exact drawn px (two regimes × the full scale) —
-                // measure == render, and Lua's GetStringWidth/Height echo the DRAWN size
-                // (0x772890); results divide back to frame-local UI units below.
-                height: crate::ui_text::drawn_px(r.height, r.text_height, rs),
-                // The TRUE outline: THICK biases the client's step law (+1px per glyph —
-                // GlyphStepBase 0x5ca2b0, THICK-only per outline-bake-tint.md) and any outline
-                // adds the +2r line pitch, so measure must see it.
-                outline: r.outline,
-                paint_halo: true,     // measure never paints; irrelevant here
-                alpha_gradient: None, // alpha never changes metrics
-            };
-            let wrap = r.wrap_width.map(|w| w * rs);
-            let (w, h) = crate::ui_text::measure_text(atlas, &r.text, wrap, spec(()));
-            // …and the NATURAL width, which is what `GetStringWidth` answers with (the reference
-            // measures its getter's string with no wrap constraint — wow-re
-            // `fontstring-overflow.md`, "The measurement echo"). A second pass only for the
-            // regions that actually carry a declared width; for the rest the two are one number.
-            let natural = if wrap.is_some() {
-                crate::ui_text::measure_text(atlas, &r.text, None, spec(())).0
-            } else {
-                w
-            };
-            (r.id, w / rs, h / rs, natural / rs, r.key)
+            let (w, h, natural) = crate::ui_text::measure_request(&mut atlas.lock(), s, r);
+            (r.id, w, h, natural, r.key)
         })
         .collect();
     script.set_measured_text(&measures);
@@ -841,6 +1242,7 @@ mod clip_plumb_tests {
             frame:SetScrollChild(child)
             local marker = child:CreateTexture(nil, "ARTWORK")
             marker:SetTexture(1, 0, 0)          -- pathless colored quad: no BLP asset needed
+            marker:SetAllPoints()               -- templateless Lua region: no implicit anchor (1310)
         "#,
             )
             .unwrap();
@@ -852,6 +1254,7 @@ mod clip_plumb_tests {
         app.init_resource::<PortraitImages>();
         app.init_resource::<crate::portrait::BoothPanes>();
         app.init_resource::<crate::minimap::MinimapWidget>();
+        app.init_resource::<crate::autocast_shine::ShineSites>();
         app.init_resource::<crate::ui_script::UiFrameCost>();
         app.init_resource::<crate::ui_script::UiCostWanted>();
         app.init_resource::<Time>();
@@ -926,6 +1329,7 @@ mod clip_plumb_tests {
             plain:SetSize(50, 50)
             local m = plain:CreateTexture(nil, "ARTWORK")
             m:SetTexture(0, 1, 0)
+            m:SetAllPoints()  -- templateless Lua region: no implicit anchor (1310)
         "#,
             )
             .unwrap();
@@ -937,6 +1341,7 @@ mod clip_plumb_tests {
         app.init_resource::<PortraitImages>();
         app.init_resource::<crate::portrait::BoothPanes>();
         app.init_resource::<crate::minimap::MinimapWidget>();
+        app.init_resource::<crate::autocast_shine::ShineSites>();
         app.init_resource::<crate::ui_script::UiFrameCost>();
         app.init_resource::<crate::ui_script::UiCostWanted>();
         app.init_resource::<Time>();
@@ -976,18 +1381,24 @@ mod extract_gate_tests {
     use crate::portrait::PortraitImages;
 
     fn app_with_marker() -> App {
-        let script = UiScript::new().unwrap();
-        script
-            .run(
-                r#"
+        app_from_script(
+            r#"
             local plain = CreateFrame("Frame", "Plain")
             plain:SetPoint("TOPLEFT", 0, 0)
             plain:SetSize(50, 50)
             marker = plain:CreateTexture(nil, "ARTWORK")
             marker:SetTexture(1, 0, 0)
+            marker:SetAllPoints()  -- templateless Lua region: no implicit anchor (1310)
         "#,
-            )
-            .unwrap();
+        )
+    }
+
+    /// The same headless app around an arbitrary boot script. The splice tests boot a SECOND
+    /// app straight into a mutated app's final state: its first frame is by construction the
+    /// full conversion the spliced output must equal.
+    fn app_from_script(lua: &str) -> App {
+        let script = UiScript::new().unwrap();
+        script.run(lua).unwrap();
         let mut app = App::new();
         app.insert_non_send_resource(script);
         app.init_resource::<UiQuads>();
@@ -995,6 +1406,7 @@ mod extract_gate_tests {
         app.init_resource::<PortraitImages>();
         app.init_resource::<crate::portrait::BoothPanes>();
         app.init_resource::<crate::minimap::MinimapWidget>();
+        app.init_resource::<crate::autocast_shine::ShineSites>();
         app.init_resource::<crate::ui_script::UiFrameCost>();
         app.init_resource::<crate::ui_script::UiCostWanted>();
         app.init_resource::<Time>();
@@ -1059,6 +1471,266 @@ mod extract_gate_tests {
         assert!(
             app.world().resource::<UiQuads>().dirty,
             "a moved frame must re-extract"
+        );
+    }
+
+    /// **A booth bake reaches the quad pass flagged PREMULTIPLIED, an ordinary region does not**
+    /// (decision 1347). This is the wiring half of the paper-doll/dressing-room fix, and it is the
+    /// half that can silently rot: the shader's `select(a, k, premultiplied)` is only correct if
+    /// exactly the render-target quads carry the flag. Drop it and every additive effect the pane
+    /// draws over EMPTY space is multiplied by its own zero alpha again — the R14 pauldrons' fire
+    /// gone, a weapon glow chopped at the model's silhouette (Goudy, `#bugs` 2026-07-27).
+    #[test]
+    fn a_booth_bake_quad_is_flagged_premultiplied_and_a_plain_one_is_not() {
+        let mut app = app_with_marker();
+        // The paper doll's own binding — the square booth pane (`BenillaSetBoothTexture`).
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run("BenillaSetBoothTexture(marker, 'paperdoll')")
+            .unwrap();
+        // The booth publishes a live bake for that slot; without an entry the region draws nothing.
+        let bake = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(Image::default());
+        app.world_mut().resource_mut::<PortraitImages>().0.insert(
+            "paperdoll".to_string(),
+            crate::portrait::PortraitSource::Live(bake.clone()),
+        );
+        app.update();
+
+        let quads = &app.world().resource::<UiQuads>().quads;
+        let pane = quads
+            .iter()
+            .find(|q| q.texture.as_ref() == Some(&bake))
+            .expect("the booth pane's quad reached the pass");
+        assert!(
+            pane.premultiplied,
+            "a render-target bake carries premultiplied colour — the pass must not re-weight it"
+        );
+        assert!(
+            quads
+                .iter()
+                .filter(|q| q.texture.as_ref() != Some(&bake))
+                .all(|q| !q.premultiplied),
+            "every straight-alpha region stays unflagged — the flag is the booth's alone"
+        );
+    }
+
+    /// The per-entry splice, in-place half: a one-entry paint write must ride the splice
+    /// (`UiFrameCost::spliced == 1` — nonzero is the proof the path FIRED, without which this
+    /// test is vacuous) and produce byte-identically what the full conversion produces —
+    /// checked against a fresh app booted straight into the final state.
+    #[test]
+    fn a_one_entry_paint_write_splices_and_matches_the_full_conversion() {
+        let mut app = app_with_marker();
+        app.world_mut()
+            .resource_mut::<crate::ui_script::UiCostWanted>()
+            .0 = true;
+        app.update();
+        app.world_mut().resource_mut::<UiQuads>().dirty = false;
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run("marker:SetTexture(0, 0, 1)")
+            .unwrap();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<crate::ui_script::UiFrameCost>()
+                .spliced,
+            1,
+            "the color write is one splice-simple entry"
+        );
+        assert!(
+            app.world().resource::<UiQuads>().dirty,
+            "the spliced write re-marks the quads dirty"
+        );
+        let mut reference = app_from_script(
+            r#"
+            local plain = CreateFrame("Frame", "Plain")
+            plain:SetPoint("TOPLEFT", 0, 0)
+            plain:SetSize(50, 50)
+            marker = plain:CreateTexture(nil, "ARTWORK")
+            marker:SetTexture(0, 0, 1)
+            marker:SetAllPoints()  -- templateless Lua region: no implicit anchor (1310)
+        "#,
+        );
+        reference.update();
+        assert!(
+            app.world().resource::<UiQuads>().quads
+                == reference.world().resource::<UiQuads>().quads,
+            "spliced output equals the full conversion of the same model"
+        );
+    }
+
+    /// The autocast-shine token (decision 1383, B282): a shown marker converts to a parked SITE
+    /// and zero quads; a spliced frame keeps last conversion's sites; hiding the marker reaches
+    /// the full path and clears them. The site's rect/z/scale are the registration — the
+    /// producer (`autocast_shine::emit_shine`) draws there with no script traffic at all.
+    #[test]
+    fn the_shine_token_parks_a_site_and_never_a_quad() {
+        let mut app = app_from_script(
+            r#"
+            local b = CreateFrame("Button", "PetB")
+            b:SetPoint("BOTTOMLEFT", 72, 652)
+            b:SetSize(30, 30)
+            local shine = b:CreateTexture(nil, "OVERLAY")
+            shine:SetTexture("benilla:autocast-shine")
+            shine:SetAllPoints()
+            marker = b:CreateTexture(nil, "ARTWORK")
+            marker:SetTexture(1, 0, 0)
+            marker:SetAllPoints()
+        "#,
+        );
+        app.update();
+        {
+            let sites = app.world().resource::<crate::autocast_shine::ShineSites>();
+            assert_eq!(sites.0.len(), 1, "one shown token, one site");
+            let site = &sites.0[0];
+            // 1024x768 window ⇒ the 768-virtual scale is 1.0 and y flips through 768: the
+            // button's y-up [652, 682] lands at y-down [86, 116].
+            assert_eq!(site.rect, Rect::new(72.0, 86.0, 102.0, 116.0));
+            assert_eq!(site.scale, 1.0);
+            assert!(site.clip.is_none());
+            assert_eq!(site.alpha, 1.0);
+            assert_eq!(
+                app.world().resource::<UiQuads>().quads.len(),
+                1,
+                "the red marker's quad alone — the token itself draws nothing"
+            );
+        }
+
+        // A paint write elsewhere splices — and the parked site survives it untouched.
+        app.world_mut()
+            .resource_mut::<crate::ui_script::UiCostWanted>()
+            .0 = true;
+        app.world_mut().resource_mut::<UiQuads>().dirty = false;
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run("marker:SetTexture(0, 0, 1)")
+            .unwrap();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<crate::ui_script::UiFrameCost>()
+                .spliced,
+            1,
+            "the marker write splices; the token entry did not change"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<crate::autocast_shine::ShineSites>()
+                .0
+                .len(),
+            1,
+            "a spliced frame keeps last conversion's sites"
+        );
+
+        // Hiding the marker changes the extracted list's length — the full path runs and the
+        // site set empties: the shine goes out with the region that registered it.
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run("getglobal('PetB'):Hide()")
+            .unwrap();
+        app.update();
+        assert!(
+            app.world()
+                .resource::<crate::autocast_shine::ShineSites>()
+                .0
+                .is_empty(),
+            "a hidden token registers nothing"
+        );
+    }
+
+    /// The stitch half: a write that CHANGES an entry's quad count (a cleared texture emits
+    /// nothing) re-derives the span table — and a later splice against the re-derived spans
+    /// still matches the full conversion, in both directions (1 → 0 quads, then 0 → 1).
+    #[test]
+    fn a_count_changing_write_stitches_and_keeps_the_spans_true() {
+        let mut app = app_with_marker();
+        app.world_mut()
+            .resource_mut::<crate::ui_script::UiCostWanted>()
+            .0 = true;
+        app.update();
+        let before = app.world().resource::<UiQuads>().quads.len();
+        app.world_mut().resource_mut::<UiQuads>().dirty = false;
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run("marker:SetTexture(nil)")
+            .unwrap();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<crate::ui_script::UiFrameCost>()
+                .spliced,
+            1,
+            "the clear rides the splice (stitch branch)"
+        );
+        let quads = app.world().resource::<UiQuads>();
+        assert!(quads.dirty, "a vanished quad is a real change");
+        assert_eq!(
+            quads.quads.len(),
+            before - 1,
+            "the cleared marker's quad is gone from the stitched list"
+        );
+        // The follow-up (0 → 1 quads) splices against the RE-DERIVED spans.
+        app.world_mut().resource_mut::<UiQuads>().dirty = false;
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run("marker:SetTexture(0, 1, 0)")
+            .unwrap();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<crate::ui_script::UiFrameCost>()
+                .spliced,
+            1
+        );
+        let mut reference = app_from_script(
+            r#"
+            local plain = CreateFrame("Frame", "Plain")
+            plain:SetPoint("TOPLEFT", 0, 0)
+            plain:SetSize(50, 50)
+            marker = plain:CreateTexture(nil, "ARTWORK")
+            marker:SetTexture(0, 1, 0)
+            marker:SetAllPoints()  -- templateless Lua region: no implicit anchor (1310)
+        "#,
+        );
+        reference.update();
+        assert!(
+            app.world().resource::<UiQuads>().quads
+                == reference.world().resource::<UiQuads>().quads,
+            "post-stitch splice output equals the full conversion"
+        );
+    }
+
+    /// A raster-environment change (window resize) must pin the conversion to the FULL path —
+    /// the splice's held quads were rasterized under the old seam and every one of them is
+    /// wrong-sized (decision 1342's edge, applied to the splice).
+    #[test]
+    fn a_resize_takes_the_full_path_not_the_splice() {
+        let mut app = app_with_marker();
+        app.world_mut()
+            .resource_mut::<crate::ui_script::UiCostWanted>()
+            .0 = true;
+        app.update();
+        let win = app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>()
+            .single(app.world())
+            .unwrap();
+        app.world_mut().get_mut::<Window>(win).unwrap().resolution = UVec2::new(800, 600).into();
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run("marker:SetTexture(0, 0, 1)")
+            .unwrap();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<crate::ui_script::UiFrameCost>()
+                .spliced,
+            0,
+            "a moved raster environment forbids splicing"
         );
     }
 }
