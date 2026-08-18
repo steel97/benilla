@@ -620,27 +620,30 @@ impl UiScript {
     /// mlua's own docs warn that a low value "can incur a very high overhead", and the step is the
     /// resolution of the bound, which nothing here needs to be precise.
     pub fn set_instruction_budget(&self, budget: u64) {
-        let used = self.instructions.clone();
-        used.store(0, std::sync::atomic::Ordering::Relaxed);
-        let _ = self.lua.set_hook(
-            mlua::HookTriggers {
-                every_nth_instruction: Some(INSTRUCTION_HOOK_STEP),
-                ..Default::default()
-            },
-            move |_, _| {
-                let n = used.fetch_add(
-                    u64::from(INSTRUCTION_HOOK_STEP),
-                    std::sync::atomic::Ordering::Relaxed,
-                ) + u64::from(INSTRUCTION_HOOK_STEP);
-                if n > budget {
-                    return Err(mlua::Error::runtime(format!(
-                        "benilla: instruction budget exhausted after {n} VM instructions — \
+        #[cfg(not(feature = "luau"))]
+        {
+            let used = self.instructions.clone();
+            used.store(0, std::sync::atomic::Ordering::Relaxed);
+            let _ = self.lua.set_hook(
+                mlua::HookTriggers {
+                    every_nth_instruction: Some(INSTRUCTION_HOOK_STEP),
+                    ..Default::default()
+                },
+                move |_, _| {
+                    let n = used.fetch_add(
+                        u64::from(INSTRUCTION_HOOK_STEP),
+                        std::sync::atomic::Ordering::Relaxed,
+                    ) + u64::from(INSTRUCTION_HOOK_STEP);
+                    if n > budget {
+                        return Err(mlua::Error::runtime(format!(
+                            "benilla: instruction budget exhausted after {n} VM instructions — \
                          treating this as a non-terminating loop"
-                    )));
-                }
-                Ok(mlua::VmState::Continue)
-            },
-        );
+                        )));
+                    }
+                    Ok(mlua::VmState::Continue)
+                },
+            );
+        }
     }
 
     /// Remove an installed instruction budget — the load edge's disarm (decision 1306): the bound
@@ -648,6 +651,7 @@ impl UiScript {
     /// The counter keeps its last value, so [`Self::instructions_used`] still answers for the
     /// phase that just ended.
     pub fn clear_instruction_budget(&self) {
+        #[cfg(not(feature = "luau"))]
         self.lua.remove_hook();
     }
 

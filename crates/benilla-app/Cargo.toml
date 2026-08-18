@@ -42,7 +42,7 @@ anyhow.workspace = true
 # bevy_egui; pinned to the same 3.x so there's one copy. Read on the main thread (the UI key feed is
 # a NonSend system) — required for the macOS NSPasteboard path. Covers macOS, Windows, and Linux/BSD
 # under X11; the Wayland backend is `smithay-clipboard` below (decision 0702).
-benilla-ui = { path = "../benilla-ui" }
+benilla-ui = { path = "../benilla-ui", features = ["luau"] }
 bevy.workspace = true
 # Optional: the dev overlays are its only consumers (the panel, the perf pill, the inspector
 # card), so a player build does not link it at all (`dev` feature, decision 1173).
