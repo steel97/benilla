@@ -51,6 +51,8 @@ const BG_ENV_PREFIXES: &[&str] = &[
     "WOW_CHARSELECT_SHOT",
     "WOW_CREATE_TEST",
     "WOW_DEPTH",
+    "WOW_FEED_GATE_CHECK",
+    "WOW_FEED_GATE_TRACE",
     "WOW_FPS_",
     "WOW_GLUE_ROUNDTRIP",
     "WOW_LIVE_",
@@ -66,6 +68,7 @@ const BG_ENV_PREFIXES: &[&str] = &[
     "WOW_PORTRAIT_TEST",
     "WOW_PROBE",
     "WOW_RIG",
+    "WOW_SCHED_CENSUS",
     "WOW_WORLDVIEW_",
 ];
 
@@ -94,11 +97,14 @@ pub fn background_run() -> bool {
 /// `WOW_PROBE…`-named env that captures pixels has to be excluded by name here, since the bare
 /// `WOW_PROBE` prefix would otherwise sweep it in.
 const NO_PIXEL_ENV_PREFIXES: &[&str] = &[
+    "WOW_FEED_GATE_CHECK",
+    "WOW_FEED_GATE_TRACE",
     "WOW_FPS_",
     "WOW_LIVE_FPS",
     "WOW_PARTICLE_CENSUS",
     "WOW_PROBE",
     "WOW_RIG",
+    "WOW_SCHED_CENSUS",
     // The engine boot check reads no pixels — it reads the ERROR LOG. Its sibling
     // `WOW_WORLDVIEW_SHOT` is deliberately absent: that one photographs the frame, and the
     // all-of rule below keeps a CHECK+SHOT pairing at full size.

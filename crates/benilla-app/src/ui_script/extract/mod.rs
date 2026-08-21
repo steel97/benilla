@@ -213,10 +213,18 @@ pub(super) fn drive_script(
 ) {
     let (capture, ui_cost_wanted) = run;
     let Some(mut script) = script else {
+        // No VM ⇒ no UI is sampling any booth pane. The panes map must not outlive its writer:
+        // every OTHER return in this system provably keeps pane presence unchanged (the settled
+        // gate compares the whole extracted list; the splice refuses `portrait_unit` entries),
+        // but a VM dying mid-world with the character window up would strand its pane here and
+        // the paper-doll camera would render behind a dead UI until the next full conversion.
+        booths.panes.0.clear();
         return;
     };
     let prev = prev.get(&script);
     let Ok(window) = window.single() else {
+        // Same law as the no-VM arm: no window, no sampling — a pane map with no writer lies.
+        booths.panes.0.clear();
         return;
     };
     let (w, h) = (window.width(), window.height());
@@ -296,7 +304,18 @@ pub(super) fn drive_script(
     };
     {
         let _span = bevy::log::info_span!("ui_script: tick").entered();
-        script.set_screen_size(w / s, if h > 0.0 { h / s } else { 768.0 });
+        let resized = script.set_screen_size(w / s, if h > 0.0 { h / s } else { 768.0 });
+        // A resize re-runs the bottom-stack manage pass (decision 1499). Anchors follow the new
+        // screen rect by themselves; what does not is a seat somebody COMPUTED from the old
+        // height — the open-bag stack starts a fresh column when the current one would run off
+        // the top, and that decision is made from `GetScreenHeight()` at layout time. Without
+        // this, dragging the window smaller leaves the bag columns wrapped for the old height
+        // until the next bag opens. Existence-guarded: the pass is defined by `UIParent.xml`,
+        // which is in-game UI, and this system also runs on the glue screens.
+        if resized {
+            let _ = script
+                .run("if UIParent_ManageFramePositions then UIParent_ManageFramePositions() end");
+        }
         script.tick(time.delta_secs());
     }
     // The frame's clock pair ([`super::UiClock`]): the VM value the tick just produced, anchored

@@ -107,6 +107,35 @@ pub(crate) struct Model {
     /// node is in the cached roster before they may name it, and that proof is a `node_of[id]`
     /// probe — which hands back the roster row, and with it the handle, for free at resolve time.
     pub(crate) layout_touched: Option<Vec<u32>>,
+    /// The MEASURE lane's ledger — [`Self::layout_touched`]'s twin for the text-measure sweep
+    /// (`UiScript::fontstrings_needing_measure`), which used to walk every `region_data` row
+    /// twice a frame to *discover* silent writes (`SetText` touches no layout until the extent
+    /// moves — that silence is the lane's defining property, decision 1370's ~300 µs standing
+    /// `resolve` lap at a city pin). `Some(handles)` = every write since the last sweep that
+    /// could move a region's measure key ([`crate::script::types::RegionData::measure_key`]:
+    /// text, font path/height, text height, outline, wrap width, owner scale) named its region
+    /// here, so the sweep asks exactly these. `None` = some write could not name one (a
+    /// font-object fan-out, a scale propagation, `invalidate_text_measures`) and the next sweep
+    /// walks the whole roster exactly as it always did — which is also the initial state.
+    ///
+    /// UNLIKE the layout ledger, `None` is not re-entered by unmigrated sites automatically:
+    /// nothing at a `region_data` field write *had* to announce itself before this existed, so
+    /// completeness of the enrolled sites is the correctness claim — and it is machine-checked,
+    /// not argued: with `WOW_LAYOUT_VERIFY` on (forced for every benilla-ui test) the sweep
+    /// re-runs the whole-roster walk beside the drained ledger and panics on any row the ledger
+    /// missed. A candidate the ledger names that the roster walk doesn't is fine (a same-value
+    /// write — the staleness check absorbs it); the reverse is a stale label waiting to ship.
+    pub(crate) measure_dirty: Option<Vec<crate::widget::RegionHandle>>,
+    /// The message-line sweep's clean tokens: frame → (lines_gen, env hash) at its last
+    /// ZERO-REQUEST sweep. A frame matching both is skipped whole (`message_lines_needing_measure`
+    /// hashes none of its lines); a sweep that produced requests stores nothing, so an unanswered
+    /// request re-requests forever exactly like the region lane's ledger (1410's rule). Stale
+    /// entries for destroyed frames are inert (generational handles never re-match) and the map
+    /// holds a handful of message frames, so no destroy hook.
+    pub(crate) msg_swept: std::collections::HashMap<crate::widget::FrameHandle, (u64, u64)>,
+    /// Lines actually hashed by the sweep — the skip's honest meter (tests assert 0 on a settled
+    /// second sweep; 0735's counts-never-milliseconds rule).
+    pub(crate) msg_lines_hashed: u64,
     /// `WOW_LAYOUT_VERIFY`'s flag that the resolve just taken was the incremental one and owes a
     /// full-derive re-run to prove it (see `layout::UiScript::resolve_layout`). Always `false` in
     /// production — nothing reads it unless the verify build set it.
@@ -228,6 +257,12 @@ pub(crate) struct Model {
     /// Which handler kinds each frame has a script for (presence mirror; the closures live Lua-side
     /// in the `REG_SCRIPTS` table). Lets `tick` find OnUpdate frames without scanning Lua.
     pub(crate) scripts: HashMap<FrameHandle, HashSet<&'static str>>,
+    /// The frames carrying an `OnUpdate` script, maintained by `SetScript` — `scripts`' one
+    /// writer — so the tick iterates exactly the OnUpdate population instead of re-filtering
+    /// (and re-allocating from) the whole scripts map every frame (decision 1446). Order is
+    /// irrelevant here: the tick sorts its visible subset by frame id every pass (the
+    /// deterministic-dispatch law stays where it was).
+    pub(crate) on_update_frames: Vec<FrameHandle>,
     /// `event name → frames registered for it` (RegisterEvent), in **registration order** — an
     /// ordered Vec, never a set: the client's `SignalEvent 0x703e50` walks a per-event listener
     /// LIST, so cross-frame dispatch order is a law, not an accident (the abbey territory-line
@@ -246,6 +281,15 @@ pub(crate) struct Model {
     /// The frame currently under the cursor (the last [`UiScript::mouse_move`] capture), so the next
     /// move knows whether to fire `OnLeave`/`OnEnter`. `None` = cursor over no mouse-enabled frame.
     pub(crate) mouseover: Option<FrameHandle>,
+    /// The hover **re-pick** is due: the world under a stationary cursor changed — the hovered
+    /// frame hid (its `OnLeave` already fired at hide time), or a frame was shown that may now
+    /// be the topmost under the cursor. The reference keeps exactly this flag on the frame
+    /// manager (`[root+0x1100]`) and its per-tick pump re-runs the hover walk at the **saved**
+    /// cursor position, explicitly bypassing the didn't-move coalesce — so the newly exposed
+    /// frame gets `OnEnter` with no physical mouse move (wow-re
+    /// `ui/scratch/hover-hide-and-tooltip-owner-law.md`: writers `0x764cbb`/`0x764b8d`, pump
+    /// tail `0x7657a1` → `0x7660d0` self-alias). [`UiScript::tick`] drains it the same way.
+    pub(crate) hover_repick: bool,
     /// Per-button, the frame a mouse-down last captured (`button name → frame`), for the `OnClick`
     /// same-frame press+release test in [`UiScript::mouse_button`]. Keyed by button so a `LeftButton`
     /// press is not cleared by a `RightButton` release.
@@ -284,6 +328,12 @@ pub(crate) struct Model {
     /// inside the failed call). A message produced *by* the handler itself goes to `errors` only —
     /// that asymmetry is the recursion guard.
     pub(crate) pending_error_dispatch: Vec<String>,
+    /// The **retained** script-error log — what [`errors`](Self::errors) and the load walk both
+    /// throw away once logged (decision 1495). `errors` is a per-frame drain for the host's
+    /// terminal; this is the session's memory, deduplicated and bounded, and the only thing a
+    /// player can actually read. See [`super::diagnostics`] for why the reference's own dialog is
+    /// not enough on its own.
+    pub(crate) diagnostics: super::diagnostics::DiagnosticLog,
     /// Non-fatal warnings surfaced to the host (e.g. `CreateFrame`'s ignored `inherits=` template).
     pub(crate) warnings: Vec<String>,
     /// The screen-root rect (`[bottom, left, top, right]`), the anchor base for top-level frames.
@@ -403,6 +453,32 @@ pub(crate) struct Model {
     /// [`super::UiScript::take_pvp_toggles`] drain — the outbound seam ([`pvp`]). A count, not a
     /// payload: `CMSG_TOGGLE_PVP` carries no body.
     pub(crate) pvp_toggles: u32,
+    /// The two **equipment-display** preferences as the VM currently believes them —
+    /// `ShowingHelm()` / `ShowingCloak()` ([`worn_display`], decision 1472). Not a setting: the
+    /// truth is `PLAYER_FLAGS`' `HIDE_HELM`/`HIDE_CLOAK` bits, pushed here on the descriptor edge
+    /// by [`super::UiScript::set_worn_display`]. Both start **shown**, which is both the reference's
+    /// panel default and the zero-flags state a fresh character logs in with.
+    pub(crate) helm_shown: bool,
+    /// The cloak half of [`Self::helm_shown`].
+    pub(crate) cloak_shown: bool,
+    /// Worn-display flips (`ShowHelm`/`ShowCloak` asked for a state we were not in) queued since
+    /// the app's last [`super::UiScript::take_worn_display_toggles`] drain — one
+    /// `CMSG_TOGGLE_HELM`/`CMSG_TOGGLE_CLOAK` each. A list, not a count like [`Self::pvp_toggles`]:
+    /// the two slots are different packets.
+    pub(crate) worn_display_toggles: Vec<super::worn_display::WornDisplay>,
+
+    /// The server's `PLAYER_FIELD_BYTES` **byte 2** — which of the four extra action bars are on
+    /// ([`action_bar_toggles`], wow-re `system/ui/scratch/action-bar-toggles.md`). `None` until the
+    /// app pushes it ([`super::UiScript::set_action_bar_toggles`]), which is the ONLY thing that
+    /// moves it: the real client never writes this cell, so `SetActionBarToggles` deliberately
+    /// leaves it alone and the value lags the setter by a round trip. That is the opposite
+    /// arrangement to [`Self::helm_shown`] next door, and the difference is the wire verb's — a
+    /// blind flip has to be predicted, an absolute post does not.
+    pub(crate) action_bar_toggles: Option<u8>,
+    /// `CMSG_SET_ACTIONBAR_TOGGLES` payloads queued since the app's last
+    /// [`super::UiScript::take_action_bar_toggle_sends`] drain — one per `SetActionBarToggles`
+    /// call. A list, because the binding gates nothing: two calls in a frame are two packets.
+    pub(crate) action_bar_toggle_sends: Vec<u8>,
 
     /// Sounds queued by the Lua `PlaySound`/`PlaySoundFile` bindings since the app's last
     /// [`UiScript::take_sounds`] drain — the outbound Lua→app intent seam ([`sound`]).
@@ -1079,6 +1155,10 @@ pub(crate) struct Model {
     /// `CMSG_PLAYED_TIME`. A COUNT, not a payload, for [`super::pvp`]'s reason: the packet is
     /// empty, so two asks in a frame are two sends rather than one collapsed intent.
     pub(crate) played_time_asks: u32,
+    /// `Screenshot()` calls queued since the app last drained them — each is one capture
+    /// (decision 1487). A COUNT for [`Self::played_time_asks`]'s reason: the request carries no
+    /// payload, so two calls in a frame are two captures.
+    pub(crate) screenshot_asks: u32,
     pub(crate) realm_name: String,
     /// The hearthstone bind location's NAME, behind `GetBindLocation()` — the app resolves the
     /// `SMSG_BINDPOINTUPDATE` area id through the same AreaTable catalog the hearthstone's `$z`
@@ -1133,6 +1213,11 @@ impl Model {
     /// a failure raised by the error handler *itself* is pushed to `errors` directly instead,
     /// which is what keeps the dispatch from recursing.
     pub(crate) fn record_script_error(&mut self, msg: String) {
+        // Three channels now, and the third is the one with a memory (decision 1495): the dialog
+        // shows a burst's first message and the host drain empties every frame, so without this
+        // the 1,112 raises after the first exist nowhere a player can reach.
+        self.diagnostics
+            .record(super::diagnostics::DiagnosticKind::Error, &msg);
         self.pending_error_dispatch.push(msg.clone());
         self.errors.push(msg);
     }
@@ -1161,6 +1246,9 @@ impl Model {
             layout_fingerprint: None,
             layout_epoch: 0,
             layout_touched: None,
+            measure_dirty: None,
+            msg_swept: std::collections::HashMap::new(),
+            msg_lines_hashed: 0,
             layout_verify_recheck: false,
             layout_derives: 0,
             layout_scope: super::layout::LayoutScope::default(),
@@ -1184,15 +1272,18 @@ impl Model {
             region_to_id: HashMap::new(),
             region_names: HashMap::new(),
             scripts: HashMap::new(),
+            on_update_frames: Vec::new(),
             event_to_frames: HashMap::new(),
             frame_events: HashMap::new(),
             focused_editbox: None,
             mouseover: None,
+            hover_repick: false,
             mouse_down_on: HashMap::new(),
             last_click: HashMap::new(),
             pending_size_changed: Vec::new(),
             errors: Vec::new(),
             pending_error_dispatch: Vec::new(),
+            diagnostics: Default::default(),
             warnings: Vec::new(),
             // Classic Era's UIParent virtual space is 1024×768-ish; a sensible default the host can
             // override with `set_screen_size`. y-up: [bottom, left, top, right].
@@ -1220,6 +1311,11 @@ impl Model {
             follow_requests: Vec::new(),
             session_requests: Vec::new(),
             pvp_toggles: 0,
+            helm_shown: true,
+            cloak_shown: true,
+            worn_display_toggles: Vec::new(),
+            action_bar_toggles: None,
+            action_bar_toggle_sends: Vec::new(),
             sound_queue: Vec::new(),
             cvars: HashMap::new(),
             cvars_saved_base: HashMap::new(),
@@ -1374,6 +1470,7 @@ impl Model {
             chat_sends: Vec::new(),
             addon_sends: Vec::new(),
             played_time_asks: 0,
+            screenshot_asks: 0,
             realm_name: String::new(),
             bind_location: String::new(),
             binder_confirms: 0,
@@ -1499,6 +1596,25 @@ impl Model {
             Some(&id) => self.touch_layout_node(id),
             None => self.touch_layout(),
         }
+    }
+
+    /// A write that could move region `rh`'s measure key — its text, its font face/height/
+    /// outline, its text height, its explicit size (the wrap width) — names the region on the
+    /// measure ledger ([`Self::measure_dirty`]). Push-only and unfiltered: non-FontStrings and
+    /// same-value writes cost one `Vec` push here and one staleness probe at the next sweep,
+    /// which is the price of keeping every enrolled site a one-liner.
+    pub(crate) fn touch_measure(&mut self, rh: RegionHandle) {
+        if let Some(list) = &mut self.measure_dirty {
+            list.push(rh);
+        }
+    }
+
+    /// A write that moves measure keys WITHOUT being able to name the regions — a font-object
+    /// edit fanning out to every inheriting region, a scale change propagating down a subtree,
+    /// [`super::UiScript::invalidate_text_measures`]. The next sweep walks the whole roster,
+    /// exactly as every sweep did before the ledger existed. All human-rate paths.
+    pub(crate) fn touch_measure_all(&mut self) {
+        self.measure_dirty = None;
     }
 
     /// Name a node **without opening tier 1** — for the resolve's own pre-pass

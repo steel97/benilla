@@ -4,19 +4,27 @@
 //! the query's comment for why the old `With<AnimDriver>` filter left every animated GO
 //! sampling off-view).
 //!
-//! The reference has NO view cull on unit skeletons — every in-range, non-hidden unit is fully
-//! animated every frame (wow-re `unit-anim-visibility-gate.md`: worklist admission is the CGUnit
-//! render vtable chain, no frustum/occlusion/distance test — the 0364 §1 dispatch's verdict). So
-//! this gate is a *modernization*, not a fidelity copy, and it preserves the verdict's two
-//! observables:
+//! 0448 shipped this as a modernization against a reference that "has NO view cull on unit
+//! skeletons" — a verdict wow-re REFUTED on 2026-08-13 (`outdoor-object-pass-election.md`: every
+//! scene object, units included, is frustum/horizon/room-elected each frame, and a pass-2 unit
+//! is neither drawn, nor animated, nor event-ticked — except creatures flagged `MORE_AUDIBLE`,
+//! re-linked for tick only). So this gate turned out to be the *faithful* direction, not a
+//! departure; what still diverges is decision 1473's ledger — parked rigs keep DRAWING (the
+//! election never reached draw submission), and observable (ii) keeps every unit audible where
+//! the reference keeps only the flagged ones. The two observables preserved here:
 //!
-//! - **(i) the absolute-clock snap** — a re-appearing unit shows the pose "now" dictates. Nothing
-//!   here pauses an [`AnimationPlayer`]: Bevy's `advance_animations` keeps ticking every seek
-//!   clock, so waking is just sampling again — there is no frozen state to resume from.
-//! - **(ii) off-screen combat stays audible** — the event scanner
-//!   ([`super::events::fire_anim_events`]) reads the player's seek, not the bones, and the driver
-//!   state machine keeps arming clips for parked rigs; `$CSS`/`$CAH`/`$HIT` (0075), footsteps,
-//!   `$BWP`/`$BWR`, and the `$CSL`-keyed missile release (0430) all fire regardless of the camera.
+//! - **(i) the absolute-clock snap** — faithful (`0x714260` samples the world clock): a
+//!   re-appearing unit shows the pose "now" dictates. Nothing here pauses an [`AnimationPlayer`]:
+//!   Bevy's `advance_animations` keeps ticking every seek clock, so waking is just sampling
+//!   again — there is no frozen state to resume from.
+//! - **(ii) off-screen combat is audible for `MORE_AUDIBLE` creatures — and only them**
+//!   (decision 1482, the tick half of the election): a parked rig's event tracks are not
+//!   scanned ([`super::events::fire_anim_events`] skips it, memory and all), except when its
+//!   cached creature template carries the `0x20` flag — the reference's `0x607da0` re-link arm.
+//!   The driver state machine still arms clips for every parked rig (pose correctness on wake —
+//!   the memo design of 1370 item 9 is the only safe skip there), so a flagged creature's
+//!   `$CSS`/`$CAH`/`$HIT` (0075), `$BWP`/`$BWR`, and `$CSL` (0430) fire off-screen exactly as
+//!   the reference's do.
 //!
 //! The park mechanism is the [`AnimParked`] marker alone (decision 0712 — the evaluator took over
 //! from `animate_targets`, and the old per-joint `AnimatedBy` repoint died with the targets): the
@@ -50,15 +58,17 @@ use bevy::camera::primitives::{Frustum, Sphere as CullSphere};
 use bevy::ecs::entity::EntityHashMap;
 use bevy::prelude::*;
 
-use benilla_assets::{WmoGroupNav, WmoModel, WmoPortalRef};
+use benilla_assets::WmoModel;
 
 use crate::entities::mount::MountBody;
 use crate::net::Embodied;
 use crate::target::SelectionRadius;
 use benilla_world::view::WorldCamera;
-use benilla_world::wmo_portal::{UnitWmoRoom, WmoPortalInstance, WmoRoom};
+use benilla_world::wmo_portal::{room_pvs_visible, UnitWmoRoom, WmoPortalInstance};
 
 use benilla_world::rig_anim::{AnimParked, RigPose};
+
+use crate::portrait::StageRig;
 
 /// Park only after the rig has been continuously out of frustum this long — a camera swing
 /// across the pack doesn't churn bone repoints. Waking is always instant.
@@ -100,16 +110,22 @@ pub(super) fn gate_rig_animation(
         // — at the LBRS pin, ~350 of the ~620 per-frame refreshes. Parking preserves their whole
         // observable surface: the event scanner requires `AnimDriver` (GOs never fired anim
         // events), `go_anim`'s state machine arms the player regardless of the marker, and the
-        // wake samples the absolute clock. Booth/studio rigs are entity-joint-lane (no
-        // `RigPose`), so this query can never park the character pane.
+        // wake samples the absolute clock.
         //
         // `Without<DoodadAnimHost>` (decision 1365): placed doodads joined the collapsed lane,
         // and their draw gate (`doodad_anim::gate_doodad_anim`) owns their `AnimParked` marker —
         // it parks on the composed draw verdict + fade sphere, the doodad lane's own law, and
         // two writers to one marker would fight every frame the two policies disagree.
+        //
+        // `Without<StageRig>` (decision 1447): booth rigs joined the collapsed lane too (1443),
+        // and a booth stage sits outside every world frustum by construction — unfiltered, this
+        // gate froze every pane and glue scene `PARK_AFTER_SECS` after its bake, a marker the
+        // booth camera gate (tracking only its own park edges) could not heal. Same one-writer
+        // law as the doodads': the booth gate owns a staged rig's marker.
         (
             With<RigPose>,
             Without<benilla_world::doodad_anim::DoodadAnimHost>,
+            Without<StageRig>,
         ),
     >,
     self_hosts: Query<Has<Embodied>>,
@@ -187,48 +203,11 @@ pub(super) fn gate_rig_animation(
     out_since.retain(|e, _| rigs.contains(*e));
 }
 
-/// The room leg's resolve chain: unit claim → placement instance → model → PVS bits. Fail-open
-/// at every seam (no claim, despawned placement, still-loading model) — a lookup miss must never
-/// park a drawable rig.
-fn room_pvs_visible(
-    room: Option<&UnitWmoRoom>,
-    instances: &Query<&WmoPortalInstance>,
-    wmos: &Assets<WmoModel>,
-) -> bool {
-    let Some(WmoRoom { instance, group }) = room.and_then(|r| r.room()) else {
-        return true;
-    };
-    let Ok(inst) = instances.get(instance) else {
-        return true;
-    };
-    let Some(model) = wmos.get(&inst.handle) else {
-        return true;
-    };
-    room_visible(&inst.visible, &model.group_nav, &model.portal_refs, group)
-}
-
-/// Is the claimed group — or any group one portal hop from it — in the PVS? The one-hop union is
-/// the doorway-straddle guard: a body can extend past its feet's room only through a portal
-/// opening, so the neighbour set bounds everything of the unit that could be on screen. Indices
-/// out of range read visible (fail-open, [`benilla_world::wmo_portal::WmoGroupVis::drawn_by`]'s
-/// convention); a group with no portal refs at all can only be seen with the camera inside it
-/// (the flood cannot reach it), which the direct bit already answered.
-fn room_visible(visible: &[bool], nav: &[WmoGroupNav], refs: &[WmoPortalRef], group: u16) -> bool {
-    let vis = |g: usize| visible.get(g).copied().unwrap_or(true);
-    if vis(group as usize) {
-        return true;
-    }
-    let Some(n) = nav.get(group as usize) else {
-        return true;
-    };
-    let Some(hops) = refs.get(n.ref_start as usize..(n.ref_start as usize + n.ref_count as usize))
-    else {
-        return true;
-    };
-    hops.iter().any(|r| vis(r.group as usize))
-}
-
 /// Register the gate: [`gate_rig_animation`] before the frame's pose evaluation.
+///
+/// The room predicate itself lives in [`benilla_world::wmo_portal::room_pvs_visible`] since 1475:
+/// the body draw election asks the identical question of the identical claim, and two private
+/// copies of one election term is exactly the drift 1473 catalogued.
 pub(super) fn plugin(app: &mut App) {
     app.add_systems(PostUpdate, gate_rig_animation.before(AnimationSystems));
 }
@@ -241,7 +220,9 @@ mod tests {
 
     use benilla_assets::{
         bone_target_id, AnimClip, ModelAnimations, PoseBone, PoseClip, PoseSource, PoseTrack,
+        WmoGroupNav, WmoPortalRef,
     };
+    use benilla_world::wmo_portal::WmoRoom;
 
     use super::super::{events::fire_anim_events, AnimDriver, AnimSoundEvent};
     use super::*;
@@ -372,6 +353,9 @@ mod tests {
         ));
         app.init_asset::<WmoModel>();
         app.add_message::<AnimSoundEvent>();
+        // The event scanner's MORE_AUDIBLE read (decision 1482) — empty ⇒ every parked rig
+        // reads unflagged, the fail-closed default.
+        app.init_resource::<crate::names::NameCache>();
         // The live schedule's shape: the gate ahead of the frame's pose evaluation; the event
         // scanner reading the advanced seek after it.
         app.add_systems(PostUpdate, gate_rig_animation.before(AnimationSystems));
@@ -404,13 +388,14 @@ mod tests {
             .translation
     }
 
-    /// The three gate laws in one flow (decision 0448): an off-frustum rig parks (joints
-    /// repointed at the park entity, bones frozen) while its seek clock keeps advancing and its
-    /// event keyframes keep firing (the 0075 trap — off-screen swings must not go silent); a
-    /// woken rig and a never-parked twin sample the SAME pose — the absolute-clock snap, not
-    /// resume-from-freeze.
+    /// The gate laws in one flow (0448, events re-lawed by 1482): an off-frustum rig parks
+    /// (joints repointed at the park entity, bones frozen) while its seek clock keeps advancing —
+    /// and its event keyframes FALL SILENT, because the reference's pass-2 walk never ticks an
+    /// unflagged model (the 0448 "off-screen swings must not go silent" law rested on the verdict
+    /// wow-re refuted on 2026-08-13; the flagged exception is the next test's). A woken rig and a
+    /// never-parked twin sample the SAME pose — the absolute-clock snap, not resume-from-freeze.
     #[test]
-    fn parked_rig_keeps_clock_and_events_and_wakes_to_the_absolute_pose() {
+    fn parked_rig_keeps_its_clock_falls_silent_and_wakes_to_the_absolute_pose() {
         let mut app = app();
         spawn_camera(&mut app);
         // `behind` starts off-frustum (+Z, behind the camera); `twin` stays in frame at −Z.
@@ -428,25 +413,29 @@ mod tests {
             !app.world().entity(twin).contains::<AnimParked>(),
             "the in-frame twin stays live"
         );
-        // While parked: the bone holds, the clock runs, the mid-loop event keyframe still fires.
+        // While parked: the bone holds, the clock runs — and the event track is not scanned.
         let frozen = bone(&app, behind_joint);
         let seek_at_park = seek(&app, behind);
         let mut cursor = app
             .world()
             .resource::<Messages<AnimSoundEvent>>()
             .get_cursor_current();
-        let mut fired = 0usize;
+        let (mut fired_parked, mut fired_twin) = (0usize, 0usize);
         for _ in 0..6 {
             // > one full loop in total, so the keyframe is crossed whatever the phase.
             std::thread::sleep(std::time::Duration::from_secs_f32(DUR * 0.3));
             app.update();
             let messages = app.world().resource::<Messages<AnimSoundEvent>>();
-            fired += cursor
-                .read(messages)
-                .filter(|ev| ev.entity == behind && &ev.ident == b"$TST")
-                .count();
+            for ev in cursor.read(messages).filter(|ev| &ev.ident == b"$TST") {
+                fired_parked += usize::from(ev.entity == behind);
+                fired_twin += usize::from(ev.entity == twin);
+            }
         }
-        assert!(fired > 0, "a parked rig's event keyframes keep firing");
+        assert_eq!(
+            fired_parked, 0,
+            "an unflagged parked rig's event keyframes are not scanned (1482)"
+        );
+        assert!(fired_twin > 0, "the live twin keeps firing — the control");
         assert_eq!(
             frozen,
             bone(&app, behind_joint),
@@ -481,6 +470,83 @@ mod tests {
         );
     }
 
+    /// The exception the silence is built around (1482): a parked creature whose cached template
+    /// carries `MORE_AUDIBLE` (`0x20`) keeps firing — the reference's `0x607da0` pass-2 re-link,
+    /// the arm that keeps an off-screen flagged creature's combat audible.
+    #[test]
+    fn a_more_audible_parked_rig_keeps_firing() {
+        let mut app = app();
+        spawn_camera(&mut app);
+        let (behind, _) = spawn_rig(&mut app, Vec3::Z * 50.0);
+        // A creature guid whose entry the cache answers with the flag set — composed the way
+        // vmangos composes one (`counter | entry << 24 | high << 48`).
+        const ENTRY: u32 = 69;
+        let guid =
+            7u64 | (u64::from(ENTRY) << 24) | (u64::from(benilla_protocol::guid::HIGH_UNIT) << 48);
+        app.world_mut()
+            .entity_mut(behind)
+            .insert(crate::net::Guid(guid));
+        app.world_mut()
+            .resource_mut::<crate::names::NameCache>()
+            .insert_creature(
+                ENTRY,
+                Some(crate::names::CreatureRecord {
+                    name: "Growler".into(),
+                    subname: None,
+                    creature_type: 1,
+                    pet_family: 0,
+                    rank: 0,
+                    type_flags: 0x20,
+                    civilian: false,
+                    racial_leader: false,
+                }),
+            );
+        app.update();
+        advance(&mut app, PARK_AFTER_SECS + 0.2, 4);
+        assert!(
+            app.world().entity(behind).contains::<AnimParked>(),
+            "flagged or not, the POSE still parks — the flag is tick-only"
+        );
+        let mut cursor = app
+            .world()
+            .resource::<Messages<AnimSoundEvent>>()
+            .get_cursor_current();
+        let mut fired = 0usize;
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_secs_f32(DUR * 0.3));
+            app.update();
+            let messages = app.world().resource::<Messages<AnimSoundEvent>>();
+            fired += cursor
+                .read(messages)
+                .filter(|ev| ev.entity == behind && &ev.ident == b"$TST")
+                .count();
+        }
+        assert!(
+            fired > 0,
+            "MORE_AUDIBLE keeps the off-screen event track scanned"
+        );
+    }
+
+    /// The 1447 regression: a staged rig (a booth doll — off every world frustum by
+    /// construction) is never this gate's to park. Its `AnimParked` belongs to the booth camera
+    /// gate alone; the night the 1443 collapse put `RigPose` on booth roots, this gate froze
+    /// every paper doll and glue scene half a second after its bake.
+    #[test]
+    fn a_stage_rig_is_never_world_parked() {
+        let mut app = app();
+        spawn_camera(&mut app);
+        let (stage, _) = spawn_rig(&mut app, Vec3::Z * 50.0); // behind the camera, like any stage
+        app.world_mut()
+            .entity_mut(stage)
+            .insert(crate::portrait::StageRig);
+        app.update();
+        advance(&mut app, PARK_AFTER_SECS + 0.2, 4);
+        assert!(
+            !app.world().entity(stage).contains::<AnimParked>(),
+            "an off-frustum stage rig stays live — its park is the booth gate's, not the world's"
+        );
+    }
+
     /// A [`WmoGroupNav`] whose only meaningful fields are its portal-ref slice — the room-leg
     /// tests never touch flags/bounds.
     fn nav(ref_start: u16, ref_count: u16) -> WmoGroupNav {
@@ -502,40 +568,6 @@ mod tests {
             group,
             side: 1,
         }
-    }
-
-    /// The room predicate's whole truth table: direct bit, the one-hop straddle guard, the
-    /// all-dark park, the sealed room, and both fail-open seams (group past every table, a
-    /// ref slice past the refs vec).
-    #[test]
-    fn room_visible_covers_the_hop_guard_and_fails_open() {
-        // Groups 0 ↔ 1 share one portal; group 2 is sealed (no refs).
-        let navs = vec![nav(0, 1), nav(1, 1), nav(2, 0)];
-        let refs = vec![pref(1), pref(0)];
-        assert!(
-            room_visible(&[true, false, false], &navs, &refs, 0),
-            "direct PVS bit"
-        );
-        assert!(
-            room_visible(&[true, false, false], &navs, &refs, 1),
-            "own bit dark but the neighbour lit — the doorway-straddle guard keeps it live"
-        );
-        assert!(
-            !room_visible(&[false, false, true], &navs, &refs, 0),
-            "own room and every hop dark ⇒ parked"
-        );
-        assert!(
-            !room_visible(&[true, true, false], &navs, &refs, 2),
-            "a sealed room's own bit decides — no hops exist to save it"
-        );
-        assert!(
-            room_visible(&[false], &navs, &refs, 9),
-            "a group past the PVS table reads visible (fail-open)"
-        );
-        assert!(
-            room_visible(&[false], &[nav(7, 2)], &refs, 0),
-            "a ref slice past the refs vec reads visible (fail-open)"
-        );
     }
 
     /// The room leg end to end: an IN-FRUSTUM rig whose claimed room (and its one hop) is

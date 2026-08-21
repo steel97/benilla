@@ -123,6 +123,7 @@ fn bake_test(
                     material: mats.off_world(
                         s,
                         s.texture.clone().or_else(|| skin.clone()),
+                        u16::try_from(pi + 1).unwrap_or(u16::MAX),
                         light,
                         false,
                     ),
@@ -184,7 +185,8 @@ fn bake_test(
             BoothMotion::Frozen,
             [false, false], // the WOW_PORTRAIT_TEST bake dresses no weapons
             &[],            // …nor an eye-glow
-        );
+        )
+        .finish(commands);
         aim(cams, token, &rig);
     }
     // Also drive the paper-doll booth from the same model, so `WOW_PORTRAIT_TEST` eyeballs the
@@ -209,7 +211,8 @@ fn bake_test(
             BoothMotion::Frozen,
             [false, false], // the paper-doll still sheaths its weapons — no in-hand grip
             &[],            // eye-glow in the paper doll is the same follow-up (see above)
-        );
+        )
+        .finish(commands);
         // The eyeball harness has no live UI publishing a pane, so it bakes square.
         aim(cams, PAPERDOLL_SLOT, &body_frame(&anchors, 1.0));
         commands

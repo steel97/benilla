@@ -209,6 +209,15 @@ fn is_instrument_consumer(rel: &str) -> bool {
 /// count. The items were always crossing; the measurement improved. That is the only kind of raise
 /// that is not a retreat — a raise for a NEW leak is the failure this number exists to catch.
 ///
+/// And 158 → 159: `vis_chain::VisChainOnly`, a PUBLISH by 1164's test (decision 1441). The
+/// chain-only visibility idiom — keep `Visibility`+`InheritedVisibility` (hide-propagation),
+/// remove `ViewVisibility` (the per-camera sweep row) — is an ENGINE law about bevy's visibility
+/// pipeline, but half the never-rendering hierarchy nodes it applies to are spawned game-side
+/// (net-object roots, held-item and spell-fx wrappers, transports). Keeping it engine-private
+/// would mean every game spawner hand-rolling `.remove::<ViewVisibility>()` with its own copy of
+/// the why — the exact drift a named idiom exists to prevent; the trait is the smallest honest
+/// carrier of the law.
+///
 /// And 157 → 158: `collision::ColliderEpoch`, a PUBLISH by 1164's test (decision 1384). It is the
 /// stamp on the world's collider set — "the geometry you last asked has changed" — and the whole
 /// point of it is that a *cached* collision answer must not outlive the world it described. The
@@ -247,7 +256,16 @@ fn is_instrument_consumer(rel: &str) -> bool {
 /// input, which is game-side; a one-field resource is the smallest honest expression of that. The
 /// alternative was ordering a game system against an engine system, which crosses this same line
 /// *and* publishes a schedule point to do it.
-const CEILING: usize = 158;
+/// And 159 → 160: `WorldLoadProgress::gx_pending`, a PUBLISH beside the two residency terms
+/// already through this door (`colliders_pending`, `merge_pending`). The retained pass (1429)
+/// moved the static world off the entity path, so a placement that has SPAWNED still draws
+/// nothing until its region bakes — and the game reads residency for two decisions the engine
+/// does not own: when the loading cover may lift, and when the post-snap physics hold may
+/// release (decision 0737's split). Both were answering "is the world there" with a fact that
+/// had stopped meaning it (decision 1498). The alternative was the game reaching into
+/// `StaticGx` itself, which is a whole engine subsystem through the door instead of one
+/// `usize` on the residency struct that exists to be read from outside.
+const CEILING: usize = 160;
 
 /// How far under [`CEILING`] the real count may sit before this test asks for the ceiling to be
 /// lowered. Slack, not tolerance: it keeps a single closure from failing the gate, while making it

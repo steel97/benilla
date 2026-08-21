@@ -177,15 +177,25 @@ impl M2BatchMaterials<'_> {
     /// eval plus the buffer's point table, decisions 0429/0435) over the sky lane, and plays the
     /// batch's authored UV animation: together, what a char-select scene is and a portrait bake
     /// is not (a booth freezes at t = 0 and is never ground-shaded).
+    ///
+    /// `order` is the authored batch index + 1, exactly as [`Self::entity_variants`] and
+    /// [`Self::skybox`] take it — the transparent sort bias that makes a model's coplanar batches
+    /// draw in FILE order ([`super::BATCH_ORDER_SORT_EPS`]). This lane hardcoded `0` until 1449,
+    /// and an off-world scene is the one place where that is not a harmless default: every batch
+    /// of a glue scene hangs off the scene root, so they all share one transparent sort distance
+    /// AND one zero bias — a total tie, broken by whatever order `check_visibility` happened to
+    /// collect the view in that frame. `UI_Human`'s `groundshadow` decal and its `street` batch
+    /// swapped sides several times a second, which is the char-select plaza "lighting up".
     pub fn off_world(
         &mut self,
         sub: &ModelSubmesh,
         texture: Option<Handle<Image>>,
+        order: u16,
         light: &Buffer,
         rig: bool,
     ) -> Handle<WowModelMaterial> {
         let shade = if rig { ShadeSel::Rig } else { ShadeSel::Lit };
-        self.build(sub, texture, 0, shade, false, false, rig, light)
+        self.build(sub, texture, order, shade, false, false, rig, light)
     }
 
     /// The full variant set an **entity** part needs: every M2 entity — unit, player, GameObject,
@@ -229,11 +239,11 @@ impl M2BatchMaterials<'_> {
             &light,
         );
         // A multiply batch (Mod/Mod2x) and an authored-Blend batch are their own twin: the first
-        // because its blend equation reads no alpha at all — the reference's instanceAlpha ramp
-        // cannot feather it, and benilla's deliberate deviation feathers it through the shader's
-        // identity-lerp on the tag alpha instead (decision 0865) — the second because its colour
-        // pass already blends. Everything else gets a real twin, built from the SOURCE blend so
-        // the 224/255 cutout marker matches what the colour pass discards (decision 0842).
+        // because its blend equation reads no alpha at all — the fade rides the shader's
+        // identity-lerp on the tag alpha instead (0865's mechanism, 1489-verified as the
+        // reference's own preset-5 shape) — the second because its colour pass already blends.
+        // Everything else gets a real twin, built from the SOURCE blend so the 224/255 cutout
+        // marker matches what the colour pass discards (decision 0842).
         let own_twin = matches!(
             sub.blend,
             ModelBlend::Blend | ModelBlend::Mod | ModelBlend::Mod2x

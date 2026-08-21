@@ -6,7 +6,8 @@
 //! cite; 0989: the directed cuts — steppers and the corner X gone, the whole bar live via
 //! the engine's track-press law, the search box at the era's verbatim seat; 0992: the
 //! dropdown row shape on the 1.12 kit — Environment Detail — and the Nameplates page's
-//! three UnitName* rows).
+//! three UnitName* rows; 1476: the ground dim — a black fill over the 0.6 tile, seated clear
+//! of the rope's ink, because a 60% veil is not a page you can read over bright terrain).
 //!
 //! What these guard: the file loads clean inside the real neighbourhood (Fonts + UiPanels +
 //! GameMenuFrame); the menu's Options button is the door in (menu down, options up, on the ref's
@@ -21,7 +22,7 @@
 //! farclip min-anchored 60), the 1.12 master→ambience dependency greys, and Defaults walks the
 //! visible page back to the registered defaults.
 
-use benilla_ui::script::{QuadContent, SoundRequest, UiScript};
+use benilla_ui::script::{QuadContent, SoundRequest, UiScript, WornDisplay};
 
 /// The window's real neighbourhood, in the manifest's own order (options before the menu — the
 /// game_menu_tests::harness_with idiom, minus the extras this file never needs).
@@ -292,6 +293,77 @@ fn the_selected_row_wears_the_gold_wash_and_hover_runs_blue() {
     let left = washes(&mut s);
     assert_eq!(left.len(), 1);
     assert!(gold(&left[0].1));
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The GROUND DIM (1476) — the plain black fill that turns 0.6 of veil into a page you can
+/// read. Two laws here, both silently breakable by hand, and neither about the taste number:
+/// the fill must draw **above** the backdrop's tiled ground (a region sorts after its frame's
+/// own draw slot, which is the whole reason a region *can* dim it), and it must sit clear of
+/// the rope's **ink** — the border's four edge slices are dead from texel 16 of 32 and the
+/// corners' ink ends by 14 (decoded from `UI-DialogBox-Border`), so anything inset 14 or more
+/// darkens the page without touching the frame. At the backdrop's own 11/12/12/11 bg insets it
+/// would smear across the rope's inner half, which is exactly the mistake this pins.
+#[test]
+fn the_ground_dim_draws_over_the_tile_and_clear_of_the_rope() {
+    let mut s = harness();
+    s.run("ERA_WINDOW_SCALE = 1").unwrap();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.resolve();
+
+    let edge = |frame: &str, side: &str| -> f32 {
+        s.eval(&format!("return {frame}:Get{side}()")).unwrap()
+    };
+    let (fl, fr, ft, fb) = (
+        edge("OptionsFrame", "Left"),
+        edge("OptionsFrame", "Right"),
+        edge("OptionsFrame", "Top"),
+        edge("OptionsFrame", "Bottom"),
+    );
+    let (dl, dr, dt, db) = (
+        edge("OptionsFrameGroundDim", "Left"),
+        edge("OptionsFrameGroundDim", "Right"),
+        edge("OptionsFrameGroundDim", "Top"),
+        edge("OptionsFrameGroundDim", "Bottom"),
+    );
+    for (name, inset) in [
+        ("left", dl - fl),
+        ("right", fr - dr),
+        ("top", ft - dt),
+        ("bottom", db - fb),
+    ] {
+        assert!(
+            inset >= 14.0,
+            "the dim must clear the rope's ink on the {name} — inset {inset}"
+        );
+    }
+
+    // Draw order: `extract` returns ascending z, so a later index draws later. The dim has to
+    // land after the tiled ground or it dims nothing.
+    let quads = s.extract();
+    let ground = quads
+        .iter()
+        .position(|q| match &q.content {
+            QuadContent::Backdrop { path, .. } => path.contains("UI-DialogBox-Background"),
+            _ => false,
+        })
+        .expect("the window still wears the 1.14 dialog ground");
+    let dim = quads
+        .iter()
+        .position(|q| {
+            let Some(r) = q.rect else { return false };
+            matches!(
+                &q.content,
+                QuadContent::Texture { path: None, color: Some(c), .. }
+                    if c[0] == 0.0 && c[1] == 0.0 && c[2] == 0.0 && c[3] > 0.0 && c[3] < 1.0
+            ) && (r.left - dl).abs() < 0.5
+                && (r.top - dt).abs() < 0.5
+        })
+        .expect("the black ground fill is drawn");
+    assert!(
+        dim > ground,
+        "the dim draws over the tile (ground #{ground}, dim #{dim})"
+    );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
@@ -605,13 +677,24 @@ fn interface_harness() -> UiScript {
     harness_on(s)
 }
 
-/// The Action Bars page's harness (decision 1136): `ActionBar.xml` declares `LOCK_ACTIONBAR`, and
-/// it needs `UIParent.xml` (the managed bottom stack it seats into) and `Cooldown.xml`
-/// (`CooldownFrame_SetTimer`, every button's child) ahead of it — the manifest's own order.
+/// The Action Bars page's harness (1136's lock row, 1500's five switches): `ActionBar.xml` declares
+/// `LOCK_ACTIONBAR` and `MultiBars.xml` the four `SHOW_MULTI_ACTIONBAR_*` globals plus
+/// `ALWAYS_SHOW_MULTIBARS` (whose file-scope "0" IS the row's registered default), and both need
+/// `UIParent.xml` (the managed bottom stack the bars move) and `Cooldown.xml`
+/// (`CooldownFrame_SetTimer`, every button's child) ahead of them — the manifest's own order.
 fn actionbars_harness() -> UiScript {
     let mut s = audio_harness();
     s.set_screen_size(1024.0, 768.0);
-    load_definers(&s, &["UIParent.xml", "Cooldown.xml", "ActionBar.xml"]);
+    load_definers(
+        &s,
+        &[
+            "Fonts.xml",
+            "UIParent.xml",
+            "Cooldown.xml",
+            "ActionBar.xml",
+            "MultiBars.xml",
+        ],
+    );
     harness_on(s)
 }
 
@@ -1697,11 +1780,16 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
         );
         checked += 1;
     }
-    // 20 CVar rows (Social's two bubble switches are 1139's; Status Bar Text, Mouse Sensitivity
-    // and Max Camera Distance 1140's; Graphics' Vertical Sync is 1394's) + the Combat page's 14
-    // saved-variable rows (1134) + the Interface page's 4 (3 from 1136, Buff Durations 1139) and
-    // the Action Bars page's 1 (1136).
-    assert_eq!(checked, 39, "every row but one carries a live 1.12 key");
+    // 21 CVar rows (Social's two bubble switches are 1139's; Status Bar Text, Mouse Sensitivity
+    // and Max Camera Distance 1140's; Graphics' Vertical Sync is 1394's; Camera Following Style
+    // 1493's) + the Combat page's 14 saved-variable rows (1134) + the Interface page's 4 (3 from
+    // 1136, Buff Durations 1139) and the Action Bars page's 2 (the lock 1136, Always Show
+    // ActionBars 1500) + 6 API rows (the Interface page's Show Cloak / Show Helm, 1472; the Action
+    // Bars page's four multibar switches, 1500) — which is the point of counting here rather than
+    // per page: the third store's rows are held to the same "the key is 1.12's own and it resolves"
+    // bar as the other two. Camera Following Style is counted on the key it wears at rest (Smart's
+    // OPTION_TOOLTIP_CAMERA1); the other two ride the same census as the selection moves.
+    assert_eq!(checked, 47, "every row but one carries a live 1.12 key");
     assert_eq!(
         untipped,
         vec!["ControlsRowAutoLoot".to_string()],
@@ -1790,10 +1878,12 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
             s.errors()
         );
     }
-    // 20 of the 21 CVar rows (Social's two are 1139's; Status Bar Text, Mouse Sensitivity and
-    // Max Camera Distance 1140's; Vertical Sync 1394's), plus the Combat page's 14 saved-variable
-    // rows (1134), the Interface page's 4 (1136, + Buff Durations 1139) and Action Bars' 1 (1136).
-    assert_eq!(raised, 39, "every row but Auto Loot has a 1.12 description");
+    // 21 of the 22 CVar rows (Social's two are 1139's; Status Bar Text, Mouse Sensitivity and
+    // Max Camera Distance 1140's; Vertical Sync 1394's; Camera Following Style 1493's), plus the
+    // Combat page's 14 saved-variable rows (1134), the Interface page's 4 (1136, + Buff Durations
+    // 1139), Action Bars' 2 (the lock 1136, Always Show ActionBars 1500) and 6 API rows (Show
+    // Cloak / Show Helm, 1472; the four multibar switches, 1500).
+    assert_eq!(raised, 47, "every row but Auto Loot has a 1.12 description");
 }
 
 /// The **Combat page** (decision 1134) — the first rows in this window whose store is a
@@ -2031,10 +2121,10 @@ fn what_the_combat_page_writes_survives_a_restart() {
     );
 }
 
-/// The **Action Bars page** (decision 1136) — one row, over the one global on that group whose
-/// store is a uvar at all (the five multibar toggles read a `func`, and our two bottom multibars
-/// are unconditionally on). It is also the page whose setting had to be BUILT first: 1134 §3 listed
-/// `LOCK_ACTIONBAR` as "not defined, and no guard exists".
+/// The **Action Bars page**'s lock row (decision 1136) — the one global on that group whose store
+/// is a uvar. It is also the page whose setting had to be BUILT first: 1134 §3 listed
+/// `LOCK_ACTIONBAR` as "not defined, and no guard exists". The five switches above it are 1500's
+/// and have their own test below.
 ///
 /// The end-to-end teeth are the last block: the row's write reaches the shipped bar's own drag
 /// guard in the same VM. `action_bar_tests`/`pet_bar_tests` own the guard's full behaviour
@@ -2156,6 +2246,117 @@ fn the_interface_page_writes_the_three_stock_globals() {
         .unwrap(),
         "these three need no apply hook"
     );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The **equipment-display rows** — Show Cloak and Show Helm (decision 1472, B123). They are the
+/// window's third kind of row and the only one with no store at all: the preference is a bit of the
+/// character's own server-side `PLAYER_FLAGS`, so the row reads an engine getter and writes an
+/// engine setter, 1.12's own `func`/`setFunc` pair for exactly these two entries.
+///
+/// Three things are asserted that no other row shape can be: the read comes from the API rather
+/// than a saved value (a page revisit re-asks), the write leaves both the CVar table and the global
+/// namespace untouched and produces a **wire** intent instead, and the getter follows the click
+/// immediately — before the server's descriptor answers — because the wire verb is a blind flip and
+/// a second click inside that round trip would otherwise compute the wrong direction.
+#[test]
+fn the_equipment_display_rows_read_and_write_through_the_api_not_a_store() {
+    let mut s = interface_harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+
+    // Both ship shown — the model's own default, and the reference's hand-written one.
+    for row in ["RowShowHelm", "RowShowCloak"] {
+        assert!(
+            s.eval::<bool>(&format!(
+                "return OptionsFrameContainerBodyInterface{row}Check:GetChecked() and true or false"
+            ))
+            .unwrap(),
+            "{row} reads the API"
+        );
+    }
+
+    let _ = s.take_cvar_changes();
+    let _ = s.take_worn_display_toggles();
+    s.run("OptionsFrameContainerBodyInterfaceRowShowHelmCheck:Click()")
+        .unwrap();
+    assert_eq!(
+        s.take_worn_display_toggles(),
+        vec![WornDisplay::Helm],
+        "the click is a CMSG_TOGGLE_HELM intent, not a stored value"
+    );
+    assert!(
+        s.take_cvar_changes().is_empty(),
+        "an API row must not touch the CVar table"
+    );
+    assert!(
+        !s.eval::<bool>("return ShowingHelm() and true or false")
+            .unwrap(),
+        "the getter follows the click at once — the server has not answered yet"
+    );
+    assert!(
+        s.eval::<bool>("return ShowingCloak() and true or false")
+            .unwrap(),
+        "and the other slot is a different bit"
+    );
+
+    // The read is a re-ask, not a remembered string: leave the page and come back.
+    s.run("OptionsFrameCategoryListRowAudio:Click()").unwrap();
+    s.run("OptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+    assert!(
+        !s.eval::<bool>(
+            "return OptionsFrameContainerBodyInterfaceRowShowHelmCheck:GetChecked() \
+             and true or false"
+        )
+        .unwrap(),
+        "the revisit re-asks the getter"
+    );
+
+    // The wire is the truth: a descriptor edge that disagrees wins over the optimistic belief.
+    s.set_worn_display(true, true);
+    s.run("OptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+    assert!(
+        s.eval::<bool>(
+            "return OptionsFrameContainerBodyInterfaceRowShowHelmCheck:GetChecked() \
+             and true or false"
+        )
+        .unwrap(),
+        "the server said the helm is shown, so the row says so"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// Defaults on an API row: both boxes go back to shown, and the flip is sent **only** for the one
+/// that was actually off — the setter is a *set* over a wire verb that is a blind *toggle*, so a
+/// no-op default must not queue a packet that would turn the preference on its head.
+#[test]
+fn defaults_sends_a_flip_only_for_the_row_that_moved() {
+    let mut s = interface_harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+    s.run("OptionsFrameContainerBodyInterfaceRowShowCloakCheck:Click()")
+        .unwrap();
+    let _ = s.take_worn_display_toggles();
+    assert!(!s
+        .eval::<bool>("return ShowingCloak() and true or false")
+        .unwrap());
+
+    s.run("OptionsFrameContainerDefaults:Click()").unwrap();
+    assert_eq!(
+        s.take_worn_display_toggles(),
+        vec![WornDisplay::Cloak],
+        "only the cloak had moved"
+    );
+    assert!(s
+        .eval::<bool>("return ShowingCloak() and true or false")
+        .unwrap());
+    assert!(s
+        .eval::<bool>("return ShowingHelm() and true or false")
+        .unwrap());
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
@@ -2611,5 +2812,283 @@ fn the_max_camera_distance_slider_stores_a_factor_and_reads_out_yards() {
             .unwrap(),
         "2"
     );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **Camera Following Style** (decisions 1493/1502) — 1.12's `cameraSmoothStyle`, worn as a
+/// Controls-page dropdown, and the setting that decides whether the camera returns to behind the
+/// character at all. What is pinned here is the trap: the reference's own dropdown writes `1/2/3`,
+/// but the ENGINE's tables are indexed `0 = Never · 1 = Smart · 2 = Always`, and `3` is not a style
+/// — the validator accepts it while the terrain-tilt consumer indexes off the end of its table
+/// (wow-re `camera-smooth-style.md` §2/§4). So our entries carry the engine's numbers in the
+/// reference's display order, a stray `3` still reads as Never rather than as the numerically
+/// nearest "Always", and the plate follows the SELECTION the way that dropdown's own does.
+#[test]
+fn the_camera_following_style_dropdown_carries_the_engine_enum_and_plate() {
+    let mut s = harness_on(audio_harness());
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowControls:Click()")
+        .unwrap();
+
+    // The registrar default is the reference's, and it is what the director asked to ship.
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyControlsRowCameraFollowStyleDropdownText:GetText()"
+        )
+        .unwrap(),
+        "Smart"
+    );
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyControlsRowCameraFollowStyleLabel:GetText()"
+        )
+        .unwrap(),
+        "Camera Following Style"
+    );
+    assert_eq!(
+        s.eval::<String>("return OptionsFrameContainerBodyControlsRowCameraFollowStyle.tip")
+            .unwrap(),
+        "OPTION_TOOLTIP_CAMERA1"
+    );
+    assert!(
+        s.take_cvar_changes().is_empty(),
+        "reading the table on select must not write it back"
+    );
+
+    // The list is the reference dropdown's, entry for entry and in its order.
+    s.run("OptionsFrameContainerBodyControlsRowCameraFollowStyleDropdownButton:Click()")
+        .unwrap();
+    assert_eq!(
+        s.eval::<f64>("return DropDownList1.numButtons").unwrap(),
+        3.0
+    );
+    assert_eq!(
+        s.eval::<String>(
+            "return DropDownList1Button1:GetText() .. \",\" .. DropDownList1Button2:GetText() \
+             .. \",\" .. DropDownList1Button3:GetText()"
+        )
+        .unwrap(),
+        "Smart,Always,Never"
+    );
+    assert!(s
+        .eval::<bool>("return DropDownList1Button1Check:IsVisible()")
+        .unwrap());
+
+    // Never stores "0" — the engine's own index, not the "3" the reference's dropdown writes —
+    // and the row's plate becomes Never's own description.
+    s.run("DropDownList1Button3:Click()").unwrap();
+    assert_eq!(
+        s.take_cvar_changes(),
+        vec![("cameraSmoothStyle".to_string(), "0".to_string())]
+    );
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyControlsRowCameraFollowStyleDropdownText:GetText()"
+        )
+        .unwrap(),
+        "Never"
+    );
+    assert_eq!(
+        s.eval::<String>("return OptionsFrameContainerBodyControlsRowCameraFollowStyle.tip")
+            .unwrap(),
+        "OPTION_TOOLTIP_CAMERA3",
+        "the plate follows the selection, like the reference dropdown's own"
+    );
+
+    // Always is the middle entry and stores "2".
+    s.run("OptionsFrameContainerBodyControlsRowCameraFollowStyleDropdownButton:Click()")
+        .unwrap();
+    s.run("DropDownList1Button2:Click()").unwrap();
+    assert_eq!(
+        s.take_cvar_changes(),
+        vec![("cameraSmoothStyle".to_string(), "2".to_string())]
+    );
+
+    // A config written by a REAL 1.12 client says "3" for Never. It must not display as the
+    // numerically nearest stop — which is Always, the opposite of what it means.
+    s.set_cvar_host("cameraSmoothStyle", "3");
+    s.run("OptionsFrameCategoryListRowAudio:Click(); OptionsFrameCategoryListRowControls:Click()")
+        .unwrap();
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyControlsRowCameraFollowStyleDropdownText:GetText()"
+        )
+        .unwrap(),
+        "Never",
+        "the reference dropdown's own stray value still means Never"
+    );
+    assert!(
+        s.take_cvar_changes().is_empty(),
+        "displaying a stray value must not write it back"
+    );
+
+    // Defaults walks it back to Smart.
+    s.run("OptionsFrameContainerDefaults:Click()").unwrap();
+    assert_eq!(
+        s.eval::<String>("return GetCVar(\"cameraSmoothStyle\")")
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyControlsRowCameraFollowStyleDropdownText:GetText()"
+        )
+        .unwrap(),
+        "Smart"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// The **Action Bars page's five switches** (decision 1500) — the four bar toggles and the grid
+/// option, on ONE page over TWO different stores, which is the whole point of the test.
+///
+/// The four bar rows are API (`func`) rows: there is nothing local to save, because the preference
+/// is four bits of this character's server-side `PLAYER_FIELD_BYTES` byte 2. A click writes the
+/// live Lua global, re-derives the bars and re-sends the whole byte — with **four** arguments, the
+/// binding's verified arity. Always Show ActionBars is a saved-variable row instead, and NOT
+/// because someone preferred it: the same binding silently drops the fifth argument the reference
+/// passes it, so that switch has no server store to write.
+///
+/// The end-to-end teeth are the real bars moving in the same VM — the row's write reaches
+/// `MultiActionBar_Update`, which reaches `UIParent_ManageFramePositions`.
+#[test]
+fn the_action_bars_page_toggles_the_real_bars() {
+    let mut s = actionbars_harness();
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowActionBars:Click()")
+        .unwrap();
+
+    let box_of = |row: &str| format!("OptionsFrameContainerBodyActionBars{row}Check");
+    let checked = |s: &UiScript, row: &str| {
+        s.eval::<bool>(&format!(
+            "return {}:GetChecked() and true or false",
+            box_of(row)
+        ))
+        .unwrap()
+    };
+    let shown =
+        |s: &UiScript, bar: &str| s.eval::<bool>(&format!("return {bar}:IsShown()")).unwrap();
+
+    // Read: every switch ships OFF, and so does every bar.
+    for row in [
+        "RowMultiBar1",
+        "RowMultiBar2",
+        "RowMultiBar3",
+        "RowMultiBar4",
+        "RowAlwaysShowMultibars",
+    ] {
+        assert!(!checked(&s, row), "{row} ships unticked");
+    }
+    for bar in [
+        "MultiBarBottomLeft",
+        "MultiBarBottomRight",
+        "MultiBarRight",
+        "MultiBarLeft",
+    ] {
+        assert!(!shown(&s, bar), "{bar} ships down");
+    }
+
+    // Bar 4's row is DEAD while bar 3's is unticked — MultiBarLeft cannot stand without
+    // MultiBarRight (the reference's own rule for this pair, UIOptionsFrame.lua l.722-726).
+    assert!(
+        !s.eval::<bool>(&format!("return {}:IsEnabled()", box_of("RowMultiBar4")))
+            .unwrap(),
+        "Show Right ActionBar 2 is disabled until Show Right ActionBar is on"
+    );
+
+    // The write: a click raises the bar, writes the global as the number 1, and sends the byte.
+    let _ = s.take_cvar_changes();
+    s.run(&format!("{}:Click()", box_of("RowMultiBar1")))
+        .unwrap();
+    assert!(shown(&s, "MultiBarBottomLeft"), "the row reached the bar");
+    assert_eq!(s.eval::<i64>("return SHOW_MULTI_ACTIONBAR_1").unwrap(), 1);
+    assert_eq!(
+        s.take_action_bar_toggle_sends(),
+        vec![0x01],
+        "one CMSG_SET_ACTIONBAR_TOGGLES carrying the whole byte"
+    );
+    assert!(
+        s.take_cvar_changes().is_empty(),
+        "an API row must not touch the CVar table"
+    );
+
+    // …and the managed bottom stack moved with it (CONTAINER_OFFSET_Y's bottomEither 27).
+    assert_eq!(s.eval::<f64>("return CONTAINER_OFFSET_Y").unwrap(), 97.0);
+
+    // Ticking bar 3 wakes bar 4's row; ticking bar 4 then brings MultiBarLeft up beside it.
+    s.run(&format!("{}:Click()", box_of("RowMultiBar3")))
+        .unwrap();
+    assert!(
+        s.eval::<bool>(&format!("return {}:IsEnabled()", box_of("RowMultiBar4")))
+            .unwrap(),
+        "bar 3 on wakes bar 4's row"
+    );
+    assert!(shown(&s, "MultiBarRight"));
+    assert!(!shown(&s, "MultiBarLeft"), "bar 4 is still off");
+    s.run(&format!("{}:Click()", box_of("RowMultiBar4")))
+        .unwrap();
+    assert!(shown(&s, "MultiBarLeft"));
+    assert_eq!(
+        s.take_action_bar_toggle_sends(),
+        vec![0x05, 0x0d],
+        "one packet per click — bars 1+3, then 1+3+4"
+    );
+
+    // Untick bar 3 and MultiBarLeft goes with it, even though bar 4's own flag is still set — the
+    // conjunction is in MultiActionBar_Update, not in the row.
+    s.run(&format!("{}:Click()", box_of("RowMultiBar3")))
+        .unwrap();
+    assert!(!shown(&s, "MultiBarRight"));
+    assert!(!shown(&s, "MultiBarLeft"), "MultiBarLeft rides on bar 3");
+    assert_eq!(s.eval::<i64>("return SHOW_MULTI_ACTIONBAR_4").unwrap(), 1);
+    assert!(
+        !s.eval::<bool>(&format!("return {}:IsEnabled()", box_of("RowMultiBar4")))
+            .unwrap(),
+        "…and its row goes back to sleep"
+    );
+
+    // The grid switch is the OTHER store: a saved-variable global, no packet, and an applyFunc
+    // that opens every extra bar's empty wells.
+    let _ = s.take_action_bar_toggle_sends();
+    s.run(&format!("{}:Click()", box_of("RowAlwaysShowMultibars")))
+        .unwrap();
+    assert_eq!(
+        s.eval::<String>("return ALWAYS_SHOW_MULTIBARS").unwrap(),
+        "1",
+        "a uvar row stores the panel's string"
+    );
+    assert!(
+        s.take_action_bar_toggle_sends().is_empty(),
+        "and sends NOTHING — the binding has no room for a fifth argument"
+    );
+    assert!(
+        s.eval::<bool>("return MultiBarBottomLeftButton5:IsShown()")
+            .unwrap(),
+        "the applyFunc opened the empty wells"
+    );
+
+    // Defaults walks the whole page back: every bar down, the grid off, the lock unlocked.
+    s.run("OptionsFrameContainerDefaults:Click()").unwrap();
+    for bar in [
+        "MultiBarBottomLeft",
+        "MultiBarBottomRight",
+        "MultiBarRight",
+        "MultiBarLeft",
+    ] {
+        assert!(!shown(&s, bar), "{bar} back down");
+    }
+    assert_eq!(
+        *s.take_action_bar_toggle_sends()
+            .last()
+            .expect("Defaults writes every bar row"),
+        0,
+        "the last packet Defaults sends is the empty byte"
+    );
+    assert_eq!(
+        s.eval::<String>("return ALWAYS_SHOW_MULTIBARS").unwrap(),
+        "0",
+        "MultiBars.xml's own file-scope assignment IS the registered default"
+    );
+    assert_eq!(s.eval::<f64>("return CONTAINER_OFFSET_Y").unwrap(), 70.0);
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }

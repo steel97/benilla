@@ -57,8 +57,10 @@ pub(crate) use twist::{wrap_pi, BodyTwist};
 /// The unit animation-LOD gate (decision 0448): park an off-frustum rig's per-bone pose
 /// evaluation — the clocks, the driver state machine, and the event tracks keep running, so
 /// off-screen combat stays audible (0075) and a re-appearing unit snaps to the absolute-clock
-/// pose. A modernization, not fidelity — the reference animates every in-range unit (wow-re
-/// `unit-anim-visibility-gate.md`).
+/// pose. Shipped as a modernization; wow-re's 2026-08-13 election correction
+/// (`outdoor-object-pass-election.md`) made it the faithful direction instead — decision 1473
+/// records that, and what still diverges (parked rigs keep drawing; the reference keeps only
+/// `MORE_AUDIBLE` creatures audible off-screen).
 mod lod;
 
 /// The unit's wielded weapon classes — `(item class, item subclass)` per hand, `None` for an empty
@@ -649,7 +651,13 @@ pub(crate) use sheath::{
 /// The `SMSG_EMOTE` → [`EmoteAnim`] consumer (Part 1 of the emote-animation wiring) — kept
 /// alongside `sheath` as its own small concern.
 mod emote_anim;
+
+/// The client-local gesture producers (decision 1469): the chat talk/question/exclamation/shout/
+/// laugh, and the NPC-interact talk. The reference's `0x60bb30`, which shares the one-shot player
+/// with `SMSG_EMOTE`.
+mod gesture;
 use emote_anim::emote_to_anim;
+pub(crate) use gesture::{select_gesture, Gesture, GestureQueue};
 
 /// The Bevy driver systems that execute the state machine [`select`] picks (decision 0049 + 0073,
 /// decision 0087's one-shot routing, decision 0080's sheath execution) — kept in its own file as
@@ -982,6 +990,7 @@ impl Plugin for CreatureAnimPlugin {
             .add_message::<SwingSlowdown>()
             .init_resource::<PendingImpacts>()
             .init_resource::<PlaySeq>()
+            .init_resource::<gesture::GestureQueue>()
             .add_message::<EmoteAnim>()
             .add_message::<MountFlourish>()
             .add_message::<WoundAnim>()
@@ -1027,6 +1036,10 @@ impl Plugin for CreatureAnimPlugin {
                     // The landing predictor's dust leg (the vocal leg lives in `sound`).
                     hard_landing_dust,
                     emote_to_anim,
+                    // The client-local gestures (decision 1469) — the chat talk/shout/laugh and
+                    // the NPC-interact talk. The client's second (and only other) producer of a
+                    // one-shot emote; same place in the order as the wire one, for the same reason.
+                    gesture::drive_gestures,
                     // The flourish hop (unit → mount child) — before the driver so the
                     // one-shot lands the same frame the packet (or space press) arrived.
                     flourish_to_anim,
@@ -1047,6 +1060,11 @@ impl Plugin for CreatureAnimPlugin {
                 )
                     .chain()
                     .after(WorldStage::Net)
+                    // After predicate B's recompute (decision 1477): the loot leg's self trigger
+                    // is that boolean, and the reference has no gap between arming the latch and
+                    // posing — its chest arm force-plays Loot 50 in the same handler. Without
+                    // this edge the kneel lands a frame late at every loot window.
+                    .after(crate::ui_loot::resolve_loot_kneel)
                     // After Input so a sheath request (the Z toggle) executes the same frame.
                     .after(WorldStage::Input)
                     // Before the entity-visuals chain: [`VisualSheath`] writes must be applied

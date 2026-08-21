@@ -82,8 +82,8 @@ pub(crate) use framing::{attachment_point, head_anchor, PortraitAnchors};
 use framing::{body_frame, frame, PORTRAIT_FOV};
 mod booth;
 use booth::{
-    spawn_booth_effects, spawn_booth_model, BoothBillboardSpec, BoothEffects, BoothMotion,
-    BoothPart, BoothRider,
+    clear_booth_rig, spawn_booth_effects, spawn_booth_model, BoothBillboardSpec, BoothEffects,
+    BoothMotion, BoothPart, BoothRider,
 };
 mod dressup;
 pub(crate) use dressup::{DressUpBake, DressUpLook, DressUpPreview};
@@ -143,6 +143,12 @@ pub(super) const DRESSUP_LAYER: usize = GLUE_LAYER + 1;
 /// rule as [`GLUE_LAYER`]). This camera exists only while the warm pass runs
 /// ([`spawn_warm_booth`]); nothing but menagerie rigs ever rides its layer.
 pub(crate) const WARM_BOOTH_LAYER: usize = DRESSUP_LAYER + 1;
+/// The **minimap interior composite**'s render layer (decision 1466) — the next one past the warm
+/// booth's. Not a portrait booth, but it is an offscreen camera with its own layer, and 0775's rule
+/// is that EVERY such layer is computed in this one ladder: the two booths that each worked out
+/// "the next layer past the paper doll's" in their own file landed on the same number, and the
+/// clash was silent in both rendering and the emitter→camera match.
+pub(crate) const MINIMAP_COMPOSITE_LAYER: usize = WARM_BOOTH_LAYER + 1;
 
 // The ladder must stay collision-free: a booth camera's layer is its identity for both rendering
 // and the emitter→camera match, and the failure above was silent in both.
@@ -154,7 +160,8 @@ const _: () = assert!(
         && PAPERDOLL_LAYER != GLUE_LAYER
         && INSPECT_LAYER != GLUE_LAYER
         && DRESSUP_LAYER > GLUE_LAYER
-        && WARM_BOOTH_LAYER > DRESSUP_LAYER,
+        && WARM_BOOTH_LAYER > DRESSUP_LAYER
+        && MINIMAP_COMPOSITE_LAYER > WARM_BOOTH_LAYER,
     "booth render layers must be distinct — see GLUE_LAYER"
 );
 const _: () = assert!(
@@ -421,15 +428,51 @@ struct Booth {
     /// until each lands (an `mpq://` image arriving after the bake would otherwise be frozen
     /// OUT of the still forever), then renders one final resident frame.
     pending: Vec<Handle<Image>>,
+    /// When the current `pending` hold began (wall secs) — `None` while it is empty. The hold
+    /// was designed for a texture in flight, not one that will NEVER land (a failed load leaves
+    /// no `Assets<Image>` entry): unbounded, that pinned the camera rendering forever behind a
+    /// closed window. [`gate_booth_cameras`] releases the hold at [`PENDING_LANDING_SECS`]
+    /// with a warn — the still keeps whatever did land.
+    pending_since: Option<f64>,
     /// The **destination pane's** aspect this booth's camera is currently framed for
     /// ([`framing::WowPortraitProjection::aspect`], decision 1069) — 1.0 until the UI has drawn the
     /// pane once, then sticky: a hidden window must not re-frame the bake back to square.
     aspect: f32,
+    /// A rig stands in this booth ([`booth::BoothRig::rigged`] at the last bake) — the park
+    /// gate's "is there anything to park". Cleared with the emptied booth.
+    rigged: bool,
+    /// The booth scene is parked: its camera is asleep, so [`gate_booth_cameras`] put
+    /// [`benilla_world::rig_anim::AnimParked`] on the root — the 0712 evaluator, the pose
+    /// composes, the palette writes and the global-sequence writes all skip (the pose HOLDS —
+    /// the buffer is state), and the booth-lane emitters freeze under the draw-set law
+    /// (`particles::sim` — the reference only ticks an emitter its frame draws). A camera wake
+    /// drops the marker before the animation lane runs, so the wake window's first render
+    /// already animates. Costs nothing while a window is open; retires the whole idle lane the
+    /// rest of the session.
+    parked: bool,
 }
 
 /// How many frames a content edge keeps a booth camera rendering ([`Booth::wake`]): covers the
 /// command-applied spawn, the billboard re-face's one-frame lag, and GPU upload of fresh meshes.
 const BOOTH_SETTLE_FRAMES: u32 = 4;
+
+/// This rig stands on a booth stage, not in the world: its `AnimParked` marker is owned by
+/// [`gate_booth_cameras`] alone, and the world-view parker (`creature_anim::lod`) filters it out
+/// (decision 1447). One marker, one writer — the same split the doodad draw gate holds for
+/// placed doodads (decision 1365). The hazard is structural: a booth stage sits outside every
+/// world frustum by construction, so an unfiltered view parker freezes every pane moments after
+/// its bake — while this gate, tracking only its own park edges, cannot heal the foreign marker.
+/// [`booth::BoothRig::finish`] inserts it beside the `RigPose`; [`booth::clear_booth_rig`]
+/// strips it with the rest. Policy, not machinery — which is why it lives here and not in
+/// `benilla_world::rig_anim` beside the marker it fences (the 1160 line).
+#[derive(bevy::prelude::Component)]
+pub(crate) struct StageRig;
+
+/// How long a [`Booth::pending`] texture hold may keep the camera awake (wall secs) before it is
+/// declared never-landing and released ([`Booth::pending_since`]). Generous against a real load —
+/// an MPQ image lands in well under a second — because a premature release only costs a stale
+/// still, while the old unbounded hold cost a forever-rendering camera.
+const PENDING_LANDING_SECS: f64 = 10.0;
 
 /// `WOW_BOOTH_LOG=1` — is the booth instrument armed? (Read once.)
 fn booth_log() -> bool {
@@ -531,6 +574,8 @@ fn wake_booth<'a>(
         .filter_map(|h| mats.get(h))
         .filter_map(|m| m.base.base_color_texture.clone())
         .collect();
+    // A fresh hold gets a fresh clock ([`Booth::pending_since`]) — the gate stamps it.
+    booth.pending_since = None;
 }
 
 #[derive(Resource, Default)]
@@ -616,6 +661,34 @@ fn feed_gx_aspect(
     }
 }
 
+/// The body panes' render rate (decision 1444): while a `<PlayerModel>`-family pane (paper
+/// doll, dressing room, inspect, pet) is on screen, its booth camera renders every OTHER frame
+/// instead of every frame. The pane's per-frame bill is the **second render pass itself** —
+/// 1441's trace put ~0.9 ms/frame in graph re-run + drawable pressure, and 1443 measured the
+/// open-pane delta at +2.7 with the pass running every frame — so a 512²-class doll at 30 fps
+/// is the cheapest half of that back. The pose keeps evaluating at full rate (the park is not
+/// touched); only the camera skips, so the held frame is always one the pose just produced.
+///
+/// `boothHalfRate` is **benilla's own CVar** (the reference has no second view to rate-limit —
+/// its doll draws in the main pass, 1069's known rent). Default ON; whether a 30 fps doll
+/// *reads* right is the director's call (§7) — flip it live with
+/// `/script SetCVar("boothHalfRate", 0)` to A/B. Booth-lane item emitters tick only on drawn
+/// frames (the draw-set law, `particles::sim`), so at half rate a sparkle cloud advances at
+/// half speed — the law's own honest consequence, flagged for the same morning eye.
+///
+/// The glue screens (`live_scene`) are exempt: a fullscreen create/select scene at 30 fps is
+/// not a pane crop, and those screens have no world behind them to pay for.
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PaneRate {
+    pub(crate) half: bool,
+}
+
+impl Default for PaneRate {
+    fn default() -> Self {
+        Self { half: true }
+    }
+}
+
 /// The two **framing inputs** a body booth reads, in one param: the pane geometry the UI extract
 /// publishes ([`BoothPanes`]) and the display aspect ([`GxAspect`]).
 ///
@@ -633,6 +706,7 @@ pub(crate) struct PortraitPlugin;
 impl Plugin for PortraitPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PortraitImages>()
+            .init_resource::<PaneRate>()
             .init_resource::<PaperDollBooth>()
             .init_resource::<InspectBooth>()
             .init_resource::<PetDollBooth>()
@@ -644,17 +718,17 @@ impl Plugin for PortraitPlugin {
             .init_resource::<BoothPanes>()
             .init_resource::<GxAspect>()
             .init_resource::<BoothLight>()
-            .init_resource::<crate::ui_session::InteractNpc>()
             .add_systems(Startup, setup_booths)
             // The variant-cache reaper: booth twins die with their world source material.
             .add_systems(Update, (light::reap_dead_variants, feed_gx_aspect))
-            // `feed_interact_npc` resolves the `"npc"` token's entity first; then the test bake owns
-            // the booths when its env is set (the live syncs yield to it). The paper-doll sync runs
-            // last (it shares the camera/booth/image resources, so the chain keeps the access ordered).
+            // The `"npc"` token's entity is resolved by `ui_session`'s own plugin (it is shared with
+            // the interaction face-me, decision 1467) — the booths read whatever it last published.
+            // Here the test bake owns the booths when its env is set (the live syncs yield to it),
+            // and the paper-doll sync runs last (it shares the camera/booth/image resources, so the
+            // chain keeps the access ordered).
             .add_systems(
                 Update,
                 (
-                    crate::ui_session::feed_interact_npc,
                     test_bake::sync_test_portraits,
                     sync_portraits,
                     sync_paperdoll,
@@ -866,7 +940,10 @@ fn setup_booths(
                 wake: 0,
                 live: false,
                 pending: Vec::new(),
+                pending_since: None,
                 aspect: 1.0,
+                rigged: false,
+                parked: false,
             },
         );
     }
@@ -936,7 +1013,10 @@ fn setup_booths(
                 wake: 0,
                 live: false,
                 pending: Vec::new(),
+                pending_since: None,
                 aspect: 1.0,
+                rigged: false,
+                parked: false,
             },
         );
     }
@@ -1098,6 +1178,12 @@ fn sync_portraits(
                 // backdrop, not the departed unit's face, before the camera sleeps.
                 booth.wake = BOOTH_SETTLE_FRAMES;
                 booth.pending.clear();
+                // The despawn reaped meshes and anchors; the rig state on the ROOT (pose buffer,
+                // player, palette slot) needs its own strip or it evaluates behind the emptied
+                // stage for as long as the booth stands empty ([`booth::clear_booth_rig`]).
+                clear_booth_rig(&mut commands, booth.root);
+                booth.rigged = false;
+                booth.parked = false;
             }
             let live = PortraitSource::Live(booth.target.clone());
             if portraits.0.get(token) != Some(&live) {
@@ -1189,7 +1275,7 @@ fn sync_portraits(
                 continue;
             }
             commands.entity(booth.root).despawn_related::<Children>();
-            spawn_booth_model(
+            let booth_rig = spawn_booth_model(
                 &mut commands,
                 &mut palettes,
                 booth.root,
@@ -1206,6 +1292,12 @@ fn sync_portraits(
                 [false, false], // a still portrait sheaths its weapons — no in-hand grip
                 &booth_billboards,
             );
+            // Even a Frozen still re-evaluates its paused pose every frame — the park matters
+            // MOST here, since a portrait's camera sleeps for the whole session outside its
+            // bake window.
+            booth.rigged = booth_rig.rigged();
+            booth_rig.finish(&mut commands);
+            booth.parked = false;
             // **No emitters here, and that is the reference's own answer** (decision 0822): the
             // round portrait is a ONE-SHOT bake — a fresh M2 scene + instance, one `0x707680` draw,
             // the texture cached by GUID/displayId and returned with *no re-render* on a hit, nothing
@@ -1437,6 +1529,11 @@ fn sync_body_booth(
             booth.wake = BOOTH_SETTLE_FRAMES;
             booth.live = false;
             booth.pending.clear();
+            // The despawn reaped meshes and anchors; the rig state on the ROOT needs its own
+            // strip ([`booth::clear_booth_rig`]).
+            clear_booth_rig(commands, booth.root);
+            booth.rigged = false;
+            booth.parked = false;
         }
         return;
     }
@@ -1518,7 +1615,7 @@ fn sync_body_booth(
             return;
         }
         commands.entity(booth.root).despawn_related::<Children>();
-        let joints = spawn_booth_model(
+        let mut booth_rig = spawn_booth_model(
             commands,
             palettes,
             booth.root,
@@ -1538,12 +1635,12 @@ fn sync_body_booth(
             [false, false], // the pane sheaths its weapons — no in-hand grip
             &booth_billboards,
         );
-        // The item effects go up on the posed skeleton's joints — the body pane is the lane that gets
-        // them (the reference's `<PlayerModel>` widget renders live; the round portraits are a
-        // one-shot cached bake — [`spawn_booth_effects`]).
+        // The item effects go up on the posed skeleton's anchors — the body pane is the lane that
+        // gets them (the reference's `<PlayerModel>` widget renders live; the round portraits are
+        // a one-shot cached bake — [`spawn_booth_effects`]).
         spawn_booth_effects(
             commands,
-            &joints,
+            &mut booth_rig,
             &booth.layer,
             booth_light.pane.buffer.as_ref(),
             &booth_effects,
@@ -1551,6 +1648,10 @@ fn sync_body_booth(
         // So the whole bake is live, emitters or not — `wake` can't gate a looping animation.
         // `gate_booth_cameras` renders it every frame its pane is on screen, and none when it isn't.
         booth.live = true;
+        // A fresh bake is animated by construction; the park state is the new rig's.
+        booth.rigged = booth_rig.rigged();
+        booth_rig.finish(commands);
+        booth.parked = false;
         // Body framing from the display's bounds — the full standing figure, feet-to-crown, at the
         // destination pane's aspect. Resolved before the teardown above; see the portrait site for
         // why it cannot be faked.
@@ -1607,6 +1708,7 @@ fn sync_body_booth(
 /// only works if the booth cameras render during the warm window.
 #[allow(clippy::too_many_arguments)] // a Bevy system: each param is one resource/query
 fn gate_booth_cameras(
+    mut commands: Commands,
     mut booths: ResMut<Booths>,
     preview: Res<GluePreview>,
     panes: Res<BoothPanes>,
@@ -1614,6 +1716,13 @@ fn gate_booth_cameras(
     warm: Res<crate::pipe_warm::WarmPass>,
     time: Res<Time<bevy::time::Real>>,
     mut cams: Query<(&BoothCam, &mut Camera)>,
+    rate: Res<PaneRate>,
+    frames: Res<bevy::diagnostic::FrameCount>,
+    // `WOW_BOOTH_LOG` only: the marker's REAL state beside this gate's `booth.parked`
+    // bookkeeping. The two can desync exactly one way — a foreign writer — and that desync is
+    // invisible in every capture (a woken rig snaps to the absolute clock), so it must be
+    // loggable (decision 1447: the world parker froze every pane and no dump could show it).
+    markers: Query<(), With<benilla_world::rig_anim::AnimParked>>,
     mut env_cache: Local<Option<bool>>,
 ) {
     let test = test_mode(&mut env_cache);
@@ -1630,6 +1739,25 @@ fn gate_booth_cameras(
         if had_pending && booth.pending.is_empty() {
             booth.wake = booth.wake.max(1);
         }
+        // Bound the hold (the `pending_since` field's doc): a texture that will never land must
+        // not keep this camera rendering for the rest of the session.
+        if booth.pending.is_empty() {
+            booth.pending_since = None;
+        } else {
+            let now = time.elapsed_secs_f64();
+            let since = *booth.pending_since.get_or_insert(now);
+            if now - since > PENDING_LANDING_SECS {
+                warn!(
+                    "booth {}: {} texture(s) never landed after {PENDING_LANDING_SECS:.0}s — \
+                     releasing the wake hold with the still as-is",
+                    token.as_str(),
+                    booth.pending.len(),
+                );
+                booth.pending.clear();
+                booth.pending_since = None;
+                booth.wake = booth.wake.max(1);
+            }
+        }
         let live_scene = token.as_str() == GLUE_SLOT && preview.scene.is_some();
         // A live bake renders every frame — but only while the UI is actually drawing its pane.
         // (The glue screens sample their booth outside the FrameXML extract, so they publish no
@@ -1641,23 +1769,57 @@ fn gate_booth_cameras(
             || live_pane
             || booth.wake > 0
             || !booth.pending.is_empty();
+        // Half-rate (decision 1444, [`PaneRate`]): when the live pane is the ONLY thing keeping
+        // this camera rendering — no wake window settling a fresh bake, no pending texture hold,
+        // no fullscreen glue scene — skip every other frame. `active` stays the LOGICAL state:
+        // the park bookkeeping below keys off it (the pose keeps evaluating; only the render
+        // skips), and the wake counter keeps draining per real frame.
+        let throttled = rate.half
+            && live_pane
+            && !(test || warming || live_scene)
+            && booth.wake == 0
+            && booth.pending.is_empty()
+            && frames.0 % 2 == 1;
+        let render = active && !throttled;
         // `WOW_BOOTH_LOG=1`: the gate's timeline — every activity flip and every armed frame,
         // wall-stamped (the first-login black-pane hunt).
         static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *LOG.get_or_init(|| std::env::var_os("WOW_BOOTH_LOG").is_some())
-            && (cam.is_active != active || active)
+            && (cam.is_active != render || active)
         {
             eprintln!(
-                "[booth] t={:7.2} {} active={} wake={} pending={}",
+                "[booth] t={:7.2} {} active={} render={} wake={} pending={} marker={}",
                 time.elapsed_secs(),
                 token.as_str(),
                 active,
+                render,
                 booth.wake,
                 booth.pending.len(),
+                markers.contains(booth.root),
             );
         }
-        if cam.is_active != active {
-            cam.is_active = active;
+        if cam.is_active != render {
+            cam.is_active = render;
+        }
+        // Park/unpark the standing scene with its camera (director report 2026-08-19: the doll
+        // bake animated at full cost from the LOGIN bake to quit, window opened or not). The
+        // park is one `AnimParked` marker on the root (decision 1443): the 0712 evaluator, the
+        // pose composes, the palette writes and the global-sequence writes all check it — the
+        // pose HOLDS, the buffer is state. Booth-lane emitters freeze on the camera bit itself
+        // (`particles::sim`). This system runs before the PostUpdate animation lane, so an
+        // unpark's marker drop is seen the same frame — the wake window's first render already
+        // animates (0739's wake law, same as every world rig).
+        if booth.parked == active && booth.rigged {
+            if active {
+                commands
+                    .entity(booth.root)
+                    .remove::<benilla_world::rig_anim::AnimParked>();
+            } else {
+                commands
+                    .entity(booth.root)
+                    .insert(benilla_world::rig_anim::AnimParked);
+            }
+            booth.parked = !active;
         }
         if active {
             booth.wake = booth.wake.saturating_sub(1);

@@ -341,41 +341,51 @@ fn real_spell_catalog_pins_the_skin_latch_effects() {
 }
 
 /// The **skill an opener provides** on the real Spell.dbc — the left-hand side of the client's lock
-/// satisfaction test (`0x5f850f`; decision 0752). This walk decides whether a right-click opens a
-/// lock at all, so its inputs (spellLevel 28 · EffectDieSides 64 · EffectBaseDice 67 ·
+/// satisfaction test (`0x5f850f`; decision 0752, level term corrected by wow-re
+/// `openlock-spell-store-order.md` §4a). This walk decides whether a right-click opens a lock at
+/// all, so its inputs (maxLevel 27 · baseLevel 28 · EffectDieSides 64 · EffectBaseDice 67 ·
 /// EffectDicePerLevel 70 · EffectRealPointsPerLevel 73 · EffectBasePoints 76) are pinned by
-/// *result*, against anchors whose right answers are known from the game rather than the file.
-/// Skips without client data.
+/// *result*, against anchors whose right answers are known from the game rather than the file —
+/// the below-cap rows are §4a's own discriminating table (the values the refuted caster-level
+/// reading could not produce). Skips without client data.
 #[test]
 fn real_spell_catalog_computes_the_lock_skill_an_opener_provides() {
     let data = crate::wow_data_or_skip!();
     let mut chain = crate::open_chain(&data).expect("open chain");
     let cat = load_spell_catalog(&mut chain).expect("load Spell/SpellIcon");
 
-    // Pick Lock (1804): `4 + 1 + 5.0×(level − 1)` — a rogue's Lockpicking cap, 5×level, exactly.
-    assert_eq!(cat.get(1804).unwrap().open_lock_skill(60), Some(300));
-    assert_eq!(cat.get(1804).unwrap().open_lock_skill(45), Some(225));
-    // Mining (2575) / Herb Gathering (2366): `−1 + 1 + 5.0×level` — the same profession cap, but
-    // quoted at spellLevel 0, so they do not lose the first level the way Pick Lock does.
-    assert_eq!(cat.get(2575).unwrap().open_lock_skill(60), Some(300));
-    assert_eq!(cat.get(2366).unwrap().open_lock_skill(60), Some(300));
+    // Pick Lock (1804): `4 + 1 + 5.0×(skill/5 − 1)` — the skill itself, exactly: a capped rogue
+    // provides 300, and a 150-skill rogue provides 150 (§4a's discriminator; the old reading
+    // said 300 for both at level 60).
+    assert_eq!(cat.get(1804).unwrap().open_lock_skill(300), Some(300));
+    assert_eq!(cat.get(1804).unwrap().open_lock_skill(225), Some(225));
+    assert_eq!(cat.get(1804).unwrap().open_lock_skill(150), Some(150));
+    // Mining (2575) / Herb Gathering (2366): `−1 + 1 + 5.0×(skill/5)` — the skill, quoted at
+    // baseLevel 0, so they do not lose the first rung the way Pick Lock does. 1 Mining provides
+    // 0 — the level-60-with-1-Mining bug (decision 1320) is the 300 the old reading put here.
+    assert_eq!(cat.get(2575).unwrap().open_lock_skill(300), Some(300));
+    assert_eq!(cat.get(2575).unwrap().open_lock_skill(100), Some(100));
+    assert_eq!(cat.get(2575).unwrap().open_lock_skill(1), Some(0));
+    assert_eq!(cat.get(2366).unwrap().open_lock_skill(300), Some(300));
     // Small / Large Seaforium Charge (4056 / 4075): flat `149 + 1` = 150 and `249 + 1` = 250 — and
     // lock 92 asks for `Blasting 150`. The charge exists to open exactly that door, so the equality
-    // is the cross-check: a column slip anywhere in the walk breaks it.
-    assert_eq!(cat.get(4056).unwrap().open_lock_skill(1), Some(150));
-    assert_eq!(cat.get(4075).unwrap().open_lock_skill(1), Some(250));
-    // The universally-known "Opening"/"Closing" family is flat 100 at every level — which is why
+    // is the cross-check: a column slip anywhere in the walk breaks it. Skill-independent — the
+    // caster's Engineering changes nothing.
+    assert_eq!(cat.get(4056).unwrap().open_lock_skill(0), Some(150));
+    assert_eq!(cat.get(4056).unwrap().open_lock_skill(300), Some(150));
+    assert_eq!(cat.get(4075).unwrap().open_lock_skill(0), Some(250));
+    // The universally-known "Opening"/"Closing" family is flat 100 at every skill — which is why
     // the Action gate, not the value test, is what keeps them off a padlocked door (decision 0752).
     for id in [3365, 6233, 6246, 6247, 6477, 6478, 21651, 21652] {
         assert_eq!(
-            cat.get(id).unwrap().open_lock_skill(1),
+            cat.get(id).unwrap().open_lock_skill(0),
             Some(100),
             "spell {id} is a flat-100 opener"
         );
-        assert_eq!(cat.get(id).unwrap().open_lock_skill(60), Some(100));
+        assert_eq!(cat.get(id).unwrap().open_lock_skill(300), Some(100));
     }
     // A spell with no OPEN_LOCK effect provides nothing.
-    assert_eq!(cat.get(133).unwrap().open_lock_skill(60), None);
+    assert_eq!(cat.get(133).unwrap().open_lock_skill(300), None);
 }
 
 /// The cooldown/cost/range columns on the real build-5875 `Spell.dbc`, pinned 2026-07-10
@@ -1090,4 +1100,97 @@ fn real_spell_catalog_cost_columns() {
         (0xFFFF_FFFE, 180, 9, 24),
         "Dark Offering: the per-level term's health-lane row"
     );
+}
+
+/// **The language join — and the shipped-data anomaly it uncovered.**
+///
+/// `Languages.dbc` carries no skill column and three of the thirteen name pairs do not match
+/// (Dwarvish/Dwarven, Demonic/Demon Tongue, Kalimag/Old Tongue), so the only route from a chat
+/// line's language id to the skill that gates it is the **spell** whose `Effect_1` is
+/// `SPELL_EFFECT_LANGUAGE` (wow-re `chat-language-scramble.md` §8, `0x4b2656`).
+///
+/// The mechanism is byte-verified; what it *does against shipped 5875 content* is this test's
+/// subject, and it is not what the mechanism alone suggests. **Fourteen spells declare a language
+/// and they cover only nine of the thirteen**: 813/814/815/816/817 all declare **7 (Common)**
+/// rather than their own, four of them named "(NYI)". So Demonic, Titan, Thalassian and Kalimag are
+/// unreachable through the client's own join and render fully garbled to everyone — correct 1.12.1
+/// behaviour, and the reason a language→spell map built over the whole DBC would be wrong (last row
+/// wins, so language 7 would resolve to Old Tongue and every character's Common would garble).
+///
+/// Walking the gate's *second* hop finishes the picture: of the nine, Draconic's declaring spell has
+/// no `SkillLineAbility` row, so the set a character can ever understand is exactly the **eight
+/// player languages**. Every flavour language garbles for everyone, always.
+///
+/// The pairs below are cross-checked where an independent source exists: **vmangos's
+/// `lang_description[]`** (`src/game/ObjectMgr.cpp`) hand-lists the same spell ids, so agreement on
+/// the nine is a real control — and its disagreement on 813–817's *language* is exactly the point,
+/// since the server picks a language to send while the client reads the DBC to decide what it
+/// renders.
+#[test]
+fn the_language_declaring_spells_cover_nine_of_thirteen_languages() {
+    let data = crate::wow_data_or_skip!();
+    let mut chain = crate::open_chain(&data).expect("open chain");
+    let spells = load_spell_catalog(&mut chain).expect("load Spell/SpellIcon");
+    let skills = crate::skill_lines::load_skill_line_catalog(&mut chain).expect("load skill lines");
+
+    // (spell, declared language, the spell's SkillLine.dbc id) — every SPELL_EFFECT_LANGUAGE row in
+    // 5875. Spell ids cross-check against vmangos `lang_description[]`; the languages are ours.
+    const DECLARED: &[(u32, u32, u32)] = &[
+        (668, 7, 98),     // Common
+        (669, 1, 109),    // Orcish
+        (670, 3, 115),    // Taurahe
+        (671, 2, 113),    // Darnassian
+        (672, 6, 111),    // Dwarvish
+        (813, 7, 137),    // "Thalassian (NYI)" — declares COMMON
+        (814, 7, 138),    // "Draconic (NYI)"   — declares COMMON
+        (815, 7, 139),    // Demon Tongue       — declares COMMON
+        (816, 7, 140),    // "Titan (NYI)"      — declares COMMON
+        (817, 7, 141),    // "Old Tongue (NYI)" — declares COMMON
+        (7340, 13, 313),  // Gnomish
+        (7341, 14, 315),  // Troll
+        (17737, 33, 673), // Gutterspeak
+    ];
+
+    // The fourteenth: "Lesser Draconic (Language)" declares Draconic (11) correctly — and has **no
+    // `SkillLineAbility` row at all**, so the gate's second hop dead-ends and Draconic can never be
+    // understood either. Language 11 is reachable in the table and still always garbled.
+    assert_eq!(spells.declared_language(25674), Some(11));
+    assert_eq!(skills.spell_to_line(25674), None);
+
+    assert_eq!(
+        spells.declared_languages().count(),
+        DECLARED.len() + 1,
+        "every SPELL_EFFECT_LANGUAGE row is accounted for (the +1 is 25674, below)"
+    );
+    for &(spell, language, line) in DECLARED {
+        assert_eq!(
+            spells.declared_language(spell),
+            Some(language),
+            "spell {spell} -> language"
+        );
+        // The second hop the garble gate walks: spell -> SkillLineAbility -> SkillLine.dbc id.
+        assert_eq!(
+            skills.spell_to_line(spell),
+            Some(line),
+            "spell {spell} -> skill line"
+        );
+    }
+
+    // **The set a character can ever understand** — what the chat gate actually sees once both hops
+    // are walked. It is exactly the eight *player* languages, which is the result that makes the
+    // whole shipped arrangement coherent: every flavour language (Demonic, Titan, Thalassian,
+    // Kalimag, Draconic) always renders garbled, to everyone, in 1.12.1.
+    let understandable: std::collections::BTreeSet<u32> = spells
+        .declared_languages()
+        .filter(|(spell, _)| skills.spell_to_line(*spell).is_some())
+        .map(|(_, l)| l)
+        .collect();
+    assert_eq!(
+        understandable,
+        [1, 2, 3, 6, 7, 13, 14, 33].into_iter().collect(),
+        "only the eight player languages have both a declaring spell and a skill line"
+    );
+
+    // An ordinary ability declares nothing.
+    assert_eq!(spells.declared_language(133), None); // Fireball
 }

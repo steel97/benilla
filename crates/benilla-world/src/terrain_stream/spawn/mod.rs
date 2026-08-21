@@ -7,7 +7,7 @@ mod assemble;
 mod fx;
 pub(crate) mod prop_light;
 
-pub use assemble::spawn_model_entities;
+pub use assemble::{spawn_model_entities, SpawnedModel};
 pub use fx::point_light;
 use fx::{
     emitter_fade, spawn_emitters_for, spawn_lights_for, spawn_ribbons_for, spawn_wmo_lights_for,
@@ -39,6 +39,7 @@ use super::collider::{
     build_collider_task, doodad_bodies_disabled, doodad_hulls_bare, placement_collider_data,
     PendingCollider,
 };
+use super::merge::{MergeSite, StaticMerge};
 use super::weld::{hull_weld_disabled, HullWelds};
 use super::{
     doodad_ground_shade, ModelHandle, Placements, ShadeResolve, TerrainStreamer, SPAWN_BUDGET,
@@ -64,6 +65,10 @@ type SpawnTables<'w> = (
     Res<'w, crate::terrain_stream::ViewFocus>,
     ResMut<'w, ModelForms>,
     ResMut<'w, HullWelds>,
+    ResMut<'w, StaticMerge>,
+    // `None` only under `WOW_STATIC_GX=0` (the resource exists whenever the retained pass
+    // is armed — the default since 1434).
+    Option<ResMut<'w, crate::static_gx::StaticGx>>,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -92,10 +97,16 @@ pub(super) fn spawn_loaded_placements(
     // model-forms cache (decision 0834).
     tables: SpawnTables,
 ) {
-    let (mut probes, mut activity, focus, mut forms, mut welds) = tables;
+    let (mut probes, mut activity, focus, mut forms, mut welds, mut merge, mut staticgx) = tables;
     let Some(shared_light) = shared_light else {
         return;
     };
+    // Steady state is everything spawned, and the walk below still visits every placement and
+    // every WMO prop to find that out — the pending count (kept by the register/handoff/release
+    // sites) makes that frame free.
+    if placements.pending_spawns == 0 {
+        return;
+    }
     let t0 = Instant::now();
     // The landing COUNT cap (B181), on top of the time budget below. The clock gates main-thread
     // cost — but ~1000 one-submesh doodads pass a 4 ms budget in 2.5 ms and hand the render world
@@ -117,6 +128,7 @@ pub(super) fn spawn_loaded_placements(
     let Placements {
         by_id,
         materials: mat_cache,
+        pending_spawns,
     } = placements.into_inner();
 
     // Per-frame spawn budget. On cold start every tile's doodads/WMOs finish decoding near-together;
@@ -162,7 +174,14 @@ pub(super) fn spawn_loaded_placements(
                         };
                     let (radius, center) = m2_fade(&m.bounds, p.transform.scale.x);
                     let anim_bound = m2_anim_bound(&m.bounds);
-                    let (mut ents, host) = spawn_model_entities(
+                    // Built here (not at the tag site below) so the gx fader seed can carry
+                    // the placement identity (B2, 1431); moved into `tag_world_object` after.
+                    let label = handle_label(h);
+                    let SpawnedModel {
+                        entities: mut ents,
+                        by_batch,
+                        host,
+                    } = spawn_model_entities(
                         &mut commands,
                         mat_cache,
                         materials,
@@ -184,6 +203,19 @@ pub(super) fn spawn_loaded_placements(
                         &mut tint_reg,
                         &mut anim_table,
                         None, // world-static placement: cards bake their world pivot
+                        Some((&mut *merge, MergeSite::Doodad { owner: p.owner })),
+                        // The retained-pass collector (1429/1431) — ADT doodads are its
+                        // lane; uid + label seed the fader exile identity (B2).
+                        staticgx.as_deref_mut().map(|gx| {
+                            (
+                                gx,
+                                crate::static_gx::GxSite::Doodad {
+                                    owner: p.owner,
+                                    uid: unique_id,
+                                    label: &label,
+                                },
+                            )
+                        }),
                     );
                     // ADT doodads are exterior scene: from inside a WMO they draw only through a
                     // portal window (`0x683700`, fed solely by the per-window walk `0x682fa0` — see
@@ -257,10 +289,25 @@ pub(super) fn spawn_loaded_placements(
                         &mut commands,
                         &ents,
                         ModelKind::Doodad,
-                        handle_label(h),
+                        label,
                         unique_id,
                         format!("emitters: {}", m.emitters.len()),
                     );
+                    if let Some((target, r)) = fade_near_target() {
+                        let pos = p.transform.translation;
+                        let d = bevy::math::Vec2::new(pos.x, pos.z).distance(target);
+                        if d <= r {
+                            log_fade_near(
+                                "doodad",
+                                &handle_label(h),
+                                unique_id,
+                                pos,
+                                d,
+                                (radius, p.transform.scale.x),
+                                &by_batch,
+                            );
+                        }
+                    }
                     ents
                 }
                 ModelHandle::Wmo(h) => {
@@ -277,55 +324,16 @@ pub(super) fn spawn_loaded_placements(
                     }
                     // WMOs carry no authored bounds → never size-fade (∞ radius), rely on the far-clip.
                     // (`m2: None` ⇒ no anim host, so the joint half of the return is always empty.)
-                    let (mut ents, _) = spawn_model_entities(
-                        &mut commands,
-                        mat_cache,
-                        materials,
-                        light,
-                        &m.submeshes,
-                        FormSlices {
-                            stat: forms.static_meshes(key).unwrap_or(&[]),
-                            skin: None,
-                        },
-                        p.transform,
-                        true,
-                        ShadeSel::Matte, // WMO lights on the FFP N·L path — the selector is unread
-                        None, // WMO groups carry their own per-submesh interior flag + batch class
-                        f32::INFINITY,
-                        Vec3::ZERO,
-                        None, // …and no authored M2 box: group geometry never animates
-                        None, // WMO group geometry is not an M2 — its doodad props animate below
-                        &mut uv_reg,
-                        &mut tint_reg,
-                        &mut anim_table,
-                        None, // world-static placement: cards bake their world pivot
-                    );
-                    // A world WMO placement is exterior scene too (`0x6856c0`, fed by the same
-                    // per-window populate `0x682fa0`): from inside one building, another building
-                    // draws only through a portal window. 0774 left this ungated because these
-                    // entities already had a `Visibility` authority and a second writer would have
-                    // fought it — that is fixed at the root now, with the window term folded INTO
-                    // that authority (decision 0784), so the tag is safe to add.
-                    //
-                    // Tagging is unconditional and the **exemption is dynamic**: the camera's own
-                    // containing placement is not exterior to itself, which the authority decides
-                    // per frame from `CameraInteriorClaim`. A static "is this the player's building"
-                    // could not be right — the player walks in and out of it.
-                    for e in &ents {
-                        commands
-                            .entity(*e)
-                            .insert(crate::exterior_cull::ExteriorScene);
-                    }
-                    // Portal visibility + interior tracking: tie every group submesh entity (the `ents`
-                    // here are exactly the submeshes, in order, before colliders/lights are appended
-                    // below) back to one per-placement instance that holds the placement transform + the
-                    // per-frame visible set. The cull is per-group, so a building with a portal graph
-                    // gets tagged; a portal-less prop keeps all groups visible but still spawns the
-                    // instance when it carries a WMOAreaTable identity — the interior down-ray
-                    // (`wmo_portal::track_current_interior`) needs it. See `crate::wmo_portal`.
+                    // Hoisted above the spawn: the merge site needs it (a portal-gated building's
+                    // blobs take `WmoGroupVis`), and the instance logic below reuses it.
                     let has_portals = !m.portal_refs.is_empty() && !m.portal_infos.is_empty();
-                    if has_portals || m.wmo_id != 0 {
-                        let instance = commands
+                    // The per-placement portal-cull instance, spawned BEFORE the batches so the
+                    // static-gx divert can key its retained region on it (slice 2 of 1429 — the
+                    // region's lifecycle IS this entity's). The group-vis tagging still runs
+                    // after the spawn, off `by_batch`; see the instance block below for why a
+                    // portal-less-but-named building spawns one too.
+                    let instance = (has_portals || m.wmo_id != 0).then(|| {
+                        commands
                             .spawn(WmoPortalInstance {
                                 handle: h.clone(),
                                 world_from_local: p.transform.compute_affine(),
@@ -351,7 +359,97 @@ pub(super) fn spawn_loaded_placements(
                                     })
                                     .collect(),
                             })
-                            .id();
+                            .id()
+                    });
+                    let SpawnedModel {
+                        entities: mut ents,
+                        by_batch,
+                        ..
+                    } = spawn_model_entities(
+                        &mut commands,
+                        mat_cache,
+                        materials,
+                        light,
+                        &m.submeshes,
+                        FormSlices {
+                            stat: forms.static_meshes(key).unwrap_or(&[]),
+                            skin: None,
+                        },
+                        p.transform,
+                        true,
+                        ShadeSel::Matte, // WMO lights on the FFP N·L path — the selector is unread
+                        None, // WMO groups carry their own per-submesh interior flag + batch class
+                        f32::INFINITY,
+                        Vec3::ZERO,
+                        None, // …and no authored M2 box: group geometry never animates
+                        None, // WMO group geometry is not an M2 — its doodad props animate below
+                        &mut uv_reg,
+                        &mut tint_reg,
+                        &mut anim_table,
+                        None, // world-static placement: cards bake their world pivot
+                        Some((
+                            &mut *merge,
+                            MergeSite::Wmo {
+                                uid: unique_id,
+                                groups: &m.submesh_group,
+                                portal_gated: has_portals,
+                            },
+                        )),
+                        // Slice 2 (1429): WMO group geometry diverts into a retained region
+                        // keyed by the instance entity — only a placement WITH an instance
+                        // qualifies (no instance ⇒ no PVS identity ⇒ entity path).
+                        instance.and_then(|i| {
+                            staticgx.as_deref_mut().map(|gx| {
+                                (
+                                    gx,
+                                    crate::static_gx::GxSite::Wmo {
+                                        instance: i,
+                                        groups: &m.submesh_group,
+                                    },
+                                )
+                            })
+                        }),
+                    );
+                    if let Some((target, r)) = fade_near_target() {
+                        let pos = p.transform.translation;
+                        let d = bevy::math::Vec2::new(pos.x, pos.z).distance(target);
+                        if d <= r {
+                            log_fade_near(
+                                "wmo",
+                                &handle_label(h),
+                                unique_id,
+                                pos,
+                                d,
+                                (f32::INFINITY, p.transform.scale.x),
+                                &by_batch,
+                            );
+                        }
+                    }
+                    // A world WMO placement is exterior scene too (`0x6856c0`, fed by the same
+                    // per-window populate `0x682fa0`): from inside one building, another building
+                    // draws only through a portal window. 0774 left this ungated because these
+                    // entities already had a `Visibility` authority and a second writer would have
+                    // fought it — that is fixed at the root now, with the window term folded INTO
+                    // that authority (decision 0784), so the tag is safe to add.
+                    //
+                    // Tagging is unconditional and the **exemption is dynamic**: the camera's own
+                    // containing placement is not exterior to itself, which the authority decides
+                    // per frame from `CameraInteriorClaim`. A static "is this the player's building"
+                    // could not be right — the player walks in and out of it.
+                    for e in &ents {
+                        commands
+                            .entity(*e)
+                            .insert(crate::exterior_cull::ExteriorScene);
+                    }
+                    // Portal visibility + interior tracking: tie every group submesh entity (the
+                    // `by_batch` map is index-parallel with the submeshes — the structural form of
+                    // what used to be a positional promise on `ents`, which the mega divert's
+                    // `continue` silently broke) back to one per-placement instance that holds the
+                    // placement transform + the per-frame visible set. The cull is per-group, so a building with a portal graph
+                    // gets tagged; a portal-less prop keeps all groups visible but still spawns the
+                    // instance when it carries a WMOAreaTable identity — the interior down-ray
+                    // (`wmo_portal::track_current_interior`) needs it. See `crate::wmo_portal`.
+                    if let Some(instance) = instance {
                         if has_portals {
                             // One shared single-group key per group — geometry belongs to exactly
                             // one room, and sharing keeps the tag one allocation per group rather
@@ -359,7 +457,8 @@ pub(super) fn spawn_loaded_placements(
                             let group_key: Vec<Arc<[u16]>> = (0..m.group_nav.len() as u16)
                                 .map(|g| Arc::from([g].as_slice()))
                                 .collect();
-                            for (&entity, &group) in ents.iter().zip(&m.submesh_group) {
+                            for (&entity, &group) in by_batch.iter().zip(&m.submesh_group) {
+                                let Some(entity) = entity else { continue };
                                 let Some(groups) = group_key.get(group as usize).cloned() else {
                                     continue;
                                 };
@@ -378,9 +477,8 @@ pub(super) fn spawn_loaded_placements(
                     }
                     // The building's embedded MLIQ liquid (Stormwind's canals + fountains, the
                     // Ironforge lava, dungeon pools): one flat animated surface per group with water,
-                    // spawned at the placement transform on the shared per-kind material. Appended
-                    // AFTER the portal-instance zip above, which requires `ents` to still be exactly the
-                    // submeshes in order.
+                    // spawned at the placement transform on the shared per-kind material. (The group
+                    // zip above reads `by_batch`, so appends to `ents` no longer threaten it.)
                     // Spawned a group at a time so each surface can take that group's cull key: a
                     // pool belongs to the room it sits in, and a culled room's lava must go with it
                     // (decision 0689 — the same defect as the props, on the same building).
@@ -408,6 +506,8 @@ pub(super) fn spawn_loaded_placements(
                                 &p.transform,
                                 m.group_bounds.get(gi),
                             ),
+                            // The root's MOMT diffColor table — an interior pool's body colour.
+                            &m.material_diff_color,
                             &mut ents,
                         );
                         if let Some(instance) = p.portal_instance {
@@ -493,6 +593,10 @@ pub(super) fn spawn_loaded_placements(
             };
             p.spawned = true;
             p.entities = entities;
+            // The placement's own model landed; a WMO's just-resolved props (all unspawned)
+            // are new work the count takes on in the same stroke.
+            *pending_spawns += p.doodads.iter().filter(|d| !d.spawned).count();
+            *pending_spawns -= 1;
             activity.placements_spawned += 1;
             spawned_n += 1;
             // Spent the frame's spawn budget on this model (a WMO with two collider meshes is the
@@ -569,7 +673,11 @@ pub(super) fn spawn_loaded_placements(
                     slot
                 }
             };
-            let (mut ents, host) = spawn_model_entities(
+            let SpawnedModel {
+                entities: mut ents,
+                host,
+                ..
+            } = spawn_model_entities(
                 &mut commands,
                 mat_cache,
                 materials,
@@ -591,11 +699,50 @@ pub(super) fn spawn_loaded_placements(
                 &mut tint_reg,
                 &mut anim_table,
                 None, // world-static placement: cards bake their world pivot
+                // The prop merge site (1418 lane 3): keyed by the rooms that name the prop,
+                // slot baked per vertex for the interior lane.
+                Some((
+                    &mut *merge,
+                    MergeSite::Prop {
+                        uid: unique_id,
+                        groups: &d.groups,
+                        slot: interior_slot,
+                    },
+                )),
+                // The prop retained-pass site (B4, decision 1433): region keyed by the
+                // building's instance entity — the PVS identity AND the lifecycle. No
+                // instance ⇒ no region key ⇒ the merge/entity path, tallied per prop so
+                // the declined population is never silent.
+                match (portal_instance, staticgx.as_deref_mut()) {
+                    (Some(instance), Some(gx)) => Some((
+                        gx,
+                        crate::static_gx::GxSite::Prop {
+                            instance,
+                            groups: &d.groups,
+                            slot: interior_slot,
+                        },
+                    )),
+                    (None, Some(gx)) => {
+                        gx.tally_prop_declined(true);
+                        None
+                    }
+                    _ => None,
+                },
             );
             // The slot frees itself when the prop despawns (streaming out) — the component hook
-            // returns it to the table whoever does the despawn.
-            if let (Some(slot), Some(&first)) = (interior_slot, ents.first()) {
-                commands.entity(first).insert(PropProbeSlot(slot));
+            // returns it to the table whoever does the despawn. A prop whose every batch
+            // diverted into a merge blob (1418 lane 3) spawns a bare carrier row for the hook:
+            // the blob aggregates many props and cannot own any single slot's lifetime.
+            if let Some(slot) = interior_slot {
+                let owner = match ents.first() {
+                    Some(&first) => first,
+                    None => {
+                        let carrier = commands.spawn_empty().id();
+                        ents.push(carrier);
+                        carrier
+                    }
+                };
+                commands.entity(owner).insert(PropProbeSlot(slot));
             }
             // Portal-cull the prop with the rooms that name it — the reference commits a WMO's
             // doodads per VISIBLE group (`0x695aa0` over the group's MODR refs, from the
@@ -701,6 +848,7 @@ pub(super) fn spawn_loaded_placements(
             );
             p.entities.extend(ents);
             d.spawned = true;
+            *pending_spawns -= 1;
             activity.placements_spawned += 1;
             spawned_n += 1;
             if Instant::now() >= deadline || spawned_n >= count_cap {
@@ -782,6 +930,46 @@ fn resolve_wmo_doodads(
         }
     }
     out
+}
+
+/// `WOW_FADE_NEAR="x,y,r"` — the "name that popping doodad" instrument: a WoW server-coordinate
+/// point (the same numbers `.go xyz` takes, director-verbatim) plus a horizontal radius in yards.
+/// Every placement spawning within `r` yd of the point logs its model path, fade radius (which
+/// selects the `model_fade` band), scale, and how many of its batches the static merge diverted —
+/// so a "this doodad pops in at .go X Y Z" report converts into the placement's actual fade
+/// inputs and its lane (merged fader / per-entity / WMO) in one parked probe run, no camera work.
+fn fade_near_target() -> Option<(bevy::math::Vec2, f32)> {
+    static T: std::sync::OnceLock<Option<(bevy::math::Vec2, f32)>> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        let s = std::env::var("WOW_FADE_NEAR").ok()?;
+        let mut it = s.split(',').map(|v| v.trim().parse::<f32>().ok());
+        let (x, y, r) = (it.next()??, it.next()??, it.next()??);
+        let b = wow_to_bevy([x, y, 0.0]);
+        Some((bevy::math::Vec2::new(b.x, b.z), r))
+    })
+}
+
+/// One `[fade-near]` line for a placement inside the [`fade_near_target`] circle — shared by the
+/// doodad and WMO arms so the two print comparably. `radius` is the fade input (∞ for a WMO);
+/// `diverted` of `batches` went to the static merge (the lane readout).
+fn log_fade_near(
+    kind: &str,
+    label: &str,
+    unique_id: u32,
+    pos: Vec3,
+    d: f32,
+    (radius, scale): (f32, f32),
+    by_batch: &[Option<Entity>],
+) {
+    let diverted = by_batch.iter().filter(|e| e.is_none()).count();
+    eprintln!(
+        "[fade-near] {kind} {label} uid={unique_id} d={d:.1} radius={radius:.2} scale={scale:.2} \
+         batches={} diverted={diverted} pos=({:.1},{:.1},{:.1})",
+        by_batch.len(),
+        pos.x,
+        pos.y,
+        pos.z,
+    );
 }
 
 /// A model handle's source path as a readable label for the object inspector (the asset path without

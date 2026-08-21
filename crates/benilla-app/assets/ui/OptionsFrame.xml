@@ -60,6 +60,9 @@
           through, the reference screenshot's actual mechanism; 0978 misread that ground as
           parchment) + UI-DialogBox-Border rope edge 32, insets 11/12/12/11. Title plate
           UI-DialogBox-Header at the options frames' 300x68 TOP (0,+12) seat, title on it.
+          ON TOP of that tile, inside the rope, a plain black 0.7 fill (1476) takes the
+          composite ground to 0.88: at the bare tile the world reached the option labels
+          hard enough to break them over bright terrain. The read-through stays, dimmed.
         · the era's one dark Options_InnerFrame panel → TWO 1.14 OptionsFrameListTemplate
           boxes: tooltip-border backdrops with the FILL AT ALPHA 0 (outlines — the ground
           shows through) and the border tinted LIGHTGRAY_FONT_COLOR 0.6, tops at -52 (1.14's
@@ -609,7 +612,7 @@
         OPTIONS_PAGE_ROWS = {
             Controls = {
                 "RowStickyTarget", "RowAutoLoot", "RowInvertMouse", "RowMouseSpeed",
-                "RowMaxCameraDistance",
+                "RowCameraFollowStyle", "RowMaxCameraDistance",
             },
             Audio = {
                 "RowEnableAll", "RowMaster", "RowSound", "RowMusic", "RowAmbience",
@@ -618,21 +621,41 @@
             Graphics = { "RowUiScale", "RowWorldDetail", "RowVerticalSync" },
             Nameplates = { "RowPlayerNames", "RowNpcNames", "RowOwnName" },
             -- The stock globals that were already defined AND consumed when 1134 opened the store
-            -- (1136; Buff Durations 1139), in the reference's own on-screen order — its Basic
-            -- Options anchor chain, Display block (CheckButton42 → 39 → 66) before Help (29).
+            -- (1136; Buff Durations 1139), plus the two equipment-display toggles (1472), in the
+            -- reference's own on-screen order. Its Basic Options Display box is three COLUMNS read
+            -- left to right: A gives Status Text (CheckButton2), B gives Show Cloak → Show Helm
+            -- (31 → 20, sitting under the name toggles that live on our Nameplates page), C gives
+            -- the 42 → 39 → 66 chain. Help (29) closes the page, as before.
             Interface = {
-                "RowStatusText", "RowInstantQuestText", "RowBuffDurations", "RowAutoQuestWatch",
+                "RowStatusText", "RowShowCloak", "RowShowHelm",
+                "RowInstantQuestText", "RowBuffDurations", "RowAutoQuestWatch",
                 "RowNewbieTips",
             },
             -- The two chat-bubble switches (decision 1139), in the reference's relative order —
             -- its Advanced Options chat chain runs CheckButton37 → 46 (Loot Spam, no knob of ours)
             -- → 38, so ours are adjacent with that gap named rather than silently closed.
             Social = { "RowChatBubbles", "RowPartyChatBubbles" },
-            -- 1.12's Advanced Options "Action Bars" group is six rows; five of them are the
-            -- multibar show/hide toggles, which read `func = MultiBarN_IsVisible` — not a store at
-            -- all, and our two bottom multibars are always on (MultiBars.xml). So the honest page
-            -- is the sixth (decision 1136).
-            ActionBars = { "RowLockActionBar" },
+            -- 1.12's Advanced Options "Action Bars" group, whole (decision 1500 completing 1136).
+            -- Its six rows, the four bar toggles then the grid switch then the lock. That is the
+            -- DIRECTOR's order, not the reference's: 1.12's box is two columns and leads with the
+            -- lock (CheckButton32 at its TOPLEFT, then 33/40/34 down the left, 35/36 down the
+            -- right), which does not survive being flattened into one column — the five switches
+            -- that decide what is on screen belong above the one that decides whether it can be
+            -- dragged. 1136 could ship only the lock, because the other five had
+            -- nothing behind them: the two bottom bars were unconditionally on and the two vertical
+            -- ones unconditionally hidden (0270/1219). 1500 made all four bars options, which is
+            -- what gave the five rows a store to read.
+            --
+            -- Two DIFFERENT stores on one page, and the split is verified rather than chosen: the
+            -- four bar rows are `func` rows over the server's own PLAYER_FIELD_BYTES byte 2 (no
+            -- local store exists to save), while Always Show ActionBars is a `uvar` row — the
+            -- engine binding takes exactly four arguments and silently drops the fifth the
+            -- reference passes it, so that switch has no server side at all. MultiBars.xml's
+            -- header carries the byte-level evidence.
+            ActionBars = {
+                "RowMultiBar1", "RowMultiBar2", "RowMultiBar3", "RowMultiBar4",
+                "RowAlwaysShowMultibars", "RowLockActionBar",
+            },
             -- The floating-combat-text family (decision 1134), in the reference's own on-screen
             -- order — its AdvancedOptionsCombatText box's anchor chain, master → scroll mode →
             -- the twelve, NOT its check-button index order (which jumps 58→60→63…59→69).
@@ -670,15 +693,23 @@
             end
         end
 
-        -- ── The row's STORE: a CVar, or a saved-variable global (decision 1134) ────────────
-        -- 1.12's own Interface panel has TWO stores, not one: each UIOptionsFrameCheckButtons
-        -- entry carries either `cvar = "name"` (an engine knob) or `uvar = "GLOBAL"` (a
-        -- RegisterForSave'd Lua global), and UIOptionsFrame_Load/_Save fork on exactly that field
-        -- (UIOptionsFrame.lua l.230-377). Values are strings either way — "1"/"0" for a toggle —
-        -- so only the accessor differs, and every row in this file now reads and writes through
-        -- this trio instead of calling Get/SetCVar directly.
+        -- ── The row's STORE: a CVar, a saved-variable global, or an API pair (1134, 1472) ──
+        -- 1.12's own Interface panel has THREE stores, not one: each UIOptionsFrameCheckButtons
+        -- entry carries `cvar = "name"` (an engine knob), `uvar = "GLOBAL"` (a RegisterForSave'd
+        -- Lua global), or a `func`/`setFunc` pair (an engine getter/setter with no client-side
+        -- store at all) — and UIOptionsFrame_Load/_Save fork on exactly that field
+        -- (UIOptionsFrame.lua l.230-377; the func fork at l.237-238 and l.296-297). Values are
+        -- strings in all three — "1"/"0" for a toggle — so only the accessor differs, and every row
+        -- in this file reads and writes through this trio instead of calling Get/SetCVar directly.
+        --
+        -- The third kind is what Show Helm / Show Cloak are: the preference is a bit of the
+        -- character's own server-side PLAYER_FLAGS, so there is nothing local to save and nothing
+        -- to restore at load — the getter IS the state (decision 1472).
         function OptionsRow_Get(row)
             if row.uvar then return getglobal(row.uvar) end
+            if row.getFunc then
+                if row.getFunc() then return "1" else return "0" end
+            end
             return GetCVar(row.cvar)
         end
 
@@ -699,6 +730,14 @@
                 if row.applyFunc then row.applyFunc() end
                 return
             end
+            -- An API row hands the setter the row's own "1"/"0" STRING, which is what 1.12 does
+            -- (UIOptionsFrame_Save l.290-297 builds value.value as a string and passes it
+            -- straight through) — so the engine binding reads its argument numerically and "0"
+            -- means off. No applyFunc: the setter IS the side effect.
+            if row.setFunc then
+                row.setFunc(value)
+                return
+            end
             SetCVar(row.cvar, value, row.cvarEvent)
         end
 
@@ -710,6 +749,7 @@
         -- drift from it, where the reference's table carries a second hand-written copy.
         function OptionsRow_Default(row)
             if row.uvar then return row.udefault end
+            if row.getFunc then return row.fdefault end
             return GetCVarDefault(row.cvar)
         end
 
@@ -720,6 +760,17 @@
             OptionsRow_OnLoad(row, nil, label, tip, child)
             row.uvar = uvar
             row.udefault = getglobal(uvar)
+        end
+
+        -- A row with no store: an engine getter/setter pair, 1.12's own `func`/`setFunc` shape
+        -- (decision 1472). `default` has to be stated because there is no registered default to
+        -- ask for — the reference states it the same way, as a hand-written arm of
+        -- UIOptionsFrame_SetDefaults (l.631-634, SHOW_CLOAK and SHOW_HELM both SetChecked(1)).
+        function OptionsFuncRow_OnLoad(row, getFunc, setFunc, default, label, tip, child)
+            OptionsRow_OnLoad(row, nil, label, tip, child)
+            row.getFunc = getFunc
+            row.setFunc = setFunc
+            row.fdefault = default
         end
 
         -- The other end of `applyFunc`, and the reason a saved "off" used to come back on
@@ -817,7 +868,12 @@
             local v = OptionsRow_Get(row)
             local match
             for _, e in ipairs(row.entries) do
-                if e.value == v then match = e end
+                -- `alt` is a second value the same entry ANSWERS to (1502): 1.12's own Camera
+                -- Following Style dropdown writes "3" for Never where the engine's tables are
+                -- indexed 0/1/2, so a config or addon carrying that value means Never — and the
+                -- nearest-stop fallback below, which assumes the values are ordinal, would show
+                -- "Always" for it. A categorical dropdown says which strays are its own.
+                if e.value == v or e.alt == v then match = e end
             end
             if not match and tonumber(v) then
                 local best
@@ -832,6 +888,12 @@
             if match then
                 dd.selectedValue = match.value
                 UIDropDownMenu_SetText(match.text, dd)
+                -- A dropdown whose ENTRIES each carry their own description repaints the row's
+                -- plate as the selection moves — the reference's own shape for exactly this row
+                -- (UIOptionsFrameCameraDropDown_OnClick: `tooltip = getglobal("OPTION_TOOLTIP_
+                -- CAMERA"..GetSelectedID())`). Rows whose entries carry no `tip` keep the single
+                -- key OptionsRow_OnLoad gave them.
+                if match.tip then row.tip = match.tip end
             else
                 dd.selectedValue = v
                 UIDropDownMenu_SetText(v, dd)
@@ -1031,6 +1093,16 @@
                             getglobal("OptionsFrameContainerBodyCombat" .. rkey), live)
                     end
                 end
+                return
+            end
+            if key == "ActionBars" then
+                -- 1.12's own rule for this pair, verbatim in effect (UIOptionsFrame.lua l.722-726):
+                -- Show Right ActionBar 2 is dead while Show Right ActionBar is unticked, because
+                -- MultiBarLeft does not appear without MultiBarRight under it (MultiBars.xml's
+                -- conjunction). It is the only cross-row dependency on this page — the two bottom
+                -- bars, the grid switch and the lock are all independent.
+                OptionsRow_SetEnabled(OptionsFrameContainerBodyActionBarsRowMultiBar4,
+                    SHOW_MULTI_ACTIONBAR_3)
                 return
             end
             if key ~= "Audio" then return end
@@ -1493,6 +1565,37 @@
             <BackgroundInsets><AbsInset left="11" right="12" top="12" bottom="11"/></BackgroundInsets>
         </Backdrop>
         <Layers>
+            <Layer level="BACKGROUND">
+                <!-- THE GROUND DIM (1476) — a plain black fill over the tiled ground, because
+                     the tile alone is not a readable page. UI-DialogBox-Background decodes to a
+                     uniform (0,0,0,153) — pure black at 0.6 — so 40% of the world reaches the
+                     text: over snow, noon water or a lit sky the page ground lands near mid-grey
+                     and the option labels stop reading (the director's report). 0.6 is right for
+                     a dialog you glance at; the options window is a page you READ, and the era's
+                     own answer is an OPAQUE FlatPanelBackgroundTemplate panel — so darkening
+                     toward it is the era structure 0985 already gives us, wearing a plain colour
+                     fill, which 0985 names as an art byte we may author.
+                     Alpha 0.7 over the 0.6 tile composites to 0.88 (the world reaches the page at
+                     0.12), not 1.0: the faint read-through is the window's character, and 0981's
+                     "the reference was never parchment" finding stands — this dims the ground, it
+                     does not replace it.
+                     SEAT: inset 15 on all four sides, NOT the backdrop's own 11/12/12/11 bg
+                     insets. Regions sort AFTER the frame's own draw slot, which is where the
+                     backdrop's bg AND its 8 border pieces both live (extract.rs) — so this fill
+                     paints OVER the rope, and at the bg insets it would smear 0.7 black across
+                     the border's inner half. The rope's ink is measured, not guessed: every edge
+                     slice of UI-DialogBox-Border is opaque only in its outer ~11 units and dead
+                     by texel 16 of 32, and the corner slices' ink ends by 14 (decoded). 15 clears
+                     every inked texel and leaves at most a 1-unit lighter hairline inside the
+                     rope, where the rope reads as frame anyway. -->
+                <Texture name="$parentGroundDim">
+                    <Anchors>
+                        <Anchor point="TOPLEFT"><Offset><AbsDimension x="15" y="-15"/></Offset></Anchor>
+                        <Anchor point="BOTTOMRIGHT"><Offset><AbsDimension x="-15" y="15"/></Offset></Anchor>
+                    </Anchors>
+                    <Color r="0" g="0" b="0" a="0.7"/>
+                </Texture>
+            </Layer>
             <Layer level="ARTWORK">
                 <!-- The carved title plate at the 1.14 options frames' own seat: 300x68 at
                      TOP (0,+12) — OptionsFrameTemplates.xml l.244-255 (GameMenuFrame's plate
@@ -1917,10 +2020,41 @@
                                              "22" means the wheel stops at 22 yards, which is the
                                              thing being chosen. Our default is the factor fully
                                              raised (30 yd), where 1.12 ships 1.0. -->
-                                        <Frame name="$parentRowMaxCameraDistance" inherits="OptionsSliderRowTemplate">
+                                        <!-- Camera Following Style (1493, values re-pinned by
+                                             1502): 1.12's own dropdown
+                                             (UIOptionsFrameCameraDropDown) in its own order —
+                                             Smart, Always, Never — each entry carrying the
+                                             reference's own description key (keyed by POSITION,
+                                             OPTION_TOOLTIP_CAMERA1..3) so the row's plate changes
+                                             with the selection, the way that dropdown's does.
+                                             The VALUES are the ENGINE's, not that dropdown's: the
+                                             reference writes 1/2/3 and 3 is not a style at all —
+                                             its validator accepts it while the terrain-tilt
+                                             consumer indexes 360 bytes off the end of its table.
+                                             0/1/2 is what the client's own tables are indexed by
+                                             (wow-re camera-smooth-style.md §2/§4). Seated at the
+                                             head of the camera block because it decides whether
+                                             the camera follows at all; the distance slider under
+                                             it decides how far. -->
+                                        <Frame name="$parentRowCameraFollowStyle" inherits="OptionsDropdownRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowMouseSpeed" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowMouseSpeed" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "cameraSmoothStyle",
+                                                    "Camera Following Style", "OPTION_TOOLTIP_CAMERA1")
+                                                OptionsDropdownRow_Setup(self, {
+                                                    { text = "Smart", value = "1", tip = "OPTION_TOOLTIP_CAMERA1" },
+                                                    { text = "Always", value = "2", tip = "OPTION_TOOLTIP_CAMERA2" },
+                                                    { text = "Never", value = "0", alt = "3", tip = "OPTION_TOOLTIP_CAMERA3" },
+                                                })
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowMaxCameraDistance" inherits="OptionsSliderRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowCameraFollowStyle" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowCameraFollowStyle" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 OptionsRow_OnLoad(self, "cameraDistanceMaxFactor",
@@ -2301,23 +2435,123 @@
                                         </Frame>
                                     </Frames>
                                 </Frame>
-                                <!-- The ACTION BARS page (decision 1136). One row, because the
-                                     reference's group is the lock plus five multibar show/hide
-                                     toggles whose store is a `func`, not a uvar or a CVar — and our
-                                     two bottom multibars are unconditionally on. The lock itself
-                                     had to be BUILT before it could have a row: ActionBar.xml and
-                                     PetActionBar.xml now guard their drag ends on it, the way the
-                                     reference does. -->
+                                <!-- The ACTION BARS page (1136's lock row; the five switches above
+                                     it are 1500). 1.12's Advanced Options group, whole.
+
+                                     The four bar rows are API (`func`) rows — the third store, the
+                                     one Show Cloak / Show Helm opened in 1472 — because there is
+                                     nothing local to save: the preference is four bits of this
+                                     CHARACTER's server-side PLAYER_FIELD_BYTES byte 2, written with
+                                     CMSG_SET_ACTIONBAR_TOGGLES. The getter reads the live Lua
+                                     global (the client never re-reads the field and nothing fires
+                                     on a change to it, so the global IS the state between logins);
+                                     the setter writes the global, re-derives the bars, and re-sends
+                                     the whole byte. Default OFF for all four — a fresh character's
+                                     byte is 0.
+
+                                     Always Show ActionBars is a SAVED-VARIABLE row instead, and the
+                                     split is a verified consequence of the engine binding rather
+                                     than an authoring choice: `SetActionBarToggles` takes exactly
+                                     four arguments and silently DROPS the fifth that the reference
+                                     passes it (`cmp esi,4` at 0x4e770e), so that switch has no
+                                     server store to write and the reference RegisterForSave's it
+                                     locally too (UIOptionsFrame.lua l.106-107). MultiBars.xml's
+                                     header carries the whole byte-level finding.
+
+                                     The getters and setters are written here as closures rather
+                                     than captured from MultiBars.xml by name, deliberately: a row's
+                                     OnLoad captures a function VALUE, so a named import would make
+                                     this page depend on load ORDER — and a harness (or a manifest
+                                     reordering) that loaded the window without the bars would give
+                                     every row a nil store instead of an unticked box. A closure
+                                     resolves its callee when the player clicks.
+
+                                     Labels and OPTION_TOOLTIP_* keys are 1.12's GlobalStrings
+                                     verbatim (SHOW_MULTIBAR1..4_TEXT l.3444-3447,
+                                     ALWAYS_SHOW_MULTIBARS_TEXT l.51) — including the leading
+                                     "Show ", which is part of the reference's own display text.
+
+                                     The lock itself had to be BUILT before it could have a row:
+                                     ActionBar.xml and PetActionBar.xml guard their drag ends on it,
+                                     the way the reference does. -->
                                 <Frame name="$parentActionBars" hidden="true">
                                     <Anchors>
                                         <Anchor point="TOPLEFT"/>
                                         <Anchor point="BOTTOMRIGHT"/>
                                     </Anchors>
                                     <Frames>
-                                        <Frame name="$parentRowLockActionBar" inherits="OptionsCheckboxRowTemplate">
+                                        <Frame name="$parentRowMultiBar1" inherits="OptionsCheckboxRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT"><Offset><AbsDimension x="10" y="-12"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT"><Offset><AbsDimension x="-20" y="-12"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsFuncRow_OnLoad(self,
+                                                    function() return SHOW_MULTI_ACTIONBAR_1 end,
+                                                    function(value) BenillaMultiBar_SetShown(1, value) end,
+                                                    "0", "Show Bottom Left ActionBar", "OPTION_TOOLTIP_SHOW_MULTIBAR1")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowMultiBar2" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowMultiBar1" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowMultiBar1" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsFuncRow_OnLoad(self,
+                                                    function() return SHOW_MULTI_ACTIONBAR_2 end,
+                                                    function(value) BenillaMultiBar_SetShown(2, value) end,
+                                                    "0", "Show Bottom Right ActionBar", "OPTION_TOOLTIP_SHOW_MULTIBAR2")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowMultiBar3" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowMultiBar2" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowMultiBar2" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsFuncRow_OnLoad(self,
+                                                    function() return SHOW_MULTI_ACTIONBAR_3 end,
+                                                    function(value) BenillaMultiBar_SetShown(3, value) end,
+                                                    "0", "Show Right ActionBar", "OPTION_TOOLTIP_SHOW_MULTIBAR3")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <!-- Bar 4 is a CHILD row: MultiBarLeft only shows when bar 3
+                                             is also on (MultiBars.xml's conjunction — its column
+                                             hangs off MultiBarRight's edge), so the switch is
+                                             meaningless on its own. `child` carries the era's
+                                             indent-and-small-font subordination; the GREYING is
+                                             OptionsPage_UpdateDependencies' ActionBars arm, which
+                                             is the reference's own rule for this exact pair
+                                             (UIOptionsFrame.lua l.722-726 disables CheckButton36
+                                             while 35 is unchecked). -->
+                                        <Frame name="$parentRowMultiBar4" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowMultiBar3" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowMultiBar3" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsFuncRow_OnLoad(self,
+                                                    function() return SHOW_MULTI_ACTIONBAR_4 end,
+                                                    function(value) BenillaMultiBar_SetShown(4, value) end,
+                                                    "0", "Show Right ActionBar 2", "OPTION_TOOLTIP_SHOW_MULTIBAR4", 1)
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowAlwaysShowMultibars" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowMultiBar4" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowMultiBar4" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsGlobalRow_OnLoad(self, "ALWAYS_SHOW_MULTIBARS",
+                                                    "Always Show ActionBars", "OPTION_TOOLTIP_ALWAYS_SHOW_MULTIBARS")
+                                                self.applyFunc = MultiActionBar_UpdateGridVisibility
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowLockActionBar" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowAlwaysShowMultibars" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowAlwaysShowMultibars" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 OptionsGlobalRow_OnLoad(self, "LOCK_ACTIONBAR",
@@ -2327,13 +2561,17 @@
                                     </Frames>
                                 </Frame>
                                 <!-- The INTERFACE page (decision 1136; the Buff Durations row is
-                                     1139) — the second store's second page, and the one 1134 §3
-                                     named as ready: stock globals already defined AND consumed,
-                                     needing only a row. Rows in the reference's own on-screen
-                                     order — Basic Options' anchor chain runs CheckButton42 → 39 →
-                                     62 → 66 in Display, then 29 in Help, and we hold all of those
-                                     but 62 (HIDE_OUTDOOR_WORLD_STATE: there is no zone-objective
-                                     tracker to hide). Labels and OPTION_TOOLTIP_* keys are its
+                                     1139, the two equipment-display rows 1472) — the second
+                                     store's second page, and the one 1134 §3 named as ready: stock
+                                     globals already defined AND consumed, needing only a row. Rows
+                                     in the reference's own on-screen order — Basic Options' anchor
+                                     chain runs CheckButton42 → 39 → 62 → 66 in Display, then 29 in
+                                     Help, and we hold all of those but 62
+                                     (HIDE_OUTDOOR_WORLD_STATE: there is no zone-objective tracker
+                                     to hide); Show Cloak → Show Helm (31 → 20) are that box's
+                                     middle column, seated after Status Text because the two rows
+                                     above them there — the player/NPC name toggles — live on our
+                                     Nameplates page. Labels and OPTION_TOOLTIP_* keys are its
                                      GlobalStrings verbatim.
 
                                      Only Buff Durations carries an `applyFunc`, and the split is
@@ -2368,10 +2606,38 @@
                                                 self.cvarEvent = "STATUS_BAR_TEXT"
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowInstantQuestText" inherits="OptionsCheckboxRowTemplate">
+                                        <!-- The two equipment-display toggles (decision 1472,
+                                             B123). Neither has a store: the preference is a bit of
+                                             this character's own server-side PLAYER_FLAGS, so the
+                                             row reads the engine getter and writes the engine
+                                             setter — 1.12's own `func`/`setFunc` pair for exactly
+                                             these two rows (UIOptionsFrame.lua l.18-19), and the
+                                             reason there is no CVar to register. Default "1" for
+                                             both, the reference's own hand-written arm. -->
+                                        <Frame name="$parentRowShowCloak" inherits="OptionsCheckboxRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowStatusText" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowStatusText" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsFuncRow_OnLoad(self, ShowingCloak, ShowCloak, "1",
+                                                    "Show Cloak", "OPTION_TOOLTIP_SHOW_CLOAK")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowShowHelm" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowShowCloak" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowShowCloak" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsFuncRow_OnLoad(self, ShowingHelm, ShowHelm, "1",
+                                                    "Show Helm", "OPTION_TOOLTIP_SHOW_HELM")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowInstantQuestText" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowShowHelm" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowShowHelm" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 OptionsGlobalRow_OnLoad(self, "QUEST_FADING_DISABLE",

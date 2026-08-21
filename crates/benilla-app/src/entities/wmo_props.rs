@@ -61,7 +61,7 @@ use benilla_world::model_render::ShadeSel;
 use benilla_world::particles;
 use benilla_world::terrain_stream::{
     build_collider_task, fold_interior_probe, m2_anim_bound, m2_fade, placement_collider_data,
-    point_light, spawn_model_entities, PendingCollider, PropLobeLight,
+    point_light, spawn_model_entities, PendingCollider, PropLobeLight, SpawnedModel,
 };
 
 use super::{GameObjects, ModelHandle, VisualAttached};
@@ -260,7 +260,11 @@ pub(super) fn spawn_wmo_gameobject_props(
                 }
                 slot
             });
-            let (ents, host) = spawn_model_entities(
+            let SpawnedModel {
+                entities: ents,
+                host,
+                ..
+            } = spawn_model_entities(
                 &mut commands,
                 mat_cache,
                 materials,
@@ -281,6 +285,11 @@ pub(super) fn spawn_wmo_gameobject_props(
                 &mut tint_reg,
                 &mut anim_table,
                 card_owner,
+                // Never diverted into 1417's production merge nor 1429's static-gx: these
+                // props parent under a MOVING gameobject, and every divert lane bakes world
+                // transforms.
+                None,
+                None,
             );
             commands.entity(entity).add_children(&ents);
             // The slot frees itself when the prop despawns — the component hook returns it to
@@ -297,10 +306,12 @@ pub(super) fn spawn_wmo_gameobject_props(
             // `Static` body — same mechanism, no motion.
             if let Some((verts, tris)) = placement_collider_data(m.collision.as_ref(), &prop.local)
             {
+                // No visibility components at all: a hull renders nothing and hosts nothing,
+                // and B0004 only checks the child→parent direction — a bare child under a
+                // visible parent is fine (benilla_world::vis_chain has the sweep-tax law).
                 let hull = commands
                     .spawn((
                         Transform::IDENTITY,
-                        Visibility::default(),
                         PendingCollider::new(build_collider_task(verts, tris), None, false),
                     ))
                     .id();

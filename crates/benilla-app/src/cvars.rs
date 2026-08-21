@@ -31,7 +31,10 @@ use bevy::prelude::*;
 use crate::chat_bubble::BubbleConfig;
 use crate::minimap::MinimapZoom;
 use crate::nameplates::NameConfig;
-use crate::player::camera::{LookConfig, ZoomLimit, MOUSE_SPEED_RANGE};
+use crate::player::camera::{
+    FollowConfig, FollowStyle, LookConfig, ZoomLimit, FOLLOW_SPEED_RANGE, MOUSE_SPEED_RANGE,
+};
+use crate::portrait::PaneRate;
 use crate::sound::SoundConfig;
 use crate::target::ClickConfig;
 use crate::ui_loot::LootConfig;
@@ -106,6 +109,22 @@ pub(crate) const REGISTERED: &[(&str, &str)] = &[
     // raised — because that IS benilla's shipped 30 yd ceiling, a knowing divergence from the
     // reference's registrar "1" that camera.rs has carried in prose since it was written.
     ("cameraDistanceMaxFactor", "2"),
+    // Camera Following Style (1493, re-pinned by 1502): 1.12's `cameraSmoothStyle` — the
+    // auto-return that swings the camera back behind the character. Registered "1" = Smart, which
+    // is BOTH the reference's registrar default (byte-verified: the argument is loaded from
+    // `[0x84f4f4]` -> "1" at the `0x50ba92` register site) and the director's call; benilla behaved
+    // as Never unconditionally until this row. The enum is the ENGINE's — 0 Never, 1 Smart,
+    // 2 Always — NOT the 1/2/3 the reference's own dropdown writes; see `FollowStyle`.
+    ("cameraSmoothStyle", "1"),
+    // Its sibling selector (1502), also registered "1": the reference reads THIS style instead
+    // whenever the state mask contains Track or Fear — the externally-driven states — indexing the
+    // same matrices. No row on any 1.12 panel, here or there; the reader is the host.
+    ("cameraSmoothTrackingStyle", "1"),
+    // The auto-follow's rate (1502), °/s — 1.12's own AUTO_FOLLOW_SPEED slider
+    // (`UIOptionsFrameSliders`, 90..270 by 10), registered at the binary's "180.0" (`[0xbe1070]`).
+    // It sets the transition's DURATION (`|dyaw| / rate * factor`), so it is an average rate, not a
+    // slew. No row yet — the slider is a one-line follow-on now that the knob exists.
+    ("cameraYawSmoothSpeed", "180"),
     // Status Text (1140): 1.12's `statusBarText`, the "always show value / max on a status bar"
     // switch. **No host knob** — its consumer is Lua (TextStatusBar.xml, decision 1082, which was
     // written waiting for this key and reads it on every repaint). Default "0": the reference's
@@ -155,6 +174,12 @@ pub(crate) const REGISTERED: &[(&str, &str)] = &[
     // `gxRestart = 1` does not apply (wgpu swaps the presentation interval live, so the box takes
     // effect on click), and `$WOW_NOVSYNC=1` overrides it session-only, below.
     ("gxVSync", "1"),
+    // The body panes' half-rate render (decision 1444) — **benilla's own CVar**, no 1.12
+    // counterpart: the reference draws its doll inside the main pass (no second view exists to
+    // rate-limit), while our RTT booths (1069) re-run the render graph per pane per frame. "1" =
+    // the doll renders at half the frame rate while its pane is open; the knob is
+    // [`crate::portrait::PaneRate`], and the default mirrors it (welded below).
+    ("boothHalfRate", "1"),
 ];
 
 /// `config.toml`'s shape: a `[cvars]` table of `Name = "value"` strings (CVars are strings in
@@ -227,7 +252,9 @@ struct Knobs<'a> {
     minimap: &'a mut MinimapZoom,
     bubbles: &'a mut BubbleConfig,
     zoom: &'a mut ZoomLimit,
+    follow: &'a mut FollowConfig,
     video: &'a mut VideoConfig,
+    pane_rate: &'a mut PaneRate,
 }
 
 /// Apply one CVar to its knob resource (parse + the knob's own clamp). `false` = not a knob this
@@ -253,6 +280,16 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
         "deselectonclick" => knobs.click.deselect_on_click = v != 0.0,
         "mouseinvertpitch" => knobs.look.invert_pitch = v != 0.0,
         "cameradistancemaxfactor" => knobs.zoom.set_factor(v),
+        // The three stops are 1 Smart / 2 Always / 3 Never; anything else reads as the registrar
+        // default rather than as a dead camera (`FollowStyle::from_cvar`).
+        "camerasmoothstyle" => knobs.follow.style = FollowStyle::from_cvar(v),
+        // Its sibling selector — the one the reference swaps in for the externally-driven states.
+        "camerasmoothtrackingstyle" => knobs.follow.tracking_style = FollowStyle::from_cvar(v),
+        // The auto-follow rate, clamped to 1.12's own AUTO_FOLLOW_SPEED slider range.
+        "camerayawsmoothspeed" => {
+            knobs.follow.yaw_speed =
+                v.clamp(*FOLLOW_SPEED_RANGE.start(), *FOLLOW_SPEED_RANGE.end());
+        }
         // The 1.12 slider's own range; an off-grid hand-edit rides between stops, like the others.
         "mousespeed" => {
             knobs.look.sensitivity = v.clamp(*MOUSE_SPEED_RANGE.start(), *MOUSE_SPEED_RANGE.end());
@@ -282,6 +319,8 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
         // Vertical Sync — a flag like every other checkbox here. `video::apply_present_mode`
         // watches the value and pushes it to the window; nothing else reads it.
         "gxvsync" => knobs.video.vsync = v != 0.0,
+        // The body panes' half-rate render (1444) — a flag like every other checkbox here.
+        "boothhalfrate" => knobs.pane_rate.half = v != 0.0,
         _ => return false,
     }
     true
@@ -311,7 +350,9 @@ fn load_config(
     mut minimap: ResMut<MinimapZoom>,
     mut bubbles: ResMut<BubbleConfig>,
     mut zoom: ResMut<ZoomLimit>,
+    mut follow: ResMut<FollowConfig>,
     mut video: ResMut<VideoConfig>,
+    mut pane_rate: ResMut<PaneRate>,
 ) {
     let mut knobs = Knobs {
         sound: &mut sound,
@@ -325,7 +366,9 @@ fn load_config(
         minimap: &mut minimap,
         bubbles: &mut bubbles,
         zoom: &mut zoom,
+        follow: &mut follow,
         video: &mut video,
+        pane_rate: &mut pane_rate,
     };
     if std::env::var_os("WOW_UI_SCALE").is_some() {
         persist.env_overridden.insert("uiscale".into());
@@ -402,7 +445,9 @@ fn sync_cvars(
     mut minimap: ResMut<MinimapZoom>,
     mut bubbles: ResMut<BubbleConfig>,
     mut zoom: ResMut<ZoomLimit>,
+    mut follow: ResMut<FollowConfig>,
     mut video: ResMut<VideoConfig>,
+    mut pane_rate: ResMut<PaneRate>,
 ) {
     let Some(mut script) = script else {
         return;
@@ -422,7 +467,7 @@ fn sync_cvars(
         );
         script.register_cvars(REGISTERED.iter().copied());
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 24] = [
+        let session: [(&str, String); 28] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -437,6 +482,12 @@ fn sync_cvars(
             ("mouseInvertPitch", flag(look.invert_pitch)),
             ("mousespeed", look.sensitivity.to_string()),
             ("cameraDistanceMaxFactor", zoom.factor().to_string()),
+            ("cameraSmoothStyle", follow.style.cvar().to_string()),
+            (
+                "cameraSmoothTrackingStyle",
+                follow.tracking_style.cvar().to_string(),
+            ),
+            ("cameraYawSmoothSpeed", follow.yaw_speed.to_string()),
             ("autoLootDefault", flag(loot.auto_loot)),
             ("UnitNamePlayer", flag(names.player)),
             ("UnitNameNPC", flag(names.npc)),
@@ -450,6 +501,7 @@ fn sync_cvars(
             ("minimapZoom", minimap.outdoor.to_string()),
             ("minimapInsideZoom", minimap.inside.to_string()),
             ("gxVSync", flag(video.vsync)),
+            ("boothHalfRate", flag(pane_rate.half)),
         ];
         for (name, value) in session {
             script.set_cvar_host(name, &value);
@@ -474,7 +526,9 @@ fn sync_cvars(
         minimap: &mut minimap,
         bubbles: &mut bubbles,
         zoom: &mut zoom,
+        follow: &mut follow,
         video: &mut video,
+        pane_rate: &mut pane_rate,
     };
     for (name, value) in changes {
         if apply_to_knobs(&name, &value, &mut knobs) {
@@ -517,7 +571,9 @@ pub(crate) fn fold_dying_vm_cvars(world: &mut World) {
         Option<ResMut<MinimapZoom>>,
         Option<ResMut<BubbleConfig>>,
         Option<ResMut<ZoomLimit>>,
+        Option<ResMut<FollowConfig>>,
         Option<ResMut<VideoConfig>>,
+        Option<ResMut<PaneRate>>,
     )> = bevy::ecs::system::SystemState::new(world);
     let (
         script,
@@ -533,7 +589,9 @@ pub(crate) fn fold_dying_vm_cvars(world: &mut World) {
         minimap,
         bubbles,
         zoom,
+        follow,
         video,
+        pane_rate,
     ) = state.get_mut(world);
     let (Some(mut script), Some(mut persist)) = (script, persist) else {
         return;
@@ -555,9 +613,12 @@ pub(crate) fn fold_dying_vm_cvars(world: &mut World) {
             Some(mut minimap),
             Some(mut bubbles),
             Some(mut zoom),
+            Some(mut follow),
             Some(mut video),
+            Some(mut pane_rate),
         ) = (
-            sound, scale, view, look, click, loot, names, clutter, minimap, bubbles, zoom, video,
+            sound, scale, view, look, click, loot, names, clutter, minimap, bubbles, zoom, follow,
+            video, pane_rate,
         ) {
             let mut knobs = Knobs {
                 sound: &mut sound,
@@ -571,7 +632,9 @@ pub(crate) fn fold_dying_vm_cvars(world: &mut World) {
                 minimap: &mut minimap,
                 bubbles: &mut bubbles,
                 zoom: &mut zoom,
+                follow: &mut follow,
                 video: &mut video,
+                pane_rate: &mut pane_rate,
             };
             for (name, value) in changes {
                 if apply_to_knobs(&name, &value, &mut knobs) {
@@ -716,6 +779,20 @@ mod tests {
         );
         assert_eq!(d["mousespeed"], LookConfig::default().sensitivity);
         assert_eq!(d["cameraDistanceMaxFactor"], ZoomLimit::default().factor());
+        // The follow trio (1493/1502) welds to FollowConfig's own defaults — and all three ARE
+        // the binary's registrar values, byte-verified: "1"/"1"/"180.0". The one corner of this
+        // arc that agrees with the reference outright.
+        let follow = FollowConfig::default();
+        assert_eq!(
+            d["cameraSmoothStyle"],
+            follow.style.cvar().parse::<f32>().unwrap()
+        );
+        assert_eq!(
+            d["cameraSmoothTrackingStyle"],
+            follow.tracking_style.cvar().parse::<f32>().unwrap()
+        );
+        assert_eq!(d["cameraYawSmoothSpeed"], follow.yaw_speed);
+        assert_eq!(FollowStyle::default(), FollowStyle::Smart);
         assert_eq!(d["autoLootDefault"] != 0.0, LootConfig::default().auto_loot);
         // The name trio (0992) welds to NameConfig's defaults the same way.
         let names = NameConfig::default();
@@ -739,6 +816,8 @@ mod tests {
         // VSync welds to the video knob, which in turn welds to the window literal's boot
         // mode (`video::tests`) — so the registered "1" cannot drift from what we ship.
         assert_eq!(d["gxVSync"] != 0.0, VideoConfig::default().vsync);
+        // The pane half-rate (1444) welds to the portrait knob's shipped default.
+        assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);
     }
 
     #[test]
@@ -760,7 +839,9 @@ mod tests {
         let mut minimap = MinimapZoom::default();
         let mut bubbles = BubbleConfig::default();
         let mut zoom = ZoomLimit::default();
+        let mut follow = FollowConfig::default();
         let mut video = VideoConfig::default();
+        let mut pane_rate = PaneRate::default();
         let mut knobs = Knobs {
             sound: &mut sound,
             scale: &mut scale,
@@ -773,7 +854,9 @@ mod tests {
             minimap: &mut minimap,
             bubbles: &mut bubbles,
             zoom: &mut zoom,
+            follow: &mut follow,
             video: &mut video,
+            pane_rate: &mut pane_rate,
         };
         assert!(apply_to_knobs("MusicVolume", "0.7", &mut knobs));
         assert_eq!(knobs.sound.music, 0.7);
@@ -797,6 +880,25 @@ mod tests {
         assert_eq!(knobs.look.sensitivity, 1.4);
         assert!(apply_to_knobs("mousespeed", "9", &mut knobs));
         assert_eq!(knobs.look.sensitivity, 1.5);
+        // The following style lands as the ENGINE's enum (0 Never / 1 Smart / 2 Always), and the
+        // "3" the reference's own dropdown writes for Never still means Never.
+        assert!(apply_to_knobs("cameraSmoothStyle", "0", &mut knobs));
+        assert_eq!(knobs.follow.style, FollowStyle::Never);
+        assert!(apply_to_knobs("camerasmoothstyle", "2", &mut knobs));
+        assert_eq!(knobs.follow.style, FollowStyle::Always);
+        assert!(apply_to_knobs("cameraSmoothStyle", "3", &mut knobs));
+        assert_eq!(knobs.follow.style, FollowStyle::Never);
+        assert!(apply_to_knobs("cameraSmoothStyle", "1", &mut knobs));
+        assert_eq!(knobs.follow.style, FollowStyle::Smart);
+        // Its two siblings land on the same knob — the tracking selector, and the rate, which
+        // clamps to 1.12's AUTO_FOLLOW_SPEED slider range.
+        assert!(apply_to_knobs("cameraSmoothTrackingStyle", "2", &mut knobs));
+        assert_eq!(knobs.follow.tracking_style, FollowStyle::Always);
+        assert_eq!(knobs.follow.style, FollowStyle::Smart, "and only that one");
+        assert!(apply_to_knobs("cameraYawSmoothSpeed", "270", &mut knobs));
+        assert_eq!(knobs.follow.yaw_speed, 270.0);
+        assert!(apply_to_knobs("cameraYawSmoothSpeed", "9000", &mut knobs));
+        assert_eq!(knobs.follow.yaw_speed, *FOLLOW_SPEED_RANGE.end());
         // The max-orbit factor lands as YARDS on the knob (base 15 x factor), clamped to 1..2.
         assert!(apply_to_knobs("cameraDistanceMaxFactor", "1", &mut knobs));
         assert_eq!(knobs.zoom.max, 15.0);
@@ -891,7 +993,9 @@ mod tests {
             .init_resource::<MinimapZoom>()
             .init_resource::<BubbleConfig>()
             .init_resource::<ZoomLimit>()
+            .init_resource::<FollowConfig>()
             .init_resource::<VideoConfig>()
+            .init_resource::<PaneRate>()
             .add_plugins(CvarPlugin);
         app.insert_non_send_resource(UiScript::new().unwrap());
 
@@ -960,7 +1064,9 @@ mod tests {
             .init_resource::<MinimapZoom>()
             .init_resource::<BubbleConfig>()
             .init_resource::<ZoomLimit>()
+            .init_resource::<FollowConfig>()
             .init_resource::<VideoConfig>()
+            .init_resource::<PaneRate>()
             .add_plugins(CvarPlugin);
         app.insert_non_send_resource(UiScript::new().unwrap());
         app.update();

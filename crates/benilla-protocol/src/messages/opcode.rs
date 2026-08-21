@@ -133,6 +133,16 @@ pub const CMSG_SET_AMMO: u16 = 0x0268; // 616
 /// VERIFIED vmangos `Opcodes_1_12_1.h`: 296 — `MiscHandler.cpp:885`'s `HandleSetActionButtonOpcode`
 /// (decision 0216 §7/0218 §4). Body in [`super::action_bar::set_action_button`].
 pub const CMSG_SET_ACTION_BUTTON: u16 = 0x0128; // 296
+/// The four extra action bars' visibility byte (`PLAYER_FIELD_BYTES` byte 2) — VERIFIED at the
+/// bytes, wow-re `system/ui/scratch/action-bar-toggles.md` §3: `0x4e771d push 0x2bf` is the ONE
+/// site image-wide that emits this opcode, and the frame it builds is `u32 opcode` + a single `u8`
+/// and nothing else (`0x418190` PutUInt32 then `0x418070` PutUInt8; `0x5379b3` computes the
+/// payload as size − read = **5**). Body in [`super::action_bar::set_actionbar_toggles`].
+///
+/// Corroborated by vmangos `Opcodes_1_12_1.h`: 703 → `HandleSetActionBarTogglesOpcode`
+/// (`Packets/Misc.cpp:150-153` reads one `uint8`; `Handlers/MiscHandler.cpp:923-932` stores it with
+/// `SetByteValue(PLAYER_FIELD_BYTES, 2, …)`).
+pub const CMSG_SET_ACTIONBAR_TOGGLES: u16 = 0x02BF; // 703
 pub const SMSG_ACTION_BUTTONS: u16 = 0x0129; // 297
 pub const SMSG_INITIAL_SPELLS: u16 = 0x012A; // 298
 
@@ -719,6 +729,23 @@ pub const CMSG_UNLEARN_SKILL: u16 = 0x0202; // 514
 /// a toggle. No ack: the answer arrives as the `UNIT_FIELD_FLAGS` PvP bit in a descriptor update,
 /// and turning the preference *off* changes nothing until the server's 300 s drop timer expires.
 pub const CMSG_TOGGLE_PVP: u16 = 0x0253; // 595
+
+/// The two **equipment-display** toggles — "show my helm" / "show my cloak" (VERIFIED vmangos
+/// `Opcodes_1_12_1.h`: 697/698, handlers `HandleShowingHelmOpcode`/`HandleShowingCloakOpcode` in
+/// `Handlers/CharacterHandler.cpp:753-761`). Both are **empty-bodied pure toggles**: the handler
+/// is a bare `ToggleFlag(PLAYER_FLAGS, PLAYER_FLAGS_HIDE_HELM | HIDE_CLOAK)` with no target-state
+/// form at all, unlike [`CMSG_TOGGLE_PVP`] above — so a client that wants a *specific* state must
+/// compare against the flag it already holds and send only on a difference.
+///
+/// No ack, exactly like the PvP toggle: the answer is the `PLAYER_FLAGS` bit arriving in the next
+/// descriptor update. That field is `UF_FLAG_PUBLIC` (vmangos `UpdateFields_1_12_1`), which is what
+/// makes the preference *everyone's* — a remote player's hidden helm hides on our screen too, off
+/// their own descriptor. The server round-trips the same preference through the char-enum record's
+/// `CHARACTER_FLAG_HIDE_HELM`/`HIDE_CLOAK` at load and save (`Player.cpp:14839-14842` /
+/// `16504-16505`), so the glue lane's flags and this one are the same stored bit (decision 1472).
+pub const CMSG_TOGGLE_HELM: u16 = 0x02B9; // 697
+/// The cloak half of [`CMSG_TOGGLE_HELM`] — same shape, `PLAYER_FLAGS_HIDE_CLOAK`.
+pub const CMSG_TOGGLE_CLOAK: u16 = 0x02BA; // 698
 
 // The solo-loot wire family (VERIFIED vmangos `Opcodes_1_12_1.h`: 264, 349-355, 357-358).
 // Bodies in [`super::loot`].

@@ -78,7 +78,7 @@
 //!   for both halves in the reference too — already covers the stop side of a resize that does
 //!   not exist yet.
 
-use mlua::{Lua, Table};
+use mlua::{Lua, MultiValue, Table, Value};
 
 use crate::script::Model;
 use crate::widget::FrameHandle;
@@ -155,6 +155,89 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         "IsResizable",
         lua.create_function(|lua, this: Table| get_flag(lua, &this, Flag::Resizable))?,
     )?;
+    // ── The resize-bounds quad — `Set/GetMinResize`, `Set/GetMaxResize` ────────────────────────
+    //
+    // Frame method table `0x878ec0`: `GetMinResize 0x775f20` · `SetMinResize 0x776020` ·
+    // `GetMaxResize 0x7761a0` · `SetMaxResize 0x7762a0`. Byte-carved end to end by wow-re
+    // (`system/ui/scratch/resize-bounds-and-button-fontstring.md` §2), and every clause below is
+    // from that read rather than from the shape of the name:
+    //
+    //  · **The argument gate is `lua_isnumber`, not a strict number** (`0x6f34d0` on BOTH slots 2
+    //    and 3), so a numeric STRING passes and is coerced — while a missing argument, an explicit
+    //    `nil`, a boolean, a table or a non-numeric string fails. Either slot failing raises
+    //    `Usage: %s:SetMinResize(minWidth, minHeight)` (`0x8797b8`) / the `MaxResize` twin
+    //    (`0x8797e4`), with `%s` the frame's name or `<unnamed>`. Arguments past slot 3 are
+    //    ignored; there is no upper arity check.
+    //  · **Stored RAW, and nothing else happens.** After the store-backs each setter is
+    //    `pop/pop/xor eax,eax/pop/…/ret` — no layout invalidate, no dirty mark, no `min > max`
+    //    reconciliation, and the frame's current size is never read. Setting a bound a frame
+    //    already violates does nothing at all until the next drag tick.
+    //  · **Zero return values from the setters; TWO from the getters, always** — `(width, height)`
+    //    as plain numbers, `0, 0` on a frame nobody bounded. Never `nil`: `0.0` is the client's
+    //    unbounded sentinel, so the "unset" answer and the "explicitly unbounded" answer are the
+    //    same answer, by construction.
+    for (name, upper) in [("MinResize", false), ("MaxResize", true)] {
+        m.set(
+            format!("Set{name}"),
+            lua.create_function(move |lua, args: MultiValue| {
+                let mut it = args.into_iter();
+                let this = match it.next() {
+                    Some(Value::Table(t)) => t,
+                    _ => return Err(mlua::Error::runtime("expected a frame")),
+                };
+                let h = frame_handle_of(lua, &this)?;
+                let pair = (it.next(), it.next());
+                // `lua_isnumber`'s own set: a number, or a string 5.0's `luaV_tonumber` converts.
+                let num = |v: &Option<Value>| match v {
+                    Some(Value::Number(n)) => Some(*n as f32),
+                    Some(Value::Integer(i)) => Some(*i as f32),
+                    Some(Value::String(s)) => s.to_str().ok()?.trim().parse::<f32>().ok(),
+                    _ => None,
+                };
+                let (Some(w), Some(hgt)) = (num(&pair.0), num(&pair.1)) else {
+                    let model = lua.app_data_ref::<Model>().expect("model");
+                    let who = model
+                        .arena
+                        .frame(h)
+                        .and_then(|f| f.name.clone())
+                        .unwrap_or_else(|| "<unnamed>".to_string());
+                    let (verb, a, b) = if upper {
+                        ("SetMaxResize", "maxWidth", "maxHeight")
+                    } else {
+                        ("SetMinResize", "minWidth", "minHeight")
+                    };
+                    return Err(mlua::Error::runtime(format!(
+                        "Usage: {who}:{verb}({a}, {b})"
+                    )));
+                };
+                let mut model = lua.app_data_mut::<Model>().expect("model");
+                if let Some(f) = model.arena.frame_mut(h) {
+                    if upper {
+                        f.max_resize = (w, hgt);
+                    } else {
+                        f.min_resize = (w, hgt);
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+        m.set(
+            format!("Get{name}"),
+            lua.create_function(move |lua, this: Table| {
+                let h = frame_handle_of(lua, &this)?;
+                let model = lua.app_data_ref::<Model>().expect("model");
+                let (w, hgt) = model.arena.frame(h).map_or((0.0, 0.0), |f| {
+                    if upper {
+                        f.max_resize
+                    } else {
+                        f.min_resize
+                    }
+                });
+                Ok((f64::from(w), f64::from(hgt)))
+            })?,
+        )?;
+    }
+
     // SetUserPlaced(flag) / IsUserPlaced() — bit 0x1000 (`0x776a50`/`0x776b40`), the client's "the
     // user placed this frame; persist its position across sessions" bit, and the one setter of the
     // three that is GUARDED: `776adb: test ah,0x3` refuses unless the frame is movable OR
@@ -229,16 +312,35 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
             let p = point.unwrap_or_default().to_ascii_uppercase();
             let (left, right) = (p.contains("LEFT"), p.contains("RIGHT"));
             let (top, bottom) = (p.contains("TOP"), p.contains("BOTTOM"));
-            // A grip naming no edge would resize nothing; the reference has no such call and we
-            // refuse rather than invent one.
-            if !(left || right || top || bottom) {
-                return Ok(());
-            }
+            // The raise and the userPlaced bit are the ENTRY's, not the grip's: `0x7652b0` runs
+            // for every `StartSizing` whatever it was handed, and only the pump's per-grip switch
+            // is selective. So both happen before the grip is looked at.
             super::toplevel::raise(&mut model, h);
             if let Some(f) = model.arena.frame_mut(h) {
                 f.user_placed = true;
             }
             let sample = model.cursor_pos;
+            // **`StartSizing("CENTER")` is a MOVE, not a resize** — and it is a real case, not a
+            // caller error. The pump's switch is on the anchor point-id, and case 4 (CENTER) is the
+            // one arm that never touches width or height: it shifts the frame's anchor offsets and
+            // returns before the clamp is ever reached, so a CENTER grip is unbounded by
+            // construction (wow-re `resize-bounds-and-button-fontstring.md` §3.6). This file used
+            // to say *"a grip naming no edge would resize nothing; the reference has no such call
+            // and we refuse rather than invent one"* — the bytes have since answered that, and the
+            // answer is the translate below, which is exactly what [`advance_move`] already does.
+            if p == "CENTER" {
+                model.moving = Some(FrameMove {
+                    frame: h,
+                    sample,
+                    // `StartSizing` enters at `0x7652b0(frame, 3, …)` — drag mode 3, the one the
+                    // mouse-up handler does NOT auto-cancel — whatever grip it was handed. So a
+                    // CENTER grip outlives the button release, like `StartMoving`'s.
+                    auto_stop: false,
+                });
+                return Ok(());
+            }
+            // Any other name resolves to no point-id at all, so the pump falls to its default tail
+            // and the drag is inert — started (raised, userPlaced) but moving nothing.
             model.sizing = Some(FrameSizing {
                 frame: h,
                 left,
@@ -381,15 +483,44 @@ pub(crate) fn start_title_move(model: &mut Model, h: FrameHandle) -> bool {
     true
 }
 
-/// Pump an in-flight move to the cursor at `pos` — the engine half of `0x7655b0`, run from
-/// [`crate::script::UiScript::mouse_move`] beside [`crate::script::cursor::maybe_start_drag`] and,
-/// like it, BEFORE the hover-boundary early return (a frame dragged around underneath the cursor
-/// crosses no boundary at all, so a move parked behind that return would only advance when the
-/// cursor happened to leave the frame).
+/// Apply a frame's `SetMinResize`/`SetMaxResize` bounds to a proposed size, per axis.
 ///
-/// Applies `(pos − sample)` scaled into the frame's anchor offsets and re-centers the sample; a
-/// zero delta does nothing at all, and a frame that died mid-move ends the move rather than
-/// writing to a dead handle.
+/// The reference's predicate, transcribed (decision 1505; wow-re
+/// `system/ui/scratch/resize-bounds-and-button-fontstring.md` §3.5 — decoded from `geo_768710`'s
+/// **emitted** `jcc`, not from the FPU status mask, and deliberately not from the dead `geo_768550`
+/// copy whose operand order differs):
+///
+/// ```text
+/// if (min != 0.0) and (v < min):  v = min
+/// if (max != 0.0) and (v > max):  v = max
+/// ```
+///
+/// Three things a plausible implementation gets wrong, all VERIFIED:
+///
+///  · **There is NO floor when no bound is set.** benilla had a hardcoded `1.0` here (inherited
+///    from the drag pump before the bounds existed) and the client has nothing of the kind — a
+///    drag can carry an unbounded frame to zero and through it into negative extents.
+///  · **Only an exactly-`0.0` bound is the sentinel**, so a *negative* bound clamps normally.
+///  · **min first, then max — so when `min > max`, MAX wins.** Nothing in the client warns,
+///    rejects or reconciles the pair.
+///
+/// The returned residual per axis is what the caller rebates out of the drag delta ([`advance_size`]).
+fn clamp_resize(model: &Model, h: FrameHandle, w: f32, hgt: f32) -> (f32, f32) {
+    let (min, max) = model
+        .arena
+        .frame(h)
+        .map_or(((0.0, 0.0), (0.0, 0.0)), |f| (f.min_resize, f.max_resize));
+    let axis = |v: f32, lo: f32, hi: f32| {
+        let v = if lo != 0.0 && v < lo { lo } else { v };
+        if hi != 0.0 && v > hi {
+            hi
+        } else {
+            v
+        }
+    };
+    (axis(w, min.0, max.0), axis(hgt, min.1, max.1))
+}
+
 /// Pump an in-flight `StartSizing`: move the gripped edges to the cursor, leave the others.
 ///
 /// The mirror of [`advance_move`] — same sample-and-recentre, same dead-frame bail, same
@@ -409,9 +540,6 @@ pub(crate) fn advance_size(model: &mut Model, pos: (f32, f32)) {
     }
     let inv = 1.0 / eff_scale(model, sz.frame);
     let (dx, dy) = (dx * inv, dy * inv);
-    let Some(input) = model.layout_inputs.get_mut(&sz.frame) else {
-        return;
-    };
     // Width grows when the RIGHT grip goes right, or the LEFT grip goes left. Height likewise with
     // y-up: the TOP grip going up grows it, the BOTTOM grip going down grows it.
     let dw = if sz.right {
@@ -428,12 +556,58 @@ pub(crate) fn advance_size(model: &mut Model, pos: (f32, f32)) {
     } else {
         0.0
     };
-    let (w0, h0) = (input.width, input.height);
-    input.width = (input.width + dw).max(1.0);
-    input.height = (input.height + dh).max(1.0);
+    let Some((w0, h0)) = model
+        .layout_inputs
+        .get(&sz.frame)
+        .map(|i| (i.width, i.height))
+    else {
+        return;
+    };
+    // The frame's own `SetMinResize`/`SetMaxResize` bounds — read before the mutable borrow, and
+    // the only path in the client that consults them at all (`clamp_resize`, and wow-re's §3.1
+    // reachability census behind it).
+    let (new_w, new_h) = clamp_resize(model, sz.frame, w0 + dw, h0 + dh);
+    // **The rebate.** A saturated clamp is not a bare `max`/`min` in the reference: the residual
+    // it swallowed is subtracted back out of the drag delta before the delta reaches the anchors
+    // (`0x768770`/`0x7687a2` — `dx := dx ∓ residual·scale`). Without it the size pins at the bound
+    // while the anchor keeps sliding, so a window held past its minimum stops shrinking and starts
+    // *walking* across the screen. With it the moving edge lands exactly on the bound and stays.
+    //
+    // Both are already in LOCAL units here (`dx`/`dy` were divided by the effective scale above,
+    // and the anchor offsets they feed are pre-scale), so the rebate is a plain subtraction — the
+    // reference's `·layoutScale` is its own conversion back out of cursor units, not part of the
+    // rule. The sign follows the grip: a growing edge (`dw = +dx`) adds the residual, a shrinking
+    // one (`dw = -dx`) subtracts it, so the delta always agrees with the size the clamp allowed.
+    // An axis nobody gripped is left alone rather than rebated against a bound the frame was
+    // already outside of — that frame stays put until a drag touches its axis, which is §3.8.
+    let rebate = |d: f32, want: f32, got: f32, grew: bool, gripped: bool| {
+        if !gripped {
+            return d;
+        }
+        let residual = got - want;
+        if grew {
+            d + residual
+        } else {
+            d - residual
+        }
+    };
+    let dx = rebate(dx, w0 + dw, new_w, sz.right, sz.left || sz.right);
+    let dy = rebate(dy, h0 + dh, new_h, sz.top, sz.top || sz.bottom);
+    let Some(input) = model.layout_inputs.get_mut(&sz.frame) else {
+        return;
+    };
+    input.width = new_w;
+    input.height = new_h;
     let mut moved = input.width.to_bits() != w0.to_bits() || input.height.to_bits() != h0.to_bits();
     // The planted edge: a frame anchored by its LEFT that is gripped on the LEFT has to move too,
     // or the resize would push the right edge instead. Only the gripped axis shifts.
+    //
+    // **Which edges travel is OURS, and the byte carve does not settle it** — stated rather than
+    // quietly aligned. The reference collapses the frame to a single planted TOPLEFT anchor at
+    // `StartSizing` (`0x768430`), so *its* travelling edges are necessarily LEFT and TOP; we keep
+    // the authored anchor set intact and shift every anchor's offsets, which is a different model
+    // with a different answer. The rebate above is the part the carve does settle, and it applies
+    // either way.
     if !input.anchors.is_empty() && (sz.left || sz.bottom) {
         for a in &mut input.anchors {
             if sz.left {
@@ -447,9 +621,9 @@ pub(crate) fn advance_size(model: &mut Model, pos: (f32, f32)) {
     }
     // The zero-delta return above is on the RAW cursor delta, which is not the same question: a
     // single-axis grip dragged purely across its axis gives `dw == dh == 0`, and so does a grip
-    // held past `.max(1.0)` saturation. Both used to bump the epoch and then hash all ~10k
-    // anchored regions to conclude nothing had moved — the castbar's bug class in miniature, for
-    // every frame of such a drag (decision 1385).
+    // held against a bound. Both used to bump the epoch and then hash all ~10k anchored regions to
+    // conclude nothing had moved — the castbar's bug class in miniature, for every frame of such a
+    // drag (decision 1385).
     if moved {
         // Offsets only — a resize grip never repoints an anchor, so the frame names itself and the
         // cached graph survives the drag (decision 1388). A drag is per-frame by nature: this is
@@ -460,6 +634,15 @@ pub(crate) fn advance_size(model: &mut Model, pos: (f32, f32)) {
     model.sizing = Some(FrameSizing { sample: pos, ..sz });
 }
 
+/// Pump an in-flight move to the cursor at `pos` — the engine half of `0x7655b0`, run from
+/// [`crate::script::UiScript::mouse_move`] beside [`crate::script::cursor::maybe_start_drag`] and,
+/// like it, BEFORE the hover-boundary early return (a frame dragged around underneath the cursor
+/// crosses no boundary at all, so a move parked behind that return would only advance when the
+/// cursor happened to leave the frame).
+///
+/// Applies `(pos − sample)` scaled into the frame's anchor offsets and re-centers the sample; a
+/// zero delta does nothing at all, and a frame that died mid-move ends the move rather than
+/// writing to a dead handle.
 pub(crate) fn advance_move(model: &mut Model, pos: (f32, f32)) {
     let Some(mv) = model.moving else { return };
     if model.arena.frame(mv.frame).is_none() {

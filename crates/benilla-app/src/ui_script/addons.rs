@@ -186,7 +186,20 @@ impl Addon {
             let path = benilla_ui::loader::join_ref(self.prefix(), file);
             let Some(bytes) = self.read(&path) else {
                 let e = format!("{}/{file}: not found", self.name);
-                error!("ui_script: {e}");
+                // Severity follows whose manifest lied. For the builtin that is us — a client
+                // bug, and the boot tests assert none. For a player's addon it is the package
+                // (the director's AtlasLoot copy lists `Bossnames\BossNames.xml`; no such folder
+                // ships in it), and the reference client silently skips a missing toc entry — so
+                // a broken addon must not read as a client ERROR, which is gate-fatal to
+                // `smoke.sh`'s zero-ERROR count (1450).
+                match self.source {
+                    Source::Builtin => error!("ui_script: {e}"),
+                    Source::Dir(_) => warn!("ui_script: {e}"),
+                }
+                // Retained where the player can read it (1495). This is the single commonest way
+                // an addon "doesn't work" with nothing on screen — the director's own AtlasLoot
+                // copy lists `Bossnames\BossNames.xml` and ships no such folder.
+                script.report_load_failure(&e);
                 failures.push(e);
                 continue;
             };
@@ -216,6 +229,10 @@ impl Addon {
                 Err(e) => {
                     let e = format!("{}/{file}: {e}", self.name);
                     error!("ui_script: parsing {e}");
+                    // Still log-only as far as the *dialog* goes — the reference answers an
+                    // unparseable document with a FrameXML.log line and silence, and 1495 does not
+                    // change that. What it changes is that the silence is no longer total.
+                    script.report_load_failure(&e);
                     failures.push(e);
                     continue;
                 }
@@ -799,6 +816,7 @@ impl Walk {
             let chain = self.loading.join(" → ");
             let e = format!("{key}: dependency cycle ({chain} → {key})");
             error!("ui_script: {e}");
+            script.report_load_failure(&e);
             self.failures.push(e);
             self.failed.insert(addon.name.clone());
             return Err(());
@@ -826,6 +844,9 @@ impl Walk {
                 addon.name
             );
             error!("ui_script: {e}");
+            // The one failure a player can usually FIX themselves — install the dependency — and
+            // until 1495 the only place it was said was the terminal.
+            script.report_load_failure(&e);
             self.failures.push(e);
             self.failed.insert(addon.name.clone());
             return Err(());
@@ -843,6 +864,7 @@ impl Walk {
                 Err(e) => {
                     let e = format!("{}/Bindings.xml: {e}", addon.name);
                     error!("ui_script: {e}");
+                    script.report_load_failure(&e);
                     self.failures.push(e);
                 }
             }

@@ -51,8 +51,13 @@ pub use factions::{
 };
 mod creature_types;
 pub use creature_types::{load_creature_type_flags, CreatureTypeFlags};
+/// The chat language scramble — the reference's `0x49b560` (B262). Reads [`LanguageWords`].
+mod garble;
+pub use garble::{garble, garble_chat, Garble, FLUENT_SKILL};
 mod languages;
-pub use languages::{load_default_languages, DefaultLanguages};
+pub use languages::{
+    load_default_languages, load_language_words, DefaultLanguages, LanguagePool, LanguageWords,
+};
 mod creature_families;
 pub use creature_families::{
     load_creature_families, load_pet_food_names, CreatureFamilies, CreatureFamily, PetFoodNames,
@@ -101,7 +106,7 @@ pub use ground_effects::{
     GroundEffectCatalog,
 };
 mod light;
-pub use light::{Atmosphere, LightCatalog, Submersion};
+pub use light::{Atmosphere, LightCatalog, Submersion, ZERO_KEY_COLOR, ZERO_KEY_SCALAR};
 mod loading_screen;
 pub use loading_screen::{load_loading_screens, LoadingScreenCatalog};
 mod liquid;

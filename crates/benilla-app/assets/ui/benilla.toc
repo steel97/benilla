@@ -96,10 +96,16 @@ BinderConfirm.xml
 # consumers (ActionBar's buttons, the multibars, the stance bar, BagFrame's slots).
 Cooldown.xml
 ActionBar.xml
-# The two always-on bottom multibars (actions 61-72 / 49-60): pure XML/Lua over
-# ActionBar.xml's shared button template + handler set — loads right after it
-# (inherits BenillaActionButtonTemplate, anchors to ActionButton1, and its
-# buttons join the BENILLA_ACTION_BUTTONS roster ActionBar.xml declares).
+# The four OPTIONAL extra bars (bottom left/right 61-72 / 49-60, vertical right/left
+# 25-36 / 37-48), all shipping hidden until the player ticks their row (decision 1500):
+# pure XML/Lua over ActionBar.xml's shared button template + handler set. Loads right
+# after it, and the order is a REQUIREMENT, not tidiness: it inherits
+# BenillaActionButtonTemplate, anchors to ActionButton1, its buttons join the
+# BENILLA_ACTION_BUTTONS roster ActionBar.xml declares, its grid verbs call that file's
+# ActionButton_ShowGrid/_HideGrid, and its BENILLA_MULTIBARS table reads that file's
+# *_ACTIONBAR_PAGE constants at FILE SCOPE. UIParent.xml (far above) owns the manage pass
+# MultiActionBar_Update ends with, and the PLAYER_ENTERING_WORLD seed that fills the four
+# SHOW_MULTI_ACTIONBAR_* globals from the server's byte.
 MultiBars.xml
 # The stance/shapeshift bar: hidden until `crate::ui_shapeshift`'s feed pushes a
 # non-empty form list (a formless class never shows it). After Cooldown.xml
@@ -132,6 +138,11 @@ MinimapCluster.xml
 # TOC loads GameTime.xml right after Minimap.xml. After MinimapCluster (its parent) and
 # GameTooltip (the hover tooltip); driven by the app's game clock (`minimap::feed_game_time`).
 GameTime.xml
+# Print screen's UI half (decision 1487): the centred "Screen Captured"/"Screen Capture Failed"
+# line, and the `TakeScreenshot()` the SCREENSHOT binding runs. Needs Fonts.xml (SystemFont) and
+# UIParent.xml (its seat) — both far above — and nothing else; seated beside ZoneText.xml, whose
+# AutoFollowStatus is the same full-screen-frame-with-a-centred-line shape.
+ScreenshotStatus.xml
 # The zone-entry splash (decision 0287): ZoneTextFrame/SubZoneTextFrame + the inlined
 # FadingFrame kit, driven by the ZONE_CHANGED family `crate::area` fires. Needs only
 # Fonts (ZoneTextFont/SubZoneTextFont) + UIParent; kept by the minimap cluster — the
@@ -353,6 +364,14 @@ ChatFrame.xml
 # show/hide), and it must come AFTER SpellBookFrame, whose shift-click reaches
 # `BenillaMacroFrame_AddMacroLine`. Before GameMenuFrame, whose Macros button opens it.
 MacroFrame.xml
+# The script error log (decision 1495): the window `/errors` opens — the list B293's two
+# reporters asked for, which the reference's one-message-at-a-time ScriptErrors modal cannot
+# be. Ours entirely (1.12 has no counterpart), reading the retained log on the model rather
+# than any per-frame feed. Needs ScrollTemplates (BOTH kits — the faux one for the fixed row
+# list, the real one for the traceback pane), UIPanelTemplates (the Clear/Close buttons) and
+# UiPanels (ShowUIPanel/HideUIPanel + the UIPanelWindows row that seats it and gets it closed
+# by ESC). Before GameMenuFrame, which is deliberately last.
+ScriptLogFrame.xml
 # The Keybindings page MODULE (decision 1008, superseding 0997's standalone window):
 # the templates + script of the Options window's Keybindings category, over the
 # engine's binding table (benilla_ui::script::keybind + crate::bindings — the 1.12

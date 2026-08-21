@@ -224,6 +224,29 @@ pub const ATTRIBUTE_WOW_JOINT_WEIGHT: bevy::mesh::MeshVertexAttribute =
         bevy::render::render_resource::VertexFormat::Float32x4,
     );
 
+/// A merged fader blob's per-vertex fade sphere (`center.xyz` world-space, `w` = fade radius —
+/// decision 1418): every vertex of one baked placement carries the placement's sphere, and
+/// `wow_model.wgsl` computes the faithful `doodad_fade_alpha` from it per vertex (the erode
+/// lane), replacing the per-entity MeshTag/twin/Hidden fade channels a merged draw cannot
+/// express. Own attribute id for the same reason as the joints above; shader location 12.
+pub const ATTRIBUTE_WOW_FADE_SPHERE: bevy::mesh::MeshVertexAttribute =
+    bevy::mesh::MeshVertexAttribute::new(
+        "Wow_FadeSphere",
+        988_540_919,
+        bevy::render::render_resource::VertexFormat::Float32x4,
+    );
+
+/// A merged interior-prop blob's per-vertex SH-probe slot (decision 1418 lane 3): the slot
+/// index every vertex of one baked placement carries, replacing the per-entity `MeshTag`
+/// payload (`wow_model.wgsl`'s `WOW_MERGED_SLOT` reads it instead of the tag bits). Shader
+/// location 13.
+pub const ATTRIBUTE_WOW_MERGED_SLOT: bevy::mesh::MeshVertexAttribute =
+    bevy::mesh::MeshVertexAttribute::new(
+        "Wow_MergedSlot",
+        988_540_920,
+        bevy::render::render_resource::VertexFormat::Uint32,
+    );
+
 /// The app-facing **static** mesh build (decision 0834): geometry only, `RENDER_WORLD`-only
 /// usages — the render world takes the vertex buffers at extract and the main world keeps no
 /// copy. Consumers must pair it with an explicit `Aabb` computed at build time (the exterior
@@ -782,6 +805,136 @@ pub(crate) fn build_global_bones(
             }
         })
         .collect()
+}
+
+/// Build ONE mesh from many placed static submeshes — the transforms baked into the vertices
+/// (the production blob build, 1418; the retired `WOW_MEGA_STATIC` bracket's unfaded twin died
+/// with it): same attribute recipe as [`submesh_to_static_mesh`], concatenated, with each part's
+/// placement transform applied to positions and its rotation to normals (placements scale
+/// uniformly, so directions survive), plus the per-vertex [`ATTRIBUTE_WOW_FADE_SPHERE`] (one
+/// sphere per PART, replicated onto each of its vertices). `slots` (index-parallel with `parts`
+/// when `Some`) additionally bakes each part's SH-probe slot as [`ATTRIBUTE_WOW_MERGED_SLOT`] —
+/// the interior-prop lane. Parts lacking vertex colours pad white when any part has them — one
+/// attribute set must cover the whole concatenation.
+///
+/// **The mesh is recentred on its union-AABB centre** and that world centre is returned last:
+/// the caller places the entity AT the centre (`Transform::from_translation`), and the returned
+/// min/max are mesh-LOCAL for its `Aabb`. A world-baked mesh on `Transform::IDENTITY` sorts the
+/// entity at the WORLD ORIGIN in Bevy's transparent phase — ~9 400 yd out, drawn first among
+/// ALL transparent content with the twin's depth-write ON, so a feathering blob's translucent
+/// pixels depth-killed every transparent entity drawn after it (a per-entity fader behind a
+/// 20 %-alpha merged fence vanished outright, popping in only when the sightline cleared the
+/// segment — decision 1422). Centre-sort restores the same location-sort semantics every
+/// per-entity draw has (whose sort key is its placement origin). The fade spheres stay
+/// WORLD-space — the shader compares them against the camera, never against mesh-local
+/// positions — so the recentring does not touch them.
+pub fn merged_static_mesh_faded(
+    parts: &[(std::sync::Arc<RenderSubmesh>, Transform)],
+    spheres: &[Vec4],
+    slots: Option<&[u32]>,
+) -> (Mesh, Vec3, Vec3, Vec3) {
+    merged_static_mesh_impl(parts, Some((spheres, slots)))
+}
+
+fn merged_static_mesh_impl(
+    parts: &[(std::sync::Arc<RenderSubmesh>, Transform)],
+    extras: Option<(&[Vec4], Option<&[u32]>)>,
+) -> (Mesh, Vec3, Vec3, Vec3) {
+    let any_colors = parts
+        .iter()
+        .any(|(s, _)| s.vertex_colors.len() == s.positions.len());
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut fade: Vec<[f32; 4]> = Vec::new();
+    let mut slot_verts: Vec<u32> = Vec::new();
+    let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for (i, (sub, transform)) in parts.iter().enumerate() {
+        let base = u32::try_from(positions.len()).expect("merged mesh under u32 vertices");
+        for p in &sub.positions {
+            let w = transform.transform_point(wow_to_bevy(*p));
+            mn = mn.min(w);
+            mx = mx.max(w);
+            positions.push(w.to_array());
+        }
+        if sub.normals.len() == sub.positions.len() {
+            let flip = sub.billboard_card_faces_away();
+            for n in &sub.normals {
+                let b = transform.rotation * wow_to_bevy(*n);
+                normals.push(if flip { -b } else { b }.normalize_or_zero().to_array());
+            }
+        } else {
+            // The lone compute_normals fallback path never merges (its models are rare and the
+            // bracket tolerates flat shading there): pad up, face normals are close enough for a
+            // measurement build.
+            normals.extend(std::iter::repeat_n([0.0, 1.0, 0.0], sub.positions.len()));
+        }
+        uvs.extend(sub.uvs.iter().copied());
+        if any_colors {
+            if sub.vertex_colors.len() == sub.positions.len() {
+                colors.extend(sub.vertex_colors.iter().copied());
+            } else {
+                colors.extend(std::iter::repeat_n(
+                    [1.0, 1.0, 1.0, 1.0],
+                    sub.positions.len(),
+                ));
+            }
+        }
+        if let Some((spheres, slots)) = extras {
+            fade.extend(std::iter::repeat_n(
+                spheres[i].to_array(),
+                sub.positions.len(),
+            ));
+            if let Some(slots) = slots {
+                slot_verts.extend(std::iter::repeat_n(slots[i], sub.positions.len()));
+            }
+        }
+        indices.extend(sub.indices.iter().map(|i| base + i));
+    }
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    if any_colors {
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    }
+    if let Some((_, slots)) = extras {
+        mesh.insert_attribute(ATTRIBUTE_WOW_FADE_SPHERE, fade);
+        if slots.is_some() {
+            mesh.insert_attribute(
+                ATTRIBUTE_WOW_MERGED_SLOT,
+                bevy::mesh::VertexAttributeValues::Uint32(slot_verts),
+            );
+        }
+    }
+    mesh.insert_indices(Indices::U32(indices));
+    // Recentre on the union-AABB centre (see `merged_static_mesh`'s doc): positions become
+    // mesh-local, min/max follow, the centre goes back to the caller for the entity Transform.
+    // Guard the empty accumulation (no parts) — a MAX/MIN sentinel centre would explode.
+    // (`mn > mx` iff the vertex loop never ran; `positions` has been moved into the mesh.)
+    let center = if mn.x > mx.x {
+        Vec3::ZERO
+    } else {
+        (mn + mx) * 0.5
+    };
+    if center != Vec3::ZERO {
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(pos)) =
+            mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
+        else {
+            unreachable!("positions were just inserted as Float32x3");
+        };
+        for p in pos.iter_mut() {
+            p[0] -= center.x;
+            p[1] -= center.y;
+            p[2] -= center.z;
+        }
+    }
+    (mesh, mn - center, mx - center, center)
 }
 
 #[cfg(test)]

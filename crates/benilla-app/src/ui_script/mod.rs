@@ -41,6 +41,11 @@ mod reference_ui;
 /// or a change-memo outliving the VM it was written against (decision 1290).
 mod session;
 
+/// The feed gate (decision 1439): the input-side early-out for a per-frame UI feed, its
+/// [`gate::Watch`] counter memory, and the `WOW_FEED_GATE_CHECK=1` audit that catches a gate
+/// missing an input.
+pub(crate) mod gate;
+
 pub(crate) use session::VmMemo;
 
 // The manifest's loaders read as `ui_script::…` at every call site, including the tests' `super::`.
@@ -610,6 +615,17 @@ fn demo_unit_feed(script: Option<NonSendMut<UiScript>>, mut fired: Local<VmMemo<
         // Set before PLAYER_ENTERING_WORLD so the bar's first Update reads it.
         script.set_player_xp(4200, 6000);
         script.fire_event("PLAYER_ENTERING_WORLD", vec![]);
+        // The two bottom multibars are player options and ship OFF since 1500, and a capture runs
+        // with no server behind it — so the login seed reads a zero toggle byte and neither bar
+        // comes up. Raise them the way the Options rows do, or the 61../49.. wells seeded above
+        // draw nowhere and `ui-actionbar` loses two rows it exists to show. This is the DEMO's
+        // choice about what to photograph, not a default: `MultiActionBar_Update` is the same
+        // function the row calls, so nothing here is a private door into the bars. Guarded because
+        // this feed also runs with `WOW_CAPTURE_UI` unset, where no interface has been loaded.
+        let _ = script.run(
+            "SHOW_MULTI_ACTIONBAR_1 = 1 SHOW_MULTI_ACTIONBAR_2 = 1 \
+             if MultiActionBar_Update then MultiActionBar_Update() end",
+        );
         script.fire_event("PLAYER_XP_UPDATE", vec![]);
         for token in ["player", "target"] {
             script.fire_event("UNIT_HEALTH", vec![ScriptValue::Str(token.into())]);
@@ -801,6 +817,9 @@ mod quest_timer_tests;
 mod durability_tests;
 
 #[cfg(test)]
+mod screenshot_tests;
+
+#[cfg(test)]
 mod questlog_tests;
 
 #[cfg(test)]
@@ -843,7 +862,15 @@ mod errors_tests;
 mod shipped_xml_tests;
 
 #[cfg(test)]
+mod bottom_hud_tests;
+
+#[cfg(test)]
 mod bagnon_render_tests;
+
+/// Bug B267 end to end: a hunter's Quiver publishes its global functions (see the file header for
+/// the three walls that stopped it).
+#[cfg(test)]
+mod quiver_tests;
 
 /// The UI's per-world-entry lifecycle: teardown at the character screen, a genuine second load at
 /// the next login (decision 1290).

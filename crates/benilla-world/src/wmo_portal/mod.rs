@@ -32,6 +32,7 @@ use std::sync::Arc;
 mod fog;
 mod interior;
 mod probe;
+mod room_vis;
 mod seed;
 
 use fog::select_wmo_fog;
@@ -47,6 +48,7 @@ pub use interior::{
 };
 pub use probe::WmoCullProbe;
 use probe::{TraceLog, PROBE_DUMP_PATH};
+pub use room_vis::room_pvs_visible;
 use seed::dominant_axes;
 pub use seed::{down_ray_seeds, floor_z_at, DownRaySeeds};
 
@@ -291,7 +293,13 @@ impl Plugin for WmoPortalPlugin {
                 track_area_interior,
                 track_unit_interiors,
             )
-                .in_set(WmoPvsSet),
+                .in_set(WmoPvsSet)
+                // **On this frame's camera pose, not last frame's** (decision 1503). The flood,
+                // the interior claim and the exterior windows all key on the eye, and every one of
+                // them decides what the frame is allowed to draw. Unordered, this set could even
+                // run before the controller had moved the camera at all; ordered here it answers
+                // about the eye the frame will be rendered from.
+                .after(crate::view::CameraPoseSet),
         );
     }
 }
@@ -321,6 +329,8 @@ fn compute_wmo_pvs(
     };
     let clip_from_world = proj.get_clip_from_view() * cam_t.to_matrix().inverse();
     let eye_world = cam_t.translation();
+    // Publish the pose this authority ran on (see [`WmoCullProbe::eye`]).
+    probe.eye = eye_world;
     // The terrain leg of the seed's down-ray, sampled once for the camera's column: the client casts the
     // same segment at the ground and drops the WMO hit when the ground is nearer (`FUN_006821f0`).
     let terrain = terrain_height_under(&streamer, &adt_tiles, eye_world);
@@ -1100,6 +1110,7 @@ mod tests {
             group_bounds: Vec::new(),
             group_footprints: Vec::new(),
             material_ground_type: Vec::new(),
+            material_diff_color: Vec::new(),
             group_footprint_bounds: Vec::new(),
             group_footprint_grids: Vec::new(),
             group_light_refs: Vec::new(),

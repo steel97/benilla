@@ -26,6 +26,7 @@ use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 
 use super::AnimParked;
+use crate::vis_chain::VisChainOnly;
 
 /// The collapsed rig's pose buffer (decision 0724), on the entity carrying the `AnimationPlayer`:
 /// one local `Transform` per bone in skeleton order — no joint entities at all (decision 0712's
@@ -140,6 +141,20 @@ impl RigPose {
         }
     }
 
+    /// This rig is rendered by an **off-world camera** (a portrait booth), so the world pass must
+    /// not camera-face its billboard bones: [`finalize_rig_worlds`](super::finalize_rig_worlds)
+    /// takes its basis from the `WorldCamera`, which is not the camera drawing this rig. Dropping
+    /// the kinds leaves those bones at their composed pose — exactly what the entity-joint booth
+    /// lane produced (its joints never carried a `BillboardJointRig`), while the booth's own card
+    /// facer counter-rotates each card's anchor to the booth camera. The `flags & 0x7` parent
+    /// arms stay: that law is camera-free and runs in [`Self::compose`] regardless.
+    pub fn without_camera_billboards(mut self) -> Self {
+        self.kinds.iter_mut().for_each(|k| *k = None);
+        self.has_billboard = false;
+        self.has_special = self.arms.iter().any(Option::is_some);
+        self
+    }
+
     /// The anchor entity standing in for `bone`, spawned on first demand (decision 1355): a
     /// consumer that needs an *entity* on a bone — a held item's parent, an emitter's owner
     /// frame, a quest marker's seat — resolves it here, and only bones something actually
@@ -164,6 +179,10 @@ impl RigPose {
         }
         let m = self.model.get(bone as usize)?;
         let (scale, rotation, translation) = m.to_scale_rotation_translation();
+        // Visibility so an attached subtree (a held item under a hand anchor) inherits the
+        // owner's hide — chain only: an anchor renders nothing, and at the Goldshire pin the
+        // anchor population was the single largest never-rendering block in the per-camera
+        // visibility sweep (4.8k rows, decision 1441).
         let anchor = commands
             .spawn((
                 Transform {
@@ -174,6 +193,7 @@ impl RigPose {
                 Visibility::default(),
                 RigAnchor { rig, bone },
             ))
+            .vis_chain_only()
             .id();
         commands.entity(self.joints_root).add_child(anchor);
         self.anchors.push((bone, anchor));

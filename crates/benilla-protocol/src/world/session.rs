@@ -98,11 +98,15 @@ impl WorldSession {
             seed.into_client_header_crypto(&username_n, session_key, server_seed);
 
         // 3. CMSG_AUTH_SESSION goes out unencrypted; obfuscation begins immediately after.
+        // The addon block is the tail of this packet and is NOT optional: cmangos-classic kicks a
+        // session whose addon size is zero, which is what benilla used to send (B277, decision
+        // 1497). `STOCK_SECURE_ADDONS` is what a stock 1.12.1 install reports.
         let body = messages::auth_session(
             u32::from(crate::CLIENT_BUILD),
             &username.to_uppercase(),
             client_seed,
             &client_proof,
+            &messages::STOCK_SECURE_ADDONS,
         );
         send_packet(&mut stream, None, opcode::CMSG_AUTH_SESSION, &body)
             .context("sending CMSG_AUTH_SESSION")?;
@@ -657,6 +661,15 @@ impl WorldSession {
             opcode::MSG_MOVE_TELEPORT_ACK,
             &messages::teleport_ack(guid, counter, client_uptime_ms()),
         )
+    }
+
+    /// Echo a cross-map worldport ack — the unsplit twin of [`WorldWriter::worldport_ack`]
+    /// (`MSG_MOVE_WORLDPORT_ACK`, empty body). Without it the server never runs
+    /// `HandleMoveWorldportAckOpcode`, so nothing on the destination map is ever streamed: no self
+    /// create block, and none of the arrival's own side effects (the `--mount-tele` probe's whole
+    /// subject — the mount strip a map that forbids mounting performs right there).
+    pub fn worldport_ack(&mut self) -> Result<()> {
+        self.send(opcode::MSG_MOVE_WORLDPORT_ACK, &[])
     }
 
     /// **Acknowledge a granted mover mode** — root, water-walk, feather-fall or hover (the ack'd

@@ -283,6 +283,33 @@ pub struct Frame {
     /// `StartSizing` half of the same family. Default false. benilla stores and reports the flag;
     /// no resize *drag* is built (`StopMovingOrSizing` already covers the stop side of both).
     pub resizable: bool,
+    /// `SetMinResize` / `SetMaxResize` — the interactive-resize bounds as `(width, height)`
+    /// (`0x776020` / `0x7762a0`, with `GetMinResize 0x775f20` / `GetMaxResize 0x7761a0`; all four
+    /// on the Frame method table `0x878ec0`, stored in the client at `CLayoutFrame+0x5c..+0x68`
+    /// as a `CRect`-shaped `{minY, minX, maxY, maxX}`).
+    ///
+    /// **`0.0` is the client's own "unbounded" sentinel, on each field independently** (1505) — not a
+    /// flag, not a negative, not a `None`: the `CLayoutFrame` ctor `0x767680` zeroes all four, the
+    /// getters hand back two plain numbers (`0, 0` on a frame nobody bounded, never `nil`), and
+    /// the clamp's first test on every axis is `bound == 0.0 → skip`. A **negative** bound is
+    /// therefore live and clamps normally. Byte-verified: wow-re
+    /// `system/ui/scratch/resize-bounds-and-button-fontstring.md` §1–2.
+    ///
+    /// The values are lengths in the same space as the explicit width/height, so they compare
+    /// directly against [`crate::layout::LayoutInput`]'s — the binding runs the byte-identical
+    /// logical→internal transform `SetWidth`'s does.
+    ///
+    /// A window kit's opening lines are `SetResizable(true)` + these two; Quiver's
+    /// `SideEffectMakeMoveable` calls `SetMinResize` on every module frame it builds and died on
+    /// the nil method (part of B267).
+    ///
+    /// **Only the interactive drag reads them** — VERIFIED, not an omission: the setters store raw
+    /// and do not even mark the layout dirty, `CLayoutFrame::SetWidth`/`SetHeight` never consult
+    /// them, and no layout-resolve path does either. A frame sized 100 wide with
+    /// `SetMinResize(400, 400)` stays 100 wide until the first drag tick snaps it into range.
+    pub min_resize: (f32, f32),
+    /// The upper twin of [`Frame::min_resize`] — see its doc, including the `0.0` sentinel.
+    pub max_resize: (f32, f32),
     /// `SetUserPlaced` — the client's "the user placed this frame; persist its position across
     /// sessions" bit. Default false. Stored and readable (`IsUserPlaced`); **nothing consumes it
     /// yet** — persisting a frame's position belongs with the layout cache, not with the drag that
@@ -377,6 +404,13 @@ pub struct WidgetArena {
     /// exists" signal, so the per-frame state feed (`set_minimap_inside`'s caller) re-pushes
     /// exactly when one appears instead of walking every frame to find out.
     minimap_created: u64,
+    /// Frames whose kind carries **engine-side per-tick behavior** — ScrollingMessageFrame /
+    /// MessageFrame (the line fades) and Cooldown (the flash-finished hide). The tick's registry
+    /// (decision 1446, the `minimap_created` disposition at list size): the per-frame advance
+    /// walks these few dozen instead of the whole arena, which it used to do TWICE per tick — a
+    /// corpus UI is thousands of frames. Appended at creation (kinds never change after);
+    /// `destroy` removes its own handle, so the list never carries dead entries.
+    ticked_kinds: Vec<FrameHandle>,
 }
 
 impl Default for WidgetArena {
@@ -394,12 +428,18 @@ impl WidgetArena {
             names: HashMap::new(),
             next_insertion: 0,
             minimap_created: 0,
+            ticked_kinds: Vec::new(),
         }
     }
 
     /// Monotonic count of Minimap widgets ever created (see the field note).
     pub fn minimap_created(&self) -> u64 {
         self.minimap_created
+    }
+
+    /// The frames whose kind the host must advance each tick (see the field note).
+    pub fn ticked_kinds(&self) -> &[FrameHandle] {
+        &self.ticked_kinds
     }
 
     // ── Read access ────────────────────────────────────────────────────────────────────────────
@@ -565,6 +605,11 @@ impl WidgetArena {
             // it, at the level it was created with.
             movable: false,
             resizable: false,
+            // All four zeroed, which IS the client's unbounded state — `CLayoutFrame`'s ctor
+            // `0x767680` does exactly this (`xor esi,esi` into `+0x5c..+0x68`), and `0.0` is the
+            // sentinel the clamp tests rather than a separate flag.
+            min_resize: (0.0, 0.0),
+            max_resize: (0.0, 0.0),
             user_placed: false,
             toplevel: false,
             scale,
@@ -598,8 +643,15 @@ impl WidgetArena {
         if matches!(kind, FrameKind::Minimap) {
             self.minimap_created += 1;
         }
+        let ticked = matches!(
+            kind,
+            FrameKind::ScrollingMessageFrame | FrameKind::MessageFrame | FrameKind::Cooldown
+        );
         let (index, generation) = self.frames.insert(frame);
         let handle = FrameHandle { index, generation };
+        if ticked {
+            self.ticked_kinds.push(handle);
+        }
 
         if let Some(p) = parent {
             self.frame_mut(p)
@@ -624,6 +676,8 @@ impl WidgetArena {
         let regions = frame.regions.clone();
         let parent = frame.parent;
         let name = frame.name.clone();
+        // Each (recursive) destroy removes its own handle — the tick registry stays dead-free.
+        self.ticked_kinds.retain(|&t| t != h);
 
         for c in children {
             self.destroy(c);

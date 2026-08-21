@@ -95,13 +95,30 @@ impl UiScript {
         }
         let ids: Vec<u32> = {
             let mut model = self.model_mut();
+            // The OnUpdate population is its own list (decision 1446) — maintained by
+            // `SetScript`, `scripts`' one writer — so this reads a few hundred handles instead
+            // of re-filtering the whole scripts map. A destroyed frame's handle stays until its
+            // liveness check fails once, then compacts here.
             let frames: Vec<FrameHandle> = model
-                .scripts
+                .on_update_frames
                 .iter()
-                .filter(|(_, kinds)| kinds.contains("OnUpdate"))
-                .map(|(&h, _)| h)
+                .copied()
                 .filter(|&h| model.arena.frame(h).is_some_and(|f| f.effective_visible))
                 .collect();
+            if model
+                .on_update_frames
+                .iter()
+                .any(|&h| model.arena.frame(h).is_none())
+            {
+                let arena = &model.arena;
+                let live: Vec<FrameHandle> = model
+                    .on_update_frames
+                    .iter()
+                    .copied()
+                    .filter(|&h| arena.frame(h).is_some())
+                    .collect();
+                model.on_update_frames = live;
+            }
             let mut ids: Vec<u32> = frames.into_iter().map(|h| model.frame_id(h)).collect();
             // **Deterministic order, by frame id — i.e. creation order.**
             //
@@ -132,13 +149,18 @@ impl UiScript {
         // plus the capacity law that is this class's stand-in for `maxLines` — the cap is what fits
         // vertically, so it needs the frame's resolved rect and is collected first (the arena walk
         // below holds a mutable borrow that cannot also read `model.resolved`).
-        let message_frames: Vec<(FrameHandle, usize)> = model
-            .arena
-            .iter_frames()
-            .filter(|(_, f)| matches!(f.kind_state, crate::widget::KindState::Message(_)))
-            .map(|(h, _)| h)
-            .collect::<Vec<_>>()
-            .into_iter()
+        // Both per-kind walks below ride the arena's ticked-kind registry (decision 1446):
+        // dozens of handles instead of two full-arena sweeps per tick.
+        let ticked: Vec<FrameHandle> = model.arena.ticked_kinds().to_vec();
+        let message_frames: Vec<(FrameHandle, usize)> = ticked
+            .iter()
+            .copied()
+            .filter(|&h| {
+                model
+                    .arena
+                    .frame(h)
+                    .is_some_and(|f| matches!(f.kind_state, crate::widget::KindState::Message(_)))
+            })
             .map(|h| (h, Self::message_viewport_rows(&model, h)))
             .collect();
         for (h, viewport_rows) in message_frames {
@@ -150,7 +172,10 @@ impl UiScript {
             }
         }
         let mut finished_cooldowns: Vec<FrameHandle> = Vec::new();
-        for (h, frame) in model.arena.iter_frames_mut() {
+        for &h in &ticked {
+            let Some(frame) = model.arena.frame_mut(h) else {
+                continue;
+            };
             if let crate::widget::KindState::ScrollingMessage(smf) = &mut frame.kind_state {
                 smf.tick(elapsed);
             }
@@ -170,6 +195,22 @@ impl UiScript {
         // Advance fading tooltips (FadeOut's ramp + end-of-ramp hide) — engine behavior like the
         // message fade above, decision 0274.
         tooltip::tick_fades(&self.lua);
+        // The hover RE-PICK ([`Model::hover_repick`]): the world under a stationary cursor
+        // changed this tick (the hovered frame hid, or a frame was shown over the cursor), so
+        // re-run the hover walk at the SAVED cursor position — the reference's own pump tail
+        // (`0x765650` → `0x7660d0` with the saved event, didn't-move coalesce bypassed).
+        // `mouse_move` at the unchanged point is exactly that walk: the hidden frame's OnLeave
+        // already fired at hide time and `mouseover` is clear, so only the new winner's
+        // boundary fires — no second OnLeave, `OnEnter` with no physical mouse move.
+        let repick = {
+            let mut model = self.model_mut();
+            let due = model.hover_repick;
+            model.hover_repick = false;
+            due.then_some(model.cursor_pos)
+        };
+        if let Some((x, y)) = repick {
+            self.mouse_move(x, y);
+        }
         // `WOW_UI_HANDLERS=<secs>` — who spent the frame (decision 1395). Last, so a report covers
         // everything this tick fired; a no-op unless the instrument is armed.
         self.report_handler_profile(elapsed);

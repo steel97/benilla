@@ -183,6 +183,19 @@ pub(crate) struct UiQuad {
     /// Splits the run like `additive`/`circular`; a booth target is its own texture anyway, so no
     /// batching is lost.
     pub premultiplied: bool,
+    /// **Alpha TEST** instead of alpha blend, at this reference value on the client's
+    /// `texel.a × vertexColour.a` — `Some(224.0 / 255.0)` is the WMO-interior minimap tile draw and
+    /// nothing else so far. A passing fragment writes FULLY OPAQUE (the screen mask still cuts it);
+    /// a failing one is discarded, so partial coverage never exists on this path.
+    ///
+    /// The reference's minimap tile draw sets EGxBlend **1**, whose applicator `glDisable`s
+    /// blending outright, and the `SetRenderState` id-7→id-8 cascade then arms
+    /// `glAlphaFunc(GL_GEQUAL, 0.87843144)` (`.data 0x85ad20[1] = 224`; wow-re
+    /// `wmo-interior-minimap-composite.md`). Blending those tiles instead leaves `(1−a)(1−b)` of
+    /// the black clear at EVERY boundary where two group tiles meet — up to 25% black where the
+    /// two filtered edges are complementary — which is B141's "odd black lines" (they recoloured
+    /// with the backing quad, which is how they were caught). Splits the batch run.
+    pub alpha_test: Option<f32>,
     /// CPU-clip stand-in for a real scissor rect (see the module doc). `None` = unclipped.
     pub clip: Option<Rect>,
     /// Rotate the quad's corners by this many radians **clockwise on screen** about the rect's
@@ -229,6 +242,7 @@ impl Default for UiQuad {
             circular: false,
             desaturated: false,
             premultiplied: false,
+            alpha_test: None,
             clip: None,
             rotation: 0.0,
             mask: None,
@@ -258,6 +272,39 @@ pub(crate) struct UiQuads {
     /// Set by the BASE-lane producer after replacing `quads` with different content; cleared by
     /// [`rebuild_ui_mesh`] once it has rebuilt the mesh batches.
     pub dirty: bool,
+}
+
+/// The **append lane's own z bands** — the world-anchored overlays' slice of the same `z_key`
+/// total order the scripted UI packs its `(stratum, level, layer, …)` tuple into
+/// ([`benilla_ui::order::ZKey`]).
+///
+/// The lane's three producers are three *different* client systems that all draw over the world,
+/// and their relative order is a fidelity fact each one owns (the floating combat numbers are a
+/// world-scene draw under all UI; the plates and the bubbles are frames). What is NOT a fidelity
+/// fact is the arithmetic that keeps them apart — and while each producer picked its own small
+/// integer, that arithmetic was three private conventions with nothing naming the shared law:
+/// combat text at 0, the bubble's four pieces at 0..=3 *on top of it*, the plates at 4..=8. The
+/// bands below make the split explicit and, more to the point, give the middle band **room** —
+/// a chat bubble is one frame per speaker with its own frame level (decision 1504), which a
+/// four-key allocation cannot express. Everything here stays far below the scripted UI's keys
+/// (a `ZKey` region carries its is-region bit at `1 << 20`), so the whole lane still paints
+/// under the player UI.
+pub(crate) mod overlay_z {
+    /// Floating combat/XP/honor numbers — the client draws them in the world scene, beneath
+    /// every UI frame ([`crate::combat_text`]).
+    pub(crate) const WORLD_TEXT: u64 = 0;
+    /// The chat bubbles' band ([`crate::chat_bubble`]): one **frame level** per live bubble,
+    /// [`BUBBLE_STRIDE`] keys wide, ordered farthest-camera-distance first.
+    pub(crate) const BUBBLE: u64 = 1 << 8;
+    /// Keys per bubble level — the frame's own four pieces (bg, edge, tail, text).
+    pub(crate) const BUBBLE_STRIDE: u64 = 4;
+    /// The V-plates ([`crate::vplates`]), above every bubble. Same-unit overlap cannot happen
+    /// (the plate/bubble mutual exclusion), so this only orders cross-unit stacking.
+    pub(crate) const VPLATE: u64 = 1 << 16;
+    /// The highest bubble level the band holds before it would reach [`VPLATE`]. Far past any
+    /// real population (a bubble needs a speaker within 20 yd), so the clamp is a guard rail,
+    /// not a policy.
+    pub(crate) const BUBBLE_MAX_LEVEL: u64 = (VPLATE - BUBBLE) / BUBBLE_STRIDE - 1;
 }
 
 /// Clear the append lane at the top of the [`UiQuadAppend`] window — every appender re-emits its
@@ -312,6 +359,9 @@ pub(crate) struct UiQuadMaterial {
     /// The texel is already premultiplied (a booth bake) — see [`UiQuad::premultiplied`].
     #[uniform(8)]
     premultiplied: u32,
+    /// Alpha-TEST reference on `texel.a × colour.a`; `<= 0` disables — see [`UiQuad::alpha_test`].
+    #[uniform(9)]
+    alpha_ref: f32,
     /// The screen-anchored mask span in **physical framebuffer px** (`min.xy, max.xy` — the
     /// fragment shader compares `@builtin(position)`, which is physical): [`UiQuadMask::rect`]
     /// scaled by the window's scale factor at mesh build. `z <= x` (degenerate) disables masking.
@@ -322,6 +372,30 @@ pub(crate) struct UiQuadMaterial {
     #[texture(5)]
     #[sampler(6)]
     mask: Option<Handle<Image>>,
+}
+
+impl UiQuadMaterial {
+    /// The **WMO-interior minimap tile** material (decision 1466): the texture, an alpha TEST at
+    /// `alpha_ref`, and nothing else — no tint, no mask, no circle, no desaturate. It is built here
+    /// rather than through the quad stream because these tiles do not draw at the screen at all:
+    /// they draw into the minimap's own 256² composite target on its own camera
+    /// ([`crate::minimap`]'s `composite`), one shared quad mesh per tile under a Transform.
+    ///
+    /// The forced `(One, OneMinusSrcAlpha)` blend in [`Self::specialize`] is what makes this
+    /// reproduce the client's *disabled* blending exactly: a fragment that passes the test emits
+    /// `a = 1`, so the state degenerates to a plain replace — and one that fails emits nothing.
+    pub(crate) fn interior_tile(texture: Handle<Image>, alpha_ref: f32) -> Self {
+        Self {
+            additive: 0,
+            texture: Some(texture),
+            circular: 0,
+            desaturate: 0,
+            premultiplied: 0,
+            alpha_ref,
+            mask_rect: Vec4::new(0.0, 0.0, -1.0, -1.0),
+            mask: None,
+        }
+    }
 }
 
 impl Material2d for UiQuadMaterial {
@@ -560,6 +634,7 @@ struct Run {
     circular: bool,
     desaturated: bool,
     premultiplied: bool,
+    alpha_test: Option<f32>,
     mask: Option<UiQuadMask>,
     positions: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
@@ -574,6 +649,7 @@ impl Run {
         circular: bool,
         desaturated: bool,
         premultiplied: bool,
+        alpha_test: Option<f32>,
         mask: Option<UiQuadMask>,
     ) -> Self {
         Self {
@@ -582,6 +658,7 @@ impl Run {
             circular,
             desaturated,
             premultiplied,
+            alpha_test,
             mask,
             positions: Vec::new(),
             uvs: Vec::new(),
@@ -656,10 +733,18 @@ impl Run {
 struct BatchPools {
     entities: Vec<Entity>,
     meshes: Vec<Handle<Mesh>>,
-    /// Each slot's last-written content — the per-run skip gate (decision 1361): a slot whose
-    /// run is bit-identical to what its pooled mesh already holds is not rewritten, so one
-    /// animating quad no longer drags every batch through the GPU mesh allocator.
+    /// Each slot's last-written MESH content (base positions, before [`Self::offsets`]) — the
+    /// per-run skip gate (decision 1361): a slot whose run is bit-identical to what its pooled
+    /// mesh already holds is not rewritten, so one animating quad no longer drags every batch
+    /// through the GPU mesh allocator.
     stored: Vec<StoredRun>,
+    /// Each slot's current XY translation from its stored base, carried by the batch entity's
+    /// `Transform` instead of the mesh (decision 1463): a run that only *panned* — the minimap
+    /// tile was ~74% of all moving-regime rebuild triggers — moves without an `Assets<Mesh>`
+    /// write, because ONE Modified event per frame arms `AssetChanged` probes over every
+    /// `Mesh3d` row in the scene (1370's all-or-nothing fast path, ~0.8 ms/frame at 1461's
+    /// Goldshire pin).
+    offsets: Vec<Vec2>,
     materials: std::collections::HashMap<MatKey, Handle<UiQuadMaterial>>,
 }
 
@@ -676,6 +761,55 @@ struct StoredRun {
     key: MatKey,
 }
 
+impl StoredRun {
+    /// The candidate's uniform XY offset from this base: `Some(d)` when every vertex is this
+    /// run's vertex plus one constant delta and everything else is bit-equal — `Some(ZERO)` is
+    /// exactly the old bit-identical skip case, so this subsumes 1361's gate. `None` means the
+    /// run genuinely changed shape and must be rebaked. The comparison is exact float
+    /// arithmetic on purpose: a miss only falls back to the rewrite path, so a widget whose
+    /// pan doesn't survive `b + d == n` bit-exactly loses the optimization, never correctness.
+    /// Why [`Self::translation_from`] missed — the pan-gate diagnostic (`WOW_UI_DIFF=1`).
+    fn translation_miss_reason(&self, new: &StoredRun) -> &'static str {
+        if self.key != new.key {
+            "key"
+        } else if self.z_bits != new.z_bits {
+            "z"
+        } else if self.positions.len() != new.positions.len() {
+            "len"
+        } else if self.indices != new.indices {
+            "indices"
+        } else if self.uvs != new.uvs {
+            "uvs"
+        } else if self.colors != new.colors {
+            "colors"
+        } else {
+            "delta-nonuniform"
+        }
+    }
+
+    fn translation_from(&self, new: &StoredRun) -> Option<Vec2> {
+        if self.key != new.key
+            || self.z_bits != new.z_bits
+            || self.positions.len() != new.positions.len()
+            || self.positions.is_empty()
+            || self.indices != new.indices
+            || self.uvs != new.uvs
+            || self.colors != new.colors
+        {
+            return None;
+        }
+        let d = Vec2::new(
+            new.positions[0][0] - self.positions[0][0],
+            new.positions[0][1] - self.positions[0][1],
+        );
+        self.positions
+            .iter()
+            .zip(&new.positions)
+            .all(|(b, n)| n[0] == b[0] + d.x && n[1] == b[1] + d.y && n[2] == b[2])
+            .then_some(d)
+    }
+}
+
 /// A material's full identity: texture, blend/shape flags, mask texture + mask rect (as bits, so
 /// NaN/-0.0 can't split cache entries byte-equal materials would share).
 type MatKey = (
@@ -684,6 +818,7 @@ type MatKey = (
     bool,
     bool,
     bool,
+    u32,
     Option<AssetId<Image>>,
     [u32; 4],
 );
@@ -696,8 +831,10 @@ fn retire_batches(pools: &mut BatchPools, commands: &mut Commands) {
         commands.entity(entity).despawn();
     }
     // The skip gate must forget with them (decision 1361): a retired slot's entity is gone, so
-    // "content unchanged" must not skip the respawn when the UI returns.
+    // "content unchanged" must not skip the respawn when the UI returns. The pan gate's
+    // offsets ride the same lifecycle (they index the same slots).
     pools.stored.clear();
+    pools.offsets.clear();
 }
 
 /// Per frame: when the BASE lane flagged a change ([`UiQuads::dirty`]) or the APPEND lane's
@@ -867,6 +1004,7 @@ fn rebuild_ui_mesh(
                 && r.circular == q.circular
                 && r.desaturated == q.desaturated
                 && r.premultiplied == q.premultiplied
+                && r.alpha_test == q.alpha_test
                 && r.mask == q.mask
         });
         if !same_run {
@@ -876,6 +1014,7 @@ fn rebuild_ui_mesh(
                 q.circular,
                 q.desaturated,
                 q.premultiplied,
+                q.alpha_test,
                 q.mask.clone(),
             ));
         }
@@ -937,12 +1076,14 @@ fn rebuild_ui_mesh(
                 run.mask.as_ref().map(|m| m.texture.id())
             );
         }
+        let alpha_ref = run.alpha_test.unwrap_or(0.0);
         let key: MatKey = (
             run.texture.id(),
             run.additive,
             run.circular,
             run.desaturated,
             run.premultiplied,
+            alpha_ref.to_bits(),
             mask.as_ref().map(bevy::asset::Handle::id),
             mask_rect.to_array().map(f32::to_bits),
         );
@@ -962,9 +1103,53 @@ fn rebuild_ui_mesh(
             z_bits: z.to_bits(),
             key,
         };
-        if pools.stored.get(used) == Some(&stored) {
+        // The pan gate (1463): a run that matches its slot's base up to one constant XY delta
+        // moves on the batch entity's `Transform` — no mesh write, no `AssetChanged` arming.
+        // `Some(ZERO)` is the bit-identical case (1361's old skip gate), where even the
+        // `Transform` write is skipped unless a previous pan is being undone.
+        let pan = pools
+            .stored
+            .get(used)
+            .and_then(|prev| prev.translation_from(&stored).map(|d| (d, prev.z_bits)));
+        if let Some((d, z_bits)) = pan {
+            if pools.offsets[used] != d {
+                pools.offsets[used] = d;
+                if let Some(&entity) = pools.entities.get(used) {
+                    commands.entity(entity).insert(Transform::from_xyz(
+                        d.x,
+                        d.y,
+                        f32::from_bits(z_bits),
+                    ));
+                }
+            }
             used += 1;
             continue;
+        }
+        // Pan-gate miss diagnostic (`WOW_UI_DIFF=1`, ≤3 lines/s so a startup burst can't
+        // exhaust it): names the check that sent this slot to the rewrite path.
+        if *UI_DIFF {
+            use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+            static SHOWN: AtomicU32 = AtomicU32::new(0);
+            static LAST_SEC: AtomicU64 = AtomicU64::new(0);
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let sec = START
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_secs();
+            if LAST_SEC.swap(sec, Ordering::Relaxed) != sec {
+                SHOWN.store(0, Ordering::Relaxed);
+            }
+            if SHOWN.fetch_add(1, Ordering::Relaxed) < 3 {
+                let why = pools
+                    .stored
+                    .get(used)
+                    .map_or("no-prev", |p| p.translation_miss_reason(&stored));
+                eprintln!(
+                    "[ui-pan] slot {used} rewrite: {why} (quads={}, key.tex={:?})",
+                    stored.positions.len() / 4,
+                    stored.key.0
+                );
+            }
         }
         // MAIN_WORLD too (not RENDER_WORLD-only): the pool rewrites this asset in place next
         // rebuild, so the main-world copy must survive extraction.
@@ -980,6 +1165,13 @@ fn rebuild_ui_mesh(
             pools.stored[used] = stored;
         } else {
             pools.stored.push(stored);
+        }
+        // A rebaked slot's mesh holds absolute positions again — its pan resets with it (the
+        // rewrite arm below writes `Transform::from_xyz(0, 0, z)`).
+        if pools.offsets.len() > used {
+            pools.offsets[used] = Vec2::ZERO;
+        } else {
+            pools.offsets.push(Vec2::ZERO);
         }
         let mesh_handle = match pools.meshes.get(used) {
             Some(handle) => {
@@ -1011,6 +1203,7 @@ fn rebuild_ui_mesh(
                     circular: u32::from(run.circular),
                     desaturate: u32::from(run.desaturated),
                     premultiplied: u32::from(run.premultiplied),
+                    alpha_ref,
                     mask_rect,
                     mask,
                 })
@@ -1048,6 +1241,7 @@ fn rebuild_ui_mesh(
     }
     pools.meshes.truncate(used);
     pools.stored.truncate(used);
+    pools.offsets.truncate(used);
 }
 
 /// Deliberately-overlapping synthetic content proving the sort: 5 z strata × 40 quads each, offset both

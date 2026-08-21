@@ -16,6 +16,7 @@
 //! `tests/common`).
 
 mod action_bar;
+pub mod addons;
 mod area_trigger;
 mod attack;
 mod bank;
@@ -58,8 +59,10 @@ mod update_object;
 mod vendor;
 mod world_state;
 pub use action_bar::{
-    set_action_button, ActionButton, ACTION_KIND_ITEM, ACTION_KIND_MACRO, ACTION_KIND_SPELL,
+    set_action_button, set_actionbar_toggles, ActionButton, ACTION_KIND_ITEM, ACTION_KIND_MACRO,
+    ACTION_KIND_SPELL,
 };
+pub use addons::{SecureAddon, STANDARD_MODULUS_CRC, STOCK_SECURE_ADDONS};
 pub use area_trigger::area_trigger;
 pub use attack::{attack_swing, AttackerState};
 pub use bank::{
@@ -198,8 +201,8 @@ pub use trainer::{train_fail, trainer_buy_spell, trainer_list, trainer_spell_sta
 pub use update_object::{
     quest_slot_state, CreateSpline, MovementBlock, Object, ObjectFields, ObjectType, OwnerFallback,
     PlayerSkillSlot, QuestLogSlot, UnitAuraSlot, AURA_FLAG_CANCELABLE, AURA_FLAG_EFF_INDEX_MASK,
-    PLAYER_EXPLORED_ZONES_SLOTS, PLAYER_QUEST_LOG_SLOTS, PLAYER_SKILL_SLOTS,
-    UNIT_AURA_POSITIVE_SLOTS, UNIT_AURA_SLOTS,
+    FIELD_PLAYER_SKILL_INFO_1_1, PLAYER_EXPLORED_ZONES_SLOTS, PLAYER_QUEST_LOG_SLOTS,
+    PLAYER_SKILL_SLOTS, UNIT_AURA_POSITIVE_SLOTS, UNIT_AURA_SLOTS,
 };
 pub use vendor::{
     buy_item, buy_result, buyback_item, list_inventory, repair_item, sell_item, sell_result,

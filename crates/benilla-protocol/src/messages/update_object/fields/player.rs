@@ -426,6 +426,22 @@ impl ObjectFields {
     pub fn player_is_ghost(&self) -> bool {
         self.player_flags() & 0x10 != 0
     }
+    /// Whether this player has asked for their **helm** not to be drawn —
+    /// `PLAYER_FLAGS_HIDE_HELM (0x400)` (vmangos `Player.h:325`), flipped by `CMSG_TOGGLE_HELM`
+    /// and persisted per character through the char-enum record's `CHARACTER_FLAG_HIDE_HELM`.
+    ///
+    /// `PLAYER_FLAGS` is `UF_FLAG_PUBLIC`, which is the whole point of reading it *here* rather
+    /// than off a local setting: the preference streams for every player in range, so a remote
+    /// player's hidden helm hides on our screen too, and ours hides on theirs (decision 1472).
+    /// Creatures have no `PLAYER_FLAGS` and read `false`.
+    pub fn player_hides_helm(&self) -> bool {
+        self.player_flags() & 0x400 != 0
+    }
+    /// Whether this player has asked for their **cloak** not to be drawn —
+    /// `PLAYER_FLAGS_HIDE_CLOAK (0x800)`, [`Self::player_hides_helm`]'s twin in every respect.
+    pub fn player_hides_cloak(&self) -> bool {
+        self.player_flags() & 0x800 != 0
+    }
     /// Whether the player is inside a rest area (inn/city) — `PLAYER_FLAGS_RESTING (0x20)`
     /// (vmangos `Player.h:320`), set/cleared by the area-trigger/zone rest checks
     /// (`SetRestType`). The real client's `IsResting()` and the player frame's flashing zzz
@@ -510,6 +526,36 @@ impl ObjectFields {
     pub fn player_combo_target(&self) -> u64 {
         self.get_guid(FIELD_PLAYER_FIELD_COMBO_TARGET).unwrap_or(0)
     }
+    /// `PLAYER_FIELD_BYTES` byte 2 — the **action-bar toggle** byte: which of the four extra bars
+    /// the player has switched on (vmangos `Player.h:360-363`
+    /// `PLAYER_FIELD_BYTES_OFFSET_ACTION_BARS = 2`, written by `HandleSetActionBarTogglesOpcode`'s
+    /// `SetByteValue(PLAYER_FIELD_BYTES, 2, packet.actionBar)`). PRIVATE — the field is only
+    /// *allocated* on our own player (self 1282 dwords vs 486 for any other player), which is why
+    /// the reference binding resolves the local GUID itself instead of taking a unit token.
+    ///
+    /// Byte-VERIFIED (wow-re `system/ui/scratch/action-bar-toggles.md` §4): `GetActionBarToggles
+    /// 0x4e7660` reads it at `[[player+0xe68]+0x102a]`, and `0x2f0 + 0x1028 = 0x1318 = 1222·4`
+    /// closes the arithmetic against index 1222 — the same player-block base that puts
+    /// [`Self::player_combo_points`] at `+0x1029` and [`Self::player_honor_rank`] at `+0x102b`.
+    /// (vmangos's inline comment on the field reads `// 0x4C0`, six low; its own arithmetic
+    /// `UNIT_END + 0x40A` and the binary both say `0x4C6`. The comment is stale — do not copy it.)
+    ///
+    /// **This is the ONLY source of the value: the client never writes the byte.** Displacement
+    /// `0x102a` occurs exactly once image-wide and it is that read; `SetActionBarToggles` stores
+    /// nothing outside its own stack frame and only posts `CMSG_SET_ACTIONBAR_TOGGLES`
+    /// ([`crate::messages::set_actionbar_toggles`]), so the cell moves solely through the generic
+    /// `SMSG_UPDATE_OBJECT` value-apply — and nothing is notified when it does (§4.2). A purely
+    /// field-driven UI therefore lags a round trip; the reference keeps its optimistic copy in Lua
+    /// and re-reads this exactly once, at `PLAYER_ENTERING_WORLD`.
+    ///
+    /// Only bits `0x01`..`0x08` are meaningful to the client — the binding tests four and can set
+    /// four (§2/§5); the high nibble is never read and is destroyed by the next `Set`. Bit→bar is a
+    /// FrameXML convention, not the descriptor's, so it is not named here. `None` before the field
+    /// streams.
+    pub fn player_action_bar_toggles(&self) -> Option<u8> {
+        self.get_u32(FIELD_PLAYER_FIELD_BYTES)
+            .map(|b| ((b >> 16) & 0xff) as u8)
+    }
     /// `PLAYER_FIELD_BYTES` byte 3 — the player's **highest lifetime honor rank** (vmangos
     /// `PLAYER_FIELD_BYTES_OFFSET_HIGHEST_HONOR_RANK`, written by `HonorMgr`): what the client's
     /// item-usable gate compares an item's `RequiredHonorRank` against (`0x5ea930` reads the
@@ -582,11 +628,12 @@ impl ObjectFields {
     /// the wire carried no component at all (vmangos omits zero fields from the create mask, and
     /// an identity-ish quat still sends its nonzero `w`/`z`); absent components within a
     /// partially-sent quat read as the create-block zero default, so a pure-yaw spawn
-    /// (`x = y = 0`, the live-data norm) round-trips exactly. Consumed by the type-11 transport
-    /// evaluator (elevators/lifts rotate their keyframe offsets through this).
+    /// (`x = y = 0`, the live-data norm) round-trips exactly. This is the field a GameObject is
+    /// *placed* by — the reference builds its render matrix from this quaternion and never from
+    /// `GAMEOBJECT_FACING` (decision 1459) — and the basis a type-11 lift rotates its keyframe
+    /// offsets through.
     pub fn gameobject_rotation(&self) -> Option<[f32; 4]> {
-        let any_sent =
-            (0..4u16).any(|i| self.fields.contains_key(&(FIELD_GAMEOBJECT_ROTATION + i)));
+        let any_sent = (0..4u16).any(|i| self.contains(FIELD_GAMEOBJECT_ROTATION + i));
         any_sent.then(|| {
             [
                 self.get_f32(FIELD_GAMEOBJECT_ROTATION).unwrap_or(0.0),
@@ -612,15 +659,15 @@ impl ObjectFields {
             self.get_f32(FIELD_GAMEOBJECT_FACING).unwrap_or(0.0),
         ))
     }
-    /// Whether the wire genuinely carried **any** `GAMEOBJECT_POS_*` field — a raw map read on purpose
+    /// Whether the wire genuinely carried **any** `GAMEOBJECT_POS_*` field — a raw presence probe on purpose
     /// (like `get_guid`'s, bypassing the create block's absent-is-zero fold) so a consumer can tell
     /// "this GO's create never carried a position" from "it did, and it's `0.0` on some axis". A normal
     /// GameObject sends at least one non-zero axis virtually always; a boat/zeppelin/elevator sends
     /// **none** (vmangos never sets `GAMEOBJECT_POS_*` on a transport).
     pub fn gameobject_pos_sent(&self) -> bool {
-        self.fields.contains_key(&FIELD_GAMEOBJECT_POS_X)
-            || self.fields.contains_key(&FIELD_GAMEOBJECT_POS_Y)
-            || self.fields.contains_key(&FIELD_GAMEOBJECT_POS_Z)
+        self.contains(FIELD_GAMEOBJECT_POS_X)
+            || self.contains(FIELD_GAMEOBJECT_POS_Y)
+            || self.contains(FIELD_GAMEOBJECT_POS_Z)
     }
     /// `GAMEOBJECT_TYPE_ID` — the GameObject sub-type (DOOR/CHEST/SPELL_FOCUS/…). **Absent ⇒ `0` =
     /// DOOR**, not "unknown": vmangos omits a zero-valued field from the create mask (the same reason an

@@ -37,6 +37,7 @@
 //! (an opaque identity in a lightuserdata) — only the *encoding* differs.
 
 mod action;
+mod action_bar_toggles;
 mod addon_message;
 mod aura;
 mod backdrop;
@@ -55,6 +56,7 @@ mod cooldown;
 mod craft;
 mod cursor;
 mod death;
+pub mod diagnostics;
 mod editbox;
 pub(crate) use editbox::adopt_text_region;
 pub(crate) mod addon;
@@ -71,6 +73,7 @@ mod font_block;
 mod gossip;
 mod guild;
 mod handler_prof;
+mod screenshot;
 pub use handler_prof::HandlerRow;
 mod inspect;
 mod item_stats;
@@ -97,6 +100,9 @@ mod pvp;
 mod quest;
 mod quest_log;
 mod region;
+/// The 19 Region-map methods, shared by frames and regions the way the reference shares them
+/// (decision 1501) — its header is the byte-verified chain and the bug that found the split.
+mod region_map;
 mod reputation;
 mod saved;
 mod scrollframe;
@@ -126,6 +132,7 @@ mod types;
 mod unit;
 mod weapon_enchant;
 mod worldmap;
+mod worn_display;
 
 pub use action::{ActionSlot, ActionState};
 pub use addon::AddOnInfo;
@@ -200,6 +207,7 @@ pub(crate) use types::{FontExplicit, MeasuredText, RegionData};
 pub use unit::{grey_band, level_reads_unknown, power_token, unit_is_grey, UnitState};
 pub use weapon_enchant::WeaponEnchant;
 pub use worldmap::{WorldMapContinentView, WorldMapOverlayView, WorldMapState, WorldMapZoneView};
+pub use worn_display::WornDisplay;
 
 use mlua::Lua;
 
@@ -501,6 +509,7 @@ impl UiScript {
         channel::install(&lua)?;
         chat_window::install(&lua)?;
         client::install(&lua)?;
+        screenshot::install(&lua)?;
         stdlib::sandbox(&lua)?;
         // Before the stdlib layer, so its aliases bind the 5.0-shaped functions (decision 1194).
         lua50::install(&lua)?;
@@ -518,6 +527,7 @@ impl UiScript {
         follow::install(&lua)?;
         session::install(&lua)?;
         pvp::install(&lua)?;
+        worn_display::install(&lua)?;
         death::install(&lua)?;
         aura::install(&lua)?;
         cvars::install(&lua)?;
@@ -526,6 +536,7 @@ impl UiScript {
         sound::install(&lua)?;
         pointer::install(&lua)?;
         action::install(&lua)?;
+        action_bar_toggles::install(&lua)?;
         container::install(&lua)?;
         cursor::install(&lua)?;
         spellbook::install(&lua)?;
@@ -564,6 +575,7 @@ impl UiScript {
         tooltip::install(&lua)?;
         worldmap::install(&lua)?;
         net_stats::install(&lua)?;
+        diagnostics::install(&lua)?;
 
         let s = UiScript {
             lua,
@@ -668,13 +680,24 @@ impl UiScript {
     /// it; changing it invalidates the next `resolve`. The app calls this every frame with an
     /// almost-always-identical size — compared before writing so the per-frame idiom doesn't
     /// dirty the layout gate's tier 1 (`Model::touch_layout`).
-    pub fn set_screen_size(&mut self, width: f32, height: f32) {
+    ///
+    /// **Returns whether the size actually changed.** Anchors follow the new rect on their own, so
+    /// most of the UI needs nothing; what does not follow is anything that *computed* a seat from
+    /// the old height and stored it — the open-bag stack wraps into a fresh column from
+    /// `GetScreenHeight()`, and that answer is stale the moment the window is resized. The 1.12
+    /// client never had to care (its resolution changed through a restart, and its own
+    /// `DISPLAY_SIZE_CHANGED` listeners are three model panes, none of them the manage pass), but
+    /// benilla runs in a freely resizable window, so the caller re-runs
+    /// `UIParent_ManageFramePositions()` on a true return. Decision 1499.
+    pub fn set_screen_size(&mut self, width: f32, height: f32) -> bool {
         let new = Rect::new(0.0, 0.0, height, width);
         let mut model = self.model_mut();
-        if model.screen != new {
-            model.screen = new;
-            model.touch_layout();
+        if model.screen == new {
+            return false;
         }
+        model.screen = new;
+        model.touch_layout();
+        true
     }
 
     /// Replace the Era atlas table (decision 0950) — pushed once at boot, before the XML loads.
@@ -996,6 +1019,8 @@ impl UiScript {
         // Measured extents are auto-size inputs — the layout gate's read set, same as
         // [`Self::set_measured_text`]'s.
         model.touch_layout();
+        // Every stored measure was just wiped; only the whole-roster sweep can re-request them.
+        model.touch_measure_all();
     }
 
     // ── Input: pointer-leaves-window cleanup (decision 0216 §3; the hit-test/mouse dispatch that
@@ -1235,13 +1260,21 @@ impl UiScript {
 
     /// Report a script error the host caught **outside** the VM's own dispatch — an addon file
     /// that failed to compile or raised at file scope during the load walk. It joins the
-    /// handler-dispatch queue only: the caller has already logged it (the load walk's per-file
-    /// `error!` + `failures` contract), so putting it in `errors` too would double-log at the
-    /// app's per-frame drain.
+    /// handler-dispatch queue and the retained log, but **not** `errors`: the caller has already
+    /// logged it (the load walk's per-file `error!` + `failures` contract), so putting it there too
+    /// would double-log at the app's per-frame drain.
+    ///
+    /// Its silent sibling is [`Self::report_load_failure`] (decision 1495) — same retention, no
+    /// dispatch, for the load failures that never raise at all.
     pub fn report_script_error(&self, msg: &str) {
-        self.model_mut()
-            .pending_error_dispatch
-            .push(msg.to_string());
+        let mut model = self.model_mut();
+        // Retained as a **Load** row, not an Error one (decision 1495): every caller of this is
+        // the load walk, and from the player's side "the addon's file scope raised" and "the
+        // addon's file was missing" are the same fact — the addon is not running.
+        model
+            .diagnostics
+            .record(diagnostics::DiagnosticKind::Load, msg);
+        model.pending_error_dispatch.push(msg.to_string());
     }
 
     /// Hand every queued script error to the Lua-side error handler — the reference's own shape:

@@ -72,6 +72,42 @@ impl PluginGroup for WorldPlugins {
             // thread inside `update_narrow_phase` for 12–41% of their samples; the run that
             // prompted this stalled >600 ms three times in five minutes. Decision 1232.
             .disable::<BvhBroadPhasePlugin>()
+            // …and NOT the dynamics pipeline either (decision 1445 — stage 2 of the same diet,
+            // on the same recorded premise as `SubstepCount(1)` below: the world has ZERO
+            // `RigidBody::Dynamic` bodies, zero joints, zero velocity/force consumers — verified
+            // by grep across the workspace, only Static colliders and Kinematic transports that
+            // write their `Position` directly). With no contacts (broad phase off) and no
+            // dynamic bodies, the solver bodies, the integrators, the xpbd joint solver, CCD,
+            // islands/sleeping, the joint graphs, mass-property upkeep, the narrow phase's
+            // empty-graph iteration and the render-side interpolation (zero
+            // `TransformInterpolation` users; transports tick in `Update` at render rate) were
+            // pure fixed-tick schedule overhead — ~60% of a parked frame's physics share on the
+            // 1445 trace. What stays is exactly what benilla consumes: the collider storage +
+            // backend, the collider BVH (`ColliderTreePlugin`) and spatial queries the
+            // controller/pick shape-casts ride, collider transform propagation, and the
+            // Transform↔Position sync. Revisit the moment a dynamic body enters the world —
+            // the `SubstepCount` note below is the standing tripwire.
+            .disable::<ForcePlugin>()
+            .disable::<MassPropertyPlugin>()
+            .disable::<NarrowPhasePlugin<Collider>>()
+            .disable::<JointPlugin>()
+            .disable::<PhysicsInterpolationPlugin>()
+            // `SolverSchedulePlugin` deliberately STAYS: it owns the `PhysicsSchedule`'s
+            // step-set scaffolding (the chain every kept system's `in_set` ordering hangs off —
+            // removing it left the collider-tree systems floating and tripped the ambiguity
+            // gate), plus the substep runner, which now runs a near-empty schedule.
+            .disable::<SolverBodyPlugin>()
+            .disable::<IntegratorPlugin>()
+            .disable::<SolverPlugin>()
+            .disable::<XpbdSolverPlugin>()
+            .disable::<CcdPlugin>()
+            .disable::<IslandPlugin>()
+            .disable::<IslandSleepingPlugin>()
+            .disable::<avian3d::dynamics::solver::joint_graph::JointGraphPlugin<FixedJoint>>()
+            .disable::<avian3d::dynamics::solver::joint_graph::JointGraphPlugin<RevoluteJoint>>()
+            .disable::<avian3d::dynamics::solver::joint_graph::JointGraphPlugin<PrismaticJoint>>()
+            .disable::<avian3d::dynamics::solver::joint_graph::JointGraphPlugin<DistanceJoint>>()
+            .disable::<avian3d::dynamics::solver::joint_graph::JointGraphPlugin<SphericalJoint>>()
             .add(WorldFoundation)
             // The per-frame world-transition ordering (Input → Stream → Present) the loading
             // screen relies on to cover a teleport the same frame it happens. See `schedule.rs`.
@@ -141,6 +177,10 @@ impl PluginGroup for WorldPlugins {
             // streamer fills its volume registry).
             .add(crate::interior::InteriorPlugin)
             .add(crate::entity_shade::EntityShadePlugin)
+            // The world camera's pose, published before the `Update`-stage viewer authorities
+            // below read it (decision 1503) — without it they answer about where the camera was
+            // last frame, which on a teleport frame is the place we just left.
+            .add(crate::view::ViewPlugin)
             // WMO portal visibility: per-frame, decides which of a building's groups are reachable
             // through portals from the camera's group, so the Stormwind cathedral culls from the
             // Trade District. Only computes the PVS; the `Visibility` authority
@@ -243,35 +283,64 @@ impl Plugin for WorldFoundation {
         {
             app.insert_resource(bevy::time::Time::<bevy::time::Fixed>::from_hz(hz));
         }
+        // Static transform tracking is ALWAYS on — the adaptive default pays two serial
+        // full-population scans per frame (`mark_dirty_trees`'s `count()` calls; a `Changed`
+        // filter count degrades to full iteration) to decide whether >30% of the world moved
+        // this frame. Ours never has: movers are the streamed units, 1–3% of a world that is
+        // overwhelmingly static placements — the check can only ever conclude "track", so the
+        // two scans are its entire price. Pinned, not a knob: no scene benilla renders can be
+        // on the other side of the threshold.
+        app.insert_resource(bevy::transform::systems::StaticTransformOptimizations::enabled());
+        // The retained static-world pass — ON by default (1429–1434; `WOW_STATIC_GX=0`
+        // opts out; the module doc owns the design). Registers NOTHING when opted out —
+        // the divert sites see `None` for its resource and the render graph never gains
+        // the node.
+        app.add_plugins(crate::static_gx::StaticGxPlugin);
+        // `WOW_MERGE_CENSUS=1` — the 1417 population census (module doc): tally rides the
+        // assembler, this is just the quiet-timer printer.
+        if crate::static_merge::census_enabled() {
+            app.add_systems(bevy::app::Update, crate::static_merge::log_merge_census);
+        }
+        // `WOW_UPLOAD_BUDGET=<MB>` — cap the render app's per-frame GPU asset upload (bevy's
+        // `RenderAssetBytesPerFrame`, unlimited by default; only assets implementing `byte_len`
+        // participate, which covers meshes and images — exactly the streaming payload). An
+        // EXPERIMENT lever for the arrival burst: the LBRS arrival trace (2026-08-17) put the
+        // fat frames in drawable/render-schedule WAITS while streamed uploads land — every
+        // suspect system's own CPU was flat, avian's whole stack included — so pacing the
+        // uploads is the candidate fix, and this knob prices it before anything is redesigned.
+        if let Some(mb) = std::env::var("WOW_UPLOAD_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            app.insert_resource(bevy::render::render_asset::RenderAssetBytesPerFrame::new(
+                mb * 1024 * 1024,
+            ));
+        }
         // Direct draws on EVERY camera — the default, not a knob (1374/1376). Bevy's indirect
         // lane is a per-draw indirect encode loop on Metal (no MULTI_DRAW_INDIRECT) plus the GPU
         // preprocessing dispatches, and the 1374 bracket priced it ~4.3 cpu_ms at LBRS on 0.18 —
         // shipped unclaimed for the campaign's whole run because 1364's knob under-measured it
         // (the UI Camera2d leak, 1370). `WOW_INDIRECT=1` restores the upstream default for
         // re-pricing. 1370's note that the lever must cover every camera, not just the world's,
-        // is why this is a sweep.
+        // is why this covers `Camera` itself rather than our own marker.
+        //
+        // **A REQUIRED COMPONENT, not a sweep** (decision 1488). 1374/1376 shipped this as an
+        // `Update` system that inserted the marker on any camera lacking it, and that is a latent
+        // GPU crash: bevy's own doc on `NoIndirectDrawing` says *"This component should only be
+        // added when initially spawning a camera. Adding or removing after spawn can result in
+        // unspecified behavior"*, and the unspecified behaviour is concrete —
+        // `get_or_create_work_item_buffer` latches Direct-vs-Indirect work-item buffers the FIRST
+        // time it sees a view (`Entry::Occupied` returns the existing one, forever), while the
+        // preprocessing node picks its pipeline from the LIVE `Has<NoIndirectDrawing>`. A camera
+        // extracted once before the sweep's deferred insert lands therefore keeps Indirect buffers
+        // under a direct pipeline for the rest of its life, and the next dispatch is a wgpu
+        // validation panic ("bind group … not compatible … Assigned entry with binding 7 not
+        // found"). Measured: the sweep was flagging 18 cameras late at startup and one 0.5 s in.
+        // `player::setup` already knew the rule for the world camera ("it must ride the SPAWN: the
+        // phase cache latches the preprocessing mode the first time it sees the view") — this
+        // gives every other camera the same guarantee, atomically, with no frame to lose.
         if std::env::var_os("WOW_INDIRECT").is_none() {
-            app.add_systems(bevy::app::Update, force_direct_draws);
+            app.register_required_components::<bevy::camera::Camera, bevy::render::view::NoIndirectDrawing>();
         }
-    }
-}
-
-/// Insert [`NoIndirectDrawing`] on any camera that lacks it — see the note at the registration
-/// site. Runs every frame so late-spawned cameras (portrait booths, the glue booth) are covered;
-/// the query is empty in steady state.
-fn force_direct_draws(
-    mut commands: Commands,
-    cams: Query<
-        Entity,
-        (
-            With<bevy::camera::Camera>,
-            Without<bevy::render::view::NoIndirectDrawing>,
-        ),
-    >,
-) {
-    for e in &cams {
-        commands
-            .entity(e)
-            .insert(bevy::render::view::NoIndirectDrawing);
     }
 }

@@ -34,6 +34,13 @@
         -- UISpecialFrames — the table exists now (1206) but it is the ADDONS' list, and mixing our
         -- windows into it would make an addon's `tremove` able to break the client's own ESC.
         UIPanelWindows["MailFrame"] = { area = "left", pushable = 0 }
+        -- The script error log (decision 1495) — OURS, with no reference row to transcribe. It is
+        -- registered here for exactly one reason: an unregistered frame takes ShowUIPanel's bare
+        -- `frame:Show()` branch (no left-slot placement, and `CloseAllWindows` never sees it), so
+        -- without this row the window would flip IsShown() without landing on screen and ESC would
+        -- not close it. `pushable = 9` puts it behind everything already registered: a diagnostic
+        -- must never shove a player's real window out of the slot it wanted.
+        UIPanelWindows["BenillaScriptLogFrame"] = { area = "left", pushable = 9 }
         -- The trade window (decision 0592 P1, TradeFrame.xml): the ref's own UIParent.lua l.27
         -- registration (`UIPanelWindows["TradeFrame"] = { area = "left", pushable = 1 }`). Without
         -- this row ShowUIPanel takes its unregistered branch — a bare frame:Show() with no left-slot
@@ -502,7 +509,8 @@
         -- tracks `backpackWasOpen` so a bag you already had open is LEFT open on the window's close;
         -- benilla stores that on each frame (`wasOpen`). benilla DIVERGES from the ref here on
         -- purpose: the real OpenBackpack touches only the backpack, but ours opens EVERY equipped
-        -- bag with the window (director's call — decision 0561 — matching the 'B' all-bags toggle),
+        -- bag with the window (director's call — decision 0561; its stated reason was matching the
+        -- 'B' all-bags toggle, which 1494 split apart — the call itself stands on its own),
         -- so the names keep the ref's caller contract while the body loops the five windows. Every
         -- step is guarded, so a surface without the bag file — a headless panel test — no-ops
         -- rather than erroring.
@@ -1283,6 +1291,10 @@
             end
             frame:Show()
             table.insert(FADEFRAMES, frame)
+            -- Wake the driver: it hides itself the moment the list empties (its OnUpdate gate),
+            -- so the ONE insertion point is where it is shown again. Every other verb only
+            -- removes or rewrites entries.
+            BenillaFadeDriver:Show()
         end
 
         -- The two directions are one call with the mode flipped; whatever endpoints the caller
@@ -1559,11 +1571,14 @@
     ]]></Script>
 
     <!-- The fade kit's tick source — the ref hangs UIFrameFadeUpdate on UIParent's OnUpdate
-         (UIParent.xml l.16-22); benilla has no UIParent frame, so a dedicated 1x1 driver ticks it. -->
+         (UIParent.xml l.16-22); benilla has no UIParent frame, so a dedicated 1x1 driver ticks it.
+         It runs only while FADEFRAMES has entries: the engine dispatches OnUpdate to visible
+         frames only (tick.rs), so hiding itself on an empty list stops the per-frame walk cold,
+         and UIFrameFade — the single inserter — shows it again (decision 1396's class). -->
     <Frame name="BenillaFadeDriver">
         <Size><AbsDimension x="1" y="1"/></Size>
         <Anchors><Anchor point="TOPLEFT"/></Anchors>
-        <Scripts><OnUpdate>UIFrameFadeUpdate(arg1)</OnUpdate></Scripts>
+        <Scripts><OnUpdate>if not FADEFRAMES[1] then this:Hide() return end UIFrameFadeUpdate(arg1)</OnUpdate></Scripts>
     </Frame>
 
     <!--

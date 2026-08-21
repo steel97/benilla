@@ -10,8 +10,10 @@
 //! forward** (vanilla's "both-button move"), steering with the mouse like a right-drag. The **scroll
 //! wheel** zooms the third-person
 //! distance (clamped to the vanilla `cameraDistanceMax` range; the camera *glides* to the new
-//! distance). A left-drag orbit offset *persists* — the vanilla `cameraSmoothStyle` auto-follow that
-//! swung the camera back behind the character while moving is deliberately removed (director's call).
+//! distance). A left-drag orbit offset is reeled back in by the **auto-follow** — vanilla's
+//! `cameraSmoothStyle`, a real player setting since decision 1493 ([`camera::FollowStyle`]):
+//! Smart (the shipped default) chases while the character moves, Always chases always, Never
+//! leaves the camera exactly where the hand put it.
 //! The **dev chord + `F`** toggles free-fly (1043); the **dev chord + `G`** lands the avatar where
 //! the camera is ([`land`]).
 //!
@@ -79,18 +81,19 @@ pub(crate) use follow::{FollowRequest, FollowState};
 // The shared avatar state + movement constants live in [`state`]; the private re-imports below are
 // what lets this module and the concern modules beside it keep naming them `super::X` unchanged.
 use state::{
-    MoveSpeed, PlayerRide, AIR_NUDGE_SPEED, CAPSULE_RADIUS, FALL_FAR_DROP, FALL_FAR_TIME,
-    FOOT_CONE_HEIGHT, GROUND_COS, GROUND_PROBE, JUMP_SPEED, LAND_PROBE, MOUSELOOK_PITCH_CLAMP,
-    RUN_BACK_RATIO, SKIN_WIDTH, STATIONARY_CHASE_RATE, STEP_SLOPE_RATIO, STEP_SNAP_SLACK,
-    STEP_UP_ADVANCE, STEP_UP_HEIGHT, TURN_RATE, TURN_RATE_MOVING, WEDGE_MIN_FALL,
-    WEDGE_STALL_RATIO, WEDGE_STILL_FRAMES,
+    MoveSpeed, PlayerRide, AIR_NUDGE_SPEED, FALL_FAR_DROP, FALL_FAR_TIME, FOOT_CONE_HEIGHT,
+    GROUND_COS, GROUND_PROBE, JUMP_SPEED, LAND_PROBE, MOUSELOOK_PITCH_CLAMP, RUN_BACK_RATIO,
+    SKIN_WIDTH, STATIONARY_CHASE_RATE, STEP_SLOPE_RATIO, STEP_SNAP_SLACK, STEP_UP_ADVANCE,
+    STEP_UP_HEIGHT, TURN_RATE, TURN_RATE_MOVING, WEDGE_MIN_FALL, WEDGE_STALL_RATIO,
+    WEDGE_STILL_FRAMES,
 };
 // `SETTLE_TIMEOUT` is `pub(crate)`: the settle release lives in the terrain streamer (decision
 // 0737 — residency releases the hold, not ground contact), which owns the deadline push while the
 // resident world is still the departed map's (0710).
 pub(crate) use state::{
-    Player, PlayerCapsule, CAPSULE_HEIGHT, DEFAULT_COLLISION_HEIGHT, FEATHER_TERMINAL_VELOCITY,
-    GRAVITY, HOVER_CLIMB_RATE, HOVER_HEIGHT, SETTLE_TIMEOUT, TERMINAL_VELOCITY,
+    Player, PlayerCapsule, CAPSULE_HEIGHT, CAPSULE_RADIUS, DEFAULT_COLLISION_HEIGHT,
+    FEATHER_TERMINAL_VELOCITY, GRAVITY, HOVER_CLIMB_RATE, HOVER_HEIGHT, SETTLE_TIMEOUT,
+    TERMINAL_VELOCITY,
 };
 /// The swim boundary `0.75·h` — and therefore the **wade ceiling**, since wading is the implicit
 /// in-liquid-but-not-swimming state and the two cannot be different numbers. Read by the creature
@@ -186,6 +189,7 @@ impl Plugin for PlayerPlugin {
         );
         app.init_resource::<camera::LookConfig>();
         app.init_resource::<camera::ZoomLimit>();
+        app.init_resource::<camera::FollowConfig>();
         // Far sight: resolve `PLAYER_FARSIGHT` into a pose before `control` reads it to seat the
         // camera. A separate system rather than another query on `control` for a hard reason —
         // `control` already holds the self entity's `Transform` mutably, so it cannot also read an
@@ -339,13 +343,15 @@ fn control(
     buttons: Res<ButtonInput<MouseButton>>,
     // Nested into one param to stay within Bevy's 16-element system-param tuple limit. (The
     // scroll wheel left this tuple with 0997: zoom reads the CAMERAZOOM bindings now.)
-    // The pointer's motion this frame + the two knobs that scale what it does with it. Bundled
-    // because a Bevy system takes at most 16 parameters and this one is at the ceiling — the
-    // grouping is the existing `mouse` tuple, widened rather than a seventeenth argument.
+    // The pointer's motion this frame + the camera knobs that scale what it does with it — the
+    // two look/zoom knobs and the auto-follow style (decision 1493). Bundled because a Bevy system
+    // takes at most 16 parameters and this one is at the ceiling — the grouping is the existing
+    // `mouse` tuple, widened rather than a seventeenth argument.
     pointer: (
         Res<AccumulatedMouseMotion>,
         Res<camera::LookConfig>,
         Res<camera::ZoomLimit>,
+        Res<camera::FollowConfig>,
     ),
     // The net bridge, bundled into one param (16-param limit): the outbound command channel + the
     // inbound teleport/worldport messages `apply_net_updates` wrote earlier this frame
@@ -487,6 +493,24 @@ fn control(
     let view_subject = &speed_capsule.8;
     let self_guid = speed_capsule.9 .0;
     let scoped = &speed_capsule.10;
+    // The auto-follow knobs (decisions 1493/1502), with far sight's one exception folded in here so
+    // both camera seats below agree: while the rig orbits somebody ELSE's body (Mind Vision, Sentry
+    // Totem), our own facing is not what "behind" means, so the return is forced off rather than
+    // reeling that camera toward a heading with nothing to do with the view.
+    let follow_cfg = camera::FollowConfig {
+        style: if view_subject.remote.is_some() {
+            camera::FollowStyle::Never
+        } else {
+            pointer.3.style
+        },
+        tracking_style: if view_subject.remote.is_some() {
+            camera::FollowStyle::Never
+        } else {
+            pointer.3.tracking_style
+        },
+        ..*pointer.3
+    };
+
     let dt = time.delta_secs();
     // While a focused UI EditBox (the chat input, a mail field) owns the keyboard, keyboard reads see
     // "no keys held" — so the avatar isn't also driven while typing (a `.tele` command). Mouse still
@@ -506,6 +530,61 @@ fn control(
     let steer_held = binds.pressed(crate::bindings::cmd::MOVE_AND_STEER);
     let both_buttons =
         (buttons.pressed(MouseButton::Left) && buttons.pressed(MouseButton::Right)) || steer_held;
+
+    // The camera's **input command word** (decision 1502) — 1.12's `[InputControl+0x4]`, bit for
+    // bit. The auto-follow is armed by *edges on this word* and its state is classified from it, so
+    // it is built once here, from the same binding state the movement code below reads, and handed
+    // to both camera seats. MOVEANDSTEER sets both mouse bits because that is what the reference's
+    // binding does — it runs the identical CameraOrSelectOrMove + TurnOrAction pair.
+    let follow_command = {
+        use camera::follow_cmd as bit;
+        let mut w = 0;
+        let mut set = |on: bool, b: u32| {
+            if on {
+                w |= b;
+            }
+        };
+        set(
+            buttons.pressed(MouseButton::Right) || steer_held,
+            bit::RIGHT_MOUSE,
+        );
+        set(
+            buttons.pressed(MouseButton::Left) || steer_held,
+            bit::LEFT_MOUSE,
+        );
+        // `/follow` is the forward bit in the reference too — the same setter the W key drives
+        // (decision 0890), so it arms the camera exactly like a held W.
+        set(
+            binds.pressed(crate::bindings::cmd::MOVE_FORWARD) || player.follow_forward,
+            bit::FORWARD,
+        );
+        set(
+            binds.pressed(crate::bindings::cmd::MOVE_BACKWARD),
+            bit::BACKWARD,
+        );
+        set(
+            binds.pressed(crate::bindings::cmd::STRAFE_LEFT),
+            bit::STRAFE_LEFT,
+        );
+        set(
+            binds.pressed(crate::bindings::cmd::STRAFE_RIGHT),
+            bit::STRAFE_RIGHT,
+        );
+        set(
+            binds.pressed(crate::bindings::cmd::TURN_LEFT),
+            bit::TURN_LEFT,
+        );
+        set(
+            binds.pressed(crate::bindings::cmd::TURN_RIGHT),
+            bit::TURN_RIGHT,
+        );
+        set(player.autorun, bit::AUTORUN);
+        // The two externally-driven flags, which the reference folds into the camera's own
+        // Track/Fear bits rather than the input word — carried here so one word carries every edge.
+        set(player.server_riding, bit::TRACK);
+        set(player.control_lost, bit::FEAR);
+        w
+    };
 
     // The look session gets a SHADOW copy of `CursorOptions`, written back only on a real change:
     // handing it the component's `Mut` directly reborrowed mutably every frame, which marks it
@@ -717,6 +796,7 @@ fn control(
             // which reads as the view detaching into free flight (director, 2026-08-13). A
             // `reseat` window is excluded — there the resource still describes the body we are
             // letting go of, and `apply_server_moves` owns the adoption.
+            //
             if player.control_lost && !player.reseat {
                 if let Ok((_, t, ..)) = body.single() {
                     let yaw = server_ride::yaw_of(t.rotation);
@@ -749,6 +829,16 @@ fn control(
                 &mut cam_t,
                 &collide,
                 cam_probe,
+                // The auto-follow still runs here — a taxi, a Charge, a knockback or a fear
+                // all translate the avatar while the controller stands down, and the reference
+                // has states for exactly those (`Track`, `Fear`: a 0.4 s delay and a lazy 18 °/s
+                // return under Smart). The word carries both flags, so the edge into and out of
+                // one of them is what arms it.
+                &camera::FollowInput {
+                    cfg: follow_cfg,
+                    face_yaw: player.face_yaw,
+                    command: follow_command,
+                },
             );
             // Flush a stale run once, so observers stop extrapolating it — but never under a ride,
             // whose FORWARD report is deliberate and would be cancelled every frame.
@@ -1068,6 +1158,11 @@ fn control(
         } else {
             run_speed
         };
+        // Root is refused HERE (the reference refuses it twice upstream of the handler: the Lua
+        // gate's `test ch,0x12` and the replay allow-list `0x615c71`/`0x618030`, where command
+        // id 7 is blocked). HOVER's refusal is NOT here — it belongs to the movement handler
+        // itself (`0x7c623a`, the breach term below and [`mover::step`]'s grounded arm), which
+        // is what keeps the mounted flourish reachable while hovering, as the reference has it.
         let mut want_jump = binds.fired(crate::bindings::cmd::JUMP) && !player.modes.rooted;
 
         // Swim vs walk: the water over our feet decides. Hysteresis-latched (`update_swimming`,
@@ -1090,7 +1185,13 @@ fn control(
         // frame — the byte handler runs before the mover, clearing SWIMMING unconditionally —
         // so the latch drops now and this frame's mover, flags, and wire all see the leap as a
         // jump.
-        let breach = swimming && want_jump;
+        // HOVER refuses the breach too: `0x7c623a`'s test sits AHEAD of the SWIMMING take-off
+        // select (`0x7c6261` only picks the seed velocity, it gates nothing), and hover does not
+        // suppress swim entry — `0x6030c0` tests only LEVITATING (`0x400`) — so a hovering
+        // swimmer is a real state and their Space does nothing at all (wow-re
+        // `fall-steep-response.md` §10). The land leg's refusal lives in [`mover::step`],
+        // the same handler's grounded arm.
+        let breach = swimming && want_jump && !player.modes.hover;
         if breach {
             player.swimming = false;
         }
@@ -1433,10 +1534,9 @@ fn control(
         // clears it under us. Root rides too — moving bits are what must not accompany it, and
         // rooted input can't produce any (`dir` is zeroed above, jumps refused).
         let mut move_flags_now = player.modes.wire_flags();
-        // `landed`/`started_falling` gate the wire's jump/fall lifecycle; the swim branch never sets
+        // `landed` gates the wire's jump/fall lifecycle; the swim branch never sets
         // them (leaving the water resumes the ground mover from rest, no airborne report).
         let landed;
-        let started_falling;
         if swimming {
             // Swimming: `MOVEFLAG_SWIMMING` (the swim-pitch tail rides with it) plus the travel-direction
             // bits the swim gait selector cascades on (TU-E: turn→41, strafe→43/44, back→45, fwd→42,
@@ -1459,7 +1559,6 @@ fn control(
             player.airborne_since = None;
             player.fall_far = false;
             landed = false;
-            started_falling = false;
         } else {
             // Straight off the net axis, so a netted-to-zero press pair streams NO direction bit
             // (the emitter's genuine STOP) rather than a phantom FORWARD we aren't actually moving
@@ -1491,7 +1590,6 @@ fn control(
             // also rides the wire (decision 0053), so observers replay it.
             let arc = player.advance_airborne_arc(airborne, jumped, now, launch_y);
             landed = arc.landed;
-            started_falling = arc.started_falling;
             if airborne {
                 move_flags_now |= move_flags::FALLING;
                 // Mid-air the direction flags stay LIVE — the real client's `CMovement+0x40` keeps
@@ -1670,6 +1768,13 @@ fn control(
         // — the deck's yaw delta was already applied to `cam.yaw` at the ride block (frame motion
         // carries the camera unconditionally; only input turns respect `seat_camera`'s
         // look-session gate).
+        // The auto-follow's own three facts (decisions 1493/1502): the knobs, where "behind" is,
+        // and the input word whose edges arm a return.
+        let follow = camera::FollowInput {
+            cfg: follow_cfg,
+            face_yaw: player.face_yaw,
+            command: follow_command,
+        };
         seat_camera(
             dt,
             turn_delta,
@@ -1681,6 +1786,7 @@ fn control(
             &mut cam_t,
             &collide,
             cam_probe,
+            &follow,
         );
 
         // The cast bar's local self-cancel trigger (`ui_cast::local_self_cancel`): a fresh
@@ -1745,7 +1851,6 @@ fn control(
                 jumped,
                 air_nudged,
                 landed,
-                started_falling,
                 fall_time: wire_fall_time,
             },
             now,

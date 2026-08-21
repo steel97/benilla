@@ -12,6 +12,7 @@ use benilla_world::model_fade::{
     join_unit_appear_fade, FadeSet, JoinedFade, PartFade, UnitAppearFade,
 };
 use benilla_world::model_render::{ModelKind, ModelPart};
+use benilla_world::vis_chain::VisChainOnly;
 
 use super::super::{item_glow::ItemGlow, spawn_carried_lights};
 use super::{
@@ -293,6 +294,9 @@ fn spawn_slot(
             // instances included (decision 0833).
             benilla_world::model_fade::ParentModel(entity),
         ))
+        // Chain-only visibility (benilla_world::vis_chain): the wrapper renders nothing —
+        // the item's parts and glows are the children.
+        .vis_chain_only()
         .id();
     commands.entity(joint).add_child(root);
     // The item/enchant glow (decision 0805): its instances hang off the ITEM's own
@@ -1188,11 +1192,11 @@ mod tests {
     /// **The director's login report on the Naxx items** (decision 0865): a MULTIPLY sheen batch
     /// (Mod2x — the ARMORREFLECT family) used to spawn Steady, popping as a full-strength ×2 layer
     /// over a body still fading in. Its blend equation reads no alpha, so no material swap can
-    /// feather it (0528, byte-reconfirmed by wow-re `m2-item-texture-fill.md`) — instead the part
-    /// now arms the ramp on its STEADY material (the "twin" is itself) and the shader lerps its
-    /// colour toward the blend identity by the tag alpha. Headless, this asserts the arm half:
-    /// joined ramp, tag alpha ≈ 0, no material swap, and a FadeMaterials record so despawn/stealth
-    /// ramps re-arm it too.
+    /// feather it (0528) — instead the part arms the ramp on its STEADY material (the "twin" is
+    /// itself) and the shader lerps its colour toward the blend identity by the tag alpha, which
+    /// is the reference's own preset-5 fade (1489; 0865 built it believing it a deviation).
+    /// Headless, this asserts the arm half: joined ramp, tag alpha ≈ 0, no material swap, and a
+    /// FadeMaterials record so despawn/stealth ramps re-arm it too.
     #[test]
     fn a_multiply_sheen_joins_the_wearers_ramp_on_its_steady_material() {
         const KIND: ItemModelKind = ItemModelKind::Weapon;

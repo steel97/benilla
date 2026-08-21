@@ -5,11 +5,12 @@
 use std::time::{Duration, Instant};
 
 use benilla_protocol::{JumpInfo, MonsterMoveFacing, MoveSpeeds};
+use bevy::prelude::Quat;
 
 use crate::creature_anim::move_flags;
 use crate::player::{GRAVITY, TERMINAL_VELOCITY};
 
-use super::facing::{resolve_facing, turn_toward};
+use super::facing::resolve_facing;
 use super::relay::RelayChain;
 use super::remote::{facing_lerp, fall_arc_step, jump_seed, reconcile_lerp};
 use super::spline::monster_move_spline;
@@ -61,6 +62,7 @@ fn motion(flags: u32, orientation: f32) -> RemoteMotion {
         relay: Default::default(),
         last_apply_ms: 0.0,
         last_apply_pos: [0.0, 0.0, 0.0],
+        settled_at: None,
     }
 }
 
@@ -97,23 +99,6 @@ fn swim_dead_reckon_folds_the_pitch_into_the_travel() {
     idle.pitch = -1.0;
     let (pos, _, _, speed) = idle.advance(speeds(), 1.0);
     assert_eq!((pos[0], pos[2], speed), (0.0, 0.0, 0.0));
-}
-
-#[test]
-fn turn_toward_caps_and_takes_short_way() {
-    use std::f32::consts::{FRAC_PI_2, PI, TAU};
-    // Big turn, small cap: advances by exactly the cap, positive (short) direction (0 → +π/2 caps).
-    let a = turn_toward(0.0, FRAC_PI_2, 0.1);
-    assert!((a - 0.1).abs() < 1e-5, "caps the step: {a}");
-    // Short way is negative: from 0.1 toward (2π − 0.1) the client turns −, not + all the way round.
-    let b = turn_toward(0.1, TAU - 0.1, 0.05);
-    assert!((b - 0.05).abs() < 1e-5, "turns the short (−) way: {b}");
-    // Within a step of the goal → lands on the goal (no overshoot/oscillation).
-    let c = turn_toward(0.0, 0.03, 1.0);
-    assert!((c - 0.03).abs() < 1e-5, "reaches the goal: {c}");
-    // Already facing (Δ≈0) → unchanged.
-    let d = turn_toward(PI, PI, 1.0);
-    assert!((d - PI).abs() < 1e-4, "no turn when aligned: {d}");
 }
 
 #[test]
@@ -748,4 +733,244 @@ fn a_due_arrival_never_jumps_the_queue() {
         "the mover ends STOPPED: the Stop is the last write, not the FORWARD packet queued in front \
          of it — a still player then sends nothing, so a stale FORWARD here runs off forever"
     );
+}
+
+// ── GameObject placement: the `GAMEOBJECT_ROTATION` quaternion (decision 1459) ────────────────
+
+/// The seven `nightelfsignpostpointer02` arms of the Ravenwind post (Feralas, The Forgotten Coast)
+/// as vmangos' `gameobject` table spawns them: `(entry, position, orientation, rotation0..3)`.
+/// Six carry the pure-yaw encoding; entry 152580 — the one bug B89 was reported on — authors a
+/// 70° tilt in `rotation0/1`.
+const RAVENWIND_POST: [(u32, [f32; 3], f32, [f32; 4]); 7] = [
+    (
+        152574,
+        [-4446.32, 2055.25, 46.2946],
+        -1.20428,
+        [0.0, 0.0, -0.566406, 0.824126],
+    ),
+    (
+        152575,
+        [-4446.34, 2055.23, 45.5724],
+        -1.20428,
+        [0.0, 0.0, -0.566406, 0.824126],
+    ),
+    (
+        152576,
+        [-4446.4, 2055.31, 46.2764],
+        0.401426,
+        [0.0, 0.0, 0.199368, 0.979925],
+    ),
+    (
+        152577,
+        [-4446.41, 2055.24, 46.2863],
+        1.97222,
+        [0.0, 0.0, 0.833886, 0.551937],
+    ),
+    (
+        152578,
+        [-4446.41, 2055.24, 45.6197],
+        1.97222,
+        [0.0, 0.0, 0.833886, 0.551937],
+    ),
+    (
+        152579,
+        [-4446.38, 2055.25, 44.954],
+        1.97222,
+        [0.0, 0.0, 0.833886, 0.551937],
+    ),
+    (
+        152580,
+        [-4445.28, 2058.18, 44.9976],
+        -0.767946,
+        [0.468413, 0.332221, -0.472813, 0.668331],
+    ),
+];
+
+/// The middle of the pointer plank in the model's OWN space (WoW axes, Z up) — the mid-point of
+/// `nightelfsignpostpointer02.m2`'s collision hull, `benilla-extract m2coll`: x ±0.197,
+/// y 0.338‥2.075, z 3.062‥3.624. It is that offset from the origin — 3.3 yd up, ~1.2 yd out — that
+/// turns a dropped rotation into a *displaced* plank.
+const PLANK_MID_MODEL: [f32; 3] = [0.0, 1.206, 3.343];
+
+/// Where the post itself stands (the six untilted arms all spawn on its axis).
+const POST_AXIS: [f32; 2] = [-4446.4, 2055.25];
+
+/// Put a model-space point (WoW axes) through a spawn transform and read the answer back in WoW
+/// world coordinates — the mesh is baked into Bevy space, so the point converts on the way in.
+fn plank_in_world(position: [f32; 3], rotation: Quat) -> [f32; 3] {
+    let t = super::pose_transform(position, rotation);
+    benilla_assets::coords::bevy_to_wow(
+        t.transform_point(benilla_assets::coords::wow_to_bevy(PLANK_MID_MODEL)),
+    )
+}
+
+/// The pure-yaw quaternion vmangos writes for a spawn with no authored tilt IS `rot_z(facing)`, so
+/// placing by the quaternion must leave those spawns exactly where the facing put them. This is the
+/// whole safety argument for the switch: 54 747 of the 56 632 live spawn rows are this case, and if
+/// the two paths disagreed by even a hair, every prop in the world would shift.
+#[test]
+fn a_pure_yaw_gameobject_quaternion_places_exactly_like_the_facing() {
+    for orientation in [0.0_f32, 0.401426, -0.767946, -1.20428, 1.97222, 3.0, -2.7] {
+        let (s, c) = (orientation * 0.5).sin_cos();
+        let by_quat = super::gameobject_rotation(Some([0.0, 0.0, s, c]), orientation);
+        let by_yaw = super::wire_yaw(orientation);
+        assert!(
+            by_quat.dot(by_yaw).abs() > 0.99999,
+            "orientation {orientation}: quat {by_quat:?} vs yaw {by_yaw:?}"
+        );
+    }
+    // …and at the reported site, on the six real spawn rows that carry no tilt.
+    for (entry, position, orientation, quat) in RAVENWIND_POST.iter().take(6) {
+        let by_quat = plank_in_world(
+            *position,
+            super::gameobject_rotation(Some(*quat), *orientation),
+        );
+        let by_yaw = plank_in_world(*position, super::wire_yaw(*orientation));
+        let moved = (0..3)
+            .map(|i| (by_quat[i] - by_yaw[i]).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(moved < 1e-3, "entry {entry} moved {moved} yd");
+    }
+}
+
+/// Entry 152580 — bug B89. Its authored 70° tilt is the difference between a plank ON the post and
+/// a plank 4.3 yd away in mid-air, and the spawn point itself is 3 yd off the post (the tilt is what
+/// carries the plank back onto it), so the facing-only placement cannot even land in the right
+/// neighbourhood.
+#[test]
+fn the_tilted_ravenwind_pointer_lands_on_its_post() {
+    let (_, position, orientation, quat) = RAVENWIND_POST[6];
+    let by_quat = plank_in_world(
+        position,
+        super::gameobject_rotation(Some(quat), orientation),
+    );
+    let by_yaw = plank_in_world(position, super::wire_yaw(orientation));
+
+    // The golden: hand-derived from the spawn row and the model's own hull, WoW world coordinates.
+    for (got, want) in by_quat.iter().zip([-4444.139_f32, 2055.174, 46.512]) {
+        assert!((got - want).abs() < 0.01, "{by_quat:?} vs the golden");
+    }
+    // What it means: the plank hangs off the post's axis at arm's length…
+    let radius = |p: [f32; 3]| (p[0] - POST_AXIS[0]).hypot(p[1] - POST_AXIS[1]);
+    assert!(
+        radius(by_quat) < 2.5,
+        "on the post: r = {}",
+        radius(by_quat)
+    );
+    // …where the facing-only placement flings it clear of the post entirely, which is the report.
+    assert!(radius(by_yaw) > 4.0, "off the post: r = {}", radius(by_yaw));
+    let apart = (0..3)
+        .map(|i| (by_quat[i] - by_yaw[i]).powi(2))
+        .sum::<f32>()
+        .sqrt();
+    assert!(
+        (apart - 4.29).abs() < 0.05,
+        "the two placements are {apart} yd apart"
+    );
+}
+
+/// No usable quaternion ⇒ the facing, not a `NaN`. A create block folds absent fields to zero, so
+/// "the wire sent nothing" can reach here as an all-zero quat — which has no length to normalize and
+/// would blank the object rather than mis-place it.
+#[test]
+fn a_gameobject_without_a_usable_quaternion_falls_back_to_its_facing() {
+    for quat in [None, Some([0.0; 4])] {
+        let r = super::gameobject_rotation(quat, 1.97222);
+        assert!(
+            r.dot(super::wire_yaw(1.97222)).abs() > 0.99999,
+            "{quat:?} → {r:?}"
+        );
+    }
+}
+
+/// **The settled memo** ([`RemoteMotion::settled_at`], 1490 item 2): an idle grounded remote
+/// arms it once its resolve reaches the fixed point, holds bitwise still while armed, keeps
+/// resolving where no ground exists, and disarms the moment a direction flag moves it — so the
+/// per-frame depenetration + down-cast run only for movers that can actually change.
+#[test]
+fn an_idle_remote_settles_and_stops_sweeping() {
+    use avian3d::prelude::{Collider, RigidBody};
+    use bevy::prelude::*;
+    use bevy::transform::TransformPlugin;
+
+    let mut app = App::new();
+    app.add_plugins((
+        MinimalPlugins,
+        TransformPlugin,
+        bevy::asset::AssetPlugin::default(),
+        bevy::scene::ScenePlugin,
+        avian3d::prelude::PhysicsPlugins::new(bevy::app::PostUpdate),
+    ));
+    app.init_asset::<Mesh>()
+        .init_resource::<benilla_world::collision::ColliderEpoch>();
+    app.finish();
+    app.cleanup();
+    app.insert_resource(crate::player::PlayerCapsule(Collider::capsule(
+        crate::player::CAPSULE_RADIUS,
+        crate::player::CAPSULE_HEIGHT - 2.0 * crate::player::CAPSULE_RADIUS,
+    )));
+    app.add_systems(Update, super::remote::extrapolate_remote_units);
+    // A 10×10 up-wound floor at bevy y = 0 (wow z = 0).
+    let verts = vec![
+        Vec3::new(-5.0, 0.0, -5.0),
+        Vec3::new(5.0, 0.0, -5.0),
+        Vec3::new(5.0, 0.0, 5.0),
+        Vec3::new(-5.0, 0.0, 5.0),
+    ];
+    app.world_mut().spawn((
+        RigidBody::Static,
+        Collider::trimesh(verts, vec![[0u32, 2, 1], [0, 3, 2]]),
+        Transform::default(),
+    ));
+    let idle = app
+        .world_mut()
+        .spawn((
+            Transform::default(),
+            motion(0, 0.0),
+            // Real speeds, so the FORWARD leg below actually translates — a flag with no speed
+            // moves nothing and would (correctly) stay settled.
+            crate::net::UnitSpeeds(speeds()),
+        ))
+        .id();
+    let mut over_nothing = motion(0, 0.0);
+    over_nothing.wow_pos = [50.0, 50.0, 10.0];
+    let stranded = app
+        .world_mut()
+        .spawn((Transform::default(), over_nothing))
+        .id();
+    // Seed the idle mover a hair above the floor — inside the standing snap reach (at zero
+    // speed the whole reach IS `STEP_SNAP_SLACK` ≈ 0.028), like a wire Z, which always arrives
+    // on the ground. The first resolve snaps it on, the second arms the memo.
+    app.world_mut()
+        .entity_mut(idle)
+        .get_mut::<RemoteMotion>()
+        .unwrap()
+        .wow_pos = [0.0, 0.0, 0.01];
+
+    for _ in 0..4 {
+        app.update();
+    }
+    let rm = app.world().entity(idle).get::<RemoteMotion>().unwrap();
+    let armed_at = rm.settled_at.expect("an idle grounded mover arms the memo");
+    assert_eq!(armed_at, rm.wow_pos, "the memo is the pose it stands at");
+    let parked = rm.wow_pos;
+    for _ in 0..3 {
+        app.update();
+    }
+    let rm = app.world().entity(idle).get::<RemoteMotion>().unwrap();
+    assert_eq!(rm.wow_pos, parked, "armed ⇒ bitwise still");
+    assert_eq!(rm.settled_at, Some(parked), "…and still armed");
+    // No ground in reach ⇒ never arms; it keeps asking until the world exists under it.
+    let rm = app.world().entity(stranded).get::<RemoteMotion>().unwrap();
+    assert_eq!(rm.settled_at, None, "no support ⇒ no memo");
+    // A direction flag moves the mover and the memo falls with it.
+    app.world_mut()
+        .entity_mut(idle)
+        .get_mut::<RemoteMotion>()
+        .unwrap()
+        .flags = move_flags::FORWARD;
+    app.update();
+    let rm = app.world().entity(idle).get::<RemoteMotion>().unwrap();
+    assert_eq!(rm.settled_at, None, "a moving mover resolves every frame");
 }

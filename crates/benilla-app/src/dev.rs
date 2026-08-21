@@ -113,6 +113,7 @@ impl Plugin for DevProbesPlugin {
                 "WOW_PROBE_CHAT",
                 "WOW_PROBE_KEY",
                 "WOW_PROBE_LUA",
+                "WOW_PROBE_CHEST",
                 "WOW_RIG",
                 "WOW_LIVE_FPS",
             ]
@@ -194,10 +195,31 @@ impl Plugin for DevProbesPlugin {
             if std::env::var("WOW_UNIT_VISUALS").is_ok() {
                 app.add_plugins(crate::capture::UnitVisualsPlugin);
             }
+            // The dress census: `WOW_DRESS_CENSUS=<secs>[,<every>]` prints one line per streamed
+            // PLAYER — what the wire asked for (`PLAYER_FLAGS`' hide bits), what we resolved
+            // (helm/cloak display ids) and what is actually attached — plus a `contradictions=`
+            // count for a body dressed in a piece its own preference asked us to hide. B123's
+            // instrument (see `capture::DressCensusPlugin`, decision 1472).
+            if std::env::var("WOW_DRESS_CENSUS").is_ok() {
+                app.add_plugins(crate::capture::DressCensusPlugin);
+            }
+            // The reveal audit: `WOW_REVEAL=<frames>` prints one line per frame from a snap —
+            // the cover, every residency term behind `presentable()`, the settle hold and the
+            // retained pass's collected-vs-published regions. The instrument for "the teleport
+            // showed me a world with no buildings in it" (see `capture::RevealAuditPlugin`).
+            if std::env::var("WOW_REVEAL").is_ok() {
+                app.add_plugins(crate::capture::RevealAuditPlugin);
+            }
             // The entity census: `WOW_ENTITY_CENSUS=<secs>` prints per-archetype entity counts once —
             // what the resident entity count is made of (see `capture::EntityCensusPlugin`).
             if std::env::var("WOW_ENTITY_CENSUS").is_ok() {
                 app.add_plugins(crate::capture::EntityCensusPlugin);
+            }
+            // The schedule census: `WOW_SCHED_CENSUS=1` prints every schedule's systems with their
+            // executor-relevant flags, both worlds, then exits — the structural inventory under
+            // the orchestration bands (see `capture::SchedCensusPlugin`, decision 1437).
+            if std::env::var("WOW_SCHED_CENSUS").is_ok() {
+                app.add_plugins(crate::capture::SchedCensusPlugin);
             }
             // The melee live probe: `WOW_PROBE=melee` auto-fights the nearest enemy so the dbg-trace
             // sink can record the combat-text timeline (see `capture::ProbeMeleePlugin`).
@@ -244,6 +266,13 @@ impl Plugin for DevProbesPlugin {
             // B240's instrument (see `capture::ProbeBookPlugin`).
             if std::env::var("WOW_PROBE_BOOK").is_ok() {
                 app.add_plugins(crate::capture::ProbeBookPlugin);
+            }
+            // The chest live probe: `WOW_PROBE_CHEST=1` parks at a real chest spawn, opens it on the
+            // click's own route and reports the self unit's base anim id before/during/after — B84's
+            // instrument, the numeric answer to "does the player kneel at a chest" (decision 1471;
+            // see `capture::ProbeChestPlugin`).
+            if std::env::var("WOW_PROBE_CHEST").is_ok() {
+                app.add_plugins(crate::capture::ProbeChestPlugin);
             }
             // The cast-cancel live probe: `WOW_PROBE=castcancel` hearths and presses W mid-cast — the
             // local self-cancel's end-to-end timing instrument (see `capture::ProbeCastCancelPlugin`).

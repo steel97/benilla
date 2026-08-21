@@ -1,13 +1,20 @@
 //! **The Bevy render glue** — the animated liquid surfaces themselves.
 //!
-//! One shared material per (kind, fog block) over a `texture_2d_array` of the kind's frames, the two
-//! spawn paths (an ADT chunk's MCLQ and a WMO group's MLIQ), the flat mesh build, and the 24 fps
-//! frame cycler. The faithful shading model is `super`'s header and `liquid.wgsl`'s; the *position*
-//! side — the grid each spawned surface publishes and the queries against it — is [`super::query`].
+//! One shared material per (kind, [`LiquidPath`], scroll) over a `texture_2d_array` of the kind's
+//! frames, the two spawn paths (an ADT chunk's MCLQ and a WMO group's MLIQ), and the flat mesh build. The faithful
+//! shading model is `super`'s header and `liquid.wgsl`'s; the *position* side — the grid each
+//! spawned surface publishes and the queries against it — is [`super::query`].
 //!
-//! The frame-flip is the client's first render animation — a deliberate **one-off** (a frame-index
-//! uniform off Bevy real `Time`), NOT a general animation system. Two clocks: animation =
-//! wall-clock; day/night = server game-time.
+//! **The 24 fps frame-flip and the lava scroll are computed IN the shader off `globals.time`**
+//! (liquid.wgsl `anim_time`): both are pure functions of the wall clock and two per-material
+//! constants baked at build, so no CPU ever mutates a liquid material again. The 24 Hz
+//! `Assets::get_mut` cycler this replaced cost a measured 0.28 cpu_ms/frame at the SW pin (the
+//! WOW_NO_LIQUID_ANIM bracket, 2026-08-18, negative in all three rounds): its per-tick Modified
+//! chain re-uploaded ~14 material uniforms, rebuilt their Metal bind groups, and armed the
+//! whole-population `AssetChanged` walks 24 times a second. A deterministic run bakes the freeze
+//! at BUILD time (`anim.w = 0` → the shader clock reads 0 forever), so captures keep frame 0 /
+//! scroll 0 bit-exactly — the same pin the old tick enforced (0600). Two clocks, unchanged in
+//! spirit: animation = wall clock; day/night = server game-time.
 
 use std::collections::HashMap;
 
@@ -24,11 +31,7 @@ use benilla_assets::LockRecover;
 use benilla_assets::{liquid_frame_array, RenderConfig, WorldAssets};
 use benilla_formats::{read_texture_mip_chain, BlpMipChain, LiquidKind, LiquidMesh};
 
-/// Frame-flip rate — 30 frames over 1.25 s (VERIFIED `FUN_0068aac0`), i.e. 24 fps, real wall-clock.
-const ANIM_FPS: f32 = 24.0;
-
-/// The shared liquid materials, keyed by [`LiquidKey`], plus each one's animated frame count (for
-/// the modulo in `animate_liquid`). Read by the terrain streamer (via [`spawn_liquids`] /
+/// The shared liquid materials, keyed by [`LiquidKey`]. Read by the terrain streamer (via [`spawn_liquids`] /
 /// [`spawn_wmo_liquids`]) to material the per-chunk water meshes. Absent when the client has no data
 /// (no `WorldAssets`).
 #[derive(Resource, Default)]
@@ -36,39 +39,93 @@ pub(crate) struct LiquidAssets {
     materials: HashMap<LiquidKey, LiquidEntry>,
 }
 
-/// Which shared material a surface takes: its kind, and **which fog block it draws under**.
+/// **Which of the reference's liquid renderers a surface belongs to.**
 ///
-/// The second lane exists because the reference decides fog per *pass*, not per liquid type. A WMO
-/// group's own pool is drawn by the WMO liquid pass, which re-submits the smoothed interior fog block
-/// (`0x6b6323`–`0x6b6342`) under the same `[0xca7f00]` gate as the WMO *geometry* pass — so the pool
-/// and the room's walls always fog alike. ADT liquid submits no fog and draws under the once-a-frame
-/// scene block. (VERIFIED wow-re `fog-env-state` §5's complete 6-site submit census +
-/// `liquid-render-state-sided` §5; decision 0691's open lane, now closed.)
+/// The reference has three, and until now benilla had one. `0x6b62e0` sends the type nibble to a
+/// category, and category 0 (river/water — nibbles 0/4/8) splits again on the owning group's
+/// `MOGP.flags & 0x48`:
 ///
-/// The third lane is the **lava/slime UV scroll** — see [`scrolls`]. It is a per-*nibble*, per-*path*
-/// property that [`LiquidKind`] deliberately collapses (2 and 6 are both `Magma`), so it cannot be
-/// derived from the kind and has to key the material.
+/// * [`Adt`](LiquidPath::Adt) — the MCLQ queues `0x6851b0` (river) / `0x685010` (ocean). **Two**
+///   texture stages: a static depth-ramp on stage 0 addressed by `tc0 = (0.5, LUT[depthByte])`, the
+///   animated sheet on stage 1 at `tc1 = (col·¼, row·¼)`, combined by `ocean0_s.bls`. The only path
+///   with a depth ramp, and its vertex carries no colour at all.
+/// * [`WmoExterior`](LiquidPath::WmoExterior) — `0x6b6630`. **One** stage (the sheet), a 9-float
+///   vertex carrying an up normal *and* a colour dword, and the pixel program `MapObjExtWater0.bls`
+///   bound at `0x6b6654`.
+/// * [`WmoInterior`](LiquidPath::WmoInterior) — `0x6b6420`. One stage, a 6-float vertex with **no
+///   normal**, lighting forced OFF, and no pixel program at all.
+///
+/// Magma and slime take none of these: they share `0x6b68f0` (WMO) / `0x68dca0` (ADT) whatever their
+/// group's flags say, so for the fullbright kinds this enum records only which *spawner* made the
+/// surface — which is still what picks the fog block below.
+///
+/// This also subsumes the old `interior: bool` lane, which existed for the **fog block**: the
+/// reference decides fog per *pass*, not per liquid type, and a WMO group's own pool is drawn by the
+/// WMO liquid pass, which re-submits the smoothed interior fog block (`0x6b6323`–`0x6b6342`) under
+/// the same `[0xca7f00]` gate as the WMO *geometry* pass — so a pool and the walls around it always
+/// fog alike, while ADT liquid submits no fog and draws under the once-a-frame scene block. (VERIFIED
+/// wow-re `fog-env-state` §5's 6-site submit census + `liquid-render-state-sided` §5; decision 0691.)
+/// `WmoInterior` is exactly the old `interior == true`, so [`Self::interior_fog`] is the whole of
+/// what that flag used to say — with the renderer identity now carried alongside it rather than
+/// inferred from it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum LiquidPath {
+    /// An ADT chunk's MCLQ surface.
+    Adt,
+    /// A WMO group's MLIQ surface, the group being exterior/exterior-lit (`MOGP.flags & 0x48 != 0`).
+    WmoExterior,
+    /// A WMO group's MLIQ surface, the group being a true interior (`MOGP.flags & 0x48 == 0`).
+    WmoInterior,
+}
+
+impl LiquidPath {
+    /// A WMO group's own class, as the reference's `[owner+0x10] & 0x48` test reads it.
+    pub(crate) fn wmo(interior: bool) -> Self {
+        if interior {
+            Self::WmoInterior
+        } else {
+            Self::WmoExterior
+        }
+    }
+
+    /// Does this surface fog with the **interior** block rather than the scene block?
+    fn interior_fog(self) -> bool {
+        matches!(self, Self::WmoInterior)
+    }
+
+    /// The renderer selector `liquid.wgsl` branches on (`LiquidParams.path.x`).
+    fn shader_id(self) -> f32 {
+        match self {
+            Self::Adt => 0.0,
+            Self::WmoExterior => 1.0,
+            Self::WmoInterior => 2.0,
+        }
+    }
+
+    /// Does a pool on this arm take its body colour from its **own MOMT `diffColor`**, baked into the
+    /// mesh's vertex colour? Only the interior arm: the exterior one is lit and reads a live
+    /// `Light.dbc` band instead, and ADT liquid has no MOMT to index at all.
+    fn takes_material_body_color(self) -> bool {
+        matches!(self, Self::WmoInterior)
+    }
+}
+
+/// Which shared material a surface takes: its kind, its renderer ([`LiquidPath`]), and whether it
+/// takes the lava/slime UV scroll.
+///
+/// The scroll lane is a per-*nibble*, per-*path* property that [`LiquidKind`] deliberately collapses
+/// (2 and 6 are both `Magma`), so it cannot be derived from the kind and has to key the material —
+/// see [`scrolls`].
 ///
 /// The variants share one decoded frame array — only the tiny uniform differs — so the extra
 /// materials cost a handful of bytes, not a second copy of 30 × 256² textures.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct LiquidKey {
     kind: LiquidKind,
-    /// This surface belongs to a WMO **interior** group (`MOGI & 0x48 == 0` — the same test
-    /// `wow_model.wgsl` fogs its interior lanes by, which is what keeps the two in step).
-    interior: bool,
+    path: LiquidPath,
     /// This surface takes the animated stage-0 texture matrix ([`scrolls`]).
     scroll: bool,
 }
-
-/// **Texture repeats per second** the reference slides a scrolling liquid sheet along **v** —
-/// `[0x801620]` = 0.1 (VERIFIED wow-re `liquid-uv-scroll-law.md`, six-agent §5).
-const SCROLL_REPEATS_PER_SEC: f32 = 0.1;
-
-/// The scroll's wrap period in seconds — the `fmod` divisor `[0x80e5a0]` = 10.0. With
-/// [`SCROLL_REPEATS_PER_SEC`] that makes the offset a **sawtooth over exactly one repeat**, so the
-/// wrap is invisible on a `REPEAT`-sampled texture and the phase never grows without bound.
-const SCROLL_PERIOD_SECS: f32 = 10.0;
 
 /// Does this surface take the reference's animated stage-0 texture matrix — the lava/slime scroll?
 ///
@@ -94,28 +151,20 @@ fn scrolls(nibble: u8) -> bool {
 
 struct LiquidEntry {
     material: Handle<LiquidMaterial>,
-    frame_count: u32,
-    /// Mirrors [`LiquidKey::scroll`], so the cycler can drive the v-offset without re-deriving the
-    /// key it is already iterating the values of.
-    scroll: bool,
 }
 
 impl LiquidAssets {
-    /// The shared material for a liquid kind on a given fog block, scrolling or not, if its frames
+    /// The shared material for a liquid kind on a given renderer, scrolling or not, if its frames
     /// loaded. `scroll` is [`scrolls`]'s verdict; a `true` for a kind that has no scrolling variant
     /// simply misses, which is the same "no material" path a failed frame load takes.
     pub(crate) fn material(
         &self,
         kind: LiquidKind,
-        interior: bool,
+        path: LiquidPath,
         scroll: bool,
     ) -> Option<Handle<LiquidMaterial>> {
         self.materials
-            .get(&LiquidKey {
-                kind,
-                interior,
-                scroll,
-            })
+            .get(&LiquidKey { kind, path, scroll })
             .map(|e| e.material.clone())
     }
 }
@@ -184,7 +233,7 @@ pub(crate) fn spawn_liquids<'a>(
         // ADT queue is a different kernel that hard-zeroes the v-translate ([`scrolls`]). Deriving
         // the flag from `lq.sound_nibble` here — the obvious-looking thing — would slide every
         // Searing Gorge and Burning Steppes lava pool in the game.
-        let Some(material) = liquid.material(lq.kind, false, false) else {
+        let Some(material) = liquid.material(lq.kind, LiquidPath::Adt, false) else {
             continue; // this kind's frames failed to load (warned at setup)
         };
         // The world-space liquid grid (MCLQ positions are already absolute WoW, so the IDENTITY
@@ -194,7 +243,7 @@ pub(crate) fn spawn_liquids<'a>(
         entities.push(
             commands
                 .spawn((
-                    Mesh3d(meshes.add(liquid_bevy_mesh(lq))),
+                    Mesh3d(meshes.add(liquid_bevy_mesh(lq, None))),
                     MeshMaterial3d(material),
                     Transform::IDENTITY,
                     LiquidSurface,
@@ -219,7 +268,7 @@ pub(crate) fn spawn_liquids<'a>(
 /// UVs, and the per-vertex swatch `V` packed into UV1.x for the shader's colour/opacity ramp. The
 /// caller decides the surface's world placement via the spawned entity's `Transform` (`IDENTITY` for
 /// absolute MCLQ water; the WMO placement transform for WMO liquid).
-fn liquid_bevy_mesh(lq: &LiquidMesh) -> Mesh {
+fn liquid_bevy_mesh(lq: &LiquidMesh, body_color: Option<[f32; 3]>) -> Mesh {
     let positions: Vec<[f32; 3]> = lq
         .positions
         .iter()
@@ -238,6 +287,14 @@ fn liquid_bevy_mesh(lq: &LiquidMesh) -> Mesh {
     // UV1.x carries the per-vertex swatch depth (0..1) for the shader's opacity ramp.
     let uv1: Vec<[f32; 2]> = lq.depths.iter().map(|&d| [d, 0.0]).collect();
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, uv1);
+    // An INTERIOR WMO pool's body colour is its own `MOMT.diffColor`, and it rides the vertex colour
+    // because that is where the reference's interior water vertex carries it (a colour dword in its
+    // 6-float record). Baking it here keeps ONE shared material per lane: a per-surface uniform would
+    // have meant a material per pool. Absent on every other lane, which adds no attribute and takes
+    // the shader's `#else` white.
+    if let Some([red, green, blue]) = body_color {
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[red, green, blue, 1.0]; n]);
+    }
     mesh.insert_indices(Indices::U32(lq.indices.clone()));
     mesh
 }
@@ -274,11 +331,16 @@ pub(crate) fn spawn_wmo_liquids<'a>(
     transform: Transform,
     interior: bool,
     pool: WmoPool,
+    // The owning root's MOMT `diffColor` table (`WmoModel::material_diff_color`). An INTERIOR
+    // pool's whole body colour is its own entry; MOMT lives in the root, so the group file the
+    // `LiquidMesh` came from could not resolve it and the lookup happens here.
+    material_diff_color: &[[f32; 3]],
     entities: &mut Vec<Entity>,
 ) {
     let Some(liquid) = liquid_assets else {
         return;
     };
+    let path = LiquidPath::wmo(interior);
     for lq in liquids {
         // `interior` picks the fog block, not the look: an interior group's pool is drawn by the WMO
         // liquid pass, which re-submits the smoothed interior fog under the same `[0xca7f00]` gate as
@@ -287,7 +349,17 @@ pub(crate) fn spawn_wmo_liquids<'a>(
         // Blackrock's lava (6) creeps, the Ironforge Great Forge's (2) does not, and both are
         // `LiquidKind::Magma` drawing the same sheet ([`scrolls`]).
         let scroll = scrolls(lq.sound_nibble);
-        let Some(material) = liquid.material(lq.kind, interior, scroll) else {
+        // The interior arm's body colour, resolved through the pool's own MLIQ `materialId`. A
+        // fullbright pool takes none (its sheet IS the body), and a missing/out-of-range index
+        // simply yields no colour rather than a guessed one.
+        let body_color = (path.takes_material_body_color() && !lq.kind.is_fullbright())
+            .then(|| {
+                lq.material_id
+                    .and_then(|id| material_diff_color.get(usize::from(id)))
+                    .copied()
+            })
+            .flatten();
+        let Some(material) = liquid.material(lq.kind, path, scroll) else {
             continue; // this kind's frames failed to load (warned at setup)
         };
         if scroll {
@@ -300,7 +372,7 @@ pub(crate) fn spawn_wmo_liquids<'a>(
         }
         let surface = commands
             .spawn((
-                Mesh3d(meshes.add(liquid_bevy_mesh(lq))),
+                Mesh3d(meshes.add(liquid_bevy_mesh(lq, body_color))),
                 MeshMaterial3d(material),
                 transform,
                 LiquidSurface,
@@ -392,11 +464,11 @@ pub(super) fn setup_liquid(
         } else {
             AlphaMode::Blend
         };
-        // One material per (FOG BLOCK × SCROLL) combination the kind can actually take (see
+        // One material per (RENDERER × SCROLL) combination the kind can actually take (see
         // [`LiquidKey`]), all sharing the one decoded frame array (`frames` is a handle; the clone is
         // a refcount, not a second 30 × 256² decode). Every other input is identical, so this is the
-        // whole cost of letting an interior room's pool fog like the room instead of like the sky
-        // outside it — and of letting Blackrock's lava creep while Ironforge's sits still.
+        // whole cost of giving each of the reference's three liquid renderers its own material — and
+        // of letting Blackrock's lava creep while Ironforge's sits still.
         //
         // The scroll variant exists only for the fullbright kinds: [`scrolls`] can only ever answer
         // true for nibbles 6/7, which map to `Magma`/`Slime` and nothing else, so building one for
@@ -406,9 +478,13 @@ pub(super) fn setup_liquid(
         } else {
             &[false]
         };
-        for (interior, &scroll) in [false, true]
-            .into_iter()
-            .flat_map(|i| scroll_lanes.iter().map(move |s| (i, s)))
+        for (path, &scroll) in [
+            LiquidPath::Adt,
+            LiquidPath::WmoExterior,
+            LiquidPath::WmoInterior,
+        ]
+        .into_iter()
+        .flat_map(|p| scroll_lanes.iter().map(move |s| (p, s)))
         {
             let material = materials.add(ExtendedMaterial {
                 base: StandardMaterial {
@@ -437,36 +513,40 @@ pub(super) fn setup_liquid(
                     kind: Vec4::new(
                         if kind.is_fullbright() { 1.0 } else { 0.0 },
                         if kind == LiquidKind::Ocean { 1.0 } else { 0.0 },
-                        if interior { 1.0 } else { 0.0 },
+                        if path.interior_fog() { 1.0 } else { 0.0 },
                         WATER_SHININESS,
                     ),
-                    // x = frame 0 (index driven by `animate_liquid`); y = frame count; z = the
-                    // v-scroll offset in texture repeats (also `animate_liquid`'s, and left at 0
-                    // forever on a non-scrolling material); w unused.
-                    anim: Vec4::new(0.0, frame_count as f32, 0.0, 0.0),
+                    // Which of the reference's three liquid renderers `liquid.wgsl` runs.
+                    path: Vec4::new(path.shader_id(), 0.0, 0.0, 0.0),
+                    // x = reserved (frame 0; the shader derives the live index from its own
+                    // clock); y = frame count; z = the SCROLL FLAG (1 = this lane takes the
+                    // stage-0 v-scroll — [`scrolls`]' nibble-6/7 WMO lane); w = the clock
+                    // enable (0 on a deterministic run bakes the 0600 capture freeze — frame 0,
+                    // scroll 0 — with no tick left to skip).
+                    anim: Vec4::new(
+                        0.0,
+                        frame_count as f32,
+                        if scroll { 1.0 } else { 0.0 },
+                        if crate::dev_state::deterministic_run() {
+                            0.0
+                        } else {
+                            1.0
+                        },
+                    ),
                     light_buf: world_assets.shared_light.clone(),
                 },
             });
-            assets.materials.insert(
-                LiquidKey {
-                    kind,
-                    interior,
-                    scroll,
-                },
-                LiquidEntry {
-                    material,
-                    frame_count,
-                    scroll,
-                },
-            );
+            assets
+                .materials
+                .insert(LiquidKey { kind, path, scroll }, LiquidEntry { material });
         }
     }
-    // Frame SETS, not materials — a set backs every fog-block/scroll variant of its kind.
+    // Frame SETS, not materials — a set backs every renderer/scroll variant of its kind.
     info!(
         "liquid: loaded {} water frame set(s)",
         FRAME_SETS
             .iter()
-            .filter(|(k, ..)| assets.material(*k, false, false).is_some())
+            .filter(|(k, ..)| assets.material(*k, LiquidPath::Adt, false).is_some())
             .count()
     );
     commands.insert_resource(assets);
@@ -507,74 +587,6 @@ fn load_frame_array(
     }
     let loaded = frames.len() as u32;
     Some((images.add(liquid_frame_array(frames)), loaded))
-}
-
-/// Advance every liquid material's frame index at [`ANIM_FPS`] off Bevy **real** `Time` (wall-clock,
-/// mirroring the reference's `GetTickCount`-driven cycler — NOT the day/night game clock), and the
-/// **v-scroll offset** on the materials that take one ([`scrolls`]). Writes only on the
-/// [`ANIM_FPS`] tick edge: `Assets::get_mut` alone marks the asset Modified and feeds the
-/// respecialization pipeline (the mark-changed scan + `Changed<Mesh3d>` sweeps) every frame — the
-/// 0353 demand-price law; between ticks the frame index cannot have changed.
-///
-/// The scroll rides the same 24 Hz edge rather than getting its own per-frame write. It is a
-/// continuous quantity, so that quantises it — but to 1/24 s, i.e. **1/240th of a repeat** per step
-/// on a 10 s sawtooth, which is far below what a 256² sheet can show, and it keeps the material
-/// upload budget exactly where 0353 put it. (The reference is quantised too, just differently: it
-/// rebuilds the matrix per draw off a millisecond clock.)
-pub(super) fn animate_liquid(
-    time: Res<Time>,
-    liquid: Option<Res<LiquidAssets>>,
-    mut materials: ResMut<Assets<LiquidMaterial>>,
-    mut last_ticks: Local<Option<u32>>,
-    surfaces: Query<(), With<MeshMaterial3d<LiquidMaterial>>>,
-) {
-    let Some(liquid) = liquid else {
-        return;
-    };
-    // No liquid mesh in the world → nothing samples these materials; skip the whole cycle (the
-    // startup-built kind set otherwise re-uploads ~10 materials at every 24 Hz edge on maps with
-    // no water at all). The cycler is wall-clock ([`ANIM_FPS`] × elapsed), so when the first
-    // surface streams in the index resumes at the current wall frame — exactly the reference's
-    // `GetTickCount`-driven phase.
-    if surfaces.is_empty() {
-        return;
-    }
-    // Captures pin the cycler to frame 0: the wall-clock at screenshot time varies with load
-    // times, so any framing with open water diffs differently run to run — the flake substrate's
-    // baseline redesign caught (MAE 3.97 → 0.009 pinned; decision 0600). One clause, one frame.
-    let ticks = if crate::dev_state::deterministic_run() {
-        0
-    } else {
-        (time.elapsed_secs() * ANIM_FPS) as u32
-    };
-    if *last_ticks == Some(ticks) {
-        return;
-    }
-    *last_ticks = Some(ticks);
-    // The scroll's sawtooth, off the SAME quantised clock as the frame index so the two can never
-    // disagree about what time it is: `fmod(t, 10) · 0.1` ∈ [0, 1) repeats. Pinned to 0 in a
-    // deterministic run for exactly the reason the frame index is (0600).
-    let scroll = if crate::dev_state::deterministic_run() {
-        0.0
-    } else {
-        (ticks as f32 / ANIM_FPS) % SCROLL_PERIOD_SECS * SCROLL_REPEATS_PER_SEC
-    };
-    for entry in liquid.materials.values() {
-        // Gated per entry: a single-frame liquid (`frame_count` 1) never changes index, and the
-        // shared cache holds every kind ever built — re-marking them all Modified on each tick
-        // edge re-uploaded ~10 materials/frame on maps with no water at all.
-        let frame = (ticks % entry.frame_count.max(1)) as f32;
-        let offset = if entry.scroll { scroll } else { 0.0 };
-        benilla_assets::write_gated(
-            &mut materials,
-            &entry.material,
-            |m| m.extension.anim.x != frame || m.extension.anim.z != offset,
-            |m| {
-                m.extension.anim.x = frame;
-                m.extension.anim.z = offset;
-            },
-        );
-    }
 }
 
 #[cfg(test)]

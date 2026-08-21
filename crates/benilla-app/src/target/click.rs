@@ -124,12 +124,6 @@ pub(super) fn select_on_click(
     }
 }
 
-/// EmoteTalk's `AnimationData.dbc` id (60) — the one-shot talk the client plays on our avatar when
-/// we interact with an NPC. Its WeaponFlags `0x10` drives the per-animation sheath reconcile to stow
-/// the drawn weapon — a committed change that persists after the talk (nothing restores it; the
-/// interact stow is the talk emote, not a sheath wire — decisions 0080/0081).
-const EMOTE_TALK: u16 = 60;
-
 /// On a clean right-*click* (vanilla's context action — [`WorldRightClick`], never a turn-drag):
 /// select the hovered unit, then act by the same classification the cursor used (wow-re
 /// cursor-system.md §6). Three branches (decision 0081):
@@ -157,8 +151,11 @@ pub(super) fn act_on_right_click(
     mut selection: ResMut<Selection>,
     mut seam: crate::creature_anim::AttackSeam,
     self_player: Query<(Entity, &Guid, Has<Engaged>), With<SelfPlayer>>,
-    mut emote: MessageWriter<crate::creature_anim::EmoteAnim>,
-    mut play_seq: ResMut<crate::creature_anim::PlaySeq>,
+    // The interact talk gesture. The reference's NPC-interact dispatcher calls the SAME gesture
+    // entry point the chat display path does, always with code 0 — so this goes through
+    // `creature_anim::gesture` rather than writing a raw AnimID, and inherits its gate chain
+    // (decision 1469; before that it played unconditionally, even asleep or mid-combat).
+    mut gestures: ResMut<crate::creature_anim::GestureQueue>,
     // The GameObject lock-routing inputs (decisions 0239 / 0545 / 0752) as one [`GoLockInputs`]
     // (the 16-SystemParam ceiling).
     mut go_inputs: GoLockInputs,
@@ -418,14 +415,11 @@ pub(super) fn act_on_right_click(
         if let Some(cmd) = interact_command(cursor.kind, guid, npc_flags) {
             debug!("right-click interact: {guid:#x} ({:?})", cursor.kind);
             let _ = seam.net.0.send(cmd);
-            // Play EmoteTalk on our avatar — the reconcile stows a drawn weapon, persistently
-            // (decisions 0080/0081; no sheath wiring here).
-            if let Some((e, _, _)) = me {
-                emote.write(crate::creature_anim::EmoteAnim {
-                    entity: e,
-                    anim_id: EMOTE_TALK,
-                    seq: play_seq.next(),
-                });
+            // Talk at the NPC. The gesture's own anim carries WeaponFlags `0x10`, so the
+            // per-animation sheath reconcile stows a drawn weapon — a committed change that
+            // persists after the talk (decisions 0080/0081; no sheath wiring here).
+            if let Some((_, my_guid, _)) = me {
+                gestures.push(my_guid.0, crate::creature_anim::Gesture::Talk);
             }
         }
     }
@@ -433,7 +427,7 @@ pub(super) fn act_on_right_click(
 
 /// The right-click action a hovered GameObject resolves to (decisions 0239 / 0545 / 0752) — chosen
 /// by its lock, through the shared chain in [`super::lock`].
-enum GoAction {
+pub(crate) enum GoAction {
     /// No lock (or no lock data): `CMSG_GAMEOBJ_USE` — door / lever / quest object / mailbox /
     /// unlocked chest.
     Use,
@@ -484,7 +478,7 @@ enum KeyFact {
 /// `Spell.cpp:7892`), and only `CMSG_USE_ITEM` supplies it. That was recorded here as the server's
 /// gap; it was ours, and wow-re's note says so in the same breath — "the client never sends a bare
 /// CMSG_CAST_SPELL for a key lock".
-fn resolve_go_action(
+pub(crate) fn resolve_go_action(
     guid: u64,
     inputs: &mut GoLockInputs,
     known: &std::collections::BTreeSet<u32>,
@@ -509,6 +503,7 @@ fn resolve_go_action(
         slots,
         known,
         inputs.spells.as_deref(),
+        inputs.skill_lines.as_ref().map(|s| &s.catalog),
         me_store,
         &inputs.items,
         facts,

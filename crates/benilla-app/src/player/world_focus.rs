@@ -105,7 +105,7 @@ pub(super) fn release_post_snap_hold(
     mut player: ResMut<Player>,
     progress: Option<Res<WorldLoadProgress>>,
     time: Res<Time>,
-    mut last_counters: Local<Option<[usize; 4]>>,
+    mut last_counters: Local<Option<[usize; 6]>>,
     net_cmds: Option<Res<crate::net::NetCommands>>,
 ) {
     let Some(p) = progress else { return };
@@ -127,9 +127,17 @@ pub(super) fn release_post_snap_hold(
         player.world_stale = false;
     }
     // Did the stream move since last frame? Any counter changing — a tile spawned, a placement
-    // up, a collider queued or attached — is the destination still arriving. Tracked every frame
+    // up, a collider queued or attached, a retained region baked — is the destination still
+    // arriving. Tracked every frame
     // (not just while settling) so the first settling frame compares against a real baseline.
-    let counters = [p.ready, p.total, p.colliders_pending, p.placements_pending];
+    let counters = [
+        p.ready,
+        p.total,
+        p.colliders_pending,
+        p.merge_pending,
+        p.placements_pending,
+        p.gx_pending,
+    ];
     let progressed = last_counters.replace(counters) != Some(counters);
     if !player.settling {
         return;
@@ -145,7 +153,7 @@ pub(super) fn release_post_snap_hold(
     // still up. Only a stream that has made NO progress for the whole budget — missing data, dead
     // IO — can time out now, which is the case the backstop was always for.
     let now = time.elapsed_secs();
-    if p.scene_ready && p.colliders_pending == 0 && !player.world_stale && focus_matches {
+    if p.presentable() && !player.world_stale && focus_matches {
         player.end_settle(true, now);
     } else if player.world_stale || progressed {
         player.settle_deadline = now + SETTLE_TIMEOUT;
@@ -310,6 +318,27 @@ mod tests {
             p.scene_ready = true;
         });
         assert!(!settling(&mut app), "presentable world, hold still on");
+    }
+
+    /// Decision 1498: geometry that has SPAWNED but not yet baked is a hole in the world exactly
+    /// like an unattached collider, so it holds the post-snap freeze too. The retained pass took
+    /// the static world off the entity path (1429), and from then on "the placement spawned" and
+    /// "the building is on screen" stopped being the same fact — the hold, like the reveal, keys
+    /// on the second.
+    #[test]
+    fn an_unbaked_region_holds_the_settle() {
+        let mut app = app();
+        app.world_mut().resource_mut::<Player>().world_stale = false;
+        step(&mut app, 1.0, |p| {
+            p.total = 2000;
+            p.ready = 2000;
+            p.colliders_pending = 0;
+            p.scene_ready = true;
+            p.gx_pending = 4;
+        });
+        assert!(settling(&mut app), "spawned but undrawn is not presentable");
+        step(&mut app, 0.1, |p| p.gx_pending = 0);
+        assert!(!settling(&mut app), "baked — the world is really there");
     }
 
     /// B263 round 3 (decision 1336): residency published for ANOTHER tile never releases the hold

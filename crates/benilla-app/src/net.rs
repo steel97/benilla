@@ -37,12 +37,19 @@ use apply::{apply_net_updates, tag_self_player};
 // and are pulled in here for the plugin + the event bridge.
 pub(crate) use io::LoginRequest;
 use motion::{
-    drain_pending_moves, extrapolate_remote_units, face_target, ground_clamp_creatures,
+    drain_pending_moves, drive_display_facing, extrapolate_remote_units, ground_clamp_creatures,
     mark_swimming_creatures, sample_splines,
 };
 pub(crate) use motion::{
-    jump_seed, CreatureSwimming, FacingStep, GroundClamped, RemoteMotion, Spline, SplineStopped,
+    jump_seed, CreatureSwimming, FacingStep, RemoteMotion, Spline, SplineStopped,
 };
+// `GroundClamped`'s only consumer outside `net::motion::spline` is the ground-census probe, and a
+// probe is an instrument — a build with the instruments compiled out contains nothing that names
+// this re-export, and warned about it every time (decision 1451). The `allow` is "unused in *that*
+// build", not dead code; a `cfg` here is not the alternative, because seam knowledge has exactly
+// three addresses and this file is not one of them (1179, and its test says so out loud).
+#[allow(unused_imports)]
+pub(crate) use motion::GroundClamped;
 
 /// The net subsystem: spawns the background IO threads and drives the per-frame event drain.
 pub(crate) struct NetPlugin {
@@ -130,12 +137,19 @@ impl Plugin for NetPlugin {
                     // the freshly-applied state and reconcile-lerps toward the next queued head.
                     drain_pending_moves,
                     extrapolate_remote_units,
-                    // Idle creatures turn to face their target here — after the movers (spline / remote)
-                    // have set their poses, so a face turn reads the target's fresh position this frame.
-                    face_target,
+                    // The client-local facing turn runs here — after the movers (spline / remote)
+                    // have set their poses, so a turn reads the goal's fresh position this frame.
+                    // A stationary unit squares up on its target, and the NPC whose interaction
+                    // window is open turns to face us (decision 1467).
+                    drive_display_facing,
                 )
                     .chain()
-                    .in_set(WorldStage::Net),
+                    .in_set(WorldStage::Net)
+                    // `drive_display_facing` reads `InteractNpc`; ordering the chain after its
+                    // writer keeps the read deterministic rather than schedule-order-dependent.
+                    // The cost is that the writer sees last frame's window state, which cannot
+                    // matter: a window is open for seconds and the ease takes ~8 frames.
+                    .after(crate::ui_session::feed_interact_npc),
             )
             // Not part of the movement chain above: one send on the world-enter message.
             .add_systems(Update, send_query_time.in_set(WorldStage::Net))
@@ -916,6 +930,21 @@ pub(crate) enum ClientCommand {
     /// engine's own `kind<<24 | action` word. Sent by the action drain on every queued
     /// `PickupAction`/`PlaceAction` mutation — client-authoritative, no answer packet.
     SetActionButton { button: u8, packed: u32 },
+    /// Post the four extra bars' visibility byte (`CMSG_SET_ACTIONBAR_TOGGLES`, `PLAYER_FIELD_BYTES`
+    /// byte 2 — wow-re `system/ui/scratch/action-bar-toggles.md`). Sent by the toggle drain, one
+    /// per `SetActionBarToggles` call: the binding gates nothing, so two calls in a frame are two
+    /// packets.
+    ///
+    /// **Nothing answers it, and the sender is not allowed to answer itself.** Unlike
+    /// [`Self::SetActionButton`], whose state is genuinely ours, this byte is *server-owned*: the
+    /// real client has no instruction that writes the cell (the one `+0x102a` access image-wide is
+    /// a read), so the value only becomes true when the server's `SMSG_UPDATE_OBJECT` echoes it
+    /// into the descriptor — and no field-change callback fires when it does. The owner therefore
+    /// sees its own change come back the long way round, and the UI's optimism lives in Lua.
+    ///
+    /// A send while disconnected is a **silent no-op**, matching the reference's three unreported
+    /// drops (`0x5ab637`, `0x5379ab`, `0x5379b6`) behind a binding that returns zero Lua values.
+    SetActionBarToggles { toggles: u8 },
     /// Press one pet bar slot (`CMSG_PET_ACTION`, decisions 0982/0988). `packed` is the slot's OWN
     /// word as the server last sent it — command, reaction and spell all ride this one command,
     /// because the server dispatches on the type byte inside the word. `target_guid` is the
@@ -1387,6 +1416,13 @@ pub(crate) enum ClientCommand {
     /// the unit popup's PvP row, both through the VM's intent queue. Nothing local changes; the
     /// answer is the descriptor's PvP bit (and flagging *off* waits out the server's 300 s timer).
     TogglePvp,
+    /// Ask to flip our own show-helm preference (`CMSG_TOGGLE_HELM`, empty body — decision 1472):
+    /// the Options window's *Show Helm* row, through the VM's intent queue. Nothing local changes;
+    /// the answer is `PLAYER_FLAGS`' `HIDE_HELM` bit, which is what dresses the body — ours and
+    /// every other player's, since the field is public.
+    ToggleHelm,
+    /// The cloak half of [`Self::ToggleHelm`] (`CMSG_TOGGLE_CLOAK`, empty body).
+    ToggleCloak,
     // ── The guild family (writer bodies in benilla-protocol `world/writer/guild.rs`) ──────────
     //
     //    Three things shape every caller of this band. **Members are addressed by NAME**, not by

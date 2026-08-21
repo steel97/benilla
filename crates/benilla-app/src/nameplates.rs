@@ -459,6 +459,18 @@ pub(crate) fn drive_nameplates(
         if !drawn.is_none_or(|v| v.get()) {
             continue;
         }
+        // **There is NO distance cull here, and adding one is the mistake to not make twice.**
+        // The overhead NAME (`CGUnit+0xc7c`, a `PLAYERNAMEDESC`) and the V-key nameplate FRAME
+        // (`CGUnit+0xe60`) are two systems on the same unit, and only the FRAME carries the
+        // 20-yard cap (`0x60f600` vs `[0xc4d988] = 400`) that `vplates.rs` implements. This
+        // lane's own update/cull/build (`0x6c6d40`/`0x6c6e00`/`0x6c6e90`) holds **zero** distance
+        // compares — every early-out is identity/state-based, and the one FP compare is the
+        // height law above, not a depth term (wow-re `overhead-name.md` §Q5 + `playername.md`,
+        // both VERIFIED). A far name just gets small: it is a world billboard, apparent size ∝
+        // scale/depth. The effective range is the server's interest management — no CGUnit, no
+        // desc. 1490 item 7 read the frame's law onto this lane and capped it at 20 yd; the
+        // director's Elwynn shot (named wolves up the hill) is the reference's own behaviour, and
+        // it outranked the mis-scoped citation. Superseded by 1492.
         // The ShouldShowName gate, in the client's own order (own-unit answers its cvar BEFORE
         // the rescue; everyone else: the current-TARGET bypass — `[0xb4e2d8]` is the selection,
         // not the mouseover — then the kind cvar). A unit carrying a V-key nameplate never also

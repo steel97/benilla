@@ -88,6 +88,7 @@ mod probe_shield;
 mod quest_markers;
 mod raid_marks;
 mod run_mode;
+mod screenshot;
 mod shaders;
 mod smart_rect;
 mod sound;
@@ -251,22 +252,29 @@ pub fn run(build: BuildId) -> AppExit {
     // flag anyway, so the cross-thread dispatch machinery was pure overhead — measured
     // −1.30 cpu_ms at the LBRS pin under 5-round grading with the wall tail (p95/p99/max)
     // flat-to-better (the 1364 "fatter tail" reading did not reproduce; 1366 has the tables,
-    // both pins). PostUpdate stays multi-threaded — its wide parallel bands
-    // (propagation, visibility) are real parallelism; re-grading it is a named open probe.
-    // `WOW_MT_UPDATE=1` is the A/B lever back to the multi-threaded executor.
+    // both pins). `WOW_MT_UPDATE=1` is the A/B lever back to the multi-threaded executor.
     if std::env::var_os("WOW_MT_UPDATE").is_none() {
         app.edit_schedule(Update, |s| {
             s.set_executor_kind(bevy::ecs::schedule::ExecutorKind::SingleThreaded);
         });
     }
-    // `WOW_ST_POSTUPDATE=1` — 1366's named open probe: PostUpdate on the single-threaded
-    // executor, an EXPERIMENT lever only. The expectation is a REGRESSION (propagation and
-    // visibility are real parallel bands there, not flag-serialized non-Send work); the lever
-    // exists so the expectation gets measured instead of assumed.
-    if std::env::var_os("WOW_ST_POSTUPDATE").is_some() {
+    // PostUpdate too (decision 1437, closing 1366's named open probe — which expected a
+    // REGRESSION here and was refuted by measurement). The census: 208 systems paying
+    // ~10 µs/system of MT dispatch parked (schedule self 2.09 ms/f in the 1435 band map) while
+    // the wide bands the 1366 expectation leaned on are exactly the ones later work gated or
+    // pinned (1429 idle-gates the animation par sweep, 1356 pins static-transform tracking).
+    // Graded −0.49 cpu_ms parked (all 5 rounds negative) and winning IN MOTION as part of the
+    // combo (−0.76/−0.80 across two 4-round LBRS walk sittings), parked tails flat, motion
+    // p99/max flipping sign wholesale between sittings on both executors — 1366's own
+    // noise-dominated shape. `WOW_MT_POSTUPDATE=1` is the lever back; the engagement line makes
+    // every leg log name the config it measured.
+    if std::env::var_os("WOW_MT_POSTUPDATE").is_none() {
         app.edit_schedule(PostUpdate, |s| {
             s.set_executor_kind(bevy::ecs::schedule::ExecutorKind::SingleThreaded);
         });
+        println!(
+            "executor: PostUpdate -> single-threaded (1437 default; WOW_MT_POSTUPDATE=1 for MT)"
+        );
     }
     // …and one startup line says which build produced this log. Registered HERE, beside the stamp
     // it prints, rather than in `preflight` where it sat until decision 1179: **which build is
@@ -519,6 +527,9 @@ pub fn run(build: BuildId) -> AppExit {
     // The glyph atlas (client TTFs -> baked bitmap) `ui_script`'s extraction draws `FontString`
     // regions through. Loads at Startup, after the asset chain opens (decision 0068 §2).
     .add_plugins(UiTextPlugin)
+    // The one "which NPC am I interacting with" answer, shared by the portrait booth's `"npc"`
+    // token and the interaction face-me (decision 1467) — hence its own plugin, ahead of both.
+    .add_plugins(ui_session::UiSessionPlugin)
     // Unit-frame portraits: the token -> off-screen-baked-face bridge the UI extract samples for a
     // `SetPortraitTexture`-bound region (the modern high-res 2D model bake).
     .add_plugins(PortraitPlugin)
@@ -671,10 +682,45 @@ pub fn run(build: BuildId) -> AppExit {
     // PLAYER_QUEST_LOG descriptor slots + the SMSG_QUEST_QUERY_RESPONSE template cache, and drives
     // QuestLogFrame.xml over the Era quest-log API.
     .add_plugins(UiQuestLogPlugin)
-    .add_plugins(UiChatPlugin);
+    .add_plugins(UiChatPlugin)
+    // Print screen (decision 1487): the SCREENSHOT binding's engine half — one PNG per
+    // `Screenshot()` call into `benilla-config/Screenshots/` (never the install — decision 1486),
+    // answered to the UI as SCREENSHOT_SUCCEEDED/FAILED so the status text can never be in the
+    // frame it announces.
+    .add_plugins(screenshot::ScreenshotPlugin);
 
     // Register benilla-assets' loaders AFTER `AssetPlugin` (they go into the live `AssetServer`).
     benilla_assets::register_asset_loaders(&mut app);
+
+    // The render app's `ExtractSchedule` runs SINGLE-THREADED too (decision 1437, same grading
+    // as the PostUpdate flip above): bevy_render never sets an executor kind, so it ran the
+    // multi-threaded one by default — 0.34 ms/f of schedule self in the 1435 parked band map
+    // over 165 systems (census) with zero true non-Send members. Graded −0.26 parked alone,
+    // −0.90 parked as the combo. `WOW_MT_EXTRACT=1` is the lever back.
+    //
+    // The `Render` schedule stays MULTI-threaded, and not as a tuning judgment (1437, measured
+    // the hard way): under pipelined rendering the MT executor is ALSO bevy's non-Send→main-
+    // thread routing, and `bevy_render::view::window::create_surfaces` is non-Send precisely to
+    // ride it — on macOS a Metal layer can only be made on the UI thread, and the ST executor
+    // runs everything on the render thread (`get_metal_layer cannot be called in non-ui thread`,
+    // a startup panic). One system pins the schedule; its 1.06 ms/f self stays on the table
+    // until that coupling changes upstream.
+    //
+    // Lives HERE, not beside its siblings: the render sub-app only exists once the plugin chain
+    // has built (pipelining detaches it at cleanup, later still).
+    if std::env::var_os("WOW_MT_EXTRACT").is_none() {
+        if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+            render_app.edit_schedule(bevy::render::ExtractSchedule, |s| {
+                s.set_executor_kind(bevy::ecs::schedule::ExecutorKind::SingleThreaded);
+            });
+            println!(
+                "executor: ExtractSchedule -> single-threaded (1437 default; WOW_MT_EXTRACT=1 for MT)"
+            );
+        } else {
+            // A silently missing sub-app would flip nothing — say so instead of measuring a ghost.
+            eprintln!("executor: no render app — ExtractSchedule flip NOT applied");
+        }
+    }
 
     // **The probe fleet** — the capture harness and every scripted live probe, each armed by its
     // own environment variable and inert without it. Added last so they observe the fully-built
