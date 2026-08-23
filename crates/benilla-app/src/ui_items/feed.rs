@@ -17,8 +17,8 @@ use crate::ui_script::gate;
 
 use super::equip_error::equip_error_key;
 use super::{
-    find_equip_slot, has_key, item_link, keyring_size, slot_guid_count, EquipErrors, BAGS,
-    BAG_SLOT_FIRST, BANK_BAGS, BANK_BAG_ID_FIRST, BANK_BAG_SLOT_FIRST, BANK_CONTAINER, BANK_SLOTS,
+    find_equip_slot, has_key, keyring_size, slot_guid_count, EquipErrors, BAGS, BAG_SLOT_FIRST,
+    BANK_BAGS, BANK_BAG_ID_FIRST, BANK_BAG_SLOT_FIRST, BANK_CONTAINER, BANK_SLOTS,
     KEYRING_CONTAINER, KEYRING_SLOTS, PACK_SLOTS,
 };
 
@@ -300,6 +300,39 @@ pub(super) fn feed_item_sets(
 /// the "hover twice" flake this replaces). **Ask**: a renderer read of an id the app never
 /// resolved still records a miss, which triggers the `CMSG_ITEM_QUERY` here and lands via the
 /// same push when the answer arrives.
+/// Push the **whole** random-suffix table into the engine, once per VM (decision 1547).
+///
+/// Not an ask-once feed like the templates beside it: the roll table is a static DBC the app holds
+/// from load, and its consumers are click-driven — a chat-link tooltip has no hover re-enter loop
+/// to repaint on a late answer. One push per VM (a `/reload` mints a new one), and it waits for
+/// both catalogs, so a session that starts before the DBC load simply pushes on the next frame.
+pub(super) fn feed_random_properties(
+    script: Option<NonSendMut<UiScript>>,
+    props: Option<Res<crate::items::RandomProperties>>,
+    enchants: Option<Res<crate::items::Enchants>>,
+    mut pushed: Local<crate::ui_script::VmMemo<bool>>,
+) {
+    let Some(mut script) = script else {
+        return;
+    };
+    if *pushed.get(&script) {
+        return;
+    }
+    // The enchant catalog is what turns the roll's five ids into lines; without it every row would
+    // push empty and the push would never be retried. Both, or neither.
+    let (Some(props), Some(enchants)) = (props, enchants) else {
+        return;
+    };
+    let rows = crate::items::random_property_views(&props, Some(&enchants));
+    let with_lines = rows.values().filter(|v| !v.enchants.is_empty()).count();
+    info!(
+        "random-property table: {} rows pushed, {with_lines} with enchant lines",
+        rows.len()
+    );
+    script.set_random_properties(rows);
+    *pushed.get(&script) = true;
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn feed_item_stats(
     script: Option<NonSendMut<UiScript>>,
@@ -500,7 +533,7 @@ fn resolve_slot(
     guid: u64,
     items: &mut Items,
     icons: Option<&ItemDisplays>,
-    enchants: Option<&crate::items::Enchants>,
+    rolls: crate::items::RollCatalogs,
     commands: &NetCommands,
     cooldowns: &crate::cooldowns::Cooldowns,
     spells: Option<&benilla_formats::SpellCatalog>,
@@ -515,7 +548,7 @@ fn resolve_slot(
     // (both live on `Items`): one `Option<ms>` per enchant slot.
     let enchant_ms: [Option<u64>; 7] =
         std::array::from_fn(|s| items.enchant_remaining_display_ms(guid, s as u32));
-    let (entry, count, durability, readable, creator, flags, enchant_lines) =
+    let (entry, count, durability, readable, creator, flags, roll, enchant_lines) =
         match items.object(guid) {
             Some(fields) => (
                 fields.object_entry().unwrap_or(0),
@@ -539,6 +572,10 @@ fn resolve_slot(
                     .and_then(|g| names.resolve(g, commands).map(str::to_string)),
                 // `ITEM_FIELD_FLAGS` — the tooltip's UNLOCKED (0x4) / WRAPPED (0x8) sub-gates.
                 fields.item_flags().unwrap_or(0),
+                // `ITEM_FIELD_RANDOM_PROPERTIES_ID` — the roll behind the NAME's "of the Bear"
+                // (decision 1547). Only the name: the roll's own enchants are already in the
+                // instance's slots 2..6 below, written there by the server.
+                fields.item_random_properties_id(),
                 // The instance's own 7 enchant slots — the tooltip's enchant lines (0915/0920). An
                 // item we hold streams as an OBJECT, so all seven are here, with their charges and
                 // their `SMSG_ITEM_ENCHANT_TIME_UPDATE` countdowns; the wire's 2-slot broadcast is
@@ -552,7 +589,7 @@ fn resolve_slot(
                             enchant_ms[usize::from(s)],
                         )
                     }),
-                    enchants,
+                    rolls.enchants,
                 ),
             ),
             // The player descriptor references a guid whose create hasn't landed (yet) —
@@ -584,7 +621,17 @@ fn resolve_slot(
         durability,
         quality: Some(t.quality),
         item_id: entry,
-        link: Some(item_link(entry, &t.name, t.quality)),
+        // The link carries the roll — both in its `randomPropertyId` field and in the bracketed
+        // NAME, which the reference builds out of the suffix-joining formatter `0x5d8b00`. The
+        // slot's tooltip plate reads its name back off this string.
+        link: Some(crate::ui_items::item_link_full(
+            entry,
+            0,
+            roll,
+            0,
+            &rolls.name(&t.name, roll),
+            t.quality,
+        )),
         locked: false,
         readable,
         creator,
@@ -651,8 +698,13 @@ pub(crate) fn feed_containers(
     script: Option<NonSendMut<UiScript>>,
     mut items: ResMut<Items>,
     icons: Option<Res<ItemDisplays>>,
-    // `SpellItemEnchantment`'s name column — the tooltip's enchant lines (decision 0915).
-    enchants: Option<Res<crate::items::Enchants>>,
+    // The two item-DBC catalogs, as one param (the 16-SystemParam ceiling): `SpellItemEnchantment`'s
+    // name column — the tooltip's enchant lines (decision 0915) — and `ItemRandomProperties`, the
+    // roll behind a slot's "of the Monkey" name (decision 1547).
+    catalogs: (
+        Option<Res<crate::items::Enchants>>,
+        Option<Res<crate::items::RandomProperties>>,
+    ),
     // The two self-descriptor legs in one param (the 16-SystemParam ceiling): the store the
     // slot arrays read, and its change tick — the gate's cheapest input (1439).
     self_q: (
@@ -702,7 +754,9 @@ pub(crate) fn feed_containers(
     // get-or-insert every frame, so `is_changed` reads true forever — 1439's gate-trace found
     // the containers gate held open by exactly this.
     let icons_changed = icons.as_ref().is_some_and(|r| r.is_added());
-    let enchants_changed = enchants.as_ref().is_some_and(|r| r.is_changed());
+    // Both DBC catalogs load once, at startup — one input covers the pair.
+    let enchants_changed = catalogs.0.as_ref().is_some_and(|r| r.is_changed())
+        || catalogs.1.as_ref().is_some_and(|r| r.is_changed());
     let spells_changed = spells.as_ref().is_some_and(|r| r.is_changed());
     let families_changed = bag_families.as_ref().is_some_and(|r| r.is_changed());
     let errors_held = !equip_errors.0.is_empty() || !error_lines.0.is_empty();
@@ -759,7 +813,10 @@ pub(crate) fn feed_containers(
     // pushed start is frame-stable (the resource's own doc).
     let (now, ui_now) = (clock.anchor, clock.ui_now);
     let spell_catalog = spells.as_deref().map(|s| &s.catalog);
-    let enchant_rows = enchants.as_deref();
+    let rolls = crate::items::RollCatalogs {
+        enchants: catalogs.0.as_deref(),
+        props: catalogs.1.as_deref(),
+    };
     // Inventory refusals surface as the client's red error line (the cast path's exact shape):
     // the wire code keys into the VM's own GlobalStrings ([`equip_error_key`], total), reason 1
     // filling its `%d` with the packet's required level.
@@ -843,7 +900,7 @@ pub(crate) fn feed_containers(
                 guid,
                 &mut items,
                 icons.as_deref(),
-                enchant_rows,
+                rolls,
                 &commands,
                 &cooldowns,
                 spell_catalog,
@@ -896,7 +953,7 @@ pub(crate) fn feed_containers(
                     guid,
                     &mut items,
                     icons.as_deref(),
-                    enchant_rows,
+                    rolls,
                     &commands,
                     &cooldowns,
                     spell_catalog,
@@ -929,7 +986,7 @@ pub(crate) fn feed_containers(
                 guid,
                 &mut items,
                 icons.as_deref(),
-                enchant_rows,
+                rolls,
                 &commands,
                 &cooldowns,
                 spell_catalog,
@@ -978,7 +1035,7 @@ pub(crate) fn feed_containers(
                     guid,
                     &mut items,
                     icons.as_deref(),
-                    enchant_rows,
+                    rolls,
                     &commands,
                     &cooldowns,
                     spell_catalog,
@@ -1015,7 +1072,7 @@ pub(crate) fn feed_containers(
                 guid,
                 &mut items,
                 icons.as_deref(),
-                enchant_rows,
+                rolls,
                 &commands,
                 &cooldowns,
                 spell_catalog,
@@ -1136,8 +1193,44 @@ fn diff_and_push(
         .filter(|b| fresh.get(b) != memory.pushed.get(b))
         .collect();
     if !changed.is_empty() {
+        // **The spent-ammo signal** (decision 1509). The reference registers a field mirror on
+        // `ITEM_FIELD_STACK_COUNT` for TYPEID ITEM (`ClntObjMgrSetTypeMirrorHandler 0x468070` at
+        // `0x5d9360`, handler `0x5d9400`); for any item the active player owns, a stack-count
+        // write fires **ITEM_LOCK_CHANGED first**, ahead of the `BAG_UPDATE` the same handler
+        // emits further down. Nothing else in the image reaches that event from a server update —
+        // its other four fire sites are all local lock/unlock — so it is the ONLY per-shot signal
+        // an addon can detect a spent arrow with, and every auto-shot timer is built on it.
+        //
+        // Computed before `memory.pushed` is replaced at the bottom of this block.
+        let restacked = {
+            let empty = HashMap::new();
+            let mut v: Vec<(i64, u32)> = Vec::new();
+            for &bag in &changed {
+                let now = fresh.get(&bag).map_or(&empty, |c| &c.slots);
+                let was = memory.pushed.get(&bag).map_or(&empty, |c| &c.slots);
+                for (&slot, n) in now {
+                    // The SAME item, restacked. A slot whose entry changed is a create or a swap,
+                    // not a field write on one item, and it does not take this path.
+                    if was.get(&slot).is_some_and(|w| {
+                        w.item_id != 0 && w.item_id == n.item_id && w.count != n.count
+                    }) {
+                        v.push((bag, slot));
+                    }
+                }
+            }
+            // Map order is not an order, and an event stream has to be reproducible.
+            v.sort_unstable();
+            v
+        };
         for &bag in &changed {
             script.set_container(bag, fresh.get(&bag).cloned());
+        }
+        // Ahead of BAG_UPDATE below, which is the reference handler's own order.
+        for (bag, slot) in restacked {
+            script.fire_event(
+                "ITEM_LOCK_CHANGED",
+                vec![ScriptValue::Int(bag), ScriptValue::Int(i64::from(slot))],
+            );
         }
         // Name the bags, not just the count: "3 changed" can't tell you WHICH container moved, and
         // the negative ids (−1 bank, −2 keyring) are exactly the ones you go looking for.
@@ -1237,6 +1330,80 @@ mod tests {
         apply_container_source(&mut s, &mut memory, Some(HashMap::new()), Vec::new());
         assert_eq!(s.eval::<i64>("return GetContainerNumSlots(0)").unwrap(), 0);
         assert_eq!(s.eval::<i64>("return BAG_EVENTS").unwrap(), 2);
+    }
+
+    /// **The spent-ammo signal** (decision 1509, B267's second half). A stack ticking down must
+    /// fire `ITEM_LOCK_CHANGED` for that slot, **before** the `BAG_UPDATE` for its bag — the
+    /// reference's `ITEM_FIELD_STACK_COUNT` mirror handler's own order.
+    ///
+    /// This is not cosmetic ordering. Quiver's auto-shot timer has no other way to learn a shot
+    /// fired: it starts the reload drain from this event, and without it the bar fills once and
+    /// sits at 100% forever (the director's report). Every vanilla shot timer works this way.
+    ///
+    /// The negative half matters as much: a slot whose ENTRY changed is a swap or a create, not a
+    /// field write on one item, and must NOT fire it — over-firing would make the addon count
+    /// shots that never happened.
+    #[test]
+    fn a_stack_ticking_down_fires_item_lock_changed_before_bag_update() {
+        use benilla_ui::script::ContainerSlot;
+
+        let mut s = UiScript::new().unwrap();
+        s.run(
+            "ORDER = {} \
+             local f = CreateFrame('Frame') \
+             f:RegisterEvent('ITEM_LOCK_CHANGED') \
+             f:RegisterEvent('BAG_UPDATE') \
+             f:SetScript('OnEvent', function() \
+                 table.insert(ORDER, event .. ':' .. tostring(arg1) .. ',' .. tostring(arg2)) \
+             end)",
+        )
+        .unwrap();
+
+        let arrows = |count: u32| ContainerSlot {
+            item_id: 2512, // Rough Arrow
+            count,
+            ..Default::default()
+        };
+        let bag = |s: ContainerSlot| {
+            HashMap::from([(
+                0,
+                ContainerState {
+                    name: Some("Backpack".into()),
+                    num_slots: 16,
+                    slots: HashMap::from([(1, s)]),
+                },
+            )])
+        };
+        let mut memory = FeedMemory::default();
+
+        // The quiver arrives full — a create, not a restack. No lock event.
+        apply_container_source(&mut s, &mut memory, Some(bag(arrows(200))), Vec::new());
+        assert_eq!(
+            s.eval::<String>("return table.concat(ORDER, ' ')").unwrap(),
+            "BAG_UPDATE:0,nil",
+            "a slot appearing is a create, not a stack-count field write"
+        );
+
+        // An arrow leaves the quiver.
+        s.run("ORDER = {}").unwrap();
+        apply_container_source(&mut s, &mut memory, Some(bag(arrows(199))), Vec::new());
+        assert_eq!(
+            s.eval::<String>("return table.concat(ORDER, ' ')").unwrap(),
+            "ITEM_LOCK_CHANGED:0,1 BAG_UPDATE:0,nil",
+            "the shot signal fires for (bag 0, slot 1) and precedes BAG_UPDATE"
+        );
+
+        // A DIFFERENT item in the same slot: a swap. The count differs too, and it must still
+        // not fire — otherwise an addon counts a shot every time you rearrange your bags.
+        s.run("ORDER = {}").unwrap();
+        let mut other = arrows(20);
+        other.item_id = 3033; // Razor Arrow
+        apply_container_source(&mut s, &mut memory, Some(bag(other)), Vec::new());
+        assert_eq!(
+            s.eval::<String>("return table.concat(ORDER, ' ')").unwrap(),
+            "BAG_UPDATE:0,nil",
+            "a changed entry is a swap, not a stack-count write"
+        );
     }
 
     fn slot(spell_id: u32, charges: i32) -> ItemSpellEntry {

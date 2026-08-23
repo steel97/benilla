@@ -269,6 +269,42 @@ fn level_up_lines_follow_the_reference_order_and_forms() {
     );
 }
 
+/// The three honor forms (COMBATLOG_HONORAWARD / COMBATLOG_HONORGAIN / COMBATLOG_DISHONORGAIN,
+/// GlobalStrings :786/:787/:785) and the fork between them, decision 1512.
+///
+/// The empty-rank case is asserted deliberately: it is what the server's floor-at-5 exists to
+/// prevent, so a change that silently starts hiding the clause instead would pass unnoticed here
+/// without it.
+#[test]
+fn honor_gain_lines_pick_the_reference_form() {
+    assert_eq!(
+        super::feed::honor_gain_line(None, None, 42),
+        "You have been awarded 42 honor points."
+    );
+    assert_eq!(
+        super::feed::honor_gain_line(Some("Grimtusk"), Some("Sergeant"), 137),
+        "Grimtusk dies, honorable kill Rank: Sergeant (Estimated Honor Points: 137)"
+    );
+    // A dishonorable kill: vmangos sends the same packet with a negative honor
+    // (`HonorMgr.cpp:807`), and the client's fork is on the sign.
+    assert_eq!(
+        super::feed::honor_gain_line(Some("Innkeeper Renee"), None, -37),
+        "Innkeeper Renee dies, dishonorable kill."
+    );
+    // The BOUNDARY, byte-verified at `0x625270`: the test is `honor <= 0`, so a zero-honor kill
+    // takes the dishonorable arm. The pre-verdict reading had `< 0` and put this one on the
+    // honorable side, where it would have printed "Rank:  (Estimated Honor Points: 0)".
+    assert_eq!(
+        super::feed::honor_gain_line(Some("Grimtusk"), Some("Sergeant"), 0),
+        "Grimtusk dies, dishonorable kill."
+    );
+    // No rank title: the clause stays, empty — the reference's own shape.
+    assert_eq!(
+        super::feed::honor_gain_line(Some("Grimtusk"), None, 5),
+        "Grimtusk dies, honorable kill Rank:  (Estimated Honor Points: 5)"
+    );
+}
+
 #[test]
 fn xp_gain_lines_pick_the_reference_form() {
     // COMBATLOG_XPGAIN_FIRSTPERSON / its EXHAUSTION1 rested form / _UNNAMED (GlobalStrings
@@ -895,7 +931,7 @@ fn every_kind_is_in_all() {
     seen.sort_unstable();
     seen.dedup();
     assert_eq!(seen.len(), before, "a kind is listed twice in ALL");
-    assert_eq!(before, 36, "36 kinds — update this when the kind set grows");
+    assert_eq!(before, 37, "37 kinds — update this when the kind set grows");
 }
 
 #[test]
@@ -1359,6 +1395,7 @@ fn real_alias_table_resolves_the_shipped_commands() {
         );
     }
     assert_eq!(parse_line("/macrohelp"), ParsedChat::MacroHelp);
+    assert_eq!(parse_line("/convertraid"), ParsedChat::ConvertRaid);
     // The whole shipped surface, so a table that half-loaded fails loudly: **225 distinct emote
     // commands** over the 169 `EmotesText` names (the strings repeat — `EMOTE87_CMD1` and `_CMD2`
     // are both "/sit" — and EMOTE27 "UNUSED" has no row, so it contributes none), and **68 distinct
@@ -1368,8 +1405,9 @@ fn real_alias_table_resolves_the_shipped_commands() {
     // 1291 added CONSOLE's `/console` — one distinct alias, SLASH_CONSOLE1 and 2 are both the
     // same string).
     //
-    // The third number is benilla's own player-facing additions: `/reload` (1291) and
-    // `/errors` `/err` (1495, the script error log) — 3 aliases over 2 commands. Present in
+    // The third number is benilla's own player-facing additions: `/reload` (1291), `/errors`
+    // `/err` (1495, the script error log) and `/convertraid` (the raid conversion trigger the
+    // unbuilt RaidFrame tab would otherwise carry) — 4 aliases over 3 commands. Present in
     // every build, deliberately counted apart from the shipped surface so the seam stays visible.
     // The error log is player-facing on purpose and NOT an instrument: gating it on
     // `dev_affordances()` would leave exactly the reporters who asked for it unable to type it.
@@ -1386,7 +1424,7 @@ fn real_alias_table_resolves_the_shipped_commands() {
     };
     assert_eq!(
         table.counts(),
-        (68, 225, 3, instruments),
+        (68, 225, 4, instruments),
         "(slash, emote, benilla addition, instrument) aliases"
     );
 }

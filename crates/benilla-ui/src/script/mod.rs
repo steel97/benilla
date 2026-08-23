@@ -39,6 +39,7 @@
 mod action;
 mod action_bar_toggles;
 mod addon_message;
+mod auction;
 mod aura;
 mod backdrop;
 mod bank;
@@ -124,6 +125,7 @@ mod tooltip;
 mod tooltip_item;
 mod tooltip_spell;
 mod tooltip_unit;
+mod ui_errors;
 pub use tooltip_unit::TooltipTint;
 mod trade;
 mod tradeskill;
@@ -137,6 +139,10 @@ mod worn_display;
 pub use action::{ActionSlot, ActionState};
 pub use addon::AddOnInfo;
 pub use addon_message::{AddonDistribution, AddonSend};
+pub use auction::{
+    AuctionBid, AuctionCategory, AuctionItemRow, AuctionListState, AuctionQuery,
+    AuctionStartRequest, AuctionState, AuctionSubCategory, BIDDER, LIST, OWNER, SORT_KEYS,
+};
 pub use aura::{AuraState, TrackingState};
 pub use backdrop::{inset_atlas_bleed, pieces, Backdrop, BackdropPiece, Insets};
 pub use bank::BankState;
@@ -145,7 +151,9 @@ pub use char_stats::{
     SKILL_DEFENSE, SKILL_UNARMED,
 };
 pub use chat_send::ChatSend;
-pub use container::{ContainerMove, ContainerSlot, ContainerState, EnchantView, UiCursorMode};
+pub use container::{
+    ContainerMove, ContainerSlot, ContainerState, EnchantView, RandomPropertyView, UiCursorMode,
+};
 pub use craft::{CraftReagent, CraftRecipe, CraftState, CraftTooltip};
 pub use cursor::{
     CursorAction, CursorItem, CursorMacro, CursorPayload, CursorPetAction, CursorSpell,
@@ -166,13 +174,14 @@ pub use item_text::ItemTextState;
 pub use loot::{LootRow, LootState};
 pub use loot_roll::{LootRollEntry, LootRollsState};
 pub use macros::{MacroState, MacroView, MAX_MACROS, MAX_MACRO_BODY, MAX_MACRO_NAME};
-pub use mail::{MailInboxRow, MailSendRequest, MailState};
+pub use mail::{MailInboxRow, MailInvoice, MailSendRequest, MailState};
 pub use measure::TextMeasure;
 pub use merchant::{ItemStatsHead, MerchantItem, MerchantState};
 pub(crate) use model::Model;
 pub use model::TextureProbe;
 pub use party::{PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo};
 pub use pet::{PetActionView, PetStats};
+pub use pvp::{HonorState, InspectHonorData};
 pub use quest::{QuestAction, QuestItemView, QuestPanel, QuestSelect, QuestState};
 pub use quest_log::{QuestLogDetail, QuestLogEntryView, QuestLogObjectiveView, QuestLogState};
 pub(crate) use region::{apply_font_parts, implicit_creation_anchor_lua};
@@ -206,7 +215,10 @@ pub use types::{
 pub(crate) use types::{FontExplicit, MeasuredText, RegionData};
 pub use unit::{grey_band, level_reads_unknown, power_token, unit_is_grey, UnitState};
 pub use weapon_enchant::WeaponEnchant;
-pub use worldmap::{WorldMapContinentView, WorldMapOverlayView, WorldMapState, WorldMapZoneView};
+pub use worldmap::{
+    WorldMapContinentView, WorldMapLandmarkView, WorldMapOverlayView, WorldMapState,
+    WorldMapZoneView,
+};
 pub use worn_display::WornDisplay;
 
 use mlua::Lua;
@@ -534,6 +546,7 @@ impl UiScript {
         saved::install(&lua)?;
         keybind::install(&lua)?;
         sound::install(&lua)?;
+        ui_errors::install(&lua)?;
         pointer::install(&lua)?;
         action::install(&lua)?;
         action_bar_toggles::install(&lua)?;
@@ -549,6 +562,7 @@ impl UiScript {
         bank::install(&lua)?;
         item_text::install(&lua)?;
         mail::install(&lua)?;
+        auction::install(&lua)?;
         trainer::install(&lua)?;
         taxi::install(&lua)?;
         trade::install(&lua)?;

@@ -19,6 +19,7 @@ mod action_bar;
 pub mod addons;
 mod area_trigger;
 mod attack;
+mod auction;
 mod bank;
 mod binder;
 mod channel;
@@ -45,6 +46,7 @@ mod parse;
 mod pet;
 mod pose;
 mod progression;
+mod pvp;
 mod quest;
 mod reputation;
 mod roster;
@@ -65,6 +67,12 @@ pub use action_bar::{
 pub use addons::{SecureAddon, STANDARD_MODULUS_CRC, STOCK_SECURE_ADDONS};
 pub use area_trigger::area_trigger;
 pub use attack::{attack_swing, AttackerState};
+pub use auction::{
+    auction_action, auction_duration, auction_error, auction_filter, auction_hello,
+    auction_list_bidder_items, auction_list_items, auction_list_owner_items, auction_place_bid,
+    auction_remove_item, auction_sell_item, AuctionBidderNotification, AuctionCommandTail,
+    AuctionListEntry, AuctionOwnerNotification, AUCTION_PAGE_SIZE, AUCTION_RECORD_BYTES,
+};
 pub use bank::{
     autobank_item, autostore_bank_item, bank_slot_result, banker_activate, buy_bank_slot,
 };
@@ -102,7 +110,7 @@ pub use duel::{
 };
 pub use gameobject::{gameobj_use, gameobject_query, GameObjectQueryInfo};
 pub use gossip::{
-    gossip_hello, gossip_select_option, npc_text_query, select_greeting, GossipOption,
+    gossip_hello, gossip_select_option, npc_text_query, select_greeting, GossipOption, GossipPoi,
     NpcTextBlock, QuestOption, NPC_TEXT_BLOCKS,
 };
 pub use group::{
@@ -159,6 +167,7 @@ pub use pet::{
 };
 pub use pose::{set_sheathed, stand_state_change};
 pub use progression::{learn_talent, ExplorationXp, LevelUpInfo, XpGain};
+pub use pvp::{inspect_honor_stats, InspectHonorStats, PvpCredit};
 pub use quest::{
     dialog_status, quest_query, questgiver_accept_quest, questgiver_choose_reward,
     questgiver_complete_quest, questgiver_hello, questgiver_query_quest, questgiver_request_reward,

@@ -10,15 +10,17 @@
 //! Coordinates stay **raw WoW** (the `benilla` boundary applies `bevy = (-y, z, -x)`).
 
 use crate::messages::{
-    ActionButton, AttackerState, ChannelNoticeTail, Character, CreateSpline, DamageShield,
+    ActionButton, AttackerState, AuctionBidderNotification, AuctionCommandTail, AuctionListEntry,
+    AuctionOwnerNotification, ChannelNoticeTail, Character, CreateSpline, DamageShield,
     EnvironmentalDamageLog, ExplorationXp, FriendEntry, FriendStatusUpdate, GossipOption,
     GroupLootInfo, GroupMemberEntry, GuildCommandResult, GuildEventNotice, GuildInfo,
-    GuildQueryResponse, GuildRoster, ItemInfo, ItemPushResult, JumpInfo, LevelUpInfo,
-    LootAllPassed, LootItem, LootRoll, LootRollWon, LootStartRoll, MailListEntry, MirrorTimerStart,
-    MonsterMoveFacing, ObjectFields, PartyMemberStatsInfo, PeriodicAuraLog, PetMode, PetSpells,
-    QuestComplete, QuestDetails, QuestGiverList, QuestOfferReward, QuestRequestItems,
-    QuestTemplate, SpellDamageLog, SpellEnergizeLog, SpellHealLog, SpellLogMiss, TaxiMask,
-    TradeStatus, TradeStatusExtended, TrainerSpell, TransportPose, VendorItem, WhoResults, XpGain,
+    GuildQueryResponse, GuildRoster, InspectHonorStats, ItemInfo, ItemPushResult, JumpInfo,
+    LevelUpInfo, LootAllPassed, LootItem, LootRoll, LootRollWon, LootStartRoll, MailListEntry,
+    MirrorTimerStart, MonsterMoveFacing, ObjectFields, PartyMemberStatsInfo, PeriodicAuraLog,
+    PetMode, PetSpells, PvpCredit, QuestComplete, QuestDetails, QuestGiverList, QuestOfferReward,
+    QuestRequestItems, QuestTemplate, SpellDamageLog, SpellEnergizeLog, SpellHealLog, SpellLogMiss,
+    TaxiMask, TradeStatus, TradeStatusExtended, TrainerSpell, TransportPose, VendorItem,
+    WhoResults, XpGain,
 };
 
 /// Coarse entity classification, free of wire types so the app can branch on it without depending on
@@ -761,6 +763,9 @@ pub enum SessionEvent {
     QuestGiverFailed { quest_id: u32, reason: u32 },
     /// The gossip window closes (`SMSG_GOSSIP_COMPLETE`) — no menu is open server-side any more.
     GossipComplete,
+    /// A guard's directions (`SMSG_GOSSIP_POI`): drop a marker at that spot on the minimap and the
+    /// world map. Volunteered by a gossip option carrying an `action_poi_id` — never requested.
+    GossipPoi(crate::messages::GossipPoi),
     /// The greeting record for a gossip menu (`SMSG_NPC_TEXT_UPDATE`, answering our
     /// `CMSG_NPC_TEXT_QUERY`) — all 8 blocks, **undrawn**: which line greets you depends on the
     /// NPC's gender and a die roll, so the app draws it when the frame opens
@@ -1025,6 +1030,14 @@ pub enum SessionEvent {
     },
     /// Start the duel countdown (`SMSG_DUEL_COUNTDOWN`) — already in whole seconds.
     DuelCountdown { seconds: u32 },
+    /// Another player's honor stats came back (`MSG_INSPECT_HONOR_STATS` reply, decision 1512) —
+    /// the inspect window's Honor tab. Arrives only in answer to our own ask, and a *refused* ask
+    /// is answered with silence (the server returns without sending), so a consumer must not
+    /// treat "no event yet" as "the data is coming".
+    InspectHonorStats(InspectHonorStats),
+    /// A kill paid out honor (`SMSG_PVP_CREDIT`) — the honor-gain chat line and floating combat
+    /// text. Also fires for a **dishonorable** kill, where `honor` is negative.
+    PvpCredit(PvpCredit),
     /// One mirror timer started, or was wholly re-stated (`SMSG_START_MIRROR_TIMER`, decision
     /// 0874) — the breath / fatigue bars. There is no separate update opcode: the server re-sends
     /// this whole packet whenever direction, remaining time or frozen state changes, so a
@@ -1130,6 +1143,52 @@ pub enum SessionEvent {
     /// mail waiting, `-86400.0` = none. Drives `HasNewMail()`/`UPDATE_PENDING_MAIL` (decision 0544
     /// P3).
     NextMailTime { seconds: f32 },
+    /// `MSG_AUCTION_HELLO`'s reply — the auctioneer we greeted plus its `AuctionHouse.dbc` row
+    /// (1..7, the deposit/cut rates). This packet, not our send, is what opens the auction window
+    /// (decision 1511 P0's wire layer; the window itself is a later phase).
+    AuctionHello { auctioneer: u64, house_id: u32 },
+    /// `SMSG_AUCTION_COMMAND_RESULT` — the verdict on a sell/cancel/bid, keyed by `action`
+    /// ([`crate::messages::auction_action`]) and `error` ([`crate::messages::auction_error`]);
+    /// `tail` is the conditional payload the error selects. `auction_id` is `0` on most failures,
+    /// and several refusals send no packet at all (decision 1511).
+    AuctionCommandResult {
+        auction_id: u32,
+        action: u32,
+        error: u32,
+        tail: AuctionCommandTail,
+    },
+    /// `SMSG_AUCTION_LIST_RESULT` — a Browse page (max 50 rows). `total_count` is the pre-cap
+    /// match count the pager needs, and it rides at the END of the wire body.
+    AuctionListResult {
+        auctions: Vec<AuctionListEntry>,
+        total_count: u32,
+    },
+    /// `SMSG_AUCTION_OWNER_LIST_RESULT` — the Auctions tab page (our own listings). Same frame
+    /// and record as [`Self::AuctionListResult`].
+    AuctionOwnerListResult {
+        auctions: Vec<AuctionListEntry>,
+        total_count: u32,
+    },
+    /// `SMSG_AUCTION_BIDDER_LIST_RESULT` — the Bid tab page. Same frame and record as
+    /// [`Self::AuctionListResult`]; the server emits the explicitly-refreshed ids first and then
+    /// our live bids, so one row can appear twice in a page.
+    AuctionBidderListResult {
+        auctions: Vec<AuctionListEntry>,
+        total_count: u32,
+    },
+    /// `SMSG_AUCTION_BIDDER_NOTIFICATION` — we won, or we were outbid (`bid_or_zero == 0` means
+    /// **won**, not "no bid").
+    AuctionBidderNotification(AuctionBidderNotification),
+    /// `SMSG_AUCTION_OWNER_NOTIFICATION` — our own auction sold or took a bid. A deliberately
+    /// different shape from the bidder notice: no house id, guid fourth, and an all-zero
+    /// `bidder_guid` is the "sold" signal.
+    AuctionOwnerNotification(AuctionOwnerNotification),
+    /// `SMSG_AUCTION_REMOVED_NOTIFICATION` — an auction we had bid on was cancelled by its seller.
+    AuctionRemovedNotification {
+        auction_id: u32,
+        item_entry: u32,
+        random_property_id: i32,
+    },
     /// `SMSG_TRADE_STATUS` — one pulse of the player-trade state machine (open/accept/cancel/
     /// complete + the refusal reasons). The app drives the trade window and the auto-`BEGIN_TRADE`
     /// reply off this (decision 0592; the window itself is P1).

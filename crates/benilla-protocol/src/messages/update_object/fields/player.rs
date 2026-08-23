@@ -85,6 +85,19 @@ impl ObjectFields {
             .flatten()
             .unwrap_or(0)
     }
+    /// `ITEM_FIELD_RANDOM_PROPERTIES_ID` (field 44 — vmangos `UpdateFields_1_12_1.h`
+    /// `OBJECT_END + 0x26`, chain-locked here by the tested `ITEM_TEXT_ID` 45 / `DURABILITY` 46
+    /// anchors on either side): the **random-suffix roll** this item instance carries, an
+    /// `ItemRandomProperties.dbc` id. `0` = unrolled.
+    ///
+    /// Its one consumer is the NAME: the client joins the row's suffix through
+    /// `ITEM_SUFFIX_TEMPLATE` in its single name formatter `0x5d8b00`, so the item reads "Chipped
+    /// Claw of the Bear" everywhere it is named. The roll's **enchants** never come from here on
+    /// an owned item — the server writes them into `ITEM_FIELD_ENCHANTMENT` slots 2..6, which
+    /// [`Self::item_enchant`] already reads.
+    pub fn item_random_properties_id(&self) -> u32 {
+        self.get_u32(44).unwrap_or(0)
+    }
     /// `ITEM_FIELD_DURABILITY` — an item's current durability (field 46: chain-locked between the
     /// tested STACK_COUNT 14 and CONTAINER_NUM_SLOTS 48 = ITEM_END anchors).
     pub fn item_durability(&self) -> Option<u32> {
@@ -131,6 +144,22 @@ impl ObjectFields {
                 .filter(|&e| e != 0)
             })
             .flatten()
+    }
+    /// `PLAYER_VISIBLE_ITEM_<slot>_PROPERTIES` — the **broadcast random-suffix roll** of the item
+    /// worn in equipment slot `i`. The 12-dword per-slot record is `creator(2) · entry ·
+    /// enchant[7] · PROPERTIES · PAD`, and PROPERTIES is a `TWO_SHORT` whose **low half** is the
+    /// `ItemRandomProperties` id — the reference reads it with a `movzx WORD` (`0x53339f`, the
+    /// inspect leg's `+0x424` source; wow-re `tooltip-content-law.md` §E7).
+    ///
+    /// This is the only roll feed a client has for anybody else's gear, and its one consumer is
+    /// the NAME: vmangos fills only the PERM/TEMP enchant slots, so an inspected item's suffix
+    /// *lines* stay empty on both sides of the wire — the same thing the reference shows.
+    pub fn player_visible_item_properties(&self, i: u8) -> u32 {
+        (i < 19)
+            .then(|| self.get_u32(FIELD_PLAYER_VISIBLE_ITEM_1_CREATOR + 10 + 12 * u16::from(i)))
+            .flatten()
+            .unwrap_or(0)
+            & 0xffff
     }
     /// `PLAYER_FIELD_INV_SLOT_HEAD + 2i` — our equipment (0–18) and equipped-bag (19–22) guids.
     pub fn player_inv_slot(&self, i: u8) -> Option<u64> {
@@ -560,9 +589,147 @@ impl ObjectFields {
     /// `PLAYER_FIELD_BYTES_OFFSET_HIGHEST_HONOR_RANK`, written by `HonorMgr`): what the client's
     /// item-usable gate compares an item's `RequiredHonorRank` against (`0x5ea930` reads the
     /// values byte at `+0x102b`). `None` before the field streams; rank 0 = never ranked.
+    ///
+    /// **Not [`Self::player_pvp_rank`]** — that is the *current* rank, a different byte of a
+    /// different (and PUBLIC) field, and the two diverge the moment a rank is lost: vmangos only
+    /// ever raises this one (`HonorMgr.cpp:894-895`, `SetHighestRank` iff the new visual rank is
+    /// strictly greater), so a demoted player keeps their old title here while the current rank
+    /// falls. The Honor pane shows the current rank; an item requirement reads this one.
     pub fn player_honor_rank(&self) -> Option<u8> {
         self.get_u32(FIELD_PLAYER_FIELD_BYTES)
             .map(|b| ((b >> 24) & 0xff) as u8)
+    }
+    /// `PLAYER_BYTES_3` byte 3 — the player's **current** honor rank (vmangos
+    /// `PLAYER_BYTES_3_OFFSET_HONOR_RANK`, written by `HonorMgr::Update`, `HonorMgr.cpp:900`).
+    /// The *internal* rank — `HonorRankInfo::rank`, whose own comment reads "internal range
+    /// [0..18]": 0 = unranked, 1..4 the negative ranks (Pariah…Dishonored), 5 up the positive ones
+    /// (Scout/Private…). It indexes the `PVP_RANK_<rank>_<team>` GlobalStrings directly; the
+    /// number the UI *draws* is the **visual** rank (`rank > 4 ? rank - 4 : -rank`,
+    /// `HonorMgr.cpp:991`), which is a derivation, not a field — do it at the display edge, not
+    /// here, and only once.
+    ///
+    /// **This field is PUBLIC** (vmangos `UpdateFields_1_12_1.h:125`), the only honor value that
+    /// is: it streams for *every visible player*, not just for us. That is what makes a foreign
+    /// unit's rank answerable at all — the reference inspect pane's `UnitPVPRank("target")` reads
+    /// this byte off the target's own descriptor, with no packet involved. Everything else on the
+    /// Honor tab is PRIVATE and has to be requested
+    /// ([`crate::messages::read_inspect_honor_stats`]).
+    ///
+    /// Contrast [`Self::player_honor_rank`], the *highest lifetime* rank in a PRIVATE field's
+    /// byte 3; [`Self::player_drunk_byte`] reads byte 1 of this same dword. `None` before the
+    /// field streams.
+    pub fn player_pvp_rank(&self) -> Option<u8> {
+        self.get_u32(FIELD_PLAYER_BYTES_3)
+            .map(|b| ((b >> 24) & 0xff) as u8)
+    }
+    /// `PLAYER_BYTES_3` **byte 2** — the **city-protector title**
+    /// (`PLAYER_BYTES_3_OFFSET_CITY_PROTECTOR_TITLE`, vmangos `Player.h:354`, whose own comment
+    /// says the value is a **race id**). PUBLIC, like [`Self::player_pvp_rank`] beside it in the
+    /// same dword.
+    ///
+    /// Its one consumer is `UnitPVPName`, which appends `"\n"` plus the `PVP_MEDAL<n>`
+    /// GlobalString when the byte is non-zero (wow-re `system/ui/scratch/honor-panel-law.md`,
+    /// `0x609370` leg C) — the "Protector of Stormwind" line under a city defender's name.
+    ///
+    /// **vmangos never writes it**, so it is 0 for every character on this server and the medal
+    /// line never renders. Decoded anyway: the field is real, the binding that reads it is real,
+    /// and a decoder that answered `None` here would make a live divergence look like an unbuilt
+    /// feature the day a server does write it. `None` before the field streams.
+    pub fn player_pvp_medal(&self) -> Option<u8> {
+        self.get_u32(FIELD_PLAYER_BYTES_3)
+            .map(|b| ((b >> 16) & 0xff) as u8)
+    }
+    /// `PLAYER_FIELD_SESSION_KILLS` — **today's** `(honorable, dishonorable)` kills, low half then
+    /// high half. The one honor kill counter vmangos genuinely writes as two shorts
+    /// (`HonorMgr.cpp:913-914`, `SetUInt16Value(…, 0, todayHK)` / `(…, 1, todayDK)`), so both
+    /// halves are live here. PRIVATE — self only; `None` before the field streams.
+    ///
+    /// Despite the name the server recomputes it from *today's* honor-CP rows, not from
+    /// session start (`HonorMgr::Update`'s `itr.date == today` arm) — the reference's
+    /// `GetPVPSessionStats()` pair.
+    pub fn player_session_kills(&self) -> Option<(u16, u16)> {
+        self.get_u16_pair(FIELD_PLAYER_FIELD_SESSION_KILLS)
+    }
+    /// `PLAYER_FIELD_YESTERDAY_KILLS` — `(honorable, dishonorable)` kills for yesterday.
+    ///
+    /// **The dishonorable half is always `0` from this server, and that is not a decode bug.**
+    /// The descriptor type really is TWO_SHORT and the real client really does read halves, but
+    /// vmangos writes the field as a whole dword (`HonorMgr.cpp:917`,
+    /// `SetUInt32Value(PLAYER_FIELD_YESTERDAY_KILLS, yesterdayKills)`) — so the high half never
+    /// receives the DK count. We decode the wire faithfully rather than collapsing the field to a
+    /// `u32`: the shape belongs to the descriptor, and a different server (or a fixed vmangos)
+    /// would fill it. Same for [`Self::player_last_week_kills`] and
+    /// [`Self::player_this_week_kills`]. PRIVATE — self only; `None` before the field streams.
+    pub fn player_yesterday_kills(&self) -> Option<(u16, u16)> {
+        self.get_u16_pair(FIELD_PLAYER_FIELD_YESTERDAY_KILLS)
+    }
+    /// `PLAYER_FIELD_LAST_WEEK_KILLS` — `(honorable, dishonorable)` kills for last week. The
+    /// high half is always `0` from vmangos (`HonorMgr.cpp:929` writes the whole dword); see
+    /// [`Self::player_yesterday_kills`]. PRIVATE — self only.
+    pub fn player_last_week_kills(&self) -> Option<(u16, u16)> {
+        self.get_u16_pair(FIELD_PLAYER_FIELD_LAST_WEEK_KILLS)
+    }
+    /// `PLAYER_FIELD_THIS_WEEK_KILLS` — `(honorable, dishonorable)` kills for the current week.
+    /// The high half is always `0` from vmangos (`HonorMgr.cpp:924` writes the whole dword); see
+    /// [`Self::player_yesterday_kills`]. PRIVATE — self only.
+    pub fn player_this_week_kills(&self) -> Option<(u16, u16)> {
+        self.get_u16_pair(FIELD_PLAYER_FIELD_THIS_WEEK_KILLS)
+    }
+    /// `PLAYER_FIELD_THIS_WEEK_CONTRIBUTION` — honor points earned this week (vmangos's
+    /// "contribution": the summed CP of the week's honor rows, floored at 0 —
+    /// `HonorMgr.cpp:925`). PRIVATE — self only; `None` before the field streams.
+    pub fn player_this_week_contribution(&self) -> Option<u32> {
+        self.get_u32(FIELD_PLAYER_FIELD_THIS_WEEK_CONTRIBUTION)
+    }
+    /// `PLAYER_FIELD_YESTERDAY_CONTRIBUTION` — honor points earned yesterday
+    /// (`HonorMgr.cpp:918`). PRIVATE — self only.
+    pub fn player_yesterday_contribution(&self) -> Option<u32> {
+        self.get_u32(FIELD_PLAYER_FIELD_YESTERDAY_CONTRIBUTION)
+    }
+    /// `PLAYER_FIELD_LAST_WEEK_CONTRIBUTION` — honor points earned last week
+    /// (`HonorMgr.cpp:930`). This is the figure the weekly rank calculation actually consumed.
+    /// PRIVATE — self only.
+    pub fn player_last_week_contribution(&self) -> Option<u32> {
+        self.get_u32(FIELD_PLAYER_FIELD_LAST_WEEK_CONTRIBUTION)
+    }
+    /// `PLAYER_FIELD_LAST_WEEK_RANK` — last week's **standing**, i.e. our numeric position on the
+    /// server-wide honor ladder for that week (vmangos `m_standing`, `HonorMgr.cpp:931`), NOT an
+    /// honor rank. `0` means "unranked that week". PRIVATE — self only.
+    pub fn player_last_week_rank(&self) -> Option<u32> {
+        self.get_u32(FIELD_PLAYER_FIELD_LAST_WEEK_RANK)
+    }
+    /// `PLAYER_FIELD_LIFETIME_HONORBALE_KILLS` (vmangos's spelling) — the lifetime honorable-kill
+    /// total (`HonorMgr.cpp:934`). PRIVATE — self only; `None` before the field streams.
+    pub fn player_lifetime_honorable_kills(&self) -> Option<u32> {
+        self.get_u32(FIELD_PLAYER_FIELD_LIFETIME_HONORABLE_KILLS)
+    }
+    /// `PLAYER_FIELD_LIFETIME_DISHONORBALE_KILLS` (vmangos's spelling) — the lifetime
+    /// dishonorable-kill total (`HonorMgr.cpp:935`). PRIVATE — self only.
+    pub fn player_lifetime_dishonorable_kills(&self) -> Option<u32> {
+        self.get_u32(FIELD_PLAYER_FIELD_LIFETIME_DISHONORABLE_KILLS)
+    }
+    /// `PLAYER_FIELD_BYTES2` byte 0 — the **honor rank progress bar**
+    /// (`PLAYER_FIELD_BYTES_2_OFFSET_HONOR_RANK_BAR`, vmangos `HonorMgr.cpp:905-909`):
+    ///
+    /// ```text
+    /// honorBar = uint32(|rankPoints|);
+    /// honorBar = uint8(((honorBar - rank.minRP) / (rank.maxRP - rank.minRP))
+    ///                  * (rank.positive ? 255 : -255));
+    /// ```
+    ///
+    /// so the byte is **how far through the CURRENT rank we are, scaled 0..255** — not an absolute
+    /// honor total, and it resets each time the rank changes (`minRP`/`maxRP` are that rank's own
+    /// bounds, `HonorMgr::CalculateRankInfo`). A *negative* rank multiplies by `-255`, and the
+    /// C++ cast of a negative float to `uint8` wraps rather than clamping, so the byte a demoted
+    /// player carries is the wrapped product. We carry the byte the wire sent; interpreting the
+    /// negative-rank case is the display edge's problem, not the decoder's.
+    ///
+    /// The field only exists from client 1.6.1 on (vmangos guards the write with
+    /// `SUPPORTED_CLIENT_BUILD >= CLIENT_BUILD_1_6_1`), which is live for build 5875. PRIVATE —
+    /// self only; `None` before the field streams.
+    pub fn player_honor_rank_bar(&self) -> Option<u8> {
+        self.get_u32(FIELD_PLAYER_FIELD_BYTES2)
+            .map(|b| (b & 0xff) as u8)
     }
     /// `UNIT_FIELD_BYTES_0` byte 0 — the unit's race. `None` when the field wasn't sent.
     pub fn unit_race(&self) -> Option<u8> {

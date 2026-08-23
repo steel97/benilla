@@ -254,6 +254,11 @@ pub const SMSG_LEVELUP_INFO: u16 = 0x01D4; // 468
 /// A newly explored area — area id + the XP it granted (0 at max level). Body
 /// in [`super::progression::read_exploration_xp`] — decision 0828.
 pub const SMSG_EXPLORATION_EXPERIENCE: u16 = 0x01F8; // 504 (VERIFIED vmangos `Opcodes_1_12_1.h:505`)
+/// The honor payout (VERIFIED vmangos `Opcodes_1_12_1.h`: 652) — the XP-gain line's PvP twin, and
+/// the only attributed notice of an honor award: the descriptor's contribution fields move too,
+/// but they are running totals. Sent for **dishonorable** kills as well, carrying negative honor.
+/// Body in [`super::pvp::read_pvp_credit`] ([`super::PvpCredit`]) — decision 1512.
+pub const SMSG_PVP_CREDIT: u16 = 0x028C; // 652
 
 // The combat-log wire (VERIFIED vmangos `Opcodes_1_12_1.h`: 464/587/590/591/592) — decision 0137
 // phase 2's floating-combat-text data feed. Bodies in [`super::spells`].
@@ -471,6 +476,16 @@ pub const CMSG_CANCEL_CHANNELLING: u16 = 0x013B; // 315
 /// streamed PUBLIC `PLAYER_VISIBLE_ITEM_*` fields without waiting on it, and no FrameXML handler
 /// registers an inspect event. Decision 0631.
 pub const CMSG_INSPECT: u16 = 0x0114; // 276
+/// 726 (VERIFIED vmangos `Opcodes_1_12_1.h`) — the inspect window's **Honor tab**, and an `MSG_`:
+/// the one opcode number carries both directions. Our request is a raw 8-byte guid
+/// ([`super::inspect_honor_stats`]); the server's reply, on the same number, is the 50-byte
+/// [`super::InspectHonorStats`] body. Nothing needs to disambiguate the two shapes — direction
+/// does: [`super::parse_server`] only ever sees inbound bodies, so a 0x2D6 there is always the
+/// reply, and our outbound body never passes through it.
+///
+/// Same three silent refusals as [`CMSG_INSPECT`] (`MiscHandler.cpp:962-972`), but *unlike* it
+/// this handler does not set our selection. Decision 1512.
+pub const MSG_INSPECT_HONOR_STATS: u16 = 0x02D6; // 726
 pub const CMSG_SET_SELECTION: u16 = 0x013D; // 317
 pub const CMSG_ATTACKSWING: u16 = 0x0141; // 321
 pub const CMSG_ATTACKSTOP: u16 = 0x0142; // 322
@@ -614,8 +629,15 @@ pub const SMSG_GOSSIP_MESSAGE: u16 = 0x017D; // 381
 pub const SMSG_GOSSIP_COMPLETE: u16 = 0x017E; // 382
 pub const CMSG_NPC_TEXT_QUERY: u16 = 0x017F; // 383
 pub const SMSG_NPC_TEXT_UPDATE: u16 = 0x0180; // 384
-                                              // The questgiver panel set — "accept/turn-in a quest at an NPC" (VERIFIED vmangos
-                                              // `Opcodes_1_12_1.h`: 386-402). Bodies + SMSG layouts in [`super::quest`] (decision 0088).
+
+// The guard's directions marker. Volunteered by a gossip option carrying an `action_poi_id`
+// (vmangos `Player::OnGossipSelect` → `PlayerMenu::SendPointOfInterest`, `GossipDef.cpp:253`), so
+// it answers no request of ours — a gossip-family SMSG with no CMSG beside it, which is why it
+// sits out at 548 instead of inside the 379-384 block. Body in [`super::gossip`].
+pub const SMSG_GOSSIP_POI: u16 = 0x0224; // 548
+
+// The questgiver panel set — "accept/turn-in a quest at an NPC" (VERIFIED vmangos
+// `Opcodes_1_12_1.h`: 386-402). Bodies + SMSG layouts in [`super::quest`] (decision 0088).
 pub const CMSG_QUESTGIVER_STATUS_QUERY: u16 = 0x0182; // 386
 pub const SMSG_QUESTGIVER_STATUS: u16 = 0x0183; // 387
 pub const CMSG_QUESTGIVER_HELLO: u16 = 0x0184; // 388
@@ -966,6 +988,43 @@ pub const MSG_QUERY_NEXT_MAIL_TIME: u16 = 0x0284; // 644
 /// One `u32` (always 0) — sent when a mail *arrives* (instant for text-only, on the delivery
 /// timer's expiry otherwise).
 pub const SMSG_RECEIVED_MAIL: u16 = 0x0285; // 645
+
+// The auction house arc (decision 1511 P0; VERIFIED vmangos `Opcodes_1_12_1.h`: 597-607, 612-613,
+// 653 — every value re-read against that table). Bodies in [`super::auction`]. Two family facts
+// belong here: **there is no `*_LIST_PENDING_SALES` on 5875** — the symbol exists in no vmangos
+// opcode table at all, so the pending-sales pane is a later client's and has no wire to build —
+// and every CMSG below carries the auctioneer guid at its head because the server re-validates
+// the 5 yd interact distance on each one independently; the hello is not a session token.
+/// Same opcode both directions (597): our request is one auctioneer guid; the reply echoes it and
+/// adds `u32 houseId` (`AuctionHouse.dbc`, rows 1..7, which carries the deposit/cut rates). It is
+/// the **reply** that opens the window, not our send.
+pub const MSG_AUCTION_HELLO: u16 = 0x0255; // 597
+pub const CMSG_AUCTION_SELL_ITEM: u16 = 0x0256; // 598
+pub const CMSG_AUCTION_REMOVE_ITEM: u16 = 0x0257; // 599
+/// The Browse search — ten fields and **no sort bytes** on 5875: filtering is server-side,
+/// sorting entirely client-side ([`super::auction::auction_list_items`]).
+pub const CMSG_AUCTION_LIST_ITEMS: u16 = 0x0258; // 600
+pub const CMSG_AUCTION_LIST_OWNER_ITEMS: u16 = 0x0259; // 601
+/// Bid *and* buy out: buyout is inferred from the price (`price >= buyout && buyout != 0`), never
+/// flagged, and there is no separate opcode for it.
+pub const CMSG_AUCTION_PLACE_BID: u16 = 0x025A; // 602
+/// The one verdict opcode for sell/cancel/bid, with a conditional tail keyed on its error
+/// ([`super::auction::AuctionCommandTail`]). Several refusals send **nothing at all** instead.
+pub const SMSG_AUCTION_COMMAND_RESULT: u16 = 0x025B; // 603
+/// This and the two list results below share ONE frame and ONE 64-byte record layout
+/// ([`super::auction::read_auction_list_result`]): `u32 count`, the records, then `u32 totalCount`
+/// at the very end — the match count *before* the 50-row page cap.
+pub const SMSG_AUCTION_LIST_RESULT: u16 = 0x025C; // 604
+pub const SMSG_AUCTION_OWNER_LIST_RESULT: u16 = 0x025D; // 605
+/// Pushed to the bidder: won, or outbid — `bidOrZero == 0` means **won**, not "no bid".
+pub const SMSG_AUCTION_BIDDER_NOTIFICATION: u16 = 0x025E; // 606
+/// Pushed to the seller. A **different field order** from the bidder notification, and no
+/// `houseId`; the two never share a struct or a reader.
+pub const SMSG_AUCTION_OWNER_NOTIFICATION: u16 = 0x025F; // 607
+pub const CMSG_AUCTION_LIST_BIDDER_ITEMS: u16 = 0x0264; // 612
+pub const SMSG_AUCTION_BIDDER_LIST_RESULT: u16 = 0x0265; // 613
+/// Pushed to a bidder whose auction the seller cancelled.
+pub const SMSG_AUCTION_REMOVED_NOTIFICATION: u16 = 0x028D; // 653
 
 // The world-state table (VERIFIED both ways: vmangos `Opcodes_1_12_1.h` 706-707, and wow-re's read
 // of the reference's own handler `0x48f690`, whose registration at `0x48f515-0x48f52f` selects these

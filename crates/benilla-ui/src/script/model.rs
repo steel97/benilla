@@ -4,11 +4,11 @@ use crate::layout::{LayoutInput, LayoutSolver, Rect};
 use crate::widget::{FrameHandle, RegionHandle, WidgetArena};
 
 use super::{
-    backdrop, bank, char_stats, container, craft, cursor, death, duel, follow, gossip, guild,
-    inspect, item_text, loot, loot_roll, macros, mail, merchant, party, quest, quest_log,
-    reputation, session, simplehtml, skills, slider, social, spellbook, taxi, trade, tradeskill,
-    trainer, weapon_enchant, ActionSlot, AuraState, FontObject, ItemTemplateView, PlayerReqState,
-    RegionData, ScriptValue, SoundRequest, UnitState,
+    auction, backdrop, bank, char_stats, container, craft, cursor, death, duel, follow, gossip,
+    guild, inspect, item_text, loot, loot_roll, macros, mail, merchant, party, pvp, quest,
+    quest_log, reputation, session, simplehtml, skills, slider, social, spellbook, taxi, trade,
+    tradeskill, trainer, weapon_enchant, ActionSlot, AuraState, FontObject, ItemTemplateView,
+    PlayerReqState, RegionData, ScriptValue, SoundRequest, UnitState,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -453,6 +453,27 @@ pub(crate) struct Model {
     /// [`super::UiScript::take_pvp_toggles`] drain — the outbound seam ([`pvp`]). A count, not a
     /// payload: `CMSG_TOGGLE_PVP` carries no body.
     pub(crate) pvp_toggles: u32,
+    /// The local player's honor snapshot ([`pvp::HonorState`], decision 1512) — the PRIVATE honor
+    /// descriptor fields the app decodes and pushes ([`super::UiScript::set_honor`]). `None`
+    /// before the first push, which the six self getters read as a zeroed snapshot (see
+    /// [`pvp`]'s module doc for why they never return short).
+    pub(crate) honor: Option<pvp::HonorState>,
+    /// The last `MSG_INSPECT_HONOR_STATS` reply the app pushed ([`pvp::InspectHonorData`]). Its
+    /// PRESENCE is `HasInspectHonorData`'s answer — the latch the reference's inspect pane gates
+    /// its request on — so `None` is a state, not a gap.
+    pub(crate) inspect_honor: Option<pvp::InspectHonorData>,
+    /// `RequestInspectHonorData` calls since the app's last
+    /// [`super::UiScript::take_inspect_honor_requests`] drain. A count for [`Self::pvp_toggles`]'s
+    /// reason: the binding takes no argument, and the guid the send needs is the app's own inspect
+    /// target. With [`Self::inspect_honor_pending`] gating the binding it can only ever drain `0`
+    /// or `1` — the engine has at most one query outstanding.
+    pub(crate) inspect_honor_requests: u32,
+    /// The engine's `pending` flag (`0xb71fcc`): a `MSG_INSPECT_HONOR_STATS` query is queued and
+    /// no reply has landed. `RequestInspectHonorData` (`0x4c80a0`) refuses while it is set, which
+    /// is what stops a pane shown/hidden/shown in quick succession sending duplicate queries.
+    /// Cleared by **either** arm of [`super::UiScript::set_inspect_honor`] — a reply landed
+    /// (`0x4c6f4c`), or the app invalidated the slot (`0x4c6f9d`).
+    pub(crate) inspect_honor_pending: bool,
     /// The two **equipment-display** preferences as the VM currently believes them —
     /// `ShowingHelm()` / `ShowingCloak()` ([`worn_display`], decision 1472). Not a setting: the
     /// truth is `PLAYER_FLAGS`' `HIDE_HELM`/`HIDE_CLOAK` bits, pushed here on the descriptor edge
@@ -910,6 +931,30 @@ pub(crate) struct Model {
     /// (`MiniMapMailFrame`) reads this on `UPDATE_PENDING_MAIL`.
     pub(crate) has_new_mail: bool,
 
+    /// The open auction house's snapshot the app pushes (`None` = no auctioneer session) and the
+    /// intents the app drains — the auction seam ([`auction`], decision 1511). `auction_selected`
+    /// is engine-local per list ([`auction::LIST`]/`BIDDER`/`OWNER`) and holds the selected
+    /// **auction id**, not a row position (wow-re §5 TU-5): an id follows its row through a
+    /// re-sort, where an index would quietly come to mean the auction that took its place. `0` =
+    /// nothing selected. It is engine-local because the reference reads the selection back
+    /// synchronously inside the same handler that sets it, so it cannot be a round trip. `auction_can_query` is the app's 5 s browse
+    /// throttle, pushed separately from the snapshot because the Search button polls it every
+    /// frame and it would otherwise churn the snapshot's diff.
+    pub(crate) auction: Option<auction::AuctionState>,
+    pub(crate) auction_selected: [u32; 3],
+    pub(crate) auction_can_query: bool,
+    pub(crate) auction_query: Option<auction::AuctionQuery>,
+    pub(crate) auction_owner_query: Option<u32>,
+    pub(crate) auction_bidder_query: Option<u32>,
+    pub(crate) auction_bids: Vec<auction::AuctionBid>,
+    pub(crate) auction_cancels: Vec<u32>,
+    pub(crate) auction_start: Option<auction::AuctionStartRequest>,
+    pub(crate) auction_sorts: Vec<(usize, String)>,
+    pub(crate) auction_close: bool,
+    /// The sell slot's staged item (a cursor drop, decision 0216) — carried until `StartAuction`
+    /// fires, when the app resolves its `(bag, slot)` to the wire item guid.
+    pub(crate) auction_sell_item: Option<cursor::CursorItem>,
+
     /// The open trade window's snapshot the app pushes (`None` = no trade open) and the intents the
     /// app drains — the trade seam ([`trade`], decision 0592 P1). `trade_initiates` are the unit
     /// tokens `InitiateTrade` queued (the app resolves each → guid → `CMSG_INITIATE_TRADE`); the
@@ -956,6 +1001,14 @@ pub(crate) struct Model {
     /// push/ask flow as the templates ([`item_stats`] module doc).
     pub(crate) item_sets: HashMap<u32, super::ItemSetView>,
     pub(crate) item_set_asks: HashSet<u32>,
+    /// The **random-suffix roll** store (`ItemRandomProperties` id → its resolved view) — pushed
+    /// WHOLE at startup, not asked for (decision 1547). It is a static DBC the app has in memory
+    /// from load, and its consumers are click-driven (a chat-link tooltip has no hover re-enter
+    /// loop to repaint on a late answer), so the ask-once shape the template store uses would
+    /// leave a first click showing an item with no lines. This mirrors the reference exactly: the
+    /// builder resolves its `+0x424` against the loaded DBC store `0xc0dbd4` at draw time, and
+    /// every source supplies only the id (wow-re `tooltip-content-law.md` §1-ENCHANT §E5).
+    pub(crate) random_properties: HashMap<u32, super::RandomPropertyView>,
     /// The red-line law's player state (level/class/race/skills — [`item_stats`] module doc).
     pub(crate) player_req: PlayerReqState,
     /// The spell-tooltip store: `spell id → resolved view` ([`tooltip_spell`] module doc,
@@ -1311,6 +1364,10 @@ impl Model {
             follow_requests: Vec::new(),
             session_requests: Vec::new(),
             pvp_toggles: 0,
+            honor: None,
+            inspect_honor: None,
+            inspect_honor_requests: 0,
+            inspect_honor_pending: false,
             helm_shown: true,
             cloak_shown: true,
             worn_display_toggles: Vec::new(),
@@ -1437,6 +1494,18 @@ impl Model {
             mail_send_cod: 0,
             mail_send_item: None,
             has_new_mail: false,
+            auction: None,
+            auction_selected: [0; 3],
+            auction_can_query: true,
+            auction_query: None,
+            auction_owner_query: None,
+            auction_bidder_query: None,
+            auction_bids: Vec::new(),
+            auction_cancels: Vec::new(),
+            auction_start: None,
+            auction_sorts: Vec::new(),
+            auction_close: false,
+            auction_sell_item: None,
             trade: None,
             trade_initiates: Vec::new(),
             trade_accept: false,
@@ -1457,6 +1526,7 @@ impl Model {
             item_templates: HashMap::new(),
             item_sets: HashMap::new(),
             item_set_asks: HashSet::new(),
+            random_properties: HashMap::new(),
             item_stat_asks: HashSet::new(),
             player_req: PlayerReqState::default(),
             spell_tooltips: HashMap::new(),

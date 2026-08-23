@@ -303,6 +303,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             vec![SessionEvent::QuestGiverFailed { quest_id, reason }]
         }
         ServerPacket::GossipComplete => vec![SessionEvent::GossipComplete],
+        ServerPacket::GossipPoi(poi) => vec![SessionEvent::GossipPoi(poi)],
         ServerPacket::NpcText { text_id, blocks } => {
             vec![SessionEvent::NpcGreeting { text_id, blocks }]
         }
@@ -485,6 +486,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             loser,
         }],
         ServerPacket::DuelCountdown { seconds } => vec![SessionEvent::DuelCountdown { seconds }],
+        ServerPacket::InspectHonorStats(stats) => vec![SessionEvent::InspectHonorStats(stats)],
+        ServerPacket::PvpCredit(credit) => vec![SessionEvent::PvpCredit(credit)],
         ServerPacket::MirrorTimerStart(start) => vec![SessionEvent::MirrorTimerStart(start)],
         ServerPacket::MirrorTimerPause { kind, paused } => {
             vec![SessionEvent::MirrorTimerPause { kind, paused }]
@@ -821,6 +824,60 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::NextMailTime { seconds } => {
             vec![SessionEvent::NextMailTime { seconds }]
         }
+        ServerPacket::AuctionHello {
+            auctioneer,
+            house_id,
+        } => vec![SessionEvent::AuctionHello {
+            auctioneer,
+            house_id,
+        }],
+        ServerPacket::AuctionCommandResult {
+            auction_id,
+            action,
+            error,
+            tail,
+        } => vec![SessionEvent::AuctionCommandResult {
+            auction_id,
+            action,
+            error,
+            tail,
+        }],
+        ServerPacket::AuctionListResult {
+            auctions,
+            total_count,
+        } => vec![SessionEvent::AuctionListResult {
+            auctions,
+            total_count,
+        }],
+        ServerPacket::AuctionOwnerListResult {
+            auctions,
+            total_count,
+        } => vec![SessionEvent::AuctionOwnerListResult {
+            auctions,
+            total_count,
+        }],
+        ServerPacket::AuctionBidderListResult {
+            auctions,
+            total_count,
+        } => vec![SessionEvent::AuctionBidderListResult {
+            auctions,
+            total_count,
+        }],
+        ServerPacket::AuctionBidderNotification(n) => {
+            vec![SessionEvent::AuctionBidderNotification(n)]
+        }
+        ServerPacket::AuctionOwnerNotification(n) => {
+            vec![SessionEvent::AuctionOwnerNotification(n)]
+        }
+        ServerPacket::AuctionRemovedNotification {
+            auction_id,
+            item_entry,
+            random_property_id,
+        } => vec![SessionEvent::AuctionRemovedNotification {
+            auction_id,
+            item_entry,
+            random_property_id,
+        }],
         ServerPacket::TradeStatus { status } => vec![SessionEvent::TradeStatus { status }],
         ServerPacket::TradeStatusExtended { state } => {
             vec![SessionEvent::TradeStatusExtended { state }]

@@ -31,10 +31,8 @@ use benilla_assets::coords::wow_to_bevy;
 
 use crate::boot;
 use crate::build_id::BuildId;
-use crate::lighting::fog_range;
 use crate::terrain_stream::SPAWN_XY;
 use crate::thread_qos;
-use benilla_assets::RenderConfig;
 
 /// Where the viewer opens, in WoW world coords. Northshire, Elwynn — the same anchor the client
 /// boots on ([`crate::terrain_stream::SPAWN_XY`]), so the two binaries stream the same tiles and a difference
@@ -131,7 +129,13 @@ pub fn run(build: BuildId) -> AppExit {
         ..default()
     }))
     .add_plugins(thread_qos::ThreadQosPlugin)
-    .add_plugins(crate::bgwin::BgWinPlugin);
+    .add_plugins(crate::bgwin::BgWinPlugin)
+    // The third launch-time platform correction, and the client's own (decision 1528): macOS's
+    // `Cmd+Q` is wired to `terminate:`, which leaves the event loop without ever running another
+    // frame. Here that costs the check its verdict — `report_check` turns the `AppExit` into the
+    // process exit code, and there is no `AppExit` — so the viewer wants it for the same reason
+    // the client does, one layer of consequence down.
+    .add_plugins(crate::mac_quit::MacQuitPlugin);
 
     // **The cut line**, and the whole of it: everything `benilla-world` will own, in one name
     // (decision 1164, `crate::world_plugins`). This binary and the client add the identical group,
@@ -312,11 +316,9 @@ struct ViewCam {
     speed: f32,
 }
 
-fn spawn_view_camera(mut commands: Commands, config: Option<Res<RenderConfig>>) {
+fn spawn_view_camera(mut commands: Commands) {
     let start = wow_to_bevy([VIEW_START.0, VIEW_START.1, 100.0]);
-    let far = config
-        .map(|c| (fog_range(c.tile_radius).1 + 800.0).max(3000.0))
-        .unwrap_or(3000.0);
+    let far = crate::view::CAM_FAR;
     commands.spawn((
         Camera3d::default(),
         crate::view::WorldCamera,

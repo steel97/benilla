@@ -264,6 +264,12 @@ pub(crate) struct UiScriptPlugin;
 
 impl Plugin for UiScriptPlugin {
     fn build(&self, app: &mut App) {
+        // **The quit root of the shutdown tail, on the exit edge** (decision 1528). It was
+        // `.add_systems(Update, shutdown_on_exit)` below, which cannot see the `AppExit` a player
+        // produces — the close button's is written in `PostUpdate` — so quitting from in-world
+        // wrote no saved variables, no per-addon files and no `AddOns.txt` at all. `Last` is after
+        // every announcement; [`crate::shutdown`] is where that argument lives.
+        crate::shutdown::on_app_exit(app, shutdown_on_exit.into_configs());
         app.insert_resource(UiScaleCvar(default_ui_scale()))
             // The UI pass publishes its per-frame phase split here every frame the cost meter or
             // the hover recorder is armed; the producer owns the resource so any minimal app that
@@ -295,12 +301,12 @@ impl Plugin for UiScriptPlugin {
             )
             // The whole shutdown tail — events then writes, in the reference's order. See
             // [`shutdown_ui_state`]; the two edges here are its five roots as far as our session
-            // has them.
+            // has them. (The quit root is registered at the top of this function, through
+            // [`crate::shutdown::on_app_exit`] — it is a `Last` system, not an `Update` one.)
             .add_systems(
                 OnExit(crate::char_select::ClientState::InWorld),
                 end_ui_session,
             )
-            .add_systems(Update, shutdown_on_exit)
             // A queued `ReloadUI()` runs in `PreUpdate` — one whole frame after the drain that
             // queued it (the reference's own deferral, `0x495590`), and BEFORE every `Update`
             // system, so no per-VM seed or feed can run against the dying VM in the reload frame
@@ -699,6 +705,9 @@ mod perf_bar_tests;
 mod panel_tests;
 
 #[cfg(test)]
+mod fade_tests;
+
+#[cfg(test)]
 mod merchant_tests;
 
 #[cfg(test)]
@@ -832,6 +841,9 @@ mod skills_frame_tests;
 mod reputation_frame_tests;
 
 #[cfg(test)]
+mod honor_frame_tests;
+
+#[cfg(test)]
 mod pet_paperdoll_tests;
 
 #[cfg(test)]
@@ -876,6 +888,10 @@ mod quiver_tests;
 /// the next login (decision 1290).
 #[cfg(test)]
 mod world_entry_tests;
+
+/// The world map's POI pool — the guard's directions marker today, the AreaPOI landmarks later.
+#[cfg(test)]
+mod world_map_tests;
 
 #[cfg(test)]
 mod seam_scale_tests {

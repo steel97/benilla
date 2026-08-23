@@ -17,6 +17,7 @@ use super::{
 use benilla_world::weather::WeatherMessage;
 
 mod anim;
+mod auction;
 mod chat;
 mod combat;
 mod combat_log;
@@ -207,6 +208,18 @@ pub(super) fn apply_net_updates(
                 // parks the innkeeper's guid here and `crate::ui_binder` turns it into the
                 // CONFIRM_BINDER dialog, whose Accept is the only thing that binds anything.
                 ResMut<crate::ui_binder::BinderState>,
+                // The guard's directions marker (`SMSG_GOSSIP_POI`) and the map id it has to be
+                // stamped with — the wire carries no map field, so "where you were standing when
+                // the guard told you" is the client's to remember (`crate::poi_marker`).
+                ResMut<crate::poi_marker::PoiMarker>,
+                Option<Res<benilla_world::world_map::CurrentMap>>,
+                // The inspect-honor reply (decision 1512) — `MSG_INSPECT_HONOR_STATS` is the only
+                // source of another player's honor numbers, so the reply parks here and
+                // `crate::ui_honor` pushes it into the pane and fires `INSPECT_HONOR_UPDATE`.
+                ResMut<crate::ui_honor::InspectHonor>,
+                // The auctioneer session (decision 1511) — the hello reply opens it, the three
+                // list results fill it, and `crate::ui_auction` feeds it to the window.
+                ResMut<crate::ui_auction::AuctionOpen>,
             ),
         ),
     ),
@@ -356,7 +369,16 @@ pub(super) fn apply_net_updates(
             mut mirror_timers,
             mut pet_bar,
             mut ui_error_keys,
-            (mut page_texts, mut played_time_answer, mut guild, mut binder),
+            (
+                mut page_texts,
+                mut played_time_answer,
+                mut guild,
+                mut binder,
+                mut poi_marker,
+                current_map,
+                mut inspect_honor,
+                mut auction_open,
+            ),
         ),
     ) = caches;
     let (
@@ -446,6 +468,7 @@ pub(super) fn apply_net_updates(
                     &mut mail_open,
                     &mut mail_pending,
                     &mut trade_session,
+                    &mut auction_open,
                     &mut bank_open,
                     &mut duel,
                     &mut social,
@@ -634,6 +657,29 @@ pub(super) fn apply_net_updates(
                 session::reputation_visible(list_id, &mut reputations)
             }
             SessionEvent::BindPoint { area } => home_bind.0 = Some(area),
+            // The honor arc's two inbound messages (decision 1512).
+            //
+            // The inspect reply REPLACES whatever is held, including for a different player: the
+            // reference's latch is a single slot, and a pane still showing the last target's
+            // kills is the failure keeping the old one produces.
+            SessionEvent::InspectHonorStats(stats) => inspect_honor.0 = Some(stats),
+            // An honor award: the combat-log line (name-resolved, so it queues) and the floating
+            // number, which are two different surfaces of one packet and are both the reference's.
+            // A DISHONORABLE kill arrives here too, carrying NEGATIVE honor — the floating text
+            // takes it signed, because the shipped `COMBAT_TEXT_HONOR_GAINED` handler prefixes a
+            // "+" only when the number is positive and therefore already expects the other case.
+            SessionEvent::PvpCredit(credit) => {
+                chat_log.push_pvp_credit(
+                    credit.honor,
+                    credit.victim_guid,
+                    u8::try_from(credit.victim_rank).unwrap_or(0),
+                );
+                audio.15 .1.write(crate::ui_unit::CombatTextEvent {
+                    message_type: "HONOR_GAINED",
+                    data: Some(credit.honor.to_string()),
+                    extra: None,
+                });
+            }
             SessionEvent::BinderConfirm { binder: npc } => binder.ask(npc),
             SessionEvent::PlayerBound { binder: npc, area } => {
                 debug!("net: bound to area {area} by {npc:#x}");
@@ -1279,6 +1325,12 @@ pub(super) fn apply_net_updates(
                 npc::npc_greeting(text_id, blocks, &mut gossip, &index, &stores)
             }
             SessionEvent::GossipComplete => npc::gossip_complete(&mut gossip, &mut quest),
+            SessionEvent::GossipPoi(poi) => npc::gossip_poi(
+                &poi,
+                &mut poi_marker,
+                current_map.as_ref().map_or(0, |m| m.0),
+                aura.1.elapsed_secs_f64(),
+            ),
             // Questgiver panels (decision 0088): fill the `QuestGiver` the quest feed
             // (`crate::ui_quest`) reads. Each panel packet replaces the open view; the greeting/gossip
             // quest-row clicks and the panel buttons flow back out through the quest/gossip drains.
@@ -1439,6 +1491,41 @@ pub(super) fn apply_net_updates(
             }
             SessionEvent::NextMailTime { seconds } => {
                 mail::next_mail_time(seconds, &mut mail_pending)
+            }
+            // The auction house arc (decision 1511 P1): the hello reply OPENS the window — our
+            // send does not — and the three list results fill the three tabs.
+            SessionEvent::AuctionHello {
+                auctioneer,
+                house_id,
+            } => auction::auction_hello(auctioneer, house_id, &mut auction_open),
+            SessionEvent::AuctionCommandResult {
+                auction_id,
+                action,
+                error,
+                tail,
+            } => {
+                auction::auction_command_result(auction_id, action, error, &tail, &mut auction_open)
+            }
+            SessionEvent::AuctionListResult {
+                auctions,
+                total_count,
+            } => auction::auction_list_result(auctions, total_count, &mut auction_open),
+            SessionEvent::AuctionOwnerListResult {
+                auctions,
+                total_count,
+            } => auction::auction_owner_list_result(auctions, total_count, &mut auction_open),
+            SessionEvent::AuctionBidderListResult {
+                auctions,
+                total_count,
+            } => auction::auction_bidder_list_result(auctions, total_count, &mut auction_open),
+            SessionEvent::AuctionBidderNotification(n) => {
+                auction::auction_bidder_notification(&n, &mut auction_open)
+            }
+            SessionEvent::AuctionOwnerNotification(n) => {
+                auction::auction_owner_notification(&n, &mut auction_open)
+            }
+            SessionEvent::AuctionRemovedNotification { item_entry, .. } => {
+                auction::auction_removed_notification(item_entry, &mut auction_open)
             }
             // The player-trade arc (decision 0592 P1): the status packet drives the open/accept/close
             // state machine, the extended snapshot replaces one side's item/gold — both into the

@@ -15,6 +15,7 @@
 //! | [`self_movement`] | our own mover: the `MSG_MOVE_*` stream + every mover ack |
 //! | [`lifecycle`] | being logged in: ping, logout, the cinematic ack |
 //! | [`selection`] | the two sends that set our target: select, inspect |
+//! | [`pvp`] | the honor system's one ask: another player's honor stats |
 //! | [`names`] | the ask-once name lookups: player, creature, pet |
 //! | [`chat`] | the chat frame's wire: every `MESSAGECHAT` flavour + `/played`, `/random`, `/wave` |
 //! | [`channel`] | channel administration: join/leave/list/moderation |
@@ -40,6 +41,7 @@
 //! | [`trade`] | the player-trade dance |
 //! | [`duel`] | accept and cancel |
 //! | [`mail`] | the mailbox |
+//! | [`auction`] | the auction house: the hello, the three list pages, sell/bid/cancel |
 //! | [`player_flags`] | the empty-bodied `PLAYER_FLAGS` toggles: PvP, show-helm, show-cloak |
 //! | [`social`] | friends, ignores, and `/who` |
 //! | [`area_trigger`] | the one "I walked into trigger N" report |
@@ -54,6 +56,7 @@ use super::send_packet;
 mod action_bar;
 mod area_trigger;
 mod attack;
+mod auction;
 mod bank;
 mod binder;
 mod channel;
@@ -73,6 +76,7 @@ mod pet;
 mod player_flags;
 mod pose;
 mod progression;
+mod pvp;
 mod quest;
 mod reputation;
 mod selection;

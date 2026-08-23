@@ -145,10 +145,14 @@ fn minimap_day_tint(ambient: [f32; 3], diffuse: [f32; 3]) -> [f32; 3] {
 }
 
 /// A `.map()` adaptor over a `md5translate.trs` hit: stream the hashed tile off-thread (like a
-/// terrain tile) but decode it as a UI **sprite** (sRGB, clamp, mip 0). The `WorldArt` default
-/// (gamma-space `Rgba8Unorm`, repeat) would draw the tile ~2× too bright through the UI pass and
-/// bleed tile edges — the invariant `benilla-assets`' `minimap_tile_settings_reach_the_async_loader`
-/// guards. Shared by the terrain and interior tile paths.
+/// terrain tile) but as a **minimap tile** (`BlpVariant::MapTile`: gamma bytes with no sRGB decode
+/// — the reference sampler's `GL_SKIP_DECODE_EXT` — clamp, mip 0, LINEAR). Gamma bytes move the
+/// sRGB decode to AFTER the filter, so every consumer must say so or draw the tile ~2× too bright
+/// through the UI pass: the outdoor quads carry
+/// [`UiQuad::gamma_texel`](crate::ui_pass::UiQuad::gamma_texel), and the interior composite's
+/// alpha-test arm decodes explicitly for its un-encoded target. The invariant `benilla-assets`'
+/// `minimap_tile_settings_reach_the_async_loader` guards these settings reaching the async loader.
+/// Shared by the terrain and interior tile paths.
 fn load_tile(asset_server: &AssetServer) -> impl Fn(&str) -> Handle<Image> + '_ {
     move |hash: &str| {
         asset_server.load_with_settings(
@@ -239,10 +243,10 @@ struct MinimapAssets {
     /// The shared POI atlas (`Interface\Minimap\POIIcons`) — the corpse blip's skull cell
     /// (decision 0308 §5) and any later POI rides it.
     poi: Option<Handle<Image>>,
-    /// The landmark-arrow art — the flat `.blp` of the reference's `minimapArrowModel`
-    /// (`Rotating-MinimapArrow.mdl`); a stand-in like the player arrow's (0203's flagged
-    /// simplification, pending the dispatched §5 draw-law verdict).
-    landmark: Option<Handle<Image>>,
+    /// The **four** rim-arrow arts — the flat `.blp` stand-ins for the one `minimapArrowModel`
+    /// (`Rotating-MinimapArrow.mdx`) the reference re-animates per blip source. See
+    /// [`blips::RimArrow`] for the sequence→layer table and why there are four of them.
+    rim_arrows: blips::RimArrowArt,
     /// The unit-blip atlas (`Interface\Minimap\ObjectIcons`, five 32-px dot cells) — the
     /// quest-giver dots.
     object_icons: Option<Handle<Image>>,
@@ -285,8 +289,10 @@ fn setup_minimap(
             let mask = assets.mask_texture("Textures\\MinimapMask", &mut images);
             let arrow = assets.sprite_texture("Interface\\Minimap\\MinimapArrow", &mut images);
             let poi = assets.sprite_texture("Interface\\Minimap\\POIIcons", &mut images);
-            let landmark =
-                assets.sprite_texture("Interface\\Minimap\\ROTATING-MINIMAPARROW", &mut images);
+            let mut rim_arrows = blips::RimArrowArt::default();
+            for kind in blips::RimArrow::ALL {
+                rim_arrows.set(kind, assets.sprite_texture(kind.texture(), &mut images));
+            }
             let object_icons =
                 assets.sprite_texture("Interface\\Minimap\\ObjectIcons", &mut images);
             let pois = {
@@ -317,7 +323,7 @@ fn setup_minimap(
                 mask,
                 arrow,
                 poi,
-                landmark,
+                rim_arrows,
                 object_icons,
                 pois,
                 forms,
@@ -413,6 +419,7 @@ fn emit_minimap(
         names,
         go_templates,
         locks,
+        poi_marker,
     ) = blip_inputs;
     // Hover resets every frame; the blip pass below re-establishes it while the map draws.
     *blip_hover = blips::MinimapBlipHover::None;
@@ -672,6 +679,11 @@ fn emit_minimap(
                     z_key: slot.z,
                     texture: Some(handle.clone()),
                     color: [tint[0], tint[1], tint[2], slot.alpha],
+                    // The tile is a SKIP_DECODE upload (gamma bytes — [`load_tile`]), so the
+                    // day-night MODULATE above lands on the authored byte, exactly the reference's
+                    // fixed-function stage. Without this the ordinary arm re-encodes an
+                    // already-encoded byte — the outdoor minimap reads visibly too bright.
+                    gamma_texel: true,
                     // No CPU clip (1463): the mask shader already zeroes everything outside
                     // `mask_rect` (`ui_quad.wgsl`'s `inside` test), and clipping a PANNING tile
                     // re-cut its quad every frame — constant positions, churning UVs — which is
@@ -700,8 +712,11 @@ fn emit_minimap(
     let blip_ctx = (blip_px_per_yd > 0.0).then(|| {
         if std::env::var("WOW_MM_BLIP_PROBE").is_ok() {
             eprintln!(
-                "BLIP-PROBE: landmark_tex={} pois={} map={} wx={wx:.0} wy={wy:.0} px_per_yd={blip_px_per_yd:.3} track_c={:#x} track_r={:#x} track_s={}",
-                assets.landmark.is_some(),
+                "BLIP-PROBE: arrow_art={} pois={} map={} wx={wx:.0} wy={wy:.0} px_per_yd={blip_px_per_yd:.3} track_c={:#x} track_r={:#x} track_s={}",
+                blips::RimArrow::ALL
+                    .iter()
+                    .filter(|k| assets.rim_arrows.get(**k).is_some())
+                    .count(),
                 assets.pois.as_ref().map(|c| c.len()).unwrap_or(0),
                 map.0,
                 tracking.creatures,
@@ -740,25 +755,35 @@ fn emit_minimap(
     });
     let mut hover = blips::MinimapBlipHover::None;
     if let Some(ctx) = &blip_ctx {
-        if let (Some(tex), Some(pois)) = (&assets.landmark, &assets.pois) {
+        // The guard-directions marker rides this pass as a landmark candidate, the way the
+        // reference appends its static blip slot after the DBC scan — so it draws even when
+        // `AreaPOI.dbc` failed to load, and the pass runs on the arrow art alone.
+        if assets.rim_arrows.any() {
             blips::emit_landmarks(
                 ctx,
-                pois,
+                assets.pois.as_ref(),
+                poi_marker.on_map(map.0),
                 map.0,
-                tex,
+                &assets.rim_arrows,
                 assets.poi.as_ref(),
                 &mut quads,
                 &mut hover,
             );
-        }
-        // The party/corpse rim arrows (0434 phase 6b, `place_party_raid_blips`' out-of-range
-        // half) draw with the POI arrows — before the player arrow, per the client's order.
-        if let Some(arrow) = &assets.arrow {
+            // The party/corpse rim arrows (0434 phase 6b, `place_party_raid_blips`' out-of-range
+            // half) draw with the POI arrows — before the player arrow, per the client's order.
             let corpse = death_net
                 .corpse
                 .filter(|cp| cp.display_map == map.0 as i32)
                 .map(|cp| cp.position);
-            blips::emit_party_arrows(ctx, &group, &guids, &unit_pos, corpse, arrow, &mut quads);
+            blips::emit_party_arrows(
+                ctx,
+                &group,
+                &guids,
+                &unit_pos,
+                corpse,
+                &assets.rim_arrows,
+                &mut quads,
+            );
         }
     }
 

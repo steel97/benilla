@@ -41,7 +41,7 @@ use display::{
 /// Attaching a visual to each net entity (the back half of this subsystem) — kept in its own file as it
 /// carries the bulk of the per-entity spawn logic (skeleton/animation, character geoset + skin, fade).
 mod attach;
-use attach::{attach_entity_visuals, build_dressup_preview, build_glue_preview};
+use attach::{attach_entity_visuals, build_dressup_preview, build_glue_pet, build_glue_preview};
 
 /// The dynamic point lights an entity's own model carries into the world — the held torch above all:
 /// decision 0016's law applied to the *entity* half of the scene, not just the placed half.
@@ -70,6 +70,7 @@ use mount::reseat_mounts;
 /// model in place (druid forms, GM morphs — ledger B69/F04) and one moving `SCALE_X` eases the
 /// render scale (the reference's 2 s cosine smoothstep); both restamp the collision height.
 mod live_display;
+pub(crate) use live_display::DisplaySwapped;
 use live_display::{refresh_live_display, tick_scale_ease};
 
 /// Terrain conform (decisions 0482/0486): every flagged model (`GlobalModelFlags & 3 ∈ {1,3}` —
@@ -290,6 +291,25 @@ impl Creatures {
     /// (`crate::aura_visual`). `None` for an unknown display.
     pub(crate) fn display_base_alpha(&self, display_id: u32) -> Option<f32> {
         self.catalog.display_base_alpha(display_id)
+    }
+
+    /// A display's **footstep camera-shake preset** (`CameraModelData.FootstepShakeSize` → a
+    /// `CameraShakes.dbc` row id) — see [`crate::camera_shake`]. `None` for the 405 of 430 shipped
+    /// models that shake nothing.
+    pub(crate) fn footstep_shake(&self, display_id: u32) -> Option<u32> {
+        self.catalog.footstep_shake(display_id)
+    }
+
+    /// A display's **death-thud camera-shake preset** — same table, fired on `$DTH`.
+    pub(crate) fn death_thud_shake(&self, display_id: u32) -> Option<u32> {
+        self.catalog.death_thud_shake(display_id)
+    }
+
+    /// A display's **spawned-creature render scale** — see
+    /// [`benilla_formats::CreatureCatalog::model_scale`] for why almost nothing reads it and why
+    /// the glue screens' pet must. `None` for an unknown display.
+    pub(crate) fn model_scale(&self, display_id: u32) -> Option<f32> {
+        self.catalog.model_scale(display_id)
     }
 
     /// A display's resolved blood id (decision 0137 phase 3 — see [`CreatureModel::blood`]):
@@ -598,6 +618,9 @@ impl Plugin for EntitiesPlugin {
         .add_message::<MissileSound>()
         // The cast router's dest one-shot orders (`dest_fx`, decision 0797).
         .add_message::<dest_fx::GroundBurst>()
+        // A live display-id swap's rebuild edge — consumed by the morph-latch replay
+        // (`crate::creature_anim`), the reference's `0x60abe0` impact-kit replay tail.
+        .add_message::<live_display::DisplaySwapped>()
         .add_systems(Startup, setup_entities.after(AssetSet::Open))
         // The map-scope teardown (`world_map::MapChange`): drop every display/material dedup
         // so a map's assets actually die with it — the #bugs teleport leak.
@@ -634,6 +657,10 @@ impl Plugin for EntitiesPlugin {
                 // the freshly-built display model, for the create booth to bake. After
                 // `update_display_models` (its want-list built the body) — server-less, at char select.
                 build_glue_preview,
+                // …and the select screen's PET beside it: an ordinary creature display, assembled
+                // off the same freshly-built cache, on its own latch so a slow pet model never
+                // holds the character back.
+                build_glue_pet,
                 // The dressing room's preview (decision 1060): the same tuple-driven assembly,
                 // for the item nobody in the world is wearing. Beside the glue one — same
                 // dependency (the display cache built by `update_display_models` above), same
@@ -933,6 +960,17 @@ fn setup_entities(
         }
         Err(e) => warn!("enchants unavailable: no enchant glow, no enchant line: {e:#}"),
     }
+    // `ItemRandomProperties` — the random-suffix roll's name and its enchant slots 2..6 (decision
+    // 1547). Absent, a rolled item reads by its base name and shows no suffix lines.
+    match benilla_formats::load_random_property_catalog(&mut chain) {
+        Ok(props) => {
+            info!("random-property catalog: {} suffix rows", props.len());
+            commands.insert_resource(crate::items::RandomProperties(props));
+        }
+        Err(e) => {
+            warn!("random properties unavailable: no item name suffix, no suffix line: {e:#}")
+        }
+    }
     match benilla_formats::load_durability_tables(&mut chain) {
         Ok(tables) => commands.insert_resource(crate::ui_merchant::RepairTables(tables)),
         Err(e) => warn!("durability tables unavailable, repair costs show 0: {e:#}"),
@@ -989,6 +1027,14 @@ fn update_display_models(
             if let Some(disp) = cc.0.body_display(race, sex) {
                 actives.push((EntityKind::Player, disp));
             }
+        }
+    }
+    // The select screen's **pet** — the same kind of wantless want, one display further. It is an
+    // ordinary creature display (`Unit`, not `Player`): the enum's pet triple carries a
+    // `CreatureDisplayInfo` id, so it resolves down the plain creature chain, skins and all.
+    if let Some(preview) = glue_preview.as_deref() {
+        if let Some(pet) = preview.look.and_then(|l| l.pet()) {
+            actives.push((EntityKind::Unit, pet.display_id));
         }
     }
 

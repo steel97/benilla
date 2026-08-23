@@ -41,6 +41,7 @@ mod autocast_shine;
 mod bindings;
 mod blob_shadow;
 mod bowstring;
+mod camera_shake;
 #[cfg(feature = "dev")]
 mod capture;
 mod char_create;
@@ -80,6 +81,7 @@ mod pending_item_ops;
 mod perf;
 mod pipe_warm;
 mod player;
+mod poi_marker;
 mod portrait;
 #[cfg(feature = "dev")]
 mod preflight;
@@ -90,12 +92,17 @@ mod raid_marks;
 mod run_mode;
 mod screenshot;
 mod shaders;
+
+/// Where "the client is going down" may be observed, and why that is `Last` and not `Update`
+/// (decision 1528). Every system that persists state on the way out registers through it.
+mod shutdown;
 mod smart_rect;
 mod sound;
 mod target;
 mod textinput;
 mod transport;
 mod ui_action;
+mod ui_auction;
 mod ui_aura;
 mod ui_bank;
 mod ui_binder;
@@ -110,6 +117,7 @@ mod ui_gamma;
 mod ui_gossip;
 mod ui_guild;
 mod ui_hide;
+mod ui_honor;
 mod ui_inspect;
 mod ui_item_text;
 mod ui_items;
@@ -152,6 +160,7 @@ mod world_state;
 use bevy::prelude::*;
 use blob_shadow::BlobShadowPlugin;
 use bowstring::BowstringPlugin;
+use camera_shake::CameraShakePlugin;
 use creature_anim::CreatureAnimPlugin;
 use cursor::CursorPlugin;
 use entities::EntitiesPlugin;
@@ -167,6 +176,7 @@ use target::TargetPlugin;
 use textinput::TextInputPlugin;
 use transport::TransportPlugin;
 use ui_action::UiActionPlugin;
+use ui_auction::UiAuctionPlugin;
 use ui_aura::UiAuraPlugin;
 use ui_bank::UiBankPlugin;
 use ui_binder::UiBinderPlugin;
@@ -440,6 +450,11 @@ pub fn run(build: BuildId) -> AppExit {
     // activation so a probe/capture launch never yanks focus off the director's screen. The
     // window-side half (unfocused + always-on-bottom) is in the `Window` above. Decision 0703.
     .add_plugins(benilla_world::bgwin::BgWinPlugin)
+    // The other winit-default the client has to undo (decision 1528): macOS's `Cmd+Q` is wired
+    // straight to `terminate:`, which never runs another frame — so the gesture a Mac player
+    // reaches for first exited without writing one line of their session. Re-pointed at the
+    // window close, which the shutdown tail in [`shutdown`] already sees.
+    .add_plugins(benilla_world::mac_quit::MacQuitPlugin)
     // **The engine, as one name** (decision 1164). Everything `benilla-world` will own,
     // in the order both binaries used before this group existed — see `world_plugins.rs`
     // for the two ordering edges inside it that are load-bearing, and for what is
@@ -470,6 +485,7 @@ pub fn run(build: BuildId) -> AppExit {
     .add_plugins(BlobShadowPlugin)
     // Footprint decals (B212, decision 1006): the prints a walking unit leaves on snow/sand,
     // spawn-once projections on the same decal projector, fading off the effect stream.
+    .add_plugins(CameraShakePlugin)
     .add_plugins(FootprintsPlugin)
     // GameObject animation (decision 0242): net-streamed GObjects (doors/chests) play an M2 sequence
     // on GAMEOBJECT_STATE change — the state-machine sibling of the doodad idle loop above.
@@ -524,6 +540,9 @@ pub fn run(build: BuildId) -> AppExit {
     // explore objectives; the server owns what each trigger means.
     .add_plugins(area_trigger::AreaTriggerPlugin)
     .add_plugins(ui_world_map::WorldMapUiPlugin)
+    // The guard's directions marker (`SMSG_GOSSIP_POI`) — one landmark record, drawn by the
+    // minimap's landmark pass and the world map's POI child, cleared by arriving at it.
+    .add_plugins(poi_marker::PoiMarkerPlugin)
     // The glyph atlas (client TTFs -> baked bitmap) `ui_script`'s extraction draws `FontString`
     // regions through. Loads at Startup, after the asset chain opens (decision 0068 §2).
     .add_plugins(UiTextPlugin)
@@ -576,6 +595,10 @@ pub fn run(build: BuildId) -> AppExit {
     // The inspect feed (decision 0631): another player's equipment off their PUBLIC visible-item
     // entries, plus the "inspect" booth's unit + yaw. Right after the character feed it mirrors.
     .add_plugins(ui_inspect::InspectUiPlugin)
+    // The honor feed (decision 1512): the PRIVATE honor descriptor block as the snapshot both
+    // Honor tabs read, plus the inspect-honor round trip. After the inspect feed because it
+    // resolves that feed's target to address its request at.
+    .add_plugins(ui_honor::UiHonorPlugin)
     // The dressing-room feed (decision 1060): the window's try-on intents → the player's own look
     // with the tried-on items substituted in, plus the "dressup" booth's yaw. Beside the inspect
     // feed, whose shape it shares (intents in, a booth look out).
@@ -652,6 +675,9 @@ pub fn run(build: BuildId) -> AppExit {
     .add_plugins(UiMerchantPlugin)
     // The bank window (decision 0604): the SHOW_BANK session (BankOpen) + the purchase row;
     // the vault's slots ride the container feed as bags −1/5..=10.
+    // The auction house (decision 1511) — an NPC-session window like the bank beside it, but the
+    // only `doublewide` panel in the UI, so it displaces both the left and center seats.
+    .add_plugins(UiAuctionPlugin)
     .add_plugins(UiBankPlugin)
     // The mail window (decision 0544 P1/P2): the client-side mailbox session (MailOpen), the
     // NPC-session range guard, and MailFrame.xml over the Era mail API (inbox, open-letter,
