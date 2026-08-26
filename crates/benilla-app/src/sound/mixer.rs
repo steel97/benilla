@@ -15,16 +15,24 @@
 //! is the WoW↔FMOD convention pair; ours is Bevy↔kira, already unified by the decision-0002
 //! world transform upstream.
 
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use bevy::prelude::*;
 use cpal::traits::{DeviceTrait, HostTrait};
 use kira::backend::cpal::CpalBackendSettings;
 use kira::effect::reverb::{ReverbBuilder, ReverbHandle};
+use kira::effect::volume_control::{VolumeControlBuilder, VolumeControlHandle};
 use kira::listener::ListenerHandle;
 use kira::sound::streaming::StreamingSoundData;
 use kira::sound::FromFileError;
 use kira::track::{SendTrackBuilder, SendTrackHandle, SpatialTrackBuilder};
 use kira::{AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Mix, Tween};
+
+use super::limiter;
+use super::meter::{self, LevelReading, MixLevel};
 
 pub(crate) use benilla_formats::SoundProvider;
 
@@ -126,21 +134,39 @@ pub(crate) struct Mixer {
     reverb_send: SendTrackHandle,
     /// The Freeverb parameters on the send — retuned per zone preset.
     reverb: ReverbHandle,
+    /// The main track's level story — what the mix asked for, and what the limiter allowed
+    /// (decision 1551). Written on the audio thread, drained by [`Mixer::take_level`].
+    level: Arc<MixLevel>,
+    /// The `SoundOutputLimiter` CVar cell the limiter reads each block.
+    limiter_on: Arc<AtomicBool>,
+    /// The master gain — first in the main chain, **upstream** of the limiter ([`main_track`]).
+    master: VolumeControlHandle,
+    /// The pre-limiter tap's frame clock while a probing run records; `None` otherwise.
+    audio_pos: Option<Arc<AtomicU64>>,
+    /// The device's negotiated sample rate — what turns a count of over-scale samples into a
+    /// duration in the health report. `None` on a device we could not probe.
+    sample_rate: Option<u32>,
 }
 
 impl Mixer {
     /// Open the default audio device. Fails cleanly when there is none (headless/CI) — the caller
     /// runs silent with `None` (mirrors the client's `-nosound` gate).
-    pub(crate) fn new() -> Result<Self> {
+    pub(crate) fn new(probe_dir: Option<&Path>) -> Result<Self> {
         let (backend_settings, sample_rate) = backend_settings();
+        let level = Arc::new(MixLevel::default());
+        let limiter_on = Arc::new(AtomicBool::new(true));
+        let MainChain {
+            builder: main_track_builder,
+            master,
+            audio_pos,
+        } = main_track(&level, &limiter_on, sample_rate, probe_dir);
         let settings = AudioManagerSettings::<DefaultBackend> {
             backend_settings,
-            // The mix tap (decision 1112, `$WOW_MIX_TAP`) rides the main track as an effect —
-            // a no-op builder unless the env var names a capture path.
-            main_track_builder: super::mix_tap::install(
-                kira::track::MainTrackBuilder::new(),
-                sample_rate,
-            ),
+            main_track_builder,
+            capacities: kira::Capacities {
+                sub_track_capacity: SPATIAL_VOICE_CAPACITY,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut manager = AudioManager::<DefaultBackend>::new(settings)
@@ -180,7 +206,18 @@ impl Mixer {
             health: MixHealth::default(),
             reverb_send,
             reverb,
+            level,
+            limiter_on,
+            master,
+            sample_rate,
+            audio_pos,
         })
+    }
+
+    /// The probing run's shared time axis — the pre-limiter tap's frame clock
+    /// ([`super::probe`]). `None` when not probing.
+    pub(super) fn audio_pos(&self) -> Option<Arc<AtomicU64>> {
+        self.audio_pos.clone()
     }
 
     /// Apply a zone reverb preset — the seam mirror of `FSOUND_Reverb_SetProperties` (the real
@@ -231,12 +268,30 @@ impl Mixer {
     }
 
     /// Master volume as linear amplitude (the whole mix — every track routes to main). Fed every
-    /// frame, so it [`glide`]s: a step on the *main* track clicks the entire mix at once, and this
-    /// is the knob a slider drag and the mute toggle both move.
+    /// frame, so it [`glide`]s: a step clicks the entire mix at once, and this is the knob a
+    /// slider drag and the mute toggle both move.
+    ///
+    /// Drives the **first effect** in the main chain, not the main track's volume — see
+    /// [`main_track`] for why the difference is audible. Same `Parameter`, same interpolation;
+    /// only the position in the chain changes.
     pub(crate) fn set_master(&mut self, amp: f32) {
-        self.manager
-            .main_track()
-            .set_volume(amp_to_db(amp), glide());
+        self.master.set_volume(amp_to_db(amp), glide());
+    }
+
+    /// Arm or bypass the output limiter — the `SoundOutputLimiter` CVar (decision 1551). The
+    /// limiter's delay line runs either way, so this is a fade, never a step in the output.
+    pub(super) fn set_limiter(&mut self, on: bool) {
+        self.limiter_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Read and reset the mix's level for this report window (decision 1551).
+    pub(super) fn take_level(&mut self) -> LevelReading {
+        self.level.take()
+    }
+
+    /// The device's negotiated sample rate, when we could probe it — the report's time axis.
+    pub(super) fn sample_rate(&self) -> Option<u32> {
+        self.sample_rate
     }
 
     /// Play a decoded (short SFX) sound on the main track — the 2D/UI path.
@@ -267,32 +322,46 @@ impl Mixer {
     ) -> Result<(SpatialTrackHandle, StaticSoundHandle)> {
         // The zone wet level lives on the send's own volume, so per-zone reverb stays one knob
         // and never a per-track update; the per-KIT half is this route existing or not.
-        let mut builder = SpatialTrackBuilder::new().attenuation_function(None);
+        // One track, one sound, always — this is a fresh track per play. kira's default
+        // `sound_capacity` is 128, and it is not free: the builder allocates two rtrb rings and an
+        // arena *sized for 128 sounds* on every play, on the game thread, to hold exactly one
+        // (`backend/resources.rs::ResourceStorage::new`). Naming the real number turns roughly ten
+        // kilobytes of per-sound churn into a few dozen bytes.
+        let mut builder = SpatialTrackBuilder::new()
+            .attenuation_function(None)
+            .sound_capacity(1);
         if reverb_send {
             builder = builder.with_send(&self.reverb_send, Decibels(0.0));
         }
-        let mut track = self
-            .manager
-            .add_spatial_sub_track(
-                self.listener.id(),
-                mint::Vector3 {
-                    x: pos.x,
-                    y: pos.y,
-                    z: pos.z,
-                },
-                builder
-                    // Outlive the handle by exactly as long as the sound needs (decision 1026).
-                    // kira defaults this to `false` (`track/sub/spatial_builder.rs`), which makes
-                    // `should_be_removed()` fire the instant the handle drops — so a channel that
-                    // is stopped-with-a-fade and then dropped in the same breath (every reaper
-                    // here: cutoff cull, despawn, leave-world) loses its track mid-ramp and gets
-                    // cut anyway. `declick()` would have been a no-op on all 3D audio. With this
-                    // set, the drop only *marks* the track and kira keeps it until its sounds
-                    // finish. Cannot leak: every path that drops a channel stops its sound first,
-                    // and a stopped sound finishes.
-                    .persist_until_sounds_finish(true),
-            )
-            .map_err(|e| anyhow::anyhow!("spatial track alloc: {e}"))?;
+        let mut track = match self.manager.add_spatial_sub_track(
+            self.listener.id(),
+            mint::Vector3 {
+                x: pos.x,
+                y: pos.y,
+                z: pos.z,
+            },
+            builder
+                // Outlive the handle by exactly as long as the sound needs (decision 1026).
+                // kira defaults this to `false` (`track/sub/spatial_builder.rs`), which makes
+                // `should_be_removed()` fire the instant the handle drops — so a channel that
+                // is stopped-with-a-fade and then dropped in the same breath (every reaper
+                // here: cutoff cull, despawn, leave-world) loses its track mid-ramp and gets
+                // cut anyway. `declick()` would have been a no-op on all 3D audio. With this
+                // set, the drop only *marks* the track and kira keeps it until its sounds
+                // finish. Cannot leak: every path that drops a channel stops its sound first,
+                // and a stopped sound finishes.
+                .persist_until_sounds_finish(true),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                // The voice ceiling, counted rather than only logged at the call site: a burst
+                // that runs the arena dry drops sounds, and a dropped sound leaves no other trace.
+                self.health.voices_refused += 1;
+                return Err(anyhow::anyhow!(
+                    "spatial track alloc ({SPATIAL_VOICE_CAPACITY}-voice ceiling): {e}"
+                ));
+            }
+        };
         let handle = track
             .play(data)
             .map_err(|e| anyhow::anyhow!("play 3d: {e}"))?;
@@ -312,8 +381,80 @@ impl Mixer {
     }
 }
 
-/// The device buffer we ask for, in frames — the underrun margin (decision 1026).
+/// How many **3D voices** can be alive at once — the spatial sub-track arena (decision 1551).
 ///
+/// Every positional one-shot gets its own spatial sub-track ([`Mixer::play_3d`]), so this is the
+/// hard ceiling on simultaneous 3D sound, and past it `add_spatial_sub_track` returns
+/// `ResourceLimitReached` and the sound is simply not heard.
+///
+/// kira's default is **128** (`manager/settings.rs`), which is a number we never chose and which
+/// a real fight reaches: `sound::combat` fires up to four kits per swing per attacker, and a kit
+/// like `HolyProtection` runs 3.4 s, so a pack pull holds many dozens of voices at a time. A
+/// ceiling that drops sounds is a *policy*, and the policy about which sounds may play belongs to
+/// the game — the reference's own per-bus caps (`0x87ce60`) — not to a backend arena size. So the
+/// arena is sized generously and explicitly, and [`MixHealth::voices_refused`] counts any refusal
+/// so that hitting even this is visible rather than silent.
+///
+/// The cost is preallocation, not per-frame work: an idle slot is a few hundred bytes and no DSP.
+const SPATIAL_VOICE_CAPACITY: usize = 512;
+
+/// Build the **main track's effect chain**, in signal order (decision 1551):
+///
+/// 1. **meter** — measures the summed mix as the game asked for it, over-scale and all. Upstream
+///    of the limiter on purpose: the number worth reporting is what the mix *wanted*, because
+///    that is the one that says whether the game is asking for something impossible.
+/// 2. **limiter** — the brickwall that makes it fit, so kira's own hard clamp never fires.
+/// 3. **mix tap** — records what is actually heard (decision 1112, `$WOW_MIX_TAP`; a no-op
+///    builder unless the env var names a capture path).
+///
+/// A free function so the offline harness (`overlapping_kits_*`, below) can build the **same**
+/// chain over kira's mock backend — a headless proof of the audible claim, not a mirror of it.
+fn main_track(
+    level: &Arc<MixLevel>,
+    limiter_on: &Arc<AtomicBool>,
+    sample_rate: Option<u32>,
+    probe_dir: Option<&Path>,
+) -> MainChain {
+    let mut main = kira::track::MainTrackBuilder::new();
+    // MASTER FIRST — and it is an *effect*, not the main track's own volume, for one reason:
+    // kira applies a track's volume **after** its effects (`track/main.rs`: the effect loop, then
+    // `*frame *= volume`). Left on the track, the master would sit downstream of the limiter, and
+    // the limiter would duck peaks the master was about to remove anyway. Turning the volume down
+    // would not stop the pumping — it would move the whole mix down *including* the pumping,
+    // which is the one thing a volume knob must never do. Here the limiter sees the signal that
+    // is actually going to the device, so it engages exactly when the output would have clipped.
+    let master = main.add_effect(VolumeControlBuilder::new(Decibels::IDENTITY));
+    meter::install(&mut main, level);
+    // A probing run brackets the limiter with two taps (decision 1556). One tap can only ever
+    // say what was heard; two say whether the limiter is the thing that changed it — which is
+    // precisely the question a "your fix changed nothing" report asks, and one the post-limiter
+    // tap alone provably cannot answer.
+    let probe = probe_dir.zip(sample_rate);
+    let audio_pos = probe
+        .and_then(|(dir, rate)| super::mix_tap::install_at(&mut main, &dir.join("pre.wav"), rate));
+    limiter::install(&mut main, level, limiter_on);
+    if let Some((dir, rate)) = probe {
+        super::mix_tap::install_at(&mut main, &dir.join("post.wav"), rate);
+    }
+    MainChain {
+        builder: super::mix_tap::install(main, sample_rate),
+        master,
+        audio_pos,
+    }
+}
+
+/// What [`main_track`] hands back: the built chain, plus the two handles a caller needs to reach
+/// into it afterwards.
+struct MainChain {
+    builder: kira::track::MainTrackBuilder,
+    /// The master gain, first in the chain (see [`main_track`]). The main track's *own* volume is
+    /// left at unity forever — writing to it would reintroduce the post-limiter stage this
+    /// exists to avoid.
+    master: VolumeControlHandle,
+    /// The pre-limiter tap's frame clock, when a probing run armed one.
+    audio_pos: Option<Arc<AtomicU64>>,
+}
+
 /// kira's cpal backend takes `device.default_output_config().config()` when handed no config of
 /// its own, and that carries `BufferSize::Default` — whatever CoreAudio happens to hand us. On
 /// macOS the buffer size is a *shared, per-device* property, so another app (an OBS capture, a
@@ -388,6 +529,9 @@ pub(crate) struct MixHealth {
     pub(crate) overruns: u64,
     /// cpal stream errors kira handled, since launch (device loss, `BufferUnderrun`).
     pub(crate) stream_errors: u64,
+    /// 3D plays refused because the spatial-voice arena was full ([`SPATIAL_VOICE_CAPACITY`]),
+    /// since launch. Every one of these is a sound the player should have heard and did not.
+    pub(crate) voices_refused: u64,
 }
 
 impl Mixer {
@@ -706,6 +850,374 @@ mod tests {
         assert!(
             stream.duration().as_secs() > 30,
             "zone music should be minutes long"
+        );
+    }
+
+    /// The **offline mix harness** (decision 1551): render N simultaneous copies of one real kit
+    /// through the *same* main-track chain the client builds, over kira's mock backend, and
+    /// report `(what the mix asked for, what came out)`.
+    ///
+    /// This is the director's report reduced to arithmetic. No device, no game, no ear: kira's
+    /// mock backend runs the real renderer on this thread, so the numbers are the numbers the
+    /// audio callback would have produced.
+    fn render_overlapping(bytes: &[u8], copies: usize, limiter: bool) -> (f32, f32, u64) {
+        use kira::backend::mock::{MockBackend, MockBackendSettings};
+
+        const RATE: u32 = 44_100;
+        let asked = Arc::new(MixLevel::default());
+        let heard = Arc::new(MixLevel::default());
+        let limiter_on = Arc::new(AtomicBool::new(limiter));
+        // The client's own chain, plus one probe meter appended to read the limiter's output.
+        let mut main = main_track(&asked, &limiter_on, Some(RATE), None).builder;
+        meter::install(&mut main, &heard);
+        let mut manager = AudioManager::<MockBackend>::new(AudioManagerSettings {
+            backend_settings: MockBackendSettings { sample_rate: RATE },
+            main_track_builder: main,
+            ..Default::default()
+        })
+        .expect("mock backend");
+
+        let data = sfx_from_bytes(bytes.to_vec()).expect("kit decodes");
+        for _ in 0..copies {
+            manager.play(data.clone()).expect("play");
+        }
+        // The whole kit, plus a beat: a buff sound swells, so its peak is nowhere near its first
+        // millisecond, and a window that stops early measures silence and calls it headroom.
+        let blocks = (data.duration().as_secs_f64() + 0.25) * f64::from(RATE) / 128.0;
+        let backend = manager.backend_mut();
+        for _ in 0..(blocks.ceil() as usize) {
+            backend.on_start_processing();
+            backend.process();
+        }
+        let heard = heard.take();
+        let asked = asked.take().peak;
+        // `--nocapture` turns the harness into a readout: the arithmetic of the reported defect.
+        eprintln!(
+            "mix harness: {copies} copies, limiter {} — asked {asked:.2}x, heard {:.2}x, \
+             {} sample(s) past full scale",
+            if limiter { "on " } else { "off" },
+            heard.peak,
+            heard.over,
+        );
+        (asked, heard.peak, heard.over)
+    }
+
+    /// A quarter-second 0 dBFS sine as a stereo float WAV — the shape every WoW SFX ships in
+    /// (mastered to full scale), built in memory so a test about the *chain* never needs the
+    /// gitignored install.
+    fn full_scale_tone(rate: u32) -> Vec<u8> {
+        let frames = rate as usize / 4;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + frames as u32 * 8).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&3u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 8).to_le_bytes());
+        wav.extend_from_slice(&8u16.to_le_bytes());
+        wav.extend_from_slice(&32u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(frames as u32 * 8).to_le_bytes());
+        for i in 0..frames {
+            let v = (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin();
+            wav.extend_from_slice(&v.to_le_bytes());
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        wav
+    }
+
+    /// The master volume must sit **upstream** of the limiter — the ordering fix in
+    /// [`main_track`], and the one place a unit test can prove it.
+    ///
+    /// kira applies a track's own volume *after* its effects, so a master left on the main track
+    /// lands downstream of the limiter. The audible symptom is specific and nasty: turn the
+    /// slider down and the limiter keeps ducking peaks that the slider was already going to
+    /// remove, so the *pumping scales with the mix instead of going away*. A quiet mix would
+    /// breathe exactly as hard as a loud one.
+    ///
+    /// Two 0 dBFS copies at master 0.25 sum to 2.0 before the master and **0.5 after** it —
+    /// comfortably inside full scale, so a correctly-placed limiter never engages at all.
+    /// Wrongly placed it sees 2.0, clamps to the ceiling, and the reading shows deep gain
+    /// reduction on a mix that was never going to clip.
+    #[test]
+    fn the_master_volume_sits_upstream_of_the_limiter() {
+        use kira::backend::mock::{MockBackend, MockBackendSettings};
+
+        const RATE: u32 = 44_100;
+        const MASTER: f32 = 0.25;
+        const COPIES: usize = 2;
+
+        let asked = Arc::new(MixLevel::default());
+        let heard = Arc::new(MixLevel::default());
+        let limiter_on = Arc::new(AtomicBool::new(true));
+        let chain = main_track(&asked, &limiter_on, Some(RATE), None);
+        let (mut main, mut master) = (chain.builder, chain.master);
+        // Appended last, so it reads the chain's actual output.
+        meter::install(&mut main, &heard);
+        let mut manager = AudioManager::<MockBackend>::new(AudioManagerSettings {
+            backend_settings: MockBackendSettings { sample_rate: RATE },
+            main_track_builder: main,
+            ..Default::default()
+        })
+        .expect("mock backend");
+        // Snap, not glide: a 10 ms ramp would let the tone's own attack through at near unity and
+        // the peak would be the ramp, not the steady state under test.
+        master.set_volume(amp_to_db(MASTER), snap());
+        // Even a zero-duration tween takes one block to land: kira interpolates a parameter from
+        // its previous value across the chunk in which the command is read. Settle over silence
+        // and reset the meters, so what follows measures the steady state and not that ramp.
+        {
+            let backend = manager.backend_mut();
+            for _ in 0..4 {
+                backend.on_start_processing();
+                backend.process();
+            }
+        }
+        asked.take();
+        heard.take();
+
+        let data = sfx_from_bytes(full_scale_tone(RATE)).expect("tone decodes");
+        for _ in 0..COPIES {
+            manager.play(data.clone()).expect("play");
+        }
+        let blocks = (data.duration().as_secs_f64() + 0.25) * f64::from(RATE) / 128.0;
+        let backend = manager.backend_mut();
+        for _ in 0..(blocks.ceil() as usize) {
+            backend.on_start_processing();
+            backend.process();
+        }
+        let heard = heard.take();
+        // The limiter reports its gain into the *shared* level cell it was installed with, not
+        // into the meter appended after it — read it from the one that can actually see it.
+        let inner = asked.take();
+
+        eprintln!(
+            "master ordering: {COPIES} copies at master {MASTER} — after master {:.3}x, \
+             heard {:.3}x, limiter deepest gain {:.3}",
+            inner.peak, heard.peak, inner.reduction,
+        );
+        // The whole point: the limiter never had anything to do.
+        assert!(
+            inner.reduction > 0.99,
+            "the limiter engaged (deepest gain {:.3}) on a mix that never exceeded full scale — \
+             the master is downstream of it again",
+            inner.reduction,
+        );
+        // And the output is the scaled sum, not the limited-then-scaled one (~0.25).
+        assert!(
+            (heard.peak - MASTER * COPIES as f32).abs() < 0.05,
+            "expected the plain scaled sum ~{:.2}, heard {:.3}",
+            MASTER * COPIES as f32,
+            heard.peak,
+        );
+        assert_eq!(heard.over, 0, "nothing should have passed full scale");
+    }
+
+    /// The probe's two taps must **bracket** the limiter (decision 1556) — and this is the test
+    /// that the capture handed to the director can actually tell the mechanisms apart.
+    ///
+    /// The whole reason for a second tap is that `post.wav` alone cannot distinguish "the mix
+    /// never clipped" from "the limiter failed to hold it". Both produce a clean post file for
+    /// entirely different reasons, and only the pre file separates them. So: render an
+    /// over-scale mix through the real chain with the probe armed, and assert the two files
+    /// disagree in exactly the way the diagnosis depends on — `pre.wav` far past full scale,
+    /// `post.wav` held under it. If these two ever agree, the instrument has gone blind and every
+    /// verdict it prints is worthless.
+    ///
+    /// Writes into the OS temp dir (never the install, never `benilla-config`) and leaves the
+    /// capture behind on purpose: `scripts/soundprobe.py $TMPDIR/benilla-probe-selftest` is then
+    /// a live check of the analyser against a capture with a known answer.
+    #[test]
+    fn the_probe_taps_bracket_the_limiter() {
+        use kira::backend::mock::{MockBackend, MockBackendSettings};
+
+        const RATE: u32 = 44_100;
+        const COPIES: usize = 5;
+
+        let dir = std::env::temp_dir().join("benilla-probe-selftest");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp capture dir");
+
+        let wav = full_scale_tone(RATE);
+
+        {
+            let level = Arc::new(MixLevel::default());
+            let limiter_on = Arc::new(AtomicBool::new(true));
+            let chain = main_track(&level, &limiter_on, Some(RATE), Some(&dir));
+            let (main, audio_pos) = (chain.builder, chain.audio_pos);
+            let audio_pos = audio_pos.expect("the pre-tap publishes a frame clock");
+            let mut manager = AudioManager::<MockBackend>::new(AudioManagerSettings {
+                backend_settings: MockBackendSettings { sample_rate: RATE },
+                main_track_builder: main,
+                ..Default::default()
+            })
+            .expect("mock backend");
+
+            let data = sfx_from_bytes(wav).expect("tone decodes");
+            for _ in 0..COPIES {
+                manager.play(data.clone()).expect("play");
+            }
+            let blocks = (data.duration().as_secs_f64() + 0.1) * f64::from(RATE) / 128.0;
+            let backend = manager.backend_mut();
+            for _ in 0..(blocks.ceil() as usize) {
+                backend.on_start_processing();
+                backend.process();
+            }
+            assert!(
+                audio_pos.load(Ordering::Relaxed) > 0,
+                "the shared clock must advance — a capture with a dead clock cannot place a mark"
+            );
+        } // manager dropped: the tap producers abandon, the writers do their final flush.
+
+        // The writers wake on a 250 ms cadence; give them room to drain and exit.
+        std::thread::sleep(std::time::Duration::from_millis(900));
+
+        let peak = |name: &str| -> (f32, u64) {
+            let bytes = std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(bytes.len() > 44, "{name} has no audio");
+            let (mut peak, mut over) = (0.0f32, 0u64);
+            for c in bytes[44..].chunks_exact(4) {
+                let v = f32::from_le_bytes(c.try_into().unwrap()).abs();
+                peak = peak.max(v);
+                over += u64::from(v > 1.0);
+            }
+            (peak, over)
+        };
+        let (pre_peak, pre_over) = peak("pre.wav");
+        let (post_peak, post_over) = peak("post.wav");
+        eprintln!(
+            "probe self-test: pre {pre_peak:.2}x ({pre_over} over) -> post {post_peak:.2}x \
+             ({post_over} over); capture left at {}",
+            dir.display()
+        );
+
+        assert!(
+            pre_peak > 3.0,
+            "pre.wav must record what the game ASKED for — {COPIES} full-scale copies, got \
+             {pre_peak:.2}x. A pre tap that already shows a limited signal is measuring the \
+             wrong side of the chain."
+        );
+        assert!(pre_over > 0, "and it must show the over-scale samples");
+        assert!(
+            post_peak <= 1.0 && post_over == 0,
+            "post.wav must record what was HEARD — held under full scale, got {post_peak:.2}x \
+             with {post_over} over"
+        );
+    }
+
+    /// The **voice ceiling is real, and it is ours** (decision 1551): a spatial-track arena
+    /// refuses past its capacity, and kira's unnamed default would have refused at 128 — a number
+    /// a pack pull reaches, and one nobody here chose. Pins both halves so a kira upgrade that
+    /// moves either cannot move benilla's voice ceiling silently.
+    #[test]
+    fn the_spatial_voice_arena_refuses_past_its_capacity() {
+        use kira::backend::mock::{MockBackend, MockBackendSettings};
+
+        fn fill(capacity: usize) -> usize {
+            let mut manager = AudioManager::<MockBackend>::new(AudioManagerSettings {
+                backend_settings: MockBackendSettings {
+                    sample_rate: 44_100,
+                },
+                capacities: kira::Capacities {
+                    sub_track_capacity: capacity,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .expect("mock backend");
+            let listener = manager
+                .add_listener(
+                    mint::Vector3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    mint::Quaternion {
+                        v: mint::Vector3 {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                        s: 1.0,
+                    },
+                )
+                .expect("listener");
+            let mut held = Vec::new();
+            for n in 0.. {
+                let track = manager.add_spatial_sub_track(
+                    listener.id(),
+                    mint::Vector3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    SpatialTrackBuilder::new().sound_capacity(1),
+                );
+                match track {
+                    Ok(t) => held.push(t),
+                    Err(_) => return n,
+                }
+            }
+            unreachable!()
+        }
+
+        assert_eq!(
+            fill(kira::Capacities::default().sub_track_capacity),
+            128,
+            "kira's default voice ceiling moved — re-read the SPATIAL_VOICE_CAPACITY reasoning"
+        );
+        assert_eq!(fill(SPATIAL_VOICE_CAPACITY), SPATIAL_VOICE_CAPACITY);
+    }
+
+    /// **The reported defect, reproduced and fixed, in numbers** (decision 1551).
+    ///
+    /// `HolyProtection.wav` is the Fortitude buff — the director's own example ("a priest buffing
+    /// a group with mass fort"). It is mastered to 1.000 peak and its kit (`SoundEntries` 3116)
+    /// carries `Flags 0x0000`, so the no-duplicate bit does not gate it: a five-target cast
+    /// starts five sample-aligned copies in one frame.
+    ///
+    /// Bypassed, the mix asks for ~5x full scale and delivers it — which the renderer's
+    /// `clamp(-1.0, 1.0)` turns into a squared-off waveform. Armed, the mix still *asks* for 5x
+    /// (the game's own gain math is untouched) and nothing past the ceiling comes out.
+    #[test]
+    fn overlapping_kits_clip_without_the_limiter_and_do_not_with_it() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let Ok(chain) = benilla_formats::open_chain(&data) else {
+            eprintln!("skipping: no client data at {}", data.display());
+            return;
+        };
+        let bytes = chain
+            .read("Sound\\Spells\\HolyProtection.wav")
+            .expect("HolyProtection.wav in the chain");
+
+        // One copy is already sitting on full scale — that is the headroom problem, before any
+        // overlap at all.
+        let (asked, heard, over) = render_overlapping(&bytes, 1, false);
+        assert!(
+            asked > 0.99,
+            "a single kit should already reach full scale, got {asked}"
+        );
+        assert!(over <= 2, "one copy should not meaningfully clip ({over})");
+        assert!(heard <= 1.001);
+
+        // Five, bypassed: the reported case. The sum is ~5x and it comes out at ~5x.
+        let (asked, heard, over) = render_overlapping(&bytes, 5, false);
+        assert!(asked > 4.0, "five copies should sum to ~5x, got {asked}");
+        assert!(
+            heard > 4.0 && over > 1_000,
+            "bypassed, the over-scale mix must reach the renderer's clamp \
+             (peak {heard}, {over} samples over)"
+        );
+
+        // Five, armed: the same request, held under the ceiling. Nothing clips.
+        let (asked, heard, over) = render_overlapping(&bytes, 5, true);
+        assert!(asked > 4.0, "the game still asks for ~5x, got {asked}");
+        assert_eq!(over, 0, "the limiter let {over} samples past full scale");
+        assert!(
+            heard <= limiter::ceiling() + 1e-5,
+            "output peaked at {heard}"
         );
     }
 

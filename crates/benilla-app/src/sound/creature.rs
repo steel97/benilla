@@ -23,9 +23,9 @@ use benilla_assets::{AssetSet, LockRecover, WorldAssets};
 use benilla_world::schedule::WorldStage;
 
 use super::kit::{
-    bark_chance_pass, play_kit, play_kit_ext, source_kit_playing, stop_source_kit,
-    unit_voice_playing, voice_category, KitRef, SoundCategory, SoundKits, STAND_CHANCE,
-    STAND_COOLDOWN,
+    bark_chance_pass, object_sound_playing, play_kit, play_kit_ext, source_kit_playing,
+    stop_source_kit, unit_voice_playing, KitRef, Latch, PlayExtras, SoundCategory, SoundKits,
+    STAND_CHANCE, STAND_COOLDOWN,
 };
 use super::{AudioListener, SoundConfig, SoundOutput};
 
@@ -126,8 +126,24 @@ fn death_vocals(
 /// threshold is **100** and the compare is inclusive, so `P = 1`. (wow-re's `smsg-ai-reaction.md`
 /// calling ALERT "probabilistic" was too strong, and has been corrected at the table.) Its one
 /// real gate is a mute while a **server-pushed** object sound is live on the unit — the
-/// `SMSG_PLAY_OBJECT_SOUND` (opcode `0x278`) registry, an opcode benilla does not implement at
-/// all — so nothing is owed here until that lands. ALERT stores no latch and stays off the slot.
+/// `SMSG_PLAY_OBJECT_SOUND` (opcode `0x278`) registry. ALERT stores no latch and stays off the
+/// slot.
+///
+/// **That gate is now in.** 1401 recorded the opcode as one "benilla does not implement at all",
+/// which was wrong when it was written — benilla has parsed, decoded and played
+/// `SMSG_PLAY_OBJECT_SOUND` since well before it (`net::apply::world::play_object_sound` →
+/// `ServerSoundKind::ObjectSound` → `sound::zone::server_sounds`, which even resolves the source
+/// entity to position the kit at it). What was missing was the **per-GUID registry** the gates
+/// consult (`0x4591f0`, tested by `0x623a40`'s gate (i) and by `0x623490`'s gate 3 for classes 0,
+/// 1, 2, 3 and 8): the pushed channel played untagged, so nothing could ask "is an object sound
+/// live on this unit".
+///
+/// It could not be tagged with a bare `PlayExtras::source`, because that shared tag also answered
+/// the greeting latch — a third meaning in one field. [`kit::Latch`] split those apart (decision
+/// 1399), and `Latch::ObjectSound` is the registry: a resolved object sound registers on its unit
+/// for as long as it sounds, and [`kit::object_sound_playing`] is `0x4591f0`. ALERT (class 8) and
+/// HOSTILE (the priority route) consult it below; the combat vocals (classes 0–3) consult it in
+/// `super::combat`. Players are exempt — the CGPlayer twin `0x62f880` omits the gate entirely.
 #[allow(clippy::too_many_arguments)]
 fn ai_reaction_vocals(
     mut reactions: MessageReader<crate::net::AiReactionMessage>,
@@ -170,6 +186,14 @@ fn ai_reaction_vocals(
         if kit == 0 {
             continue;
         }
+        // The `AISOUNDDESC` gate (`0x4591f0`, from `0x6234cb` for ALERT's class route and
+        // `0x623a59` for HOSTILE's priority route): a server-pushed object sound live on this
+        // unit suppresses its own vocals, so a scripted voice line is not talked over. Applies to
+        // classes 0-3 and 8 — ALERT is 8 and HOSTILE takes the priority route, so both are in.
+        // The CGPlayer twin omits this gate entirely, hence the player exemption.
+        if net.kind != EntityKind::Player && object_sound_playing(&out, r.unit) {
+            continue;
+        }
         // The `[unit+0xb20]` gate. Only HOSTILE latches the slot; ALERT neither tests nor stores
         // it here (see the doc comment) and stays on the plain play.
         if !r.hostile {
@@ -199,10 +223,11 @@ fn ai_reaction_vocals(
             KitRef::Id(kit),
             Some(transform.translation),
             SoundCategory::Sfx,
-            None,
-            Some(r.unit),
-            false,
-            Some(voice_category::HOSTILE),
+            PlayExtras {
+                source: Some(r.unit),
+                latch: Latch::Voice,
+                ..default()
+            },
         ) {
             warn!("aggro vocal (kit {kit}): {e:#}");
         }
@@ -289,10 +314,11 @@ fn creature_body_loops(
                 KitRef::Id(desired),
                 Some(transform.translation),
                 SoundCategory::Sfx,
-                None,
-                Some(entity),
-                true,
-                None,
+                PlayExtras {
+                    source: Some(entity),
+                    force_loop: true,
+                    ..default()
+                },
             ) {
                 warn!("body loop (kit {desired}): {e:#}");
             }
@@ -511,16 +537,16 @@ mod tests {
     /// and that reap IS the handle release.
     fn barks_that_sound(arrivals: &[f32], clip: f32) -> Vec<f32> {
         let bear = Entity::from_raw_u32(1).expect("valid entity id");
-        let mut slot: Option<(Option<Entity>, Option<u8>, f32)> = None;
+        let mut slot: Option<(Option<Entity>, Latch, f32)> = None;
         let mut sounded = Vec::new();
         for &t in arrivals {
             if slot.is_some_and(|(_, _, ends)| ends <= t) {
                 slot = None;
             }
-            if slot.is_some_and(|(src, v, _)| occupies_voice_slot(src, v, bear)) {
+            if slot.is_some_and(|(src, l, _)| occupies_voice_slot(src, l, bear)) {
                 continue; // category 0 is the lowest — a live bark wins, this one is dropped
             }
-            slot = Some((Some(bear), Some(voice_category::HOSTILE), t + clip));
+            slot = Some((Some(bear), Latch::Voice, t + clip));
             sounded.push(t);
         }
         sounded
@@ -559,7 +585,7 @@ mod tests {
             Entity::from_raw_u32(1).expect("valid entity id"),
             Entity::from_raw_u32(2).expect("valid entity id"),
         );
-        let barking = (Some(a), Some(voice_category::HOSTILE));
+        let barking = (Some(a), Latch::Voice);
         assert!(occupies_voice_slot(barking.0, barking.1, a));
         assert!(!occupies_voice_slot(barking.0, barking.1, b));
     }

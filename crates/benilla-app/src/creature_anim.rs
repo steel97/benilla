@@ -45,7 +45,7 @@ use benilla_world::schedule::WorldStage;
 /// The pure animation-selection logic (RF-0057/0073 tables, movement/Special state, gait/swing/ready
 /// picks, playback-rate math) — kept in its own file as it carries the bulk of the unit-tested selector
 /// logic, separate from the Bevy driver systems in [`driver`].
-mod select;
+pub(crate) mod select;
 pub(crate) use select::{ease_strafe_yaw, move_flags, strafe_body_offset, MovementState};
 use select::{Mode, Special};
 
@@ -822,8 +822,10 @@ pub(crate) struct AnimDriver {
     /// survives to its clip's end).
     last_special: Option<Special>,
     /// The **airborne snapshot** node whose clock [`driver::play::leave_special`] stopped
-    /// (decision 0503 — the client blends out of a cut airborne clip from a frozen pose, not from
-    /// a still-running one). The per-frame rate write
+    /// (decision 0503, the swim hop's too-short kick — kept as a symptom fix whose mechanism is
+    /// open, because the "blends from a frozen pose" law it was justified by is refuted: the
+    /// client's blend source keeps running, decision **1566**. Scoped to the airborne cut and
+    /// **not** to be generalised). The per-frame rate write
     /// ([`driver::play::sync_base_rate`](driver::play)) must not restart it, so it is named here
     /// rather than inferred from a zero speed — a rate-scaled clip legitimately reads 0 when the
     /// body is standing still, and skipping *that* would strand it frozen forever. Self-clearing:

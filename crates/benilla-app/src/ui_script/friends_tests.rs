@@ -48,6 +48,7 @@ fn setup() -> UiScript {
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
     load_xml(&s, "Fonts.xml");
+    load_xml(&s, "MoneyFrame.xml");
     load_xml(&s, "UiPanels.xml");
     load_xml(&s, "GameTooltip.xml");
     load_xml(&s, "UIDropDownMenu.xml");
@@ -61,6 +62,14 @@ fn setup() -> UiScript {
     // otherwise let those frames load art-less and silent.
     load_xml(&s, "UIPanelTemplates.xml");
     load_xml(&s, "FriendsFrame.xml");
+    // The social window's fourth tab lives in its own file, and it is part of THIS window's
+    // manifest slice now: `BENILLA_FRIENDS_SUBFRAMES` names "RaidFrame", and both
+    // `FriendsFrame_ShowSubFrame` and `FriendsFrame_OnHide` resolve every name in that list
+    // through `getglobal` and call `:Hide()` on it. The reference's list names it too and never
+    // guards, because there RaidFrame.xml is FrameXML and always loaded — so the guard belongs in
+    // the harness's load order, not in shipped Lua defending against a state the client cannot be
+    // in (decision 1549).
+    load_xml(&s, "RaidFrame.xml");
     s
 }
 

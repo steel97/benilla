@@ -29,8 +29,8 @@
 //! discovered sub-area's overlay art (`GetNumMapOverlays`/`GetMapOverlayInfo`, filtered by the
 //! pushed `PLAYER_EXPLORED_ZONES` bitset) fills it in — the reference's own overlay pool draws
 //! the returned pieces. The landmark family (`GetNumMapLandmarks`/`GetMapLandmarkInfo`) answers
-//! with the guard-directions marker (decision 1514); the `AreaPOI.dbc` rows that also belong in
-//! it are 0203's still-deferred slice.
+//! with the `AreaPOI.dbc` rows the displayed level admits, then the guard-directions marker
+//! (decisions 1586, 1514).
 
 use mlua::{Lua, MultiValue, Value};
 
@@ -57,12 +57,15 @@ pub struct WorldMapZoneView {
 /// One **map landmark** — a POI icon on the displayed map (`GetNumMapLandmarks` /
 /// `GetMapLandmarkInfo`). The app projects it, so what arrives here is already map UV.
 ///
-/// Today the only landmark is the guard-directions marker (`SMSG_GOSSIP_POI` — the flag a guard
-/// drops when you ask where the warrior trainer is), and the reference routes it through this same
-/// list: its landmark-list builder `0x4a67a0` appends the marker as the one element with
-/// `+0x10 == 1`, exempt from every gate a real AreaPOI must pass (VERIFIED, wow-re
-/// `system/ui/scratch/gossip-poi-marker.md`). The `AreaPOI.dbc` rows that also belong here are
-/// 0203's still-deferred landmark slice, and land in this list when they do.
+/// Two sources feed it, in the reference's own order (its builder `0x4a67a0`, VERIFIED in wow-re
+/// `system/ui/scratch/gossip-poi-marker.md` §8):
+///
+/// - the **`AreaPOI.dbc` rows** that survive the builder's level-flag, exploration and
+///   world-state gates — the town and capital icons, the capitals' "Under Attack" markers, and the
+///   Eastern Plaguelands towers (decision 1586);
+/// - then the **guard-directions marker** (`SMSG_GOSSIP_POI` — the flag a guard drops when you ask
+///   where the warrior trainer is), appended last as the one element with `+0x10 == 1` and exempt
+///   from every gate above.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WorldMapLandmarkView {
     /// The label its tooltip shows ("Stormwind Warrior Trainer").
@@ -208,6 +211,14 @@ pub struct WorldMapState {
     /// `GetPlayerMapPosition("player")` for the CURRENT selection — projected app-side each frame
     /// (`map_proj`), `None`/(0,0) = off this map (the reference hides the blip).
     pub player_uv: Option<(f32, f32)>,
+    /// `GetPlayerMapPosition("party1".."party4")` for the CURRENT selection, in `party_slots`
+    /// order — projected app-side through the same law as [`Self::player_uv`] (report B320).
+    /// A slot is `None` when there is no member there, when we hold no position for them, or when
+    /// that position is off the displayed map; all three read as the reference's `(0,0)` hide
+    /// sentinel at the binding, which is the only answer its FrameXML consumer knows.
+    ///
+    /// Shorter than 4 whenever the party is: a missing index is a `None`.
+    pub party_uv: Vec<Option<(f32, f32)>>,
     /// `GetPlayerFacing()` — wow orientation radians (0 = north, counterclockwise-positive). Our
     /// transcribed frame spins its arrow texture with it (`SetRotation`); the reference rotates
     /// an engine-rendered arrow model instead (0203 flags the stand-in).
@@ -297,19 +308,22 @@ impl super::UiScript {
         }
     }
 
-    /// Push the per-frame feed (player zone/projection/facing — see [`WorldMapState`]).
+    /// Push the per-frame feed (player zone/projection/facing, the corpse marker, and the party
+    /// slots' projections — see [`WorldMapState`]).
     pub fn set_world_map_feed(
         &mut self,
         player_zone: Option<(u32, u32)>,
         player_uv: Option<(f32, f32)>,
         player_facing: f32,
         corpse_uv: Option<(f32, f32)>,
+        party_uv: Vec<Option<(f32, f32)>>,
     ) {
         let mut model = self.model_mut();
         model.worldmap.player_zone = player_zone;
         model.worldmap.player_uv = player_uv;
         model.worldmap.player_facing = player_facing;
         model.worldmap.corpse_uv = corpse_uv;
+        model.worldmap.party_uv = party_uv;
     }
 
     /// The engine-owned selection `(continent, zone)` — the app reads it each frame to project
@@ -471,14 +485,21 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // GetPlayerMapPosition(unit) → x, y in [0,1] map UV; (0,0) = not on this map (hide the
-    // blip). Only "player" resolves — party/raid are the party arc's, not this one's (0203).
+    // blip). `"player"` and `"party1".."party4"` resolve (report B320); `"raid1".."raid40"` do
+    // not yet — the reference's raid arm draws a 25-frame pool this map has no children for, and
+    // its party arm is the one a five-man actually takes.
     g.set(
         "GetPlayerMapPosition",
         lua.create_function(|lua, unit: String| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let (x, y) = match unit.as_str() {
                 "player" => model.worldmap.player_uv.unwrap_or((0.0, 0.0)),
-                _ => (0.0, 0.0),
+                u => u
+                    .strip_prefix("party")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|n| *n >= 1)
+                    .and_then(|n| model.worldmap.party_uv.get(n - 1).copied().flatten())
+                    .unwrap_or((0.0, 0.0)),
             };
             Ok((f64::from(x), f64::from(y)))
         })?,
@@ -602,9 +623,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // GetNumMapLandmarks() — how many POI icons the displayed map carries. Today that is the
-    // guard-directions marker and nothing else; the `AreaPOI.dbc` rows are 0203's deferred
-    // landmark slice, and they join this same list when it lands.
+    // GetNumMapLandmarks() — how many POI icons the displayed map carries: the `AreaPOI.dbc` rows
+    // that pass the builder's gates, then the guard-directions marker.
     g.set(
         "GetNumMapLandmarks",
         lua.create_function(|lua, ()| {
@@ -615,11 +635,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     // GetMapLandmarkInfo(i) → name, description, textureIndex, x, y — the i-th (1-based) landmark
     // (return shape VERIFIED at `0x4a8740`, wow-re `system/ui/scratch/gossip-poi-marker.md`).
-    // `textureIndex` indexes `Interface\Minimap\POIIcons`' 8×8 grid — for the guard's marker it is
-    // the packet's own `Icon`, verbatim, exempt from the substitution an ordinary landmark gets at
-    // zone level; x/y are `[0,1]` UV on the displayed map, the same space `GetPlayerMapPosition`
-    // answers in. A landmark with no description answers **nil** there, as the reference does
-    // (`0x6f3890` pushes nil on a NULL string) — the guard's marker never carries one.
+    // `textureIndex` indexes `Interface\Minimap\POIIcons`' 8×8 grid, already resolved app-side
+    // through the reference's own leg (`0x4a8848`): a row's `Icon`, or the constant 15 at zone
+    // level unless it carries `Flags & 0x80`; the guard's marker is its packet `Icon` verbatim.
+    // x/y are `[0,1]` UV on the displayed map, the same space `GetPlayerMapPosition` answers in. A
+    // landmark with no description answers **nil** there, as the reference does (`0x6f3890` pushes
+    // nil on a NULL string) — the guard's marker never carries one, and neither do the ~2/3 of
+    // AreaPOI rows with no live status text.
     g.set(
         "GetMapLandmarkInfo",
         lua.create_function(|lua, i: i64| {

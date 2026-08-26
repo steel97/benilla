@@ -81,6 +81,58 @@ const SWIM_DEPTH_FRAC: f32 = 0.75;
 /// `0.75·h`, leave against `0.75·h − 1/36`, so between them the swim state holds (`0x603100`/`0x6031c0`).
 const SWIM_HYSTERESIS: f32 = 1.0 / 36.0;
 
+/// The `UNIT_FIELD_FLAGS` bits that decide whether a unit **may be locally SWIMMING at all** —
+/// **VERIFIED** in the shipped 5875 image (wow-re `collision/scratch/remote-swim-decision.md`, §5
+/// trio). `0x6030c0` tests them on **both** legs of its decision, with **opposite sense**:
+///
+/// ```text
+/// ENTER (after depth > 0.75·R):
+/// 60310b mov ecx,[esi+0x110]   ; the unit descriptor block base — writer 0x5fad25
+/// 603111 mov eax,[ecx+0xa0]    ;   `add ebx,0x18` ⇒ &values[OBJECT_END=6], so +0xa0 = index 46
+/// 603117 test ah,ah   ; js  60312c    ; bit 15 SET → permit entry
+/// 60311b shr ecx,3    ; test cl,1 ; jne 60312c   ; bit  3 SET → permit
+/// 603125 shr eax,0xb  ; test al,1 ; je  60314a   ; ALL clear → skip TryStartSwim
+///
+/// EXIT (0x6031b4, after !inLiquid and depth < 0.75·R − 1/36 have both passed):
+/// 6031d6 test ah,ah   ; js  6031fa    ; bit 15 SET → RETURN, stay swimming
+/// 6031df test cl,1    ; jne 6031fa    ; bit  3 SET → stay
+/// 6031e9 test al,1    ; jne 6031fa    ; bit 11 SET → stay
+/// 6031eb ... call 0x60dff0            ; ALL clear → StopSwim ANYWAY, at any depth
+/// ```
+///
+/// So the three bits are **one predicate**, not an entry permit: false blocks entry *and* forces an
+/// exit however deep the water. (Decision 1568 shipped this as enter-only, on the reading that the
+/// exit leg was flag-free — `wmo-liquid-scoping.md` §4.6 had never re-derived it. The §5 that
+/// re-derived it cold says otherwise; corrected in 1572.)
+///
+/// What each bit is:
+///
+/// - `0x8` **PLAYER_CONTROLLED** (bit 3) — every body a player can steer: players (set at creation,
+///   vmangos `Player.cpp:462`), pets, totems, guardians, companions, charms. Named by the *client*,
+///   not just the server: the `UnitPlayerControlled` binding pair.
+/// - `0x800` **PET_IN_COMBAT** (bit 11) — likewise client-named, by the `PET_ATTACK_START/STOP`
+///   event firing.
+/// - `0x8000` **USE_SWIM_ANIMATION** (bit 15) — applied on spawn from
+///   `creature_template.static_flags1 & CREATURE_STATIC_FLAG_CAN_SWIM`. **956 of 10912** rows carry
+///   it. The client gives this bit no other meaning whatever: a whole-image census finds exactly
+///   three readers (`0x5fb922`, `0x603111`, `0x6031d0`), all of them this predicate — so vmangos's
+///   name for it (*"Without it units walk on the sea floor instead of swimming"*, and at its
+///   pathing site *"Giant type creatures walk underwater"*) describes the server's intent, and the
+///   client's three reads are the whole of its effect.
+///
+/// **The local avatar does not consult this**, and that is a verified no-op rather than an
+/// omission: bit 3 is set on every body a player can be [`crate::net::Embodied`] in — its own
+/// character, a charmed creature, a possessed one. It bites on the creature marker
+/// (`crate::net::motion::spline::mark_swimming_creatures`), which is where benilla derives the swim
+/// state the wire never carries for a creature.
+const SWIM_UNIT_FLAGS: u32 = 0x8 | 0x800 | 0x8000;
+
+/// May this unit be locally SWIMMING at all? — [`SWIM_UNIT_FLAGS`]'s one spelling. False blocks
+/// entry **and** forces an exit at any depth; see the constant for the two byte sites.
+pub(crate) fn may_swim(unit_flags: u32) -> bool {
+    unit_flags & SWIM_UNIT_FLAGS != 0
+}
+
 /// Submersion depth (yd, water surface above the feet) to **start** swimming — VERIFIED `0.75·h`
 /// from the feet, where `h` is **the unit's own collision height**
 /// ([`crate::entities::CollisionHeight`]): water covering ~three-quarters of its collision box,
@@ -417,6 +469,28 @@ mod tests {
             collision_height: crate::entities::CollisionHeight(h),
             ..Default::default()
         }
+    }
+
+    /// The gate's three bits, named — `0x6030c0`'s `js` / `shr 3` / `shr 0xb` tests, which appear
+    /// **twice**: once permitting entry (`0x60310b`) and once preventing the stop (`0x6031ca`).
+    /// PET_IN_COMBAT is the one that reads like a typo and is not: the reference really does let a
+    /// pet's combat bit keep it swimming, and it is bit 11 of `UNIT_FIELD_FLAGS` in 1.12.1.
+    #[test]
+    fn the_swim_gate_is_those_three_unit_flags_and_no_others() {
+        const PLAYER_CONTROLLED: u32 = 0x8;
+        const PET_IN_COMBAT: u32 = 0x800;
+        const USE_SWIM_ANIMATION: u32 = 0x8000;
+        assert_eq!(
+            SWIM_UNIT_FLAGS,
+            PLAYER_CONTROLLED | PET_IN_COMBAT | USE_SWIM_ANIMATION
+        );
+        for bit in [PLAYER_CONTROLLED, PET_IN_COMBAT, USE_SWIM_ANIMATION] {
+            assert!(may_swim(bit), "any ONE of the three admits ({bit:#x})");
+        }
+        assert!(!may_swim(0), "no flags at all → walks the lakebed");
+        // Not vacuous: a unit carrying every OTHER unit flag still cannot enter. IN_COMBAT,
+        // SKINNABLE, PVP, NOT_SELECTABLE — none of them is a swim permit.
+        assert!(!may_swim(!SWIM_UNIT_FLAGS));
     }
 
     /// Swim mode latches with the verified 1/36-yd hysteresis: enter is a strict `depth > 0.75·h`, leave

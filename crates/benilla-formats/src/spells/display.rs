@@ -35,8 +35,9 @@ pub struct SpellDisplay {
     /// impact (decision 0099's `Speed==0` gate — no missile phase).
     pub speed: f32,
     /// `Attributes` (column 6, module docs) — consumed by [`Self::ranged_attack`] (`0x2`),
-    /// [`Self::in_spellbook`] (`0x20`/`0x80`), [`Self::cooldown_on_event`] (bit 25), and the
-    /// aura-bar display filter [`Self::hidden_from_aura_bar`] (`0x80`).
+    /// [`Self::targets_main_hand_item`] (`0x200`), [`Self::in_spellbook`] (`0x20`/`0x80`),
+    /// [`Self::cooldown_on_event`] (bit 25), and the aura-bar display filter
+    /// [`Self::hidden_from_aura_bar`] (`0x80`).
     pub attributes: u32,
     /// `AttributesEx` (column 7, `SpellRec+0x1c`) — only bit `0x10000000` is consumed
     /// ([`Self::hidden_from_aura_bar`]'s `SPELL_ATTR_EX_NO_AURA_ICON` half).
@@ -49,6 +50,35 @@ pub struct SpellDisplay {
     /// `AttributesEx3` (column 9, `SpellRec+0x24`) — only bit `0x8000` is consumed
     /// ([`Self::melee_white_damage`]).
     pub attributes_ex3: u32,
+    /// **`modalNextSpell`** (`Spell.dbc` column 38, `SpellRec + 0x98`) — the spell this one makes
+    /// the client cast **by itself**, one server round-trip later, with no user input and no addon.
+    /// `0` for all but 57 of the 22357 shipped rows.
+    ///
+    /// `HandleCastResult 0x6e7330` — the `SMSG_CAST_RESULT` (0x130) handler — reads it for the
+    /// spell the reply names, **on success as well as failure** (`0x6e7356 cmp [ebp+0xf],0x2` /
+    /// `0x6e735a jne` sends a non-failure straight to the same block the failure path falls into
+    /// at `0x6e73eb`), provided the reply is for the in-flight cast (`0x6e7408` vs `[0xceca88]`).
+    /// Then, at `0x6e7447`:
+    ///
+    /// - `0` → nothing happens (`0x6e744f je`);
+    /// - `== [0xceac30]`, the **running** auto-repeat → the pending-cast record is re-armed and
+    ///   nothing is cast (`0x6e745d`) — which is why a second sting does not restart Auto Shot or
+    ///   reset its swing timer;
+    /// - otherwise → the client **casts it** (`0x6e74aa call 0x6e5a90` → `TryCast`), at the null
+    ///   target guid, through the ordinary ladder.
+    ///
+    /// **This is how a hunter starts shooting.** Every rank of every hunter shot — Serpent Sting,
+    /// Arcane Shot, Multi-Shot, Concussive Shot, Aimed Shot, Viper/Scorpid Sting, Black Arrow,
+    /// Distracting Shot — carries **75 (Auto Shot)** here, and Auto Shot's own column 38 is `0`, so
+    /// the chain is exactly one hop and cannot loop. The only other non-zero values in the shipped
+    /// file are three "(TEST) bow shot" rows → 59 and two `Minigun` rows → 23675 (self-referential,
+    /// absorbed by the equal-branch).
+    ///
+    /// wow-re `spell/scratch/modalnext-chain-cast.md` (§5 round, 7 agents + orchestrator byte
+    /// arbitration); benilla decision 1597. It **corrects** the reading in 0994 §4 — the client
+    /// really does not start the repeat from the sting's *own* send, and then starts it from a
+    /// *second cast it issues itself*.
+    pub modal_next_spell: u32,
     /// `Attributes & 0x40` (`SPELL_ATTR_PASSIVE`, module docs) — the spellbook's gray-and-refuse
     /// gate (consumed by `benilla-ui/src/script/spellbook.rs`, decision 0216 §8).
     pub passive: bool,
@@ -270,6 +300,7 @@ impl Default for SpellDisplay {
             attributes: 0,
             attributes_ex: 0,
             attributes_ex2: 0,
+            modal_next_spell: 0,
             attributes_ex3: 0,
             passive: false,
             cast_ui: 0,
@@ -397,6 +428,28 @@ impl SpellDisplay {
     /// site `0x6e5930`).
     pub fn ranged_attack(&self) -> bool {
         self.attributes_ex2 & ATTR_EX2_AUTO_REPEAT != 0 || self.attributes & ATTR_RANGED != 0
+    }
+
+    /// **This cast aims itself at the equipped main hand** — `Attributes & 0x200`
+    /// ([`ATTR_TARGET_MAIN_HAND_ITEM`]), the client's own auto-pick for a weapon imbue.
+    ///
+    /// `ArmCast 0x6e5250` resolves the cast's candidate guid from ONE of three places, and this
+    /// bit picks the first: for a **player** caster (`6e5361`: `[[caster+8]+8] >> 4 & 1`, the
+    /// typemask-`0x10` test) carrying the bit (`6e5371: test ah,0x2`), the candidate is the
+    /// player's inventory slot table entry 15 — `[player+0x1d3c][15]`, `EQUIPMENT_SLOT_MAINHAND`
+    /// (`6e5385`–`6e538e`, the `+0x78/+0x7c` guid pair; the table is wow-re's pinned
+    /// `[player+0x1d38]` count / `[player+0x1d3c]` array, bounds-checked at `6e5376`). Only if
+    /// the bit is clear does the walk fall to the explicit guid, then to the current selection
+    /// (`6e5393`/`6e539f`).
+    ///
+    /// So a spell carrying it never raises the item-targeting cursor over an equipped weapon:
+    /// the imbue binds and sends on the press. Exactly 22 rows of the shipped 5875 `Spell.dbc`
+    /// carry the bit, four distinct names — **Rockbiter / Flametongue / Frostbrand / Windfury
+    /// Weapon**, every rank of the shaman's weapon imbues and nothing else — and every one is
+    /// `Targets == 0x10` with an `ENCHANT_ITEM_TEMPORARY` effect (censused against the real file
+    /// in `catalog_tests.rs`, which also records why vmangos answers 28). Decision 1552.
+    pub fn targets_main_hand_item(&self) -> bool {
+        self.attributes & ATTR_TARGET_MAIN_HAND_ITEM != 0
     }
 
     /// The auto-repeat attribute **alone** (`AttributesEx2 & 0x20`) — the narrower gate on the
@@ -602,6 +655,38 @@ impl SpellDisplay {
         (self.attributes & ATTR_ON_NEXT_SWING != 0
             || self.attributes_ex & ATTR_EX_INITIATES_COMBAT != 0)
             && self.attributes_ex2 & ATTR_EX2_INITIATE_COMBAT_POST_CAST == 0
+    }
+
+    /// Whether *this spell's own `SMSG_SPELL_GO`* turns on the melee auto-attack — the **deferred**
+    /// half of the same law, [`Self::initiates_auto_attack`]'s exact complement.
+    /// `HandleSpellGo 0x6e7a70` @ `0x6e83c0` (re-read at the bytes for 1593):
+    ///
+    /// ```text
+    /// 6e83c0  call 0x6e5230(rec); test al,al; jne 6e83da   ; AttrEx2 bit20 SET -> start
+    /// 6e83cb  call 0x6e5200(rec); test al,al; je  6e8407   ; else the triad must hold
+    /// 6e83d4  test byte[rec+0x54],0x8; je 6e8407           ; ...AND rec+0x54 bit3
+    /// 6e83da  lea ecx,[esi+0xc48]; call 0x47bf60; or eax,edx; jne 6e8407  ; NOT already attacking
+    /// 6e83e9  hitCount>0 ? guid = hits[0] : (0,0)          ; [ebp-0x20] count, [ebp-0x1c] array
+    /// 6e8402  call 0x6131a0(ecx=caster, guid)              ; START MELEE AUTO-ATTACK
+    /// ```
+    ///
+    /// **Only the bit20 leg is modelled**, deliberately — and the §5 that closed B280 measured the
+    /// other one rather than leaving it to the argument below. `rec+0x54` is `Spell.dbc` **column
+    /// 21, `InterruptFlags`** (VERIFIED position; bit 3's *semantics* stay INFERRED), which is
+    /// [`Self::interrupt_flags`] — so we could build the leg today. Its live set in the shipped
+    /// file is **8 rows, 3 names** (Slam, Shield Slam, Polymorphic Ray) and is **disjoint from the
+    /// 36** bit20 rows, so every one of them passes `0x6e5200` with bit20 CLEAR and therefore
+    /// started its attack at the *send* ([`Self::initiates_auto_attack`]); by their GO the
+    /// reference's `[+0xc48]` is set and `0x6e83e7` refuses. Unreachable-in-effect, measured, not
+    /// assumed. Modelling it would also be actively *wrong* here: our engaged mirror is the
+    /// server-echoed `Engaged`, not a local lock, so a leg the reference silences with `[+0xc48]`
+    /// would fire a second `CMSG_ATTACKSWING` on our side.
+    ///
+    /// The 36 spells that reach this and nothing else are the stealth openers and positional
+    /// strikes — Backstab, Garrote, Ambush, Cheap Shot, Shred, Ravage, Pounce — plus Judgement:
+    /// exactly the class whose attack must wait for the server to say the strike landed.
+    pub fn initiates_auto_attack_at_go(&self) -> bool {
+        self.attributes_ex2 & ATTR_EX2_INITIATE_COMBAT_POST_CAST != 0
     }
 
     /// Hidden from the player's buff bar — the cache-builder's **display filter**

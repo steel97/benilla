@@ -15,6 +15,9 @@ use crate::ui_script::UiInput;
 #[cfg(test)]
 mod ace_gate_tests;
 mod channels;
+/// The combat log's chat lines (B297) — classification, chat type, and the GlobalString key each
+/// combat packet's sentence is built from.
+pub(crate) mod combat;
 pub(crate) mod commands;
 mod edit;
 mod event;
@@ -23,9 +26,16 @@ mod frames;
 mod input;
 /// The language gate — the exemptions and the fluency lookup behind the chat garble (B262).
 mod language;
+/// The chat windows' saved look (B246, decision 1589) — where the tab menu's tint/alpha/font-size
+/// picks are read from at login and written back at logout.
+mod settings;
 #[cfg(test)]
 mod tests;
 
+/// The joined-channel roster + the `ChatChannels.dbc` catalog. Read outside this module by the
+/// world-state readout ([`crate::world_state_ui`]), whose `Type == 1` gate is "has the player
+/// joined a zone-dependent defense channel".
+pub(crate) use edit::ChannelState;
 /// Test-only: `ui_script::chat_tests` checks every name we fire against the live `ChatTypeInfo`
 /// table, which lives on that side of the tree. The app itself calls it through `event::` — the
 /// router is the only production caller and it is inside this module.
@@ -132,6 +142,8 @@ impl Plugin for UiChatPlugin {
                 OnExit(crate::char_select::ClientState::InWorld),
                 (channels::end_session_channels, end_session_chat),
             );
+        // The per-character saved look (B246) — its own load/watch/save edges.
+        settings::plugin(app);
     }
 }
 

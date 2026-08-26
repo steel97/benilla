@@ -290,6 +290,15 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
         opcode::SMSG_BINDER_CONFIRM => ServerPacket::BinderConfirm {
             binder: binder::read_binder_confirm(&mut r)?,
         },
+        // The talent twin of the confirm above, on a two-way `MSG_` opcode: this direction is the
+        // question (guid + cost); the answer we send back carries the guid alone (decision 1580).
+        opcode::MSG_TALENT_WIPE_CONFIRM => {
+            let ask = progression::read_talent_wipe_confirm(&mut r)?;
+            ServerPacket::TalentWipeConfirm {
+                trainer: ask.trainer,
+                cost: ask.cost,
+            }
+        }
         opcode::SMSG_PLAYERBOUND => {
             let bound = binder::read_player_bound(&mut r)?;
             ServerPacket::PlayerBound {
@@ -414,6 +423,9 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
         },
         opcode::SMSG_LEARNED_SPELL => ServerPacket::LearnedSpell {
             spell_id: spellbook::read_learned_spell(&mut r)?,
+        },
+        opcode::SMSG_REMOVED_SPELL => ServerPacket::RemovedSpell {
+            spell_id: spellbook::read_removed_spell(&mut r)?,
         },
         opcode::SMSG_SUPERCEDED_SPELL => {
             let (old_spell_id, new_spell_id) = spellbook::read_superceded_spell(&mut r)?;
@@ -932,6 +944,9 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
                 ServerPacket::RaidTargetSet { icon, guid }
             }
             group::RaidTargetUpdate::List(entries) => ServerPacket::RaidTargetList { entries },
+        },
+        opcode::SMSG_RAID_INSTANCE_INFO => ServerPacket::RaidInstanceInfo {
+            entries: group::read_raid_instance_info(&mut r)?,
         },
         opcode::MSG_RAID_READY_CHECK => match group::read_ready_check(&mut r)? {
             group::ReadyCheck::Started => ServerPacket::ReadyCheckRequest,

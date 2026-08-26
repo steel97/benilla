@@ -344,6 +344,11 @@ pub enum SessionEvent {
     /// question the `CONFIRM_BINDER` dialog puts on screen. `binder` is the innkeeper's guid, and
     /// it must be echoed in `CMSG_BINDER_ACTIVATE` for the bind to happen at all (decision 1331).
     BinderConfirm { binder: u64 },
+    /// A class trainer is asking whether to unlearn every talent (`MSG_TALENT_WIPE_CONFIRM`,
+    /// inbound) — the question the `CONFIRM_TALENT_WIPE` dialog puts on screen, carrying the
+    /// `trainer` to answer with and the `cost` in copper its money frame shows. Answering means
+    /// sending the SAME opcode back with the guid; declining sends nothing (decision 1580).
+    TalentWipeConfirm { trainer: u64, cost: u32 },
     /// The bind took (`SMSG_PLAYERBOUND`): `area` is the AreaTable id we are now bound in, the
     /// same one [`Self::BindPoint`] carries in the packet beside it.
     PlayerBound { binder: u64, area: u32 },
@@ -477,6 +482,10 @@ pub enum SessionEvent {
     /// A spell added to the book after login (`SMSG_LEARNED_SPELL`): trainer/quest/level-up, widened
     /// from the wire `u16`. The first post-login spell-book mutation (decision 0237).
     SpellLearned { spell_id: u32 },
+    /// A spell taken back out of the book (`SMSG_REMOVED_SPELL`), widened from the wire `u16`:
+    /// a talent wipe, an abandoned profession, a GM `.unlearn`. Every rank of every talent arrives
+    /// as one of these after a respec, and until decision 1584 none of them did.
+    SpellRemoved { spell_id: u32 },
     /// A rank-up (`SMSG_SUPERCEDED_SPELL`): the new rank replaces the old in the book and on the
     /// action bar. Both ids widened from the wire `u16`.
     SpellSuperceded {
@@ -1011,6 +1020,11 @@ pub enum SessionEvent {
     /// One member's ready-check answer, forwarded to the leader only (`MSG_RAID_READY_CHECK`,
     /// non-empty body).
     ReadyCheckAnswer { guid: u64, ready: u8 },
+    /// Our saved raid lockouts (`SMSG_RAID_INSTANCE_INFO`) — the Raid tab's Raid Info panel
+    /// (decision 1549). Replaces the list wholesale; empty is the normal answer.
+    RaidInstanceInfo {
+        entries: Vec<crate::messages::RaidInstanceEntry>,
+    },
     /// A duel challenge (`SMSG_DUEL_REQUESTED`, decision 0633) — delivered to challenger and
     /// challenged alike. `arbiter` is the duel-flag GameObject that identifies the duel and is
     /// echoed on accept/cancel; `challenger` equal to our own guid means we are the one asking.

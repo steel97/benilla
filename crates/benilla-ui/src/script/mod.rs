@@ -82,6 +82,7 @@ mod item_text;
 pub mod keybind;
 mod keyboard;
 mod layout;
+mod layout_cache;
 mod loot;
 mod loot_roll;
 mod lua50;
@@ -100,7 +101,7 @@ mod pointer;
 mod pvp;
 mod quest;
 mod quest_log;
-mod region;
+pub(crate) mod region;
 /// The 19 Region-map methods, shared by frames and regions the way the reference shares them
 /// (decision 1501) — its header is the byte-verified chain and the bug that found the split.
 mod region_map;
@@ -134,6 +135,7 @@ mod types;
 mod unit;
 mod weapon_enchant;
 mod worldmap;
+mod worldstate;
 mod worn_display;
 
 pub use action::{ActionSlot, ActionState};
@@ -151,6 +153,7 @@ pub use char_stats::{
     SKILL_DEFENSE, SKILL_UNARMED,
 };
 pub use chat_send::ChatSend;
+pub use chat_window::ChatWindowLook;
 pub use container::{
     ContainerMove, ContainerSlot, ContainerState, EnchantView, RandomPropertyView, UiCursorMode,
 };
@@ -168,9 +171,10 @@ pub use guild::{
     GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildRequest, GuildState, LastOnline, UnitGuild,
     MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
 };
-pub use inspect::InspectView;
+pub use inspect::{InspectView, UnitReach};
 pub use item_stats::{item_usable, ItemSetView, ItemTemplateView, PlayerReqState};
 pub use item_text::ItemTextState;
+pub use layout_cache::{FrameLayout, LayoutPoint};
 pub use loot::{LootRow, LootState};
 pub use loot_roll::{LootRollEntry, LootRollsState};
 pub use macros::{MacroState, MacroView, MAX_MACROS, MAX_MACRO_BODY, MAX_MACRO_NAME};
@@ -179,7 +183,7 @@ pub use measure::TextMeasure;
 pub use merchant::{ItemStatsHead, MerchantItem, MerchantState};
 pub(crate) use model::Model;
 pub use model::TextureProbe;
-pub use party::{PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo};
+pub use party::{PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, SavedInstanceInfo};
 pub use pet::{PetActionView, PetStats};
 pub use pvp::{HonorState, InspectHonorData};
 pub use quest::{QuestAction, QuestItemView, QuestPanel, QuestSelect, QuestState};
@@ -219,6 +223,7 @@ pub use worldmap::{
     WorldMapContinentView, WorldMapLandmarkView, WorldMapOverlayView, WorldMapState,
     WorldMapZoneView,
 };
+pub use worldstate::WorldStateUiView;
 pub use worn_display::WornDisplay;
 
 use mlua::Lua;
@@ -588,6 +593,7 @@ impl UiScript {
         cooldown::install(&lua)?;
         tooltip::install(&lua)?;
         worldmap::install(&lua)?;
+        worldstate::install(&lua)?;
         net_stats::install(&lua)?;
         diagnostics::install(&lua)?;
 
@@ -746,6 +752,25 @@ impl UiScript {
                 m.inside = inside;
             }
         }
+    }
+
+    /// Publish the live minimap ping's **normalized** offsets from the widget centre (fractions
+    /// of the widget side, x right / y up), or `None` when no ping is live —
+    /// `Minimap:GetPingPosition()`'s source. The app recomputes this from the ping's WORLD point
+    /// every frame a ping is live, before the tick, so a poller sees it track the world as the
+    /// player walks.
+    ///
+    /// One field, not one per widget: there is exactly one ping (decision 1596), and the old
+    /// per-widget push walked the whole ~3k-frame arena every frame a ping was live.
+    pub fn set_minimap_ping(&mut self, ping: Option<(f32, f32)>) {
+        self.model_mut().minimap_ping = ping;
+    }
+
+    /// Drain a `Minimap:PingLocation(x, y)` call — centre-relative offsets in **UI units**
+    /// (x right, y up). The app converts: UI units × the seam scale = window px, ÷ the live
+    /// `px_per_yd` = yards, and the click resolves against the geometry drawn in the same frame.
+    pub fn take_minimap_ping_request(&mut self) -> Option<(f32, f32)> {
+        self.model_mut().minimap_ping_request.take()
     }
 
     /// Monotonic count of Minimap widgets ever created in this VM — the O(1) signal that a new
@@ -1049,8 +1074,24 @@ impl UiScript {
     /// `OnClick` if the pointer re-enters and releases over the very frame it left from. The app
     /// calls this from the same branch that fires the synthetic `OnLeave` (`ui_script/input.rs`).
     pub fn pointer_left_window(&mut self) {
+        // **A started drag ENDS here, it is not merely forgotten.** The reference cannot reach
+        // this state at all — the OS holds the pointer for the whole of a button-held drag, so its
+        // release always arrives and `OnDragStop` always runs. Ours has no such capture: walk the
+        // cursor off the window edge mid-drag and no release is ever fed. Dropping the gesture
+        // silently (what this did) leaves the addon's `OnDragStop → StopMovingOrSizing` unrun, so
+        // the engine's single `Model::moving` slot stays taken and `object::movable::advance_move`
+        // glues that frame to the cursor for the rest of the session — where it also swallows
+        // every press aimed at whatever is underneath. That is B310: one raid row dragged off the
+        // window edge, and no row could be dragged again. Firing the stop is the faithful end,
+        // because it is the same end the reference's own release gives the handler.
+        let abandoned = {
+            let mut model = self.model_mut();
+            cursor::abandon_drag(&mut model)
+        };
+        if let Some(source) = abandoned {
+            self.fire_drag_stop(source);
+        }
         let mut model = self.model_mut();
-        model.drag = None;
         model.mouse_down_on.clear();
         // [`Model::last_click`] is deliberately NOT cleared here. It looks like it belongs in this
         // list, and the binary says otherwise: `[CButton+0x334]` has exactly three writers

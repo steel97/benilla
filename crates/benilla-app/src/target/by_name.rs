@@ -608,8 +608,11 @@ pub(super) fn follow_requests(
 #[derive(SystemParam)]
 #[allow(clippy::type_complexity)] // one bundled system param — the app's convention for big query sets
 pub(crate) struct SelectCommit<'w, 's> {
-    selection: ResMut<'w, Selection>,
+    pub(super) selection: ResMut<'w, Selection>,
     seam: crate::creature_anim::AttackSeam<'w, 's>,
+    // Our own body, read only for what the classification needs: the guid to compare against, the
+    // store `can_attack` reads, and whether we are mid-swing. It used to carry the `Entity` too,
+    // for `TargetUnit("player")`; that resolves through `crate::ui_unit::UnitTokens` now.
     me: Query<
         'w,
         's,
@@ -620,13 +623,13 @@ pub(crate) struct SelectCommit<'w, 's> {
         ),
         With<SelfPlayer>,
     >,
-    stores: Query<'w, 's, &'static ObjectStore>,
+    pub(super) stores: Query<'w, 's, &'static ObjectStore>,
     factions: Option<Res<'w, super::Factions>>,
     reputations: Res<'w, crate::net::Reputations>,
 }
 
 impl SelectCommit<'_, '_> {
-    fn commit(&mut self, entity: Entity, guid: u64) {
+    pub(super) fn commit(&mut self, entity: Entity, guid: u64) {
         let me = self.me.single().ok();
         // The new-target classification `scan::commit` expects from its callers (it does not
         // re-derive one) — the same `can_attack` the cursor and the TAB scan pass.

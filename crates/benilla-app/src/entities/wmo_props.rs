@@ -350,7 +350,6 @@ pub(super) fn spawn_wmo_gameobject_props(
                         placement,
                         particles::EmitterFrames {
                             owner: Some(owner),
-                            attach: None, // a placed prop is never an attached model
                             // The cloud anchors at the PROP: the boat carries the risen flame (the
                             // reference re-anchors every cloud to the emitter's live position),
                             // while an animated bone still never drags it.
@@ -360,9 +359,6 @@ pub(super) fn spawn_wmo_gameobject_props(
                             // A placed prop carries no fade component of its own; its emitters
                             // take the doodad distance fade in the sim instead (0827).
                             alpha: None,
-                            // Scene-graph-carried: this model's world motion arrives on the reference's
-                            // device stack, so its cloud RIDES (0986's baseline).
-                            world_composed: false,
                         },
                         // A placed prop: the doodad law — which is NOT one arm for life. It re-rolls
                         // its variation every play-window (decision 0768), so the emitter resolves

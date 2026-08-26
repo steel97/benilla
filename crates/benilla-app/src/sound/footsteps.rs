@@ -17,6 +17,28 @@
 //! turn-in-place shuffle, whose *only* keys are `$SL0 $SR0` at `t = 0.000`, clatter where the
 //! reference is silent ([`crate::creature_anim::is_footstep_sound`]).
 //!
+//! ## A footfall is two sounds
+//!
+//! `$FSD` fires the terrain step **and** an armor foley, and the reference orders them: the foley
+//! is `0x623390`'s first act after the state gates (`0x6233d9 call [vt+0x8c]`), *ahead of* the
+//! class gate and every terrain lookup below. So a creature whose footstep class is 0 still
+//! rustles, and the two land on different buses — the foley uncapped on bus 0, the step on bus
+//! 9's cap of 6. Both are voiced here, in that order, rather than in two systems, because they
+//! share those three gates and the client shares them too.
+//!
+//! The foley's material has two sources, one per vtable slot:
+//! - **a unit** (`0x623610`) — `CreatureModelData.FoleyMaterialID` off its display
+//!   (`[[unit+0xb3c]+0x28]`), i.e. what the *model* is dressed in.
+//! - **a player** (`0x62fa30`) — the **chest** item's `Material`, read through the equipment
+//!   GUID array at `[player+0x1d38]` element 4. That array is populated only for the local
+//!   player (its ctor writes a count of 113 when the object's guid matches
+//!   `0x468550`'s and **0 otherwise**, `0x5dd454`), so in the reference *other* players are
+//!   silent-bodied. benilla reproduces that for free: `PLAYER_FIELD_INV_SLOT_*` is a private
+//!   field the server sends only to you, so the same read is naturally self-only.
+//!
+//! `Material.dbc` then names the kit, and only three of its eight rows carry one — chain, plate
+//! and leather. **Cloth is silent**, which is data, not a gap: a robed mage rustles nothing.
+//!
 //! The unit's class comes from its voice row (`CreatureSoundData.FootstepID`) through the
 //! generic display→sound chain incl. the model fallback (`benilla_formats::creature_sound` —
 //! characters reach class 7 as *data*). **Class 0, or no row at all, = no footstep sounds**:
@@ -42,20 +64,28 @@ use benilla_assets::coords::bevy_to_wow;
 use benilla_formats::FootstepCatalog;
 
 use crate::creature_anim::{is_footstep_sound, move_flags, AnimSoundEvent, MovementState};
-use crate::entities::CollisionHeight;
-use crate::net::{NetEntity, ObjectStore};
+use crate::entities::{CollisionHeight, Creatures};
+use crate::items::Items;
+use crate::net::{NetCommands, NetEntity, ObjectStore};
 use crate::player::swim_enter_depth;
 use benilla_assets::{AssetSet, LockRecover, WorldAssets};
+use benilla_protocol::EntityKind;
 use benilla_world::schedule::WorldStage;
 
 use super::creature::CreatureVoices;
-use super::kit::{play_kit, KitRef, SoundCategory, SoundKits};
+use super::kit::{play_kit_ext, Bus, KitRef, PlayExtras, SoundCategory, SoundKits};
 use super::{AudioListener, SoundConfig, SoundOutput};
 
 /// The loaded terrain-chain catalog. `pub(crate)`: [`crate::footprints`] reads the same chain's
 /// `TerrainType.Flags` gate (`leaves_footprints`) — one load, two footfall consumers.
 #[derive(Resource)]
 pub(crate) struct Footsteps(pub(crate) FootstepCatalog);
+
+/// **The foley's Z offset** — `0x45851d fadd [0x801628]`, a flat `2.0` added to the emitter's Z
+/// before the play. The rustle comes from the body, not the boots, and the reference lifts it by
+/// a fixed two yards rather than anything model-derived. WoW's Z is Bevy's Y at the same scale
+/// (`benilla_assets::coords`), so this adds to `translation.y`.
+const FOLEY_HEIGHT: f32 = 2.0;
 
 fn load_footsteps(mut commands: Commands, assets: Option<Res<WorldAssets>>) {
     let Some(assets) = assets else { return };
@@ -86,6 +116,13 @@ fn footstep_sounds(
     parents: Query<&ChildOf>,
     root_state: Query<(Option<&ObjectStore>, Option<&MovementState>)>,
     footsteps: Option<Res<Footsteps>>,
+    // The foley half: the material table, the creature catalog that answers a unit's material,
+    // and the item store that answers a player's (a chest template ask rides the same
+    // once-per-entry discipline every other consumer uses).
+    materials: Option<Res<super::Materials>>,
+    creatures: Option<Res<Creatures>>,
+    mut items: Option<ResMut<Items>>,
+    net_commands: Res<NetCommands>,
     voices: Option<Res<CreatureVoices>>,
     world: benilla_world::world_point::WorldPoint,
     kits: Option<ResMut<SoundKits>>,
@@ -123,6 +160,37 @@ fn footstep_sounds(
         }
         if store.is_some_and(|s| s.0.unit_is_stealthed() || s.0.player_is_ghost()) {
             continue;
+        }
+        // **The armor foley** — `0x6233d9 call [vt+0x8c]`, the handler's first act past the gates
+        // above and ahead of every gate below (module docs). Emitted on the stepping entity, not
+        // the root: a mount's own body is what rustles under the rider.
+        if let (Some(materials), Some(it)) = (materials.as_deref(), items.as_mut()) {
+            let material = match net.kind {
+                // The player override (`0x62fa30`) reads the chest through the *private*
+                // inv-slot array, so this resolves for you and no one else — the reference's
+                // own reach, not a restriction added here.
+                EntityKind::Player => super::worn_chest_material(store, it, &net_commands),
+                _ => net
+                    .display_id
+                    .and_then(|d| creatures.as_deref()?.foley_material(d)),
+            };
+            if let Some(kit) = material.and_then(|m| materials.0.foley_kit(m)) {
+                let mut at = transform.translation();
+                at.y += FOLEY_HEIGHT;
+                if let Err(e) = play_kit_ext(
+                    &mut kits,
+                    &assets,
+                    &mut out,
+                    &config,
+                    listener,
+                    KitRef::Id(kit),
+                    Some(at),
+                    SoundCategory::Sfx,
+                    PlayExtras::default(), // bus 0, uncapped, volume 1.0 — `0x458870`'s own
+                ) {
+                    warn!("foley (kit {kit}): {e:#}");
+                }
+            }
         }
         // The unit's footstep class (module docs): the voice row's class verbatim; zero or no
         // row = silent (the client's class-0 gate — no code default exists, B11).
@@ -168,7 +236,7 @@ fn footstep_sounds(
                 .room_group(who)
                 .map_or_else(|| "adt".to_string(), |g| format!("wmo g{g}"))
         );
-        if let Err(e) = play_kit(
+        if let Err(e) = play_kit_ext(
             &mut kits,
             &assets,
             &mut out,
@@ -177,6 +245,10 @@ fn footstep_sounds(
             KitRef::Id(kit),
             Some(transform.translation()),
             SoundCategory::Sfx,
+            PlayExtras {
+                bus: Bus::FOOTSTEP,
+                ..default()
+            },
         ) {
             warn!("footstep (kit {kit}): {e:#}");
         }

@@ -65,6 +65,19 @@ pub(crate) use manifest::{load_font_registry, load_ingame_ui};
 #[derive(Resource, Default)]
 pub(crate) struct PointerOverUi(pub(crate) bool);
 
+/// **A synthetic pointer owns the mouse this frame** — set by the headless drag probe
+/// ([`crate::capture::ProbeDragPlugin`]) while it drives a gesture through the real pointer path.
+///
+/// [`input::feed_ui_input`] skips its whole mouse half while this is set, and that is the ONLY
+/// thing it does. Without it a scripted gesture cannot exist: the OS cursor is wherever the
+/// director left it (usually outside a backgrounded probe window), so every frame between the
+/// synthetic press and the synthetic release would feed the real position — dragging the frame to
+/// the wrong place at best, and at worst calling `pointer_left_window`, which disarms the very
+/// gesture the probe just armed. The keyboard half is untouched: a probe driving the mouse has no
+/// business swallowing keys.
+#[derive(Resource, Default)]
+pub(crate) struct SyntheticPointer(pub(crate) bool);
+
 /// The egui dev overlay's half of the pointer arbitration, written each egui pass by the debug
 /// panel's `track_pointer_over_ui`. **Defined here, with the arbiter that reads it** (decision
 /// 1174 finishing 0026): the type has to exist in a build with no dev overlays compiled in, and
@@ -277,6 +290,7 @@ impl Plugin for UiScriptPlugin {
             .init_resource::<UiFrameCost>()
             .init_resource::<UiCostWanted>()
             .init_resource::<PointerOverUi>()
+            .init_resource::<SyntheticPointer>()
             .init_resource::<EguiPointerOver>()
             .init_resource::<InspectMode>()
             .init_resource::<PlayerUiHover>()
@@ -678,6 +692,9 @@ mod unit_frame_tests;
 mod unit_popup_tests;
 
 #[cfg(test)]
+mod chat_resize_tests;
+
+#[cfg(test)]
 mod dropdown_tests;
 
 #[cfg(test)]
@@ -694,6 +711,9 @@ mod pet_bar_tests;
 
 #[cfg(test)]
 mod pet_frame_tests;
+
+#[cfg(test)]
+mod tot_frame_tests;
 
 #[cfg(test)]
 mod micro_menu_tests;
@@ -752,6 +772,12 @@ mod group_loot_tests;
 #[cfg(test)]
 mod chat_tests;
 
+/// The chat tab's options menu, end to end (decision 1589 / B246) — its own file because it needs
+/// the whole dropdown + colour-picker stack under `ChatFrame.xml`, where `chat_tests` deliberately
+/// runs on the window alone.
+#[cfg(test)]
+mod chat_options_tests;
+
 #[cfg(test)]
 mod bag_tests;
 #[cfg(test)]
@@ -795,6 +821,9 @@ mod static_popup_tests;
 mod binder_tests;
 
 #[cfg(test)]
+mod talent_wipe_tests;
+
+#[cfg(test)]
 mod death_tests;
 
 #[cfg(test)]
@@ -816,6 +845,12 @@ mod friends_tests;
 #[cfg(test)]
 mod guild_tests;
 
+/// The social window's fourth tab — the raid pane and its grid (decision 1549). Its own module for
+/// `guild_tests`' reason: every test in it pushes a RAID roster first, which a file about the
+/// friends list must not be in the business of.
+#[cfg(test)]
+mod raid_tests;
+
 #[cfg(test)]
 mod quest_tests;
 
@@ -824,6 +859,8 @@ mod quest_timer_tests;
 
 #[cfg(test)]
 mod durability_tests;
+#[cfg(test)]
+mod world_state_tests;
 
 #[cfg(test)]
 mod screenshot_tests;

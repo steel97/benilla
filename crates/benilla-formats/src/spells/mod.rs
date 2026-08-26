@@ -185,6 +185,17 @@ const COL_MANA_PER_SECOND: usize = 34;
 /// `GetMinMaxRange 0x6e3480` resolves (wow-re `wave-cooldown.md`). Same empirical pin (Auto
 /// Shot/Aimed Shot 114, Throw 74, Charge 95, Fireball 35).
 const COL_RANGE_INDEX: usize = 36;
+/// `modalNextSpell` — `Spell.dbc` **column 38** (`SpellRec + 0x98`): a spell the client casts **by
+/// itself**, with no user input, when the server's `SMSG_CAST_RESULT` for this spell arrives. See
+/// [`SpellDisplay::modal_next_spell`] for the whole law and the shipped-file census.
+///
+/// The column's position is chain-locked the same way the interrupt trio's is (offset = column×4,
+/// between the verified `+0x90` = 36 rangeIndex and `+0xf4` = 61 Effect[0]); the name is wow-re's
+/// (`modalnext-chain-cast.md` §3/§11) and the community's. This repo's own reason to trust it is
+/// the distribution: non-zero on 57 of 22357 rows, and 52 of those 57 name spell **75, Auto Shot**,
+/// every one of them a hunter shot. A column that fell where this one falls by accident could not
+/// look like that.
+const COL_MODAL_NEXT_SPELL: usize = 38;
 /// `StartRecoveryCategory` (`SpellRec+0x274`, `0x274/4 == 157`) / `StartRecoveryTime` (`+0x278`,
 /// 158) — the **global-cooldown** pair `StartGlobalCooldown 0x6e2de0` reads at the local
 /// cast-send (`0x6e58fb`, wow-re `wave-cast.md`, VERIFIED). Category 133 / 1500 ms for ordinary
@@ -375,6 +386,12 @@ const ATTR_EX3_NO_CASTING_BAR_TEXT: u32 = 0x4;
 /// `Attributes` bit `0x2` — the "uses the ranged slot" attribute (mangos `SPELL_ATTR_RANGED`).
 /// One half of the client's ranged-stance gate (module docs).
 const ATTR_RANGED: u32 = 0x2;
+/// `Attributes` bit 9 (`0x200`) — **this cast targets the equipped main hand, without asking**
+/// (`SPELL_ATTR0_TARGET_MAINHAND_ITEM`). vmangos leaves the bit unnamed (`SPELL_ATTR_UNK9`)
+/// because it is a purely *client-side* targeting instruction: the server only ever sees the
+/// resolved item guid. The law is `ArmCast 0x6e5250`'s candidate leg (`6e536e`–`6e5391`), read by
+/// [`SpellDisplay::targets_main_hand_item`]; decision 1552.
+const ATTR_TARGET_MAIN_HAND_ITEM: u32 = 0x200;
 /// `AttributesEx2` bit `0x20` — the auto-repeat attribute (mangos `SPELL_ATTR_EX2_AUTO_REPEAT`);
 /// the other half of the gate. Auto Shot and wand Shoot carry it.
 const ATTR_EX2_AUTO_REPEAT: u32 = 0x20;
@@ -448,9 +465,16 @@ const ATTR_EX_CHANNELED: u32 = 0x44;
 /// `AttributesEx2` bit `0x100000` — vmangos `SPELL_ATTR_EX2_INITIATE_COMBAT_POST_CAST` ("Client
 /// will send CMSG_ATTACK_SWING after SMSG_SPELL_GO"). The §5-verified send-tail predicate
 /// EXCLUDES it (`[ebp-2] = 0x6e5200 && Ex2-bit20 CLEAR`): a bit20 spell defers its attack-start
-/// to the `SMSG_SPELL_GO` handler (`0x6e83c0`) instead of starting at send. No spell benilla
-/// meets carries it (asserted against the real 5875 `Spell.dbc` in `catalog_tests.rs`), so the
-/// deferred path stays unbuilt — this bit only *suppresses* the send-time start.
+/// to the `SMSG_SPELL_GO` handler (`0x6e83c0`) instead of starting at send. Both halves are
+/// built — [`SpellDisplay::initiates_auto_attack`] is the send-time one, and
+/// [`SpellDisplay::initiates_auto_attack_at_go`] the deferred one.
+///
+/// This doc used to say "no spell benilla meets carries it, so the deferred path stays unbuilt".
+/// That was a proof by absence over the ten warrior/rogue spells `catalog_tests.rs` happened to
+/// list. The real 5875 `Spell.dbc` carries the bit on **36 rows** — every rank of Backstab,
+/// Garrote, Ambush, Cheap Shot, Shred, Ravage and Pounce, plus Judgement 20271 — i.e. every
+/// stealth opener and positional strike in the game, whose attack must wait for the server to
+/// resolve it. The census is the test beside this now (decision 1593, bug B280's sweep).
 const ATTR_EX2_INITIATE_COMBAT_POST_CAST: u32 = 0x0010_0000;
 
 /// `Attributes` bit 25 (`0x0200_0000`) — `SPELL_ATTR_COOLDOWN_ON_EVENT` (vmangos; "disabled while
@@ -763,6 +787,7 @@ pub fn load_spell_catalog(chain: &mut Chain) -> Result<SpellCatalog> {
                 mana_cost_per_level: u32_at(r, COL_MANA_COST_PER_LEVEL).unwrap_or(0),
                 mana_per_second: u32_at(r, COL_MANA_PER_SECOND).unwrap_or(0),
                 range_index: u32_at(r, COL_RANGE_INDEX).unwrap_or(0),
+                modal_next_spell: u32_at(r, COL_MODAL_NEXT_SPELL).unwrap_or(0),
                 targets: u32_at(r, COL_TARGETS).unwrap_or(0),
                 implicit_target_a1: u32_at(r, COL_IMPLICIT_TARGET_A1).unwrap_or(0),
                 stances: u32_at(r, COL_STANCES).unwrap_or(0),

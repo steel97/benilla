@@ -230,10 +230,74 @@
         chatType("BATTLEGROUND",                         1,  93, 255, 127,   0)
         chatType("BATTLEGROUND_LEADER",                  0,  94, 255, 219, 183)
 
-        -- ── BenillaFCF: the FloatingChatFrame behaviors, re-expressed (ref FloatingChatFrame.lua)
-        -- Quoted constants: CHAT_TAB_SHOW_DELAY=0.2, CHAT_FRAME_FADE_TIME=0.15,
-        -- DEFAULT_CHATFRAME_ALPHA=0.25, CHAT_BUTTON_FLASH_TIME=0.5,
+        -- ── The FloatingChatFrame constants, as the GLOBALS the reference declares ───────────
+        -- These were comments here until decision 1589 (B246): the Chat options page's *Remove
+        -- Chat Hover Delay* row writes the first two through `SetChatMouseOverDelay`, so they
+        -- have to be values something can move rather than numbers inlined in the fade. Names,
+        -- spellings and values are the reference's own (FloatingChatFrame.lua l.8-12), and two of
+        -- them — `CHAT_FRAME_FADE_TIME` and `CHAT_FRAME_TEXTURES` — are in the captured 1.12 `_G`
+        -- as `framexml` globals, so an addon can read them.
+        CHAT_TAB_SHOW_DELAY = 0.2
+        CHAT_FRAME_FADE_TIME = 0.15
+        DEFAULT_CHATFRAME_ALPHA = 0.25
+        DEFAULT_CHATFRAME_COLOR = { r = 0, g = 0, b = 0 }
+        -- Still quoted rather than declared (nothing writes them): CHAT_BUTTON_FLASH_TIME=0.5,
         -- MESSAGE_SCROLLBUTTON_INITIAL_DELAY=0, MESSAGE_SCROLLBUTTON_SCROLL_DELAY=0.05.
+
+        -- REMOVE_CHAT_DELAY — the Chat options page's *Remove Chat Hover Delay* row (decision
+        -- 1589), a saved variable exactly as the reference has it (`UIOptionsFrameCheckButtons`
+        -- CheckButton18, `uvar = "REMOVE_CHAT_DELAY"`, `default = "0"`). Declared HERE because
+        -- this is the file that owns what it changes — a row whose defining file was not loaded
+        -- gets a nil `applyFunc` and is skipped, which is what keeps a partial harness honest
+        -- (OptionsFrame.xml's `OptionsFrame_ApplySavedSettings`). The `RegisterForSave` sits on
+        -- the line under the assignment, per 1128's load order.
+        REMOVE_CHAT_DELAY = "0"
+        RegisterForSave("REMOVE_CHAT_DELAY")
+
+        -- CHAT_LOCKED — the master "no chat window may be moved or resized" switch, the reference's
+        -- own saved variable. The reference declares it in `UIOptionsFrame.lua` l.96-97 (`"0"` plus
+        -- `RegisterForSave`) because that is where its *Lock Chat Settings* checkbox lives; ours is
+        -- declared here for the reason the row above is — the file that owns what it changes owns
+        -- the variable, and a row whose defining file was not loaded gets a nil `applyFunc` and is
+        -- skipped rather than half-applied.
+        --
+        -- **`"0"` — off.** Note the reference's own two-value disagreement: its checkbox table says
+        -- `default = "1"` (`UIOptionsFrame.lua:44`) while the variable is initialised `"0"` two
+        -- lines later, and the initialiser is what a fresh client actually runs. `"0"` here too.
+        -- The per-window lock (`FCF_SetLocked`, the tab menu's row) is the one that ships ON; this
+        -- one is the blanket override on top of it.
+        CHAT_LOCKED = "0"
+        RegisterForSave("CHAT_LOCKED")
+
+        -- The tab menu's lock row labels (GlobalStrings l.2590 / l.4448). Live text comes off the
+        -- player's own `GlobalStrings.lua`; these are the headless-test fallback this file already
+        -- uses everywhere else.
+        LOCK_WINDOW = LOCK_WINDOW or "Lock Window"
+        UNLOCK_WINDOW = UNLOCK_WINDOW or "Unlock Window"
+
+        -- The row's applyFunc. The reference has no such function because it calls
+        -- `SetChatMouseOverDelay(REMOVE_CHAT_DELAY)` inline from two places (its options load,
+        -- l.216, and the checkbox's own commit); ours needs a zero-argument name to hand the row,
+        -- and this is it — one line, in the file that owns both halves.
+        function ChatFrame_ApplyMouseOverDelay()
+            SetChatMouseOverDelay(REMOVE_CHAT_DELAY)
+        end
+
+        -- SetChatMouseOverDelay(noDelay) — ref FloatingChatFrame.lua l.1456-1464, verbatim in
+        -- effect: "1" collapses BOTH the stationary-hover delay and the fade to zero, so the box
+        -- appears the instant the cursor crosses it. The options row's `applyFunc` is the only
+        -- caller, and `UIOptionsFrame_Load` calls it at login for the same reason ours does.
+        function SetChatMouseOverDelay(noDelay)
+            if noDelay == "1" then
+                CHAT_TAB_SHOW_DELAY = 0
+                CHAT_FRAME_FADE_TIME = 0
+            else
+                CHAT_TAB_SHOW_DELAY = 0.2
+                CHAT_FRAME_FADE_TIME = 0.15
+            end
+        end
+
+        -- ── BenillaFCF: the FloatingChatFrame behaviors, re-expressed (ref FloatingChatFrame.lua)
         BenillaFCF = {
             selected = 1,           -- SELECTED_DOCK_FRAME (1 = General, 2 = Combat Log)
             hover = false,          -- cursor inside the dock's padded rect
@@ -250,27 +314,266 @@
             flashLeft = 0,          -- remaining flash seconds (ref: 60s, blink 0.25/0.25)
         }
 
-        -- The per-window texture sets the hover fade drives (ref CHAT_FRAME_TEXTURES: the
-        -- background + the 8 border pieces; benilla authors the borders as plain textures —
-        -- resizing is settings, the hover LOOK is not). Global: the load-time tint below needs it.
+        -- CHAT_FRAME_TEXTURES — the reference's own list (FloatingChatFrame.lua l.14-24), verbatim
+        -- in content and in spelling: the background plus the eight RESIZE GRIPS' textures. The
+        -- window's border art IS the grips, which is why one list drives both the hover fade
+        -- (`FCF_OnUpdate`) and the tint/alpha setters (`FCF_SetWindowColor`/`FCF_SetWindowAlpha`) —
+        -- the ring appears with the box and is invisible with it.
+        --
+        -- benilla used to author these as plain `$parentBorder*` textures ("the hover LOOK without
+        -- the resize mechanics"); the mechanics landed with the move/resize arc, so the suffixes
+        -- are the reference's again and the pieces are its buttons' children.
+        CHAT_FRAME_TEXTURES = {
+            "Background",
+            "ResizeTopLeftTexture", "ResizeTopRightTexture",
+            "ResizeBottomLeftTexture", "ResizeBottomRightTexture",
+            "ResizeTopTexture", "ResizeBottomTexture",
+            "ResizeLeftTexture", "ResizeRightTexture",
+        }
+
+        -- The live texture objects of one window's set. Global: the load-time tint below needs it.
         function BenillaFCF_Textures(id)
             local n = "ChatFrame" .. id
             local list = {}
-            for _, suffix in ipairs({
-                "Background",
-                "BorderTopLeft", "BorderTopRight", "BorderBottomLeft", "BorderBottomRight",
-                "BorderTop", "BorderBottom", "BorderLeft", "BorderRight",
-            }) do
+            for _, suffix in ipairs(CHAT_FRAME_TEXTURES) do
                 local t = getglobal(n .. suffix)
                 if t then table.insert(list, t) end
             end
             return list
         end
 
+        -- ── The per-window LOOK: the tint and the base alpha (decision 1589, B246) ───────────
+        -- `frame.oldAlpha` and the CHAT_FRAME_TEXTURES vertex colour in the reference; a pair of
+        -- constants here (alpha 0, black) until B246 asked for a way to change them. The store is
+        -- the engine's — `GetChatWindowInfo`/`SetChatWindowColor`/`SetChatWindowAlpha`, which is
+        -- what an addon reads too — and this table is the per-frame cache the fade reads each
+        -- frame instead of re-crossing that seam.
+        BenillaFCF_Look = {}
+
+        local function lookFor(id)
+            local l = BenillaFCF_Look[id]
+            if not l then
+                l = { r = 0, g = 0, b = 0, a = 0 }
+                BenillaFCF_Look[id] = l
+            end
+            return l
+        end
+
+        -- FCF_SetWindowColor(frame, r, g, b, doNotSave) — ref FloatingChatFrame.lua l.696-704.
+        -- The tint is applied here and now (a vertex colour is not part of the fade); the save is
+        -- what makes it outlive the session, and `doNotSave` is the reference's own flag for
+        -- "this value CAME from the store" (its `FloatingChatFrame_Update` passes it).
+        function FCF_SetWindowColor(frame, r, g, b, doNotSave)
+            local id = frame:GetID()
+            local l = lookFor(id)
+            l.r, l.g, l.b = r, g, b
+            for _, t in ipairs(BenillaFCF_Textures(id)) do
+                t:SetVertexColor(r, g, b)
+            end
+            if not doNotSave then
+                SetChatWindowColor(id, r, g, b)
+            end
+        end
+
+        -- FCF_SetWindowAlpha(frame, alpha, doNotSave) — ref l.706-716.
+        --
+        -- The reference writes the nine textures' alpha straight here; ours cannot, because the
+        -- hover fade below is the single writer of those alphas (decision 1396's latch is what
+        -- keeps an idle dock from rewriting them every frame). So this moves the BASE the fade
+        -- interpolates from and invalidates that latch, which makes the next frame's apply the
+        -- one write — the reference's own `frame.oldAlpha` bookkeeping, minus the double write.
+        function FCF_SetWindowAlpha(frame, alpha, doNotSave)
+            local id = frame:GetID()
+            lookFor(id).a = alpha
+            frame.oldAlpha = alpha       -- ref: "Remember the alpha"
+            BenillaFCF.appliedReveal = -1
+            if not doNotSave then
+                SetChatWindowAlpha(id, alpha)
+            end
+        end
+
+        -- The alpha a window's chrome actually wears at a given point in the hover fade.
+        --
+        -- **The reference only fades a window that is DIMMER than the hover value**: both the fade
+        -- in and the fade out are guarded by `chatFrame.oldAlpha < DEFAULT_CHATFRAME_ALPHA`
+        -- (FloatingChatFrame.lua l.871 / l.913). So a player who has made their chat box solid
+        -- keeps it solid when the cursor leaves — the box does not dim itself back down — while
+        -- the shipped default (alpha 0) rides the full 0 → 0.25 ramp exactly as before.
+        local function windowAlpha(id, reveal)
+            local base = lookFor(id).a
+            if base >= DEFAULT_CHATFRAME_ALPHA then
+                return base
+            end
+            return base + (DEFAULT_CHATFRAME_ALPHA - base) * reveal
+        end
+
+        -- ── The lock, the move and the resize (ref FloatingChatFrame.lua) ────────────────────
+        --
+        -- Three gates decide whether a window may be dragged or resized, and the reference applies
+        -- all three at both verbs (`FCF_Resize` l.583-601, `FCF_Tab_OnClick`'s move arm l.1247-1256):
+        --   1 · `FCF_Get_ChatLocked()` — the blanket `CHAT_LOCKED` saved variable;
+        --   2 · `chatFrame.isLocked`   — this window's own lock, the tab menu's row;
+        --   3 · docked-and-not-the-default — a docked window's rect belongs to the DOCK, so only
+        --       `DEFAULT_CHAT_FRAME` may move it. ChatFrame2's anchors ARE ChatFrame1's corners:
+        --       resizing it directly would stretch it off the window it follows.
+
+        -- The eight grips' name suffixes, the reference's own (see `CHAT_FRAME_TEXTURES`).
+        local RESIZE_GRIPS = {
+            "TopLeft", "TopRight", "BottomLeft", "BottomRight",
+            "Top", "Bottom", "Left", "Right",
+        }
+
+        -- May this window be moved/resized at all? The three gates above, in one place because
+        -- both verbs and the lock's own plumbing ask the same question.
+        function FCF_CanMove(chatFrame)
+            if FCF_Get_ChatLocked() then return nil end
+            if chatFrame.isLocked then return nil end
+            if chatFrame.isDocked and chatFrame ~= DEFAULT_CHAT_FRAME then return nil end
+            return 1
+        end
+
+        -- Hand the window's EDGES and its BODY to the mouse, or take them back. benilla's own —
+        -- the reference needs nothing like it because its chat window is `enableMouse="false"` and
+        -- so competes for no click. Ours does (`OnClick`, `OnHyperlinkClick`), so a locked window
+        -- has to be exactly as click-through as it was before this arc: eight live grip buttons
+        -- would shadow the outer 16px of the window, and the bottom strip is where the newest chat
+        -- line — the one with the item link in it — is drawn.
+        function BenillaFCF_ApplyLock(chatFrame)
+            local free = FCF_CanMove(chatFrame)
+            local name = chatFrame:GetName()
+            for _, grip in ipairs(RESIZE_GRIPS) do
+                local b = getglobal(name .. "Resize" .. grip)
+                if b then b:EnableMouse(free and true or false) end
+            end
+            local tab = getglobal(name .. "Tab")
+            if free then
+                chatFrame:RegisterForDrag("LeftButton")
+                if tab then tab:RegisterForDrag("LeftButton") end
+            else
+                chatFrame:RegisterForDrag()
+                if tab then tab:RegisterForDrag() end
+            end
+        end
+
+        -- ref l.802-805, verbatim: the frame field and the engine store, together.
+        -- `BenillaFCF_ApplyLock` is ours, and it is what makes the flag do something structurally
+        -- rather than only in the two early returns below.
+        function FCF_SetLocked(chatFrame, isLocked)
+            chatFrame.isLocked = isLocked
+            SetChatWindowLocked(chatFrame:GetID(), isLocked)
+            BenillaFCF_ApplyLock(chatFrame)
+        end
+
+        -- ref l.785-800. **Its undock branch is deliberately absent**: the reference, on unlocking
+        -- a docked frame that is not the default one, calls `FCF_UnDockFrame`, re-centres it on the
+        -- screen and re-seats its tab. benilla has no undock (0288 §2), so that arm has nothing to
+        -- run — named here rather than stubbed (1134 §4), and reachable only from the Combat Log's
+        -- tab, whose own gate above already refuses to move it.
+        function FCF_ToggleLock()
+            local chatFrame = FCF_GetCurrentChatFrame()
+            if chatFrame.isLocked then
+                FCF_SetLocked(chatFrame, nil)
+            else
+                FCF_SetLocked(chatFrame, 1)
+            end
+        end
+
+        -- ref l.1428-1441, verbatim. `CHAT_LOCKED` is the blanket switch over every window; the
+        -- re-apply is ours, for the reason `FCF_SetLocked`'s is.
+        function FCF_Set_ChatLocked(isLocked)
+            -- The saved variable is a STRING, not a boolean — the uvar contract every options row
+            -- in this client shares, and what `RegisterForSave` writes out.
+            CHAT_LOCKED = isLocked and "1" or "0"
+            for i = 1, 2 do
+                local frame = getglobal("ChatFrame" .. i)
+                if frame then BenillaFCF_ApplyLock(frame) end
+            end
+        end
+
+        function FCF_Get_ChatLocked()
+            -- `1`/nil rather than a boolean, because every caller here is an `if` and the
+            -- reference's own callers pass the result around as one.
+            if CHAT_LOCKED == "1" then return 1 end
+            return nil
+        end
+
+        -- ref l.583-601. `this` is the grip button; the window is its parent. The commented-out
+        -- `DEFAULT_CHAT_FRAME.resizing = 1` block in the reference is left out with it.
+        function FCF_Resize(anchorPoint)
+            local chatFrame = this:GetParent()
+            if not FCF_CanMove(chatFrame) then return end
+            chatFrame.resizing = 1
+            chatFrame:StartSizing(anchorPoint)
+        end
+
+        -- ref l.603-609. The reference also calls `FCF_DockUpdate()` when the parent is the default
+        -- frame; ours has no such function and needs none — the tab is anchored to the window's own
+        -- background, so it follows a resize by anchor rather than by a re-layout pass.
+        function FCF_StopResize()
+            local chatFrame = this:GetParent()
+            chatFrame:StopMovingOrSizing()
+            chatFrame.resizing = nil
+        end
+
+        -- The move half. The reference reaches `StartMoving`/`StopMovingOrSizing` from
+        -- `FCF_Tab_OnClick`'s press/release arms; ours reaches them from the drag trio, for the
+        -- reasons written at the template's `OnDragStart`. Same two engine verbs, same three gates.
+        --
+        -- `MOVING_CHATFRAME` (the reference's global) is not set: its only readers there are
+        -- `FCF_IsValidChatFrame` and the dock-region hit test, neither of which exists here, and a
+        -- global nothing reads is state that starts lying the first time a path forgets to clear it.
+        function FCF_StartMove(chatFrame)
+            if not FCF_CanMove(chatFrame) then return end
+            chatFrame.moving = 1
+            chatFrame:StartMoving()
+        end
+
+        function FCF_StopMove(chatFrame)
+            chatFrame:StopMovingOrSizing()
+            chatFrame.moving = nil
+        end
+
+        -- Is either dock window mid-drag? The hover fade holds the chrome visible while it is —
+        -- ref FCF_OnUpdate's own `(MouseIsOver(...) or chatFrame.resizing)`. Without it the box
+        -- fades out under a moving cursor and takes the grip out of the hand holding it.
+        function BenillaFCF_Dragging()
+            for i = 1, 2 do
+                local f = getglobal("ChatFrame" .. i)
+                if f and (f.resizing or f.moving) then return 1 end
+            end
+            return nil
+        end
+
+        -- FloatingChatFrame_Update's look half (ref l.49-57): pull every window's stored tint and
+        -- alpha out of the engine and seat them, WITHOUT saving them back (they came from there).
+        -- Runs at load and on `UPDATE_CHAT_WINDOWS`, which is the event the host fires after it
+        -- restores the player's file.
+        function BenillaFCF_LoadWindowLooks()
+            for i = 1, 2 do
+                local frame = getglobal("ChatFrame" .. i)
+                if frame then
+                    local _, fontSize, r, g, b, a, _, locked = GetChatWindowInfo(i)
+                    FCF_SetWindowColor(frame, r, g, b, 1)
+                    FCF_SetWindowAlpha(frame, a, 1)
+                    -- ref l.56, in the same block and for the same reason as the two above: the
+                    -- window's stored LOCKED is seated onto the frame. It ships `1` (the stock
+                    -- chat-cache row), so both dock windows start locked exactly as a fresh 1.12
+                    -- client's do — and the write back through `SetChatWindowLocked` is idempotent,
+                    -- so seating what was just read dirties nothing.
+                    FCF_SetLocked(frame, locked)
+                    -- SIZE 0 is the stock "use the font's own height" and applies nothing.
+                    if fontSize and fontSize > 0 then
+                        FCF_SetChatWindowFontSize(frame, fontSize, 1)
+                    end
+                end
+            end
+        end
+
         -- FCF_SelectDockFrame: show the selected frame, hide the other; selected tab full alpha,
         -- unselected half (both still scaled by the reveal fade below). Stops the selected tab's
-        -- whisper flash (ref FCF_SelectDockFrame → UIFrameFlashRemoveFrame). Tab getglobals are
-        -- guarded: window 2's tab is deliberately unbuilt (see the note at the tab section).
+        -- whisper flash (ref FCF_SelectDockFrame → UIFrameFlashRemoveFrame). The tab getglobal
+        -- stays guarded: both dock tabs exist (1575), but the guard also covers ChatFrame3..7,
+        -- which have no tabs at all and which the error above is what actually keeps out.
         function BenillaFCF_SelectDock(id)
             BenillaFCF.selected = id
             for i = 1, 2 do
@@ -317,10 +620,191 @@
             BenillaFCF_SelectDock(id)
         end
 
-        function BenillaFCF_TabClick(id)
-            -- ref FCF_Tab_OnClick (docked, left click): select; UChatScrollButton per click.
+        function BenillaFCF_TabClick(id, button)
+            -- ref FCF_Tab_OnClick l.1219-1226: a RIGHT click opens the window's options menu and
+            -- returns — it does not select the tab, and it plays no click sound (the ref's sound
+            -- is on the OnClick *after* the call, which the early return skips). The ref also
+            -- calls `chatFrame:StopMovingOrSizing()` first; benilla has no drag, so there is
+            -- nothing in flight to stop.
+            if button == "RightButton" then
+                ToggleDropDownMenu(1, nil, getglobal("ChatFrame" .. id .. "TabDropDown"),
+                                   "ChatFrame" .. id .. "Tab", 0, 0)
+                return
+            end
+            -- ref FCF_Tab_OnClick (docked, left click): close any open menu, then select.
+            CloseDropDownMenus()
             BenillaFCF_SelectDock(id)
             PlaySound("UChatScrollButton")
+        end
+
+        -- ── The chat tab's options menu (decision 1589, B246) ────────────────────────────────
+        -- ref `FCFOptionsDropDown_Initialize` (FloatingChatFrame.lua l.87-393). The reference's
+        -- level-1 menu has four blocks: the window verbs (Lock/Unlock · Rename · Create New ·
+        -- Remove), a **DISPLAY** header over Font Size and Background, a **FILTERS** header over
+        -- seven message-group submenus, and Join New Channel.
+        --
+        -- benilla ships the DISPLAY block, and that is the honest tree rather than a first pass:
+        -- every window verb needs the window management 0288 §2 deliberately left out (there is
+        -- no lock, no rename, no undock, no create/close), and the FILTERS block needs a runtime
+        -- message-group editor over `ui_chat::frames`' registration, which is its own feature and
+        -- not the one B246 reports missing. Each block lands with the machinery under it.
+        --
+        -- The menu is per tab (`ChatFrame<n>TabDropDown`), because `FCF_GetCurrentChatFrameID`
+        -- reads the open menu's PARENT id — that is the reference's contract and the reason the
+        -- capsule is declared inside the tab rather than shared.
+        -- ref l.81-85 is `UIDropDownMenu_Initialize(this, …, "MENU")` plus two width setters.
+        -- Ours assigns the two fields that call would have set, and skips the widths — both
+        -- departures are about OUR kit, not about the reference:
+        --   · `UIDropDownMenu_Initialize` clears every row of both shared lists, which is work at
+        --     LOAD time for a menu nobody has opened — and it would make this file's load order
+        --     depend on the dropdown kit's, and through it on GameTooltip's
+        --     `TOOLTIP_DEFAULT_COLOR`. `ToggleDropDownMenu` runs that init on every open anyway,
+        --     which is where the reference's own re-init happens too.
+        --   · `UIDropDownMenu_SetWidth(50)` means something DIFFERENT here: our kit reads a
+        --     declared width as `noResize` + a fixed list width (UIDropDownMenu.xml l.672-679),
+        --     so transcribing it would pin the menu at 50 px and cut "Background" in half. In the
+        --     reference, MENU mode never draws the capsule at all, so its width is inert there.
+        -- `BenillaFriendsDropDown` (FriendsFrame.xml) is already this same shape.
+        function FCFOptionsDropDown_OnLoad()
+            this.initialize = FCFOptionsDropDown_Initialize
+            this.displayMode = "MENU"
+        end
+
+        function FCFOptionsDropDown_Initialize()
+            local _, _, r, g, b, a = GetChatWindowInfo(FCF_GetCurrentChatFrameID())
+            local info
+
+            -- Level 2: the font-height list.
+            if UIDROPDOWNMENU_MENU_LEVEL == 2 then
+                if UIDROPDOWNMENU_MENU_VALUE == FONT_SIZE then
+                    local _, fontHeight = FCF_GetCurrentChatFrame():GetFont()
+                    for _, value in ipairs(CHAT_FONT_HEIGHTS) do
+                        info = {}
+                        info.text = format(FONT_SIZE_TEMPLATE, value)
+                        info.value = value
+                        info.func = FCF_SetChatWindowFontSize
+                        -- ref: `value == floor(fontHeight+0.5)` — the tick follows the font the
+                        -- frame is actually wearing, not the stored SIZE (which is 0 until the
+                        -- player picks one).
+                        if fontHeight and value == floor(fontHeight + 0.5) then
+                            info.checked = 1
+                        end
+                        UIDropDownMenu_AddButton(info, UIDROPDOWNMENU_MENU_LEVEL)
+                    end
+                end
+                return
+            end
+
+            -- Window options — the reference's FIRST row (ref l.236-246), and the only one of its
+            -- four window verbs benilla can honour. Rename, Create New and Remove each need the
+            -- window management 0288 §2 holds out (there is no rename, no undock, no create/close),
+            -- so they are named here rather than stubbed: a row that looks like a setting and
+            -- changes nothing cannot be told from a working one by looking (1134 §4).
+            local current = FCF_GetCurrentChatFrame()
+            info = {}
+            info.text = (current and current.isLocked) and UNLOCK_WINDOW or LOCK_WINDOW
+            info.func = FCF_ToggleLock
+            info.notCheckable = 1
+            UIDropDownMenu_AddButton(info)
+
+            -- Display header (ref l.273-279).
+            info = {}
+            info.text = DISPLAY
+            info.notClickable = 1
+            info.isTitle = 1
+            info.notCheckable = 1
+            UIDropDownMenu_AddButton(info)
+
+            -- Font size (ref l.281-288).
+            info = {}
+            info.text = FONT_SIZE
+            info.hasArrow = 1
+            info.func = nil
+            info.notCheckable = 1
+            UIDropDownMenu_AddButton(info)
+
+            -- Background — the colour swatch plus the opacity slider (ref l.290-307). This row is
+            -- B246's actual fix: `hasOpacity` is what puts `OpacitySliderFrame` beside the colour
+            -- wheel, and `opacityFunc` is what makes the chat box follow the thumb live.
+            --
+            -- **`info.opacity = 1 - a` is the reference's own line**, comment included ("Done
+            -- because the slider is reversed"): the opacity slider reads 0 at the TOP, so the
+            -- value it is seeded with and the value read back off it are both complements. The
+            -- read-back half is `FCF_SetChatWindowOpacity` below.
+            info = {}
+            info.text = BACKGROUND
+            info.hasColorSwatch = 1
+            info.r, info.g, info.b = r, g, b
+            if a then
+                a = 1 - a
+            end
+            info.opacity = a
+            info.swatchFunc = FCF_SetChatWindowBackGroundColor
+            info.func = UIDropDownMenuButton_OpenColorPicker
+            info.hasOpacity = 1
+            info.opacityFunc = FCF_SetChatWindowOpacity
+            info.cancelFunc = FCF_CancelWindowColorSettings
+            UIDropDownMenu_AddButton(info)
+        end
+
+        -- ref l.723-733: the id/frame the open menu belongs to. The menu's capsule is a child of
+        -- the tab, and the tab's id is its window's — which is why the tabs carry `id=` at all.
+        function FCF_GetCurrentChatFrameID()
+            return UIDropDownMenu_GetCurrentDropDown():GetParent():GetID()
+        end
+
+        -- ref l.729-735, fallback included: `UIDropDownMenu_GetCurrentDropDown` answers `this`
+        -- when no menu has ever been opened, so the lookup can miss — and then the caller IS a
+        -- row of the menu, whose parent is the capsule.
+        function FCF_GetCurrentChatFrame()
+            local current = getglobal("ChatFrame"
+                .. UIDropDownMenu_GetCurrentDropDown():GetParent():GetID())
+            if not current then
+                current = getglobal("ChatFrame" .. this:GetParent():GetID())
+            end
+            return current
+        end
+
+        -- ref l.740-744. The picker drives this on every drag of the colour wheel.
+        function FCF_SetChatWindowBackGroundColor()
+            local r, g, b = ColorPickerFrame:GetColorRGB()
+            FCF_SetWindowColor(FCF_GetCurrentChatFrame(), r, g, b)
+        end
+
+        -- ref l.746-749, the reversed slider's other half (see the Background row above).
+        function FCF_SetChatWindowOpacity()
+            FCF_SetWindowAlpha(FCF_GetCurrentChatFrame(), 1.0 - OpacitySliderFrame:GetValue())
+        end
+
+        -- Cancel restores what the row was opened with. The reference names this
+        -- `FCF_CancelWindowColorSettings` and hands it the pre-open r/g/b/opacity as arguments;
+        -- ours reads them off the button the picker was opened from, which is where
+        -- `UIDropDownMenuButton_OpenColorPicker` already stashes them (UIDropDownMenu.xml) — the
+        -- same values, one hop closer, and no argument contract to get wrong.
+        function FCF_CancelWindowColorSettings(prev)
+            local frame = FCF_GetCurrentChatFrame()
+            if prev and prev.r then
+                FCF_SetWindowColor(frame, prev.r, prev.g, prev.b)
+            end
+            if prev and prev.opacity then
+                FCF_SetWindowAlpha(frame, 1.0 - prev.opacity)
+            end
+        end
+
+        -- ref l.751-763: the visible half is the frame's own font, the stored half is SIZE.
+        -- `doNotSave` is ours, for the load path (the value already came from the store).
+        function FCF_SetChatWindowFontSize(chatFrame, fontSize, doNotSave)
+            if not chatFrame then
+                chatFrame = FCF_GetCurrentChatFrame()
+            end
+            if not fontSize then
+                fontSize = this.value
+            end
+            local fontFile, unused, fontFlags = chatFrame:GetFont()
+            chatFrame:SetFont(fontFile, fontSize, fontFlags)
+            if not doNotSave then
+                SetChatWindowSize(chatFrame:GetID(), fontSize)
+            end
         end
 
         -- The whisper tab flash (ref FCF_FlashTab: never the selected tab; 0.25s on/off for 60s,
@@ -355,7 +839,12 @@
         -- (FCF_OnUpdate: MouseIsOver(chatFrame, 45, -10, -5, 5) — 45 up into the tab zone,
         -- 10 down past the edit box seam, 5 out each side).
         local function overDock(x, y)
-            local f = ChatFrame1
+            -- **The SELECTED frame, not ChatFrame1.** The two dock windows are mutually exclusive
+            -- — selecting one hides the other — so reading a fixed frame here meant that the
+            -- instant the Combat Log was selected the hover test measured a hidden window, went
+            -- false, and drove the reveal fade to 0: the tabs and the chat background disappeared
+            -- together (director-reported). The dock's rect is whichever window is up.
+            local f = getglobal("ChatFrame" .. BenillaFCF.selected) or ChatFrame1
             local left, right = f:GetLeft(), f:GetRight()
             local top, bottom = f:GetTop(), f:GetBottom()
             if not left then return false end
@@ -381,24 +870,38 @@
                     s.hoverTime = 0
                     s.oldX, s.oldY = x, y
                 end
-                if s.hoverTime > 0.2 then s.revealTarget = 1 end
+                if s.hoverTime > CHAT_TAB_SHOW_DELAY then s.revealTarget = 1 end
             else
                 s.hover = false
                 s.hoverTime = 0
                 s.revealTarget = 0
             end
             if s.flashTab ~= 0 then s.revealTarget = 1 end
+            -- ref FCF_OnUpdate's `(MouseIsOver(...) or chatFrame.resizing)`: a drag in flight pins
+            -- the chrome open. The cursor is moving during a resize, which would otherwise keep
+            -- resetting the stationary-hover delay and fade the grips out from under it.
+            if BenillaFCF_Dragging() then s.revealTarget = 1 end
 
-            -- The 0.15s linear fade toward the target (ref UIFrameFadeIn/Out over
-            -- CHAT_FRAME_FADE_TIME).
-            if s.reveal < s.revealTarget then
-                s.reveal = math.min(s.revealTarget, s.reveal + elapsed / 0.15)
+            -- The linear fade toward the target (ref UIFrameFadeIn/Out over CHAT_FRAME_FADE_TIME).
+            -- **Zero is a real setting, not a guard against nothing**: the Chat page's *Remove
+            -- Chat Hover Delay* row sets both this and the delay to 0 (ref SetChatMouseOverDelay),
+            -- and the division would be 0/0 on the frame `elapsed` is also zero. The reference
+            -- lands in the same place by a different road — `UIFrameFadeIn` with timeToFade 0
+            -- finishes on its first tick.
+            local fade = CHAT_FRAME_FADE_TIME
+            if fade <= 0 then
+                s.reveal = s.revealTarget
+            elseif s.reveal < s.revealTarget then
+                s.reveal = math.min(s.revealTarget, s.reveal + elapsed / fade)
             elseif s.reveal > s.revealTarget then
-                s.reveal = math.max(s.revealTarget, s.reveal - elapsed / 0.15)
+                s.reveal = math.max(s.revealTarget, s.reveal - elapsed / fade)
             end
 
-            -- Apply: tabs at 1.0 (selected) / 0.5 (unselected) × reveal; the selected window's
-            -- background+borders at 0.25 × reveal (ref: fade oldAlpha↔DEFAULT_CHATFRAME_ALPHA).
+            -- Apply: tabs at 1.0 (selected) / 0.5 (unselected) × reveal; each window's
+            -- background+borders at its own `windowAlpha` (ref: fade oldAlpha↔DEFAULT_CHATFRAME_
+            -- ALPHA). Until 1589 that second term was the constant `0.25 * reveal`, which is what
+            -- `windowAlpha` still computes for the shipped base of 0 — the default look is
+            -- unchanged, it is now just one case of a rule instead of the only case.
             --
             -- GATED on everything the writes below depend on — the reveal, the selected tab, and
             -- whether the label measurements have landed (decision 1396). **The reference needs
@@ -415,8 +918,9 @@
                     if tab then
                         tab:SetAlpha(((i == s.selected) and 1.0 or 0.5) * s.reveal)
                     end
+                    local a = windowAlpha(i, s.reveal)
                     for _, t in ipairs(BenillaFCF_Textures(i)) do
-                        t:SetAlpha(0.25 * s.reveal)
+                        t:SetAlpha(a)
                     end
                 end
                 s.appliedReveal = s.reveal
@@ -682,21 +1186,46 @@
 
     <!-- ── The dock: ChatFrame1 (General) + ChatFrame2 (Combat Log) sharing its rect ─────── -->
     <!--
-        ChatFrame1: 430×120 at BOTTOMLEFT (32, 85) — the managed-position base
-        (UIPARENT_MANAGED_FRAME_POSITIONS["ChatFrame1"]: baseY 85 + the bottom-stack offsets,
-        applied by UIParent_ManageFramePositions per decision 0272); displayDuration 120 /
-        maxLines 128 (ref ChatFrameTemplate). The background stretches -2/+2 x and +3/-6 y past
-        the frame (ref $parentBackground anchors), the 8 border slices ring it (the ref draws
-        them through its resize buttons' textures; benilla authors them as plain textures — the
-        hover LOOK without the resize mechanics). Everything starts alpha 0; BenillaFCF fades.
+        **One declaration, two windows.** The dock's two windows are the SAME widget seated
+        differently, and saying that twice is how three straight rounds of bugs got in: 1575 found
+        the Combat Log with no tab, 1579 found it with no rect and no border art, and 1588 found it
+        with no `OnUpdate` and no scroll column — each time because window 2 was a HAND-MIRRORED
+        partial copy of window 1 and the mirroring missed a part. The reference does not mirror: it
+        declares `FloatingChatFrameTemplate` `virtual="true"` and every `ChatFrameN` inherits it
+        (FloatingChatFrame.xml l.211, l.685-832). So do we, and the class of bug goes with it —
+        a part that exists for one docked window now cannot fail to exist for the other.
+
+        Per-instance is only what genuinely differs: the seat (ChatFrame1 is the managed-position
+        base — `UIPARENT_MANAGED_FRAME_POSITIONS["ChatFrame1"]`, baseY 85 + the bottom-stack
+        offsets, decision 0272 — and ChatFrame2 takes its rect from ChatFrame1's, which is what
+        being docked MEANS and why it must never carry a managed row of its own, 1579), the id,
+        and which of the two ships shown.
+
+        The chrome the template carries: displayDuration 120 / maxLines 128 (ref ChatFrameTemplate);
+        a background stretched -2/+2 x and +3/-6 y past the frame (ref $parentBackground anchors)
+        and the 8 resize grips ringing it, which are the border art AND the handles (ref
+        CHAT_FRAME_TEXTURES — see the block below); the scroll column; and the per-frame scripts.
+        Everything starts alpha 0; BenillaFCF fades it.
+
+        `movable`/`resizable`/`<ResizeBounds>` are the reference's own attributes at the reference's
+        own numbers (FloatingChatFrame.xml l.211, l.222-230): min 296×75, max 608×400. The
+        `<TitleRegion setAllPoints="true"/>` that sits beside them THERE is deliberately absent
+        here — see the drag scripts at the foot of this template for why, and for what replaces it.
+
+        **`EXECUTE_CHAT_LINE` is gated to window 1 on purpose** — see the OnLoad below. It is the
+        one script here that is genuinely ChatFrame1's rather than the dock's, so the template
+        carries the gate rather than the registration.
     -->
-    <ScrollingMessageFrame name="ChatFrame1" frameStrata="BACKGROUND" displayDuration="120.0" maxLines="128" id="1">
-        <Size><AbsDimension x="430" y="120"/></Size>
-        <Anchors>
-            <Anchor point="BOTTOMLEFT" relativePoint="BOTTOMLEFT">
-                <Offset><AbsDimension x="32" y="85"/></Offset>
-            </Anchor>
-        </Anchors>
+    <ScrollingMessageFrame name="BenillaDockedChatFrameTemplate" virtual="true"
+                           frameStrata="BACKGROUND" displayDuration="120.0" maxLines="128"
+                           movable="true" resizable="true">
+        <!-- ref FloatingChatFrame.xml l.222-230, verbatim. The only `<ResizeBounds>` in the whole
+             of 1.12.1's FrameXML, and the numbers are the window's whole size domain: nothing else
+             clamps a chat window. -->
+        <ResizeBounds>
+            <minResize><AbsDimension x="296" y="75"/></minResize>
+            <maxResize><AbsDimension x="608" y="400"/></maxResize>
+        </ResizeBounds>
         <Layers>
             <Layer level="BACKGROUND">
                 <Texture name="$parentBackground" file="Interface\ChatFrame\ChatFrameBackground" alpha="0">
@@ -705,63 +1234,212 @@
                         <Anchor point="BOTTOMRIGHT"><Offset><AbsDimension x="2" y="-6"/></Offset></Anchor>
                     </Anchors>
                 </Texture>
-                <!-- The ChatFrameBorder ring (ref ChatFrameBorder slices; texcoords quoted from
-                     the ref resize buttons). Corners 16×16, edges stretched between them. -->
-                <Texture name="$parentBorderTopLeft" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
-                    <Size><AbsDimension x="16" y="16"/></Size>
-                    <Anchors><Anchor point="TOPLEFT" relativeTo="$parentBackground"><Offset><AbsDimension x="-2" y="2"/></Offset></Anchor></Anchors>
-                    <TexCoords left="0" right="0.25" top="0" bottom="0.125"/>
-                </Texture>
-                <Texture name="$parentBorderTopRight" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
-                    <Size><AbsDimension x="16" y="16"/></Size>
-                    <Anchors><Anchor point="TOPRIGHT" relativeTo="$parentBackground"><Offset><AbsDimension x="2" y="2"/></Offset></Anchor></Anchors>
-                    <TexCoords left="0.75" right="1.0" top="0" bottom="0.125"/>
-                </Texture>
-                <Texture name="$parentBorderBottomLeft" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
-                    <Size><AbsDimension x="16" y="16"/></Size>
-                    <Anchors><Anchor point="BOTTOMLEFT" relativeTo="$parentBackground"><Offset><AbsDimension x="-2" y="-3"/></Offset></Anchor></Anchors>
-                    <TexCoords left="0" right="0.25" top="0.7265625" bottom="0.8515625"/>
-                </Texture>
-                <Texture name="$parentBorderBottomRight" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
-                    <Size><AbsDimension x="16" y="16"/></Size>
-                    <Anchors><Anchor point="BOTTOMRIGHT" relativeTo="$parentBackground"><Offset><AbsDimension x="2" y="-3"/></Offset></Anchor></Anchors>
-                    <TexCoords left="0.75" right="1.0" top="0.7265625" bottom="0.8515625"/>
-                </Texture>
-                <Texture name="$parentBorderTop" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
-                    <Size><AbsDimension x="16" y="16"/></Size>
-                    <Anchors>
-                        <Anchor point="LEFT" relativeTo="$parentBorderTopLeft" relativePoint="RIGHT"/>
-                        <Anchor point="RIGHT" relativeTo="$parentBorderTopRight" relativePoint="LEFT"/>
-                    </Anchors>
-                    <TexCoords left="0.25" right="0.75" top="0" bottom="0.125"/>
-                </Texture>
-                <Texture name="$parentBorderBottom" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
-                    <Size><AbsDimension x="16" y="16"/></Size>
-                    <Anchors>
-                        <Anchor point="LEFT" relativeTo="$parentBorderBottomLeft" relativePoint="RIGHT"/>
-                        <Anchor point="RIGHT" relativeTo="$parentBorderBottomRight" relativePoint="LEFT"/>
-                    </Anchors>
-                    <TexCoords left="0.25" right="0.75" top="0.7265625" bottom="0.8515625"/>
-                </Texture>
-                <Texture name="$parentBorderLeft" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
-                    <Size><AbsDimension x="16" y="16"/></Size>
-                    <Anchors>
-                        <Anchor point="TOP" relativeTo="$parentBorderTopLeft" relativePoint="BOTTOM"/>
-                        <Anchor point="BOTTOM" relativeTo="$parentBorderBottomLeft" relativePoint="TOP"/>
-                    </Anchors>
-                    <TexCoords left="0" right="0.25" top="0.125" bottom="0.7265625"/>
-                </Texture>
-                <Texture name="$parentBorderRight" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
-                    <Size><AbsDimension x="16" y="16"/></Size>
-                    <Anchors>
-                        <Anchor point="TOP" relativeTo="$parentBorderTopRight" relativePoint="BOTTOM"/>
-                        <Anchor point="BOTTOM" relativeTo="$parentBorderBottomRight" relativePoint="TOP"/>
-                    </Anchors>
-                    <TexCoords left="0.75" right="1.0" top="0.125" bottom="0.7265625"/>
-                </Texture>
             </Layer>
         </Layers>
         <Frames>
+            <!-- ── The eight RESIZE GRIPS (ref FloatingChatFrame.xml l.260-540) ─────────────────
+                 The window's border art and its resize handles are the same eight objects: four
+                 16×16 corners and four strips stretched between them, each a Button whose
+                 `$parentTexture` is one slice of `ChatFrameBorder`. `CHAT_FRAME_TEXTURES` names
+                 them, so they ride the hover fade and the tab menu's tint/opacity exactly as the
+                 background does — they appear when the box appears and are invisible otherwise.
+
+                 They were plain `$parentBorder*` textures until this arc (the look without the
+                 mechanics); the anchors and TexCoords below are unchanged from those, so the ring
+                 draws pixel-for-pixel where it did.
+
+                 **Two of the reference's clauses are deliberately NOT transcribed, and both are
+                 downstream of ONE divergence: its chat window is `enableMouse="false"` and ours is
+                 not** (a `<ScrollingMessageFrame>` takes the mouse by construction here, and our
+                 window uses it — `OnClick` dismisses a held spell, 0843, and `OnHyperlinkClick`
+                 opens an item link, 0288 P2). In the reference the window competes for nothing, so:
+
+                   · **No `this:SetFrameLevel(this:GetFrameLevel()-1)` OnLoad.** There it only sinks
+                     the border art under the background wash. Here it would sink the grips under a
+                     mouse-enabled parent, and every grip STRADDLES the window's edge (the top-left
+                     corner overlaps its interior by 12×11 px, the edge strips by most of their
+                     width) — so the overlapping half would stop hitting the grip and the handle
+                     would be the outer sliver only. Level unchanged also keeps the ring drawing
+                     over the wash, which is where benilla's border textures already were (they sat
+                     after `$parentBackground` in the same layer).
+                   · **The grips take the mouse only while the window is UNLOCKED**
+                     (`BenillaFCF_ApplyLock`). Eight always-live buttons would shadow the outer
+                     16px of the window — including the bottom strip, where the newest chat line
+                     is — so an item link on the last line would stop being clickable. Locked is
+                     the shipped state, so out of the box the window behaves exactly as it did;
+                     unlocking it hands the edges over, which is what unlocking means. This is
+                     benilla's stand-in for the click-through the reference gets for free.
+
+                 `FCF_Resize`/`FCF_StopResize` still carry the reference's own three gates on top —
+                 they are what `CHAT_LOCKED` and the docked-but-not-default case need. ── -->
+            <Button name="$parentResizeTopLeft">
+                <Size><AbsDimension x="16" y="16"/></Size>
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentBackground"><Offset><AbsDimension x="-2" y="2"/></Offset></Anchor>
+                </Anchors>
+                <Layers>
+                    <Layer level="BACKGROUND">
+                        <Texture name="$parentTexture" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
+                            <Size><AbsDimension x="16" y="16"/></Size>
+                            <Anchors><Anchor point="TOPLEFT"/></Anchors>
+                            <TexCoords left="0" right="0.25" top="0" bottom="0.125"/>
+                        </Texture>
+                    </Layer>
+                </Layers>
+                <Scripts>
+                    <OnMouseDown>FCF_Resize("TOPLEFT")</OnMouseDown>
+                    <OnMouseUp>FCF_StopResize()</OnMouseUp>
+                </Scripts>
+            </Button>
+            <Button name="$parentResizeTopRight">
+                <Size><AbsDimension x="16" y="16"/></Size>
+                <Anchors>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentBackground"><Offset><AbsDimension x="2" y="2"/></Offset></Anchor>
+                </Anchors>
+                <Layers>
+                    <Layer level="BACKGROUND">
+                        <Texture name="$parentTexture" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
+                            <Size><AbsDimension x="16" y="16"/></Size>
+                            <Anchors><Anchor point="TOPLEFT"/></Anchors>
+                            <TexCoords left="0.75" right="1.0" top="0" bottom="0.125"/>
+                        </Texture>
+                    </Layer>
+                </Layers>
+                <Scripts>
+                    <OnMouseDown>FCF_Resize("TOPRIGHT")</OnMouseDown>
+                    <OnMouseUp>FCF_StopResize()</OnMouseUp>
+                </Scripts>
+            </Button>
+            <Button name="$parentResizeBottomLeft">
+                <Size><AbsDimension x="16" y="16"/></Size>
+                <Anchors>
+                    <Anchor point="BOTTOMLEFT" relativeTo="$parentBackground"><Offset><AbsDimension x="-2" y="-3"/></Offset></Anchor>
+                </Anchors>
+                <Layers>
+                    <Layer level="BACKGROUND">
+                        <Texture name="$parentTexture" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
+                            <Size><AbsDimension x="16" y="16"/></Size>
+                            <Anchors><Anchor point="TOPLEFT"/></Anchors>
+                            <TexCoords left="0" right="0.25" top="0.7265625" bottom="0.8515625"/>
+                        </Texture>
+                    </Layer>
+                </Layers>
+                <Scripts>
+                    <OnMouseDown>FCF_Resize("BOTTOMLEFT")</OnMouseDown>
+                    <OnMouseUp>FCF_StopResize()</OnMouseUp>
+                </Scripts>
+            </Button>
+            <Button name="$parentResizeBottomRight">
+                <Size><AbsDimension x="16" y="16"/></Size>
+                <Anchors>
+                    <Anchor point="BOTTOMRIGHT" relativeTo="$parentBackground"><Offset><AbsDimension x="2" y="-3"/></Offset></Anchor>
+                </Anchors>
+                <Layers>
+                    <Layer level="BACKGROUND">
+                        <Texture name="$parentTexture" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
+                            <Size><AbsDimension x="16" y="16"/></Size>
+                            <Anchors><Anchor point="TOPLEFT"/></Anchors>
+                            <TexCoords left="0.75" right="1.0" top="0.7265625" bottom="0.8515625"/>
+                        </Texture>
+                    </Layer>
+                </Layers>
+                <Scripts>
+                    <OnMouseDown>FCF_Resize("BOTTOMRIGHT")</OnMouseDown>
+                    <OnMouseUp>FCF_StopResize()</OnMouseUp>
+                </Scripts>
+            </Button>
+            <Button name="$parentResizeTop">
+                <Size><AbsDimension x="16" y="16"/></Size>
+                <Anchors>
+                    <Anchor point="LEFT" relativeTo="$parentResizeTopLeft" relativePoint="RIGHT"/>
+                    <Anchor point="RIGHT" relativeTo="$parentResizeTopRight" relativePoint="LEFT"/>
+                </Anchors>
+                <Layers>
+                    <Layer level="BACKGROUND">
+                        <Texture name="$parentTexture" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
+                            <Size><AbsDimension x="16" y="16"/></Size>
+                            <Anchors>
+                                <Anchor point="LEFT"/>
+                                <Anchor point="RIGHT"/>
+                            </Anchors>
+                            <TexCoords left="0.25" right="0.75" top="0" bottom="0.125"/>
+                        </Texture>
+                    </Layer>
+                </Layers>
+                <Scripts>
+                    <OnMouseDown>FCF_Resize("TOP")</OnMouseDown>
+                    <OnMouseUp>FCF_StopResize()</OnMouseUp>
+                </Scripts>
+            </Button>
+            <Button name="$parentResizeBottom">
+                <Size><AbsDimension x="16" y="16"/></Size>
+                <Anchors>
+                    <Anchor point="LEFT" relativeTo="$parentResizeBottomLeft" relativePoint="RIGHT"/>
+                    <Anchor point="RIGHT" relativeTo="$parentResizeBottomRight" relativePoint="LEFT"/>
+                </Anchors>
+                <Layers>
+                    <Layer level="BACKGROUND">
+                        <Texture name="$parentTexture" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
+                            <Size><AbsDimension x="16" y="16"/></Size>
+                            <Anchors>
+                                <Anchor point="LEFT"/>
+                                <Anchor point="RIGHT"/>
+                            </Anchors>
+                            <TexCoords left="0.25" right="0.75" top="0.7265625" bottom="0.8515625"/>
+                        </Texture>
+                    </Layer>
+                </Layers>
+                <Scripts>
+                    <OnMouseDown>FCF_Resize("BOTTOM")</OnMouseDown>
+                    <OnMouseUp>FCF_StopResize()</OnMouseUp>
+                </Scripts>
+            </Button>
+            <Button name="$parentResizeLeft">
+                <Size><AbsDimension x="16" y="16"/></Size>
+                <Anchors>
+                    <Anchor point="TOP" relativeTo="$parentResizeTopLeft" relativePoint="BOTTOM"/>
+                    <Anchor point="BOTTOM" relativeTo="$parentResizeBottomLeft" relativePoint="TOP"/>
+                </Anchors>
+                <Layers>
+                    <Layer level="BACKGROUND">
+                        <Texture name="$parentTexture" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
+                            <Size><AbsDimension x="16" y="16"/></Size>
+                            <Anchors>
+                                <Anchor point="TOP"/>
+                                <Anchor point="BOTTOM"/>
+                            </Anchors>
+                            <TexCoords left="0" right="0.25" top="0.125" bottom="0.7265625"/>
+                        </Texture>
+                    </Layer>
+                </Layers>
+                <Scripts>
+                    <OnMouseDown>FCF_Resize("LEFT")</OnMouseDown>
+                    <OnMouseUp>FCF_StopResize()</OnMouseUp>
+                </Scripts>
+            </Button>
+            <Button name="$parentResizeRight">
+                <Size><AbsDimension x="16" y="16"/></Size>
+                <Anchors>
+                    <Anchor point="TOP" relativeTo="$parentResizeTopRight" relativePoint="BOTTOM"/>
+                    <Anchor point="BOTTOM" relativeTo="$parentResizeBottomRight" relativePoint="TOP"/>
+                </Anchors>
+                <Layers>
+                    <Layer level="BACKGROUND">
+                        <Texture name="$parentTexture" file="Interface\ChatFrame\ChatFrameBorder" alpha="0">
+                            <Size><AbsDimension x="16" y="16"/></Size>
+                            <Anchors>
+                                <Anchor point="TOP"/>
+                                <Anchor point="BOTTOM"/>
+                            </Anchors>
+                            <TexCoords left="0.75" right="1.0" top="0.125" bottom="0.7265625"/>
+                        </Texture>
+                    </Layer>
+                </Layers>
+                <Scripts>
+                    <OnMouseDown>FCF_Resize("RIGHT")</OnMouseDown>
+                    <OnMouseUp>FCF_StopResize()</OnMouseUp>
+                </Scripts>
+            </Button>
             <!-- The scroll column, outside bottom-left (ref: BottomButton at (-32,-4), Down and
                  Up stacked above it, 2px overlaps). Sounds + hold-repeat per the ref scripts. -->
             <Button name="$parentBottomButton">
@@ -846,13 +1524,41 @@
                  SubmitChatInput stands in for ChatEdit_SendText: the grammar behind it is Rust
                  (0881), which is the only part of that chain we replace. -->
             <OnLoad>
-                this:RegisterEvent("EXECUTE_CHAT_LINE")
+                <!-- UPDATE_CHAT_WINDOWS — the reference's own event for "a window's stored
+                     settings moved", and the one FloatingChatFrame_OnEvent listens for
+                     (FloatingChatFrame.lua l.34-38) to re-read GetChatWindowInfo. Ours is fired
+                     by the host once it has restored the player's per-character file
+                     (ui_chat::settings), which lands after this file has already run. It rides
+                     window 1's registration for the same reason EXECUTE_CHAT_LINE does: the
+                     template is shared by all seven, the handler re-reads EVERY window, and seven
+                     registrations would run it seven times per restore. -->
+                if this:GetID() == 1 then
+                    this:RegisterEvent("EXECUTE_CHAT_LINE")
+                    this:RegisterEvent("UPDATE_CHAT_WINDOWS")
+                end
+                -- `isDocked` — the reference's own flag, and it is LOAD-BEARING now rather than an
+                -- advertisement. Only this template is inherited, and only ChatFrame1/ChatFrame2
+                -- inherit it, so every frame that reaches this line is docked: they share one rect
+                -- (window 2's anchors are window 1's corners) and one tab strip.
+                --
+                -- This file used to withhold the flag on the grounds that it "belongs to a dock
+                -- MODEL (dock/undock, FCF_DockUpdate's re-anchoring) that 0288 §2 holds out", i.e.
+                -- setting it would advertise verbs we do not have. What changed is that the
+                -- reference's move and resize gates READ it — `chatFrame.isDocked and chatFrame ~=
+                -- DEFAULT_CHAT_FRAME` is the clause that keeps the Combat Log from being resized
+                -- out of the dock it is anchored into — so withholding it now means the gate that
+                -- protects window 2 silently never fires. The flag is a fact about our two windows;
+                -- the verbs remain out.
+                this.isDocked = 1
             </OnLoad>
             <OnEvent>
-                if event == "EXECUTE_CHAT_LINE" then SubmitChatInput(arg1) end
+                if event == "EXECUTE_CHAT_LINE" then
+                    SubmitChatInput(arg1)
+                elseif event == "UPDATE_CHAT_WINDOWS" then
+                    BenillaFCF_LoadWindowLooks()
+                end
             </OnEvent>
             <OnUpdate>
-                FCF_OnUpdate(arg1)
                 ChatFrame_OnUpdate(arg1)
             </OnUpdate>
             <OnMouseWheel>
@@ -865,41 +1571,97 @@
             <OnHyperlinkClick>
                 SetItemRef(arg1, arg2, arg3)
             </OnHyperlinkClick>
+            <!-- ── Dragging the window ──────────────────────────────────────────────────────────
+                 **What the reference does, and why we cannot copy the declaration.** Its template
+                 carries `<TitleRegion setAllPoints="true"/>` — the engine drag where a mouse-down
+                 anywhere in the frame moves it — and that region is INERT there, because the same
+                 line declares `enableMouse="false"`. So 1.12 never drags a chat window by its body;
+                 it drags it by the TAB (`FCF_Tab_OnClick`'s `chatFrame:StartMoving()`, and the
+                 tab's own newbie tip says so in as many words: *"Left-click and drag to move the
+                 window"*).
+
+                 Ours is mouse-enabled (a `<ScrollingMessageFrame>` takes the mouse by construction,
+                 and this window uses it for `OnClick` and `OnHyperlinkClick`), so transcribing the
+                 title region would have three consequences the reference never pays: a press on the
+                 chat body would be SWALLOWED before `OnClick` (0843's held-spell dismissal dies), a
+                 LOCKED window would drag anyway (the engine title path has no lock gate — wow-re Q6
+                 records that the movable bit is not read on it at all), and there would be no way to
+                 turn it off again (an anchorless region falls back to its owner's rect, 1349, so
+                 `ClearAllPoints` widens it rather than removing it). It is also inert for a fourth,
+                 duller reason: our loader has no `<TitleRegion>` element — the region is
+                 Lua-created only.
+
+                 So the gesture is the drag TRIO instead, which is the reference's own layering
+                 (`RegisterForDrag` + `OnDragStart`/`OnDragStop` → `StartMoving`/
+                 `StopMovingOrSizing`) and buys exactly what the title region costs: a CLICK still
+                 reaches `OnClick` because an un-started gesture leaves the click path alone, the
+                 lock is a Lua gate like every other one here, and `OnDragStop` fires on the SOURCE
+                 frame, so a drag released anywhere at all still ends the move.
+
+                 The registration itself is switched by `BenillaFCF_ApplyLock` — a locked window is
+                 not drag-registered, so it behaves exactly as it did before this arc. Both the body
+                 (benilla's addition, the affordance the title region would have given) and the tab
+                 (the reference's own, on ChatFrame<n>Tab) reach the same two verbs. ── -->
+            <OnDragStart>
+                FCF_StartMove(this)
+            </OnDragStart>
+            <OnDragStop>
+                FCF_StopMove(this)
+            </OnDragStop>
         </Scripts>
         <FontString inherits="ChatFontNormal" justifyH="LEFT"/>
     </ScrollingMessageFrame>
 
-    <!-- ChatFrame2 "Combat Log": docked — shares ChatFrame1's rect (ref FCF_DockUpdate anchors),
-         hidden until its tab selects it. Its message-group wiring (the chat-cache combat set)
-         lands with the router (0288 P4); until then it renders what it's given: nothing. -->
-    <ScrollingMessageFrame name="ChatFrame2" frameStrata="BACKGROUND" displayDuration="120.0" maxLines="128" hidden="true" id="2">
+    <ScrollingMessageFrame name="ChatFrame1" inherits="BenillaDockedChatFrameTemplate" id="1">
+        <Size><AbsDimension x="430" y="120"/></Size>
+        <Anchors>
+            <Anchor point="BOTTOMLEFT" relativePoint="BOTTOMLEFT">
+                <Offset><AbsDimension x="32" y="85"/></Offset>
+            </Anchor>
+        </Anchors>
+    </ScrollingMessageFrame>
+
+    <!-- ChatFrame2 "Combat Log": docked — it takes ChatFrame1's rect from these two anchors and
+         nothing else, ships hidden, and its tab (ChatFrame2Tab, below) selects it. Its message
+         groups are the chat-cache combat set, registered app-side (`ui_chat::frames`, 1571). -->
+    <ScrollingMessageFrame name="ChatFrame2" inherits="BenillaDockedChatFrameTemplate" hidden="true" id="2">
         <Anchors>
             <Anchor point="TOPLEFT" relativeTo="ChatFrame1" relativePoint="TOPLEFT"/>
             <Anchor point="BOTTOMRIGHT" relativeTo="ChatFrame1" relativePoint="BOTTOMRIGHT"/>
         </Anchors>
-        <Layers>
-            <Layer level="BACKGROUND">
-                <Texture name="$parentBackground" file="Interface\ChatFrame\ChatFrameBackground" alpha="0">
-                    <Anchors>
-                        <Anchor point="TOPLEFT"><Offset><AbsDimension x="-2" y="3"/></Offset></Anchor>
-                        <Anchor point="BOTTOMRIGHT"><Offset><AbsDimension x="2" y="-6"/></Offset></Anchor>
-                    </Anchors>
-                </Texture>
-            </Layer>
-        </Layers>
-        <Scripts>
-            <OnMouseWheel>
-                if arg1 > 0 then this:ScrollUp() else this:ScrollDown() end
-            </OnMouseWheel>
-            <OnClick>
-                BenillaChatFrame_DismissCursor(arg1)
-            </OnClick>
-            <OnHyperlinkClick>
-                SetItemRef(arg1, arg2, arg3)
-            </OnHyperlinkClick>
-        </Scripts>
-        <FontString inherits="ChatFontNormal" justifyH="LEFT"/>
     </ScrollingMessageFrame>
+
+    <!-- The dock's DRIVER. `FCF_OnUpdate` is dock-GLOBAL — one `reveal`, one selected tab, both
+         windows' tabs and textures — and it used to ride ChatFrame1's own OnUpdate. Selecting the
+         Combat Log hides ChatFrame1, a hidden frame gets no OnUpdate, and so the whole dock froze
+         the instant it was used: the tab alphas stuck showing General as selected (what the
+         director saw), the hover fade stuck at whatever it was, the tab-width settle stopped, and
+         the whisper flash stopped blinking. A driver must not be one of the things it drives.
+
+         So it rides a frame the dock cannot hide. Mounting it on BOTH windows instead would work
+         only while exactly one of them is ever visible — an invariant the dock happens to hold
+         today and that a second visible window would turn into a double-speed fade.
+
+         **A frame the dock cannot hide is the reference's own answer**, and this comment used to
+         claim the opposite: that 1.12.1 ships `FCF_OnUpdate` defined and never referenced, so
+         vanilla's tabs never hover-fade and the reveal was benilla's own (0288). That is wrong.
+         `UIParent.xml` l.19 calls `FCF_OnUpdate(arg1)` from **UIParent's** `<OnUpdate>`, in the
+         same list as `UIFrameFadeUpdate`/`UIFrameFlashUpdate` — never from a chat frame, for the
+         reason above. A 1x1 frame parented to UIParent is that mounting point re-expressed; the
+         reasoning was right and only its premise was invented. The hover reveal, the 0.2 s
+         stationary delay and the 1.0/0.5 selected/unselected tab alphas are all the reference's.
+
+         `ChatFrame_OnUpdate` stays on the windows, where it belongs: it reads `this` and blinks
+         that frame's own bottom button. -->
+    <Frame name="BenillaChatDockDriver" parent="UIParent">
+        <Size><AbsDimension x="1" y="1"/></Size>
+        <Anchors><Anchor point="TOPLEFT"/></Anchors>
+        <Scripts>
+            <OnUpdate>
+                FCF_OnUpdate(arg1)
+            </OnUpdate>
+        </Scripts>
+    </Frame>
 
     <!-- ── ChatFrame3..ChatFrame7: the five undocked windows ────────────────────────────────
          The reference declares seven ScrollingMessageFrames (FloatingChatFrame.xml l.822-832,
@@ -932,10 +1694,14 @@
          nothing reads them while these frames stay hidden and undocked. Outfitter.lua:3099 is
          the one addon that would touch a tab — `local vTab = getglobal("ChatFrame"..i.."Tab")`
          then `vTab:GetText()`, unguarded — but only INSIDE `if vChatFrame:IsVisible() or
-         vChatFrame.isDocked`, so a hidden, `isDocked`-less window never reaches it. That is also
-         precisely why `isDocked` is not set on ChatFrame2 either: our Combat Log tab is
-         deliberately unbuilt (see the tab section below), and marking window 2 docked — which
-         the reference does — would walk Outfitter straight into a nil tab.
+         vChatFrame.isDocked`, so a hidden, `isDocked`-less window never reaches it.
+
+         `isDocked` is NOT set on these five, and that is the whole point of the flag now: the two
+         dock windows set it in the shared template's `OnLoad` (it is what the reference's move and
+         resize gates read), and ChatFrame3..7 are the frames that genuinely are not docked. The
+         Outfitter hazard the flag used to carry — `if vChatFrame:IsVisible() or vChatFrame.isDocked`
+         then `vTab:GetText()` on a window with no tab — is why it stays off here: these have no
+         tabs, and they are hidden, so neither arm reaches the nil.
 
          No background/border art: the ref's own defaults put every one of these at window alpha
          0 (COLOR's fourth byte), and BenillaFCF only fades the dock's two. A shown ChatFrame5
@@ -1018,7 +1784,7 @@
          line pipeline doesn't exist), so the tab just selected an empty window. ChatFrame2
          itself stays above (the router keeps feeding it) so the tab can return whole with the
          combat-log arc — director's call, 2026-07-11. The FCF loops guard the missing tab. ── -->
-    <Button name="ChatFrame1Tab" frameStrata="LOW" alpha="0">
+    <Button name="ChatFrame1Tab" frameStrata="LOW" alpha="0" id="1">
         <Size><AbsDimension x="70" y="32"/></Size>
         <Anchors>
             <Anchor point="BOTTOMLEFT" relativeTo="ChatFrame1Background" relativePoint="TOPLEFT"><Offset><AbsDimension x="2" y="0"/></Offset></Anchor>
@@ -1055,13 +1821,47 @@
                     </Layer>
                 </Layers>
             </Frame>
+            <!-- The window's options menu (decision 1589). A child of the TAB, because
+                 FCF_GetCurrentChatFrameID reads the open menu's parent id — the reference's own
+                 contract, and why the tab carries `id` above. -->
+            <Frame name="$parentDropDown" inherits="UIDropDownMenuTemplate" hidden="true">
+                <Scripts>
+                    <OnLoad>FCFOptionsDropDown_OnLoad()</OnLoad>
+                </Scripts>
+            </Frame>
         </Frames>
         <Scripts>
+            <!-- ref FloatingChatFrame.xml l.121: the tab takes the right button too, which is
+                 what opens the options menu. A Button's default set is LeftButtonUp only, so
+                 without this the right-click never reaches OnClick at all. -->
+            <OnLoad>
+                this:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+            </OnLoad>
             <OnClick>
-                BenillaFCF_TabClick(1)
+                BenillaFCF_TabClick(1, arg1)
             </OnClick>
+            <!-- The reference's own move handle (ref FCF_Tab_OnClick's press/release arms, and the
+                 tip below, which says "Left-click and drag to move the window" in as many words).
+                 It reaches the same two verbs as the window body does; the registration that arms
+                 it is `BenillaFCF_ApplyLock`'s, so a locked window's tab still only selects. -->
+            <OnDragStart>
+                FCF_StartMove(getglobal("ChatFrame" .. this:GetID()))
+            </OnDragStart>
+            <OnDragStop>
+                FCF_StopMove(getglobal("ChatFrame" .. this:GetID()))
+            </OnDragStop>
+            <!-- ref l.129-134. The tip is how the menu is DISCOVERABLE: nothing on screen says a
+                 chat tab has a right-click menu, which is half of why B246 read as "no chat
+                 options at all". `noNormalText` is the reference's own 6th argument. -->
+            <OnEnter>
+                BenillaTooltip_AddNewbieTipFor(this, CHAT_OPTIONS_LABEL, 1.0, 1.0, 1.0,
+                    NEWBIE_TOOLTIP_CHATOPTIONS, 1)
+            </OnEnter>
+            <OnLeave>
+                GameTooltip:Hide()
+            </OnLeave>
         </Scripts>
-        <ButtonText name="$parentText" text="General">
+        <ButtonText name="$parentText" text="GENERAL">
             <Anchors>
                 <Anchor point="LEFT" relativeTo="$parentLeft" relativePoint="RIGHT"><Offset><AbsDimension x="0" y="-5"/></Offset></Anchor>
             </Anchors>
@@ -1073,6 +1873,115 @@
              natural-size law (an unpinned axis inherits the owner's edges, decision 0068), which
              parked the glow 7 units high; the explicit height states what the ref reads from the
              file. -->
+        <HighlightTexture file="Interface\PaperDollInfoFrame\UI-Character-Tab-Highlight" alphaMode="ADD">
+            <Size><AbsDimension x="0" y="32"/></Size>
+            <Anchors>
+                <Anchor point="LEFT" relativeTo="$parentLeft"><Offset><AbsDimension x="0" y="-7"/></Offset></Anchor>
+                <Anchor point="RIGHT" relativeTo="$parentRight"><Offset><AbsDimension x="0" y="-7"/></Offset></Anchor>
+            </Anchors>
+        </HighlightTexture>
+    </Button>
+
+    <!--
+        ChatFrame2Tab — the "Combat Log" dock tab. **This is the tab that was missing**: every
+        piece of machinery around it already existed and was written to expect it — `BenillaFCF`'s
+        fade, resize and flash loops all run `for i = 1, 2` over
+        `getglobal("ChatFrame"..i.."Tab")`, `selected = 1` is commented "2 = Combat Log", and
+        `FCF_SelectDockFrame` errors on any id that is not 1 or 2 — but the button itself was never
+        authored, and each of those loops has an `if tab then` guard that swallowed its absence
+        without a word. ChatFrame2 was therefore reachable only from Lua: it is `hidden`, as a
+        non-selected dock frame should be, and nothing on screen could select it.
+
+        Labels are the GlobalString KEYS (`GENERAL`, `COMBAT_LOG`), resolved out of the player's own
+        `GlobalStrings.lua` by the loader's ALL-CAPS key rule — the same shape the combat log's own
+        format strings use (1571), and the reason neither word is quoted in this file.
+
+        Anchored LEFT-to-RIGHT off tab 1; `BenillaFCF_TabResize` sizes both to their measured label
+        widths, so the abutment survives a locale whose words are longer.
+    -->
+    <Button name="ChatFrame2Tab" frameStrata="LOW" alpha="0" id="2">
+        <Size><AbsDimension x="70" y="32"/></Size>
+        <Anchors>
+            <Anchor point="LEFT" relativeTo="ChatFrame1Tab" relativePoint="RIGHT"/>
+        </Anchors>
+        <Layers>
+            <Layer level="BACKGROUND">
+                <Texture name="$parentLeft" file="Interface\ChatFrame\ChatFrameTab">
+                    <Size><AbsDimension x="16" y="32"/></Size>
+                    <Anchors><Anchor point="TOPLEFT"/></Anchors>
+                    <TexCoords left="0.0" right="0.25" top="0.0" bottom="1.0"/>
+                </Texture>
+                <Texture name="$parentMiddle" file="Interface\ChatFrame\ChatFrameTab">
+                    <Size><AbsDimension x="38" y="32"/></Size>
+                    <Anchors><Anchor point="LEFT" relativeTo="$parentLeft" relativePoint="RIGHT"/></Anchors>
+                    <TexCoords left="0.25" right="0.75" top="0.0" bottom="1.0"/>
+                </Texture>
+                <Texture name="$parentRight" file="Interface\ChatFrame\ChatFrameTab">
+                    <Size><AbsDimension x="16" y="32"/></Size>
+                    <Anchors><Anchor point="LEFT" relativeTo="$parentMiddle" relativePoint="RIGHT"/></Anchors>
+                    <TexCoords left="0.75" right="1.0" top="0.0" bottom="1.0"/>
+                </Texture>
+            </Layer>
+        </Layers>
+        <Frames>
+            <Frame name="$parentFlash" hidden="true">
+                <Size><AbsDimension x="5" y="32"/></Size>
+                <Anchors>
+                    <Anchor point="LEFT" relativeTo="$parentLeft"><Offset><AbsDimension x="0" y="-7"/></Offset></Anchor>
+                    <Anchor point="RIGHT" relativeTo="$parentRight"><Offset><AbsDimension x="0" y="-7"/></Offset></Anchor>
+                </Anchors>
+                <Layers>
+                    <Layer level="BACKGROUND">
+                        <Texture file="Interface\PaperDollInfoFrame\UI-Character-Tab-Highlight" alphaMode="ADD" setAllPoints="true"/>
+                    </Layer>
+                </Layers>
+            </Frame>
+            <!-- The window's options menu (decision 1589). A child of the TAB, because
+                 FCF_GetCurrentChatFrameID reads the open menu's parent id — the reference's own
+                 contract, and why the tab carries `id` above. -->
+            <Frame name="$parentDropDown" inherits="UIDropDownMenuTemplate" hidden="true">
+                <Scripts>
+                    <OnLoad>FCFOptionsDropDown_OnLoad()</OnLoad>
+                </Scripts>
+            </Frame>
+        </Frames>
+        <Scripts>
+            <!-- ref FloatingChatFrame.xml l.121: the tab takes the right button too, which is
+                 what opens the options menu. A Button's default set is LeftButtonUp only, so
+                 without this the right-click never reaches OnClick at all. -->
+            <OnLoad>
+                this:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+            </OnLoad>
+            <OnClick>
+                BenillaFCF_TabClick(2, arg1)
+            </OnClick>
+            <!-- The reference's own move handle (ref FCF_Tab_OnClick's press/release arms, and the
+                 tip below, which says "Left-click and drag to move the window" in as many words).
+                 It reaches the same two verbs as the window body does; the registration that arms
+                 it is `BenillaFCF_ApplyLock`'s, so a locked window's tab still only selects. -->
+            <OnDragStart>
+                FCF_StartMove(getglobal("ChatFrame" .. this:GetID()))
+            </OnDragStart>
+            <OnDragStop>
+                FCF_StopMove(getglobal("ChatFrame" .. this:GetID()))
+            </OnDragStop>
+            <!-- ref l.129-134. The tip is how the menu is DISCOVERABLE: nothing on screen says a
+                 chat tab has a right-click menu, which is half of why B246 read as "no chat
+                 options at all". `noNormalText` is the reference's own 6th argument. -->
+            <OnEnter>
+                BenillaTooltip_AddNewbieTipFor(this, CHAT_OPTIONS_LABEL, 1.0, 1.0, 1.0,
+                    NEWBIE_TOOLTIP_CHATOPTIONS, 1)
+            </OnEnter>
+            <OnLeave>
+                GameTooltip:Hide()
+            </OnLeave>
+        </Scripts>
+        <ButtonText name="$parentText" text="COMBAT_LOG">
+            <Anchors>
+                <Anchor point="LEFT" relativeTo="$parentLeft" relativePoint="RIGHT"><Offset><AbsDimension x="0" y="-5"/></Offset></Anchor>
+            </Anchors>
+        </ButtonText>
+        <NormalFont inherits="GameFontNormalSmall"/>
         <HighlightTexture file="Interface\PaperDollInfoFrame\UI-Character-Tab-Highlight" alphaMode="ADD">
             <Size><AbsDimension x="0" y="32"/></Size>
             <Anchors>
@@ -1295,10 +2204,12 @@
     </EditBox>
 
     <!-- The load-order hack, like the ref's own trailing FCF_DockFrame(ChatFrame1, 1): select
-         the General tab once everything above exists — and tint the window chrome BLACK
-         (FCF_SetWindowColor: the ref vertex-colors every CHAT_FRAME_TEXTURES piece with the
+         the General tab once everything above exists — and seat every window's stored LOOK
+         (FCF_SetWindowColor/Alpha: the ref vertex-colors every CHAT_FRAME_TEXTURES piece with the
          chat-cache window COLOR, which ships 0 0 0; the ChatFrameBackground art itself is
-         white, so untinted it reads as a white wash over the world). -->
+         white, so untinted it reads as a white wash over the world). Since 1589 that colour is
+         read out of the engine rather than written as a literal, because the player can now
+         change it — a fresh store still answers 0 0 0, so a first run looks exactly as before. -->
     <Script><![CDATA[
         -- `DEFAULT_CHAT_FRAME = ChatFrame1` — the reference's own line (ChatFrame.lua), and the
         -- name half of FrameXML actually prints through. It sits here rather than in the header
@@ -1309,10 +2220,6 @@
         DEFAULT_CHAT_FRAME = ChatFrame1
 
         BenillaFCF_SelectDock(1)
-        for i = 1, 2 do
-            for _, t in ipairs(BenillaFCF_Textures(i)) do
-                t:SetVertexColor(0, 0, 0)
-            end
-        end
+        BenillaFCF_LoadWindowLooks()
     ]]></Script>
 </Ui>

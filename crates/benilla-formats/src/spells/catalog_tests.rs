@@ -711,29 +711,55 @@ fn real_spell_catalog_reads_tooltip_columns() {
     );
 }
 
-/// The combat-initiation classes on the real build-5875 `Spell.dbc` — the two accessor masks
+/// The combat-initiation classes on the real build-5875 `Spell.dbc` — the three accessor masks
 /// the cast seam's queue/attack-start logic keys on ([`SpellDisplay::on_next_swing`] `0x404`,
-/// [`SpellDisplay::initiates_auto_attack`] adding `AttributesEx & 0x200`), pinned against the
-/// vmangos `spell_template` rows read at decision time (2026-07-14). A column slip or a mask
-/// slip fails loudly. Skips without client data.
+/// [`SpellDisplay::initiates_auto_attack`] adding `AttributesEx & 0x200`, and its GO-deferred
+/// complement [`SpellDisplay::initiates_auto_attack_at_go`] on `AttributesEx2 & 0x100000`),
+/// pinned against the vmangos `spell_template` rows read at decision time (2026-07-14). A column
+/// slip or a mask slip fails loudly. Skips without client data.
+///
+/// **The bit20 column is why this test was rewritten** (decision 1593). It used to assert
+/// `attributes_ex2 & 0x100000 == 0` *for each of the ten spells listed here* and read that as
+/// "no spell carries the bit, so the deferred GO-time start is unbuilt". Ten warrior/mage rows
+/// are not a census: the real file carries it on 36. The census below is the check that claim
+/// needed, and it is now the thing that would catch the bit going dormant for real.
 #[test]
 fn real_spell_catalog_classifies_combat_initiation() {
     let data = crate::wow_data_or_skip!();
     let mut chain = crate::open_chain(&data).expect("open chain");
     let cat = load_spell_catalog(&mut chain).expect("load Spell/SpellIcon");
 
-    // (spell, on_next_swing, initiates_auto_attack)
-    for (id, name, next_swing, initiates) in [
-        (78u32, "Heroic Strike", true, true), // Attributes 0x50014
-        (845, "Cleave", true, true),          // Attributes 0x50014, Ex 0x200
-        (2973, "Raptor Strike", true, true),  // Attributes 0x50404
-        (772, "Rend", false, true),           // Ex 0x8000200
-        (7386, "Sunder Armor", false, true),  // Ex 0x8000200
-        (1464, "Slam", false, true),          // Ex 0x8000200
-        (100, "Charge", false, false),        // Ex 0x400 — neither bit
-        (6673, "Battle Shout", false, false), // Ex 0x0
-        (6603, "Attack", false, false),       // the auto-attack pseudo-spell itself
-        (133, "Fireball", false, false),      // an ordinary cast
+    // (spell, on_next_swing, initiates_auto_attack, initiates_auto_attack_at_go)
+    for (id, name, next_swing, initiates, at_go) in [
+        (78u32, "Heroic Strike", true, true, false), // Attributes 0x50014
+        (845, "Cleave", true, true, false),          // Attributes 0x50014, Ex 0x200
+        (2973, "Raptor Strike", true, true, false),  // Attributes 0x50404
+        (772, "Rend", false, true, false),           // Ex 0x8000200
+        (7386, "Sunder Armor", false, true, false),  // Ex 0x8000200
+        (1464, "Slam", false, true, false),          // Ex 0x8000200
+        (100, "Charge", false, false, false),        // Ex 0x400 — neither bit, and bit20 CLEAR
+        (6673, "Battle Shout", false, false, false), // Ex 0x0
+        (6603, "Attack", false, false, false),       // the auto-attack pseudo-spell itself
+        (133, "Fireball", false, false, false),      // an ordinary cast
+        // The GO-deferred class: bit20 SET, so the send-time tail is suppressed and the start
+        // waits for `SMSG_SPELL_GO` (`0x6e83c0`). Every stealth opener and positional strike.
+        (53, "Backstab", false, false, true), // Attributes 0x50010, Ex 0x8000200, Ex2 0x100000
+        (703, "Garrote", false, false, true),
+        (8676, "Ambush", false, false, true),
+        (1833, "Cheap Shot", false, false, true),
+        (5221, "Shred", false, false, true),
+        (6785, "Ravage", false, false, true),
+        (9005, "Pounce", false, false, true),
+        (20271, "Judgement", false, false, true), // Ex 0x0 — bit20 is its ONLY initiation bit
+        // The hunter's instant shots (bug B280): `Attributes 0x00010002` (ranged slot),
+        // `AttributesEx 0`, `AttributesEx2 0x00020000` — bit 17, vmangos
+        // `SPELL_ATTR_EX2_DO_NOT_RESET_COMBAT_TIMERS`, the shot-weaving bit, and NOT bit 20.
+        // So no client attack-start of either kind fires for them; casting one does not begin
+        // Auto Shot, which is what 0994 §4 recorded and what this pins in data.
+        (1978, "Serpent Sting", false, false, false),
+        (3044, "Arcane Shot", false, false, false),
+        (2643, "Multi-Shot", false, false, false),
+        (75, "Auto Shot", false, false, false), // the auto-repeat itself: Ex2 0x20, not 0x100000
     ] {
         let d = cat
             .get(id)
@@ -747,21 +773,122 @@ fn real_spell_catalog_classifies_combat_initiation() {
         assert_eq!(
             d.initiates_auto_attack(),
             initiates,
-            "{name} ({id}) initiates_auto_attack (Attributes {:#x}, Ex {:#x})",
+            "{name} ({id}) initiates_auto_attack (Attributes {:#x}, Ex {:#x}, Ex2 {:#x})",
             d.attributes,
-            d.attributes_ex
-        );
-        // The §5's one DBC-owed bit (wow-re `combat-feel-law.md` @ c445713b): `AttributesEx2 &
-        // 0x100000` (INITIATE_COMBAT_POST_CAST) defers a spell's attack-start to SMSG_SPELL_GO —
-        // a client path benilla leaves unbuilt because no spell here carries the bit. This pins
-        // that from the real client DBC: in particular Charge (100) is bit20-CLEAR, so vanilla
-        // Charge starts no auto-attack through ANY client channel.
-        assert_eq!(
-            d.attributes_ex2 & 0x0010_0000,
-            0,
-            "{name} ({id}) must not carry INITIATE_COMBAT_POST_CAST (Ex2 {:#x}) — the deferred \
-             GO-time attack-start is unbuilt",
+            d.attributes_ex,
             d.attributes_ex2
+        );
+        assert_eq!(
+            d.initiates_auto_attack_at_go(),
+            at_go,
+            "{name} ({id}) initiates_auto_attack_at_go (Ex2 {:#x})",
+            d.attributes_ex2
+        );
+        // The two halves are mutually exclusive by construction — bit20 suppresses the send-time
+        // tail — so no spell may ever start the attack twice.
+        assert!(
+            !(d.initiates_auto_attack() && d.initiates_auto_attack_at_go()),
+            "{name} ({id}) may not start the auto-attack at BOTH the send and the GO"
+        );
+    }
+
+    // The census the old ten-row assertion stood in for. 36 rows carry bit20 in the shipped file,
+    // and every one of them is a stealth opener, a positional strike or Judgement — the class
+    // whose attack-start has to wait for the server to resolve the strike.
+    let deferred: Vec<(u32, &str)> = cat
+        .iter()
+        .filter(|(_, d)| d.initiates_auto_attack_at_go())
+        .map(|(id, d)| (id, d.name.as_str()))
+        .collect();
+    assert_eq!(
+        deferred.len(),
+        36,
+        "5875 ships 36 INITIATE_COMBAT_POST_CAST rows, got {}: {:?}",
+        deferred.len(),
+        deferred
+    );
+    let mut names: Vec<&str> = deferred.iter().map(|&(_, n)| n).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(
+        names,
+        [
+            "Ambush",
+            "Backstab",
+            "Cheap Shot",
+            "Garrote",
+            "Judgement",
+            "Pounce",
+            "Ravage",
+            "Shred",
+            "Test Stab R50",
+        ],
+        "the deferred-start class is the openers, the positional strikes and Judgement"
+    );
+}
+
+/// **`modalNextSpell` — `Spell.dbc` column 38** on the real build-5875 file (decision 1597, bug
+/// B280). This is the column that makes casting a hunter shot start Auto Shot, so a column slip
+/// here is a silently-broken hunter; and the shape of the census is itself the evidence that the
+/// column is the one wow-re named — non-zero on 57 of 22357 rows, 52 of those naming spell 75.
+/// Skips without client data.
+#[test]
+fn real_spell_catalog_reads_modal_next_spell() {
+    let data = crate::wow_data_or_skip!();
+    let mut chain = crate::open_chain(&data).expect("open chain");
+    let cat = load_spell_catalog(&mut chain).expect("load Spell/SpellIcon");
+
+    // Rank 1 of each hunter shot, and the two spells that terminate the chain.
+    for (id, name, next) in [
+        (1978u32, "Serpent Sting", 75u32),
+        (3044, "Arcane Shot", 75),
+        (2643, "Multi-Shot", 75),
+        (5116, "Concussive Shot", 75),
+        (19434, "Aimed Shot", 75),
+        (3034, "Viper Sting", 75),
+        (3043, "Scorpid Sting", 75),
+        (3674, "Black Arrow", 75),
+        (14274, "Distracting Shot", 75),
+        // Auto Shot's own column 38 is 0 — the chain is one hop, and cannot loop.
+        (75, "Auto Shot", 0),
+        // A melee strike and an ordinary cast carry nothing here.
+        (78, "Heroic Strike", 0),
+        (133, "Fireball", 0),
+    ] {
+        let d = cat
+            .get(id)
+            .unwrap_or_else(|| panic!("{name} ({id}) in the catalog"));
+        assert_eq!(
+            d.modal_next_spell, next,
+            "{name} ({id}) modalNextSpell (column 38)"
+        );
+    }
+
+    // The census — and the reason to believe the column map. A wrong column would not land on a
+    // 57-row population that is 91 % one value, and that value the spell every one of those rows
+    // exists to resume.
+    let chained: Vec<(u32, u32)> = cat
+        .iter()
+        .filter(|(_, d)| d.modal_next_spell != 0)
+        .map(|(id, d)| (id, d.modal_next_spell))
+        .collect();
+    assert_eq!(
+        chained.len(),
+        57,
+        "5875 ships 57 rows with a non-zero column 38, got {}",
+        chained.len()
+    );
+    let to_auto_shot = chained.iter().filter(|&&(_, next)| next == 75).count();
+    assert_eq!(
+        to_auto_shot, 52,
+        "52 of the 57 name Auto Shot (the rest: three (TEST) bow shot rows → 59, two Minigun → 23675)"
+    );
+    // Nothing points at a spell that would chain onward — the one-hop property, in data.
+    for &(id, next) in &chained {
+        let onward = cat.get(next).map(|d| d.modal_next_spell).unwrap_or(0);
+        assert!(
+            onward == 0 || onward == next,
+            "spell {id} chains {next}, which itself chains {onward} — the chain must not walk"
         );
     }
 }
@@ -839,6 +966,76 @@ fn the_tooltip_gates_read_effect_and_mask() {
 
     // §3-EQUIPITEM's naming rule moved to `ItemSubClassCatalog::requirement_name`, where the
     // vocabulary it reads lives — see `itemsubclass::tests` for its coverage against the real DBCs.
+}
+
+/// The **main-hand auto-pick** family (`Attributes & 0x200`, decision 1552), against the real
+/// 5875 file. `ArmCast 0x6e5250` reads this bit to skip the item-targeting cursor and bind the
+/// equipped main hand instead, so the client's behaviour rests on the family being exactly what
+/// the app assumes: a set of temporary weapon imbues, each already an item-target spell.
+///
+/// **vmangos is not the authority for this census and gets it wrong.** Its `spell_template` keeps
+/// a row per *build*: mage Feedback (13896, 19271-19275) and druid Omen of Clarity carried this
+/// exact shape — effect 54, `Targets 0x10`, `Attributes 0x50200` — at builds 4375/4449, and both
+/// had been rewritten into plain auras with the bit CLEAR by build 5302. A `GROUP BY entry` over
+/// that table hands back the early row and inflates the family to 28. The shipped file is the
+/// authority, and it says four names.
+///
+/// The app's resolver takes the shortcut of only handling a word the item arm fully discharges
+/// (`Targets` exactly `0x10`). That is byte-equivalent only while no row mixes the attribute with
+/// another target bit — which is what the `0x10` assertion below pins. If a row ever does, this
+/// fails here rather than silently sending an unbound cast.
+#[test]
+fn real_main_hand_autopick_family() {
+    let data = crate::wow_data_or_skip!();
+    let mut chain = crate::open_chain(&data).expect("open chain");
+    let cat = load_spell_catalog(&mut chain).expect("load Spell/SpellIcon");
+
+    let mut names = std::collections::BTreeSet::<String>::new();
+    let mut rows = 0usize;
+    for (id, d) in cat.iter().filter(|(_, d)| d.targets_main_hand_item()) {
+        rows += 1;
+        names.insert(d.name.clone());
+        assert_eq!(
+            d.targets, 0x10,
+            "spell {id} ({}) carries the main-hand attribute with word {:#x} — the resolver's \
+             item arm cannot discharge it",
+            d.name, d.targets
+        );
+        assert_eq!(
+            d.effects[0],
+            crate::SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY,
+            "spell {id} ({}) is not a temporary weapon enchant",
+            d.name
+        );
+        // The auto-pick bypasses `0x495d60` entirely, so an equipped-item gate on one of these
+        // rows would be a gate the client never runs. None carries one.
+        assert_eq!(
+            (
+                d.equipped_item_subclass_mask,
+                d.equipped_item_inventory_type_mask
+            ),
+            (0, 0),
+            "spell {id} ({}) carries an equipped-item gate the auto-pick path never runs",
+            d.name
+        );
+    }
+    assert_eq!(rows, 22, "the whole main-hand auto-pick family");
+    assert_eq!(
+        names.iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "Flametongue Weapon",
+            "Frostbrand Weapon",
+            "Rockbiter Weapon",
+            "Windfury Weapon",
+        ],
+        "in 5875 the family is the four shaman weapon imbues and nothing else"
+    );
+    // Windfury TOTEM is not in it — it is a totem summon with no target word at all. Worth
+    // pinning because the report that prompted 1552 named it (ledger B308), and the fix would
+    // look wrong if it had ever needed one.
+    let wf_totem = cat.get(8512).expect("Windfury Totem");
+    assert!(!wf_totem.targets_main_hand_item());
+    assert_eq!(wf_totem.targets, 0, "a totem summon binds nothing");
 }
 
 /// The item-target family and its gate columns (decision 0923), against the real 5875 file. The

@@ -33,6 +33,7 @@
 
 pub mod addon_harness;
 mod area;
+mod area_poi;
 mod area_trigger;
 #[cfg(feature = "dev")]
 mod asset_churn;
@@ -121,6 +122,7 @@ mod ui_honor;
 mod ui_inspect;
 mod ui_item_text;
 mod ui_items;
+mod ui_layout;
 mod ui_logout;
 mod ui_loot;
 mod ui_loot_roll;
@@ -145,6 +147,7 @@ mod ui_shapeshift;
 mod ui_social;
 mod ui_spellbook;
 mod ui_talent;
+mod ui_talent_wipe;
 mod ui_taxi;
 mod ui_text;
 mod ui_tooltip;
@@ -156,6 +159,7 @@ mod ui_world_map;
 mod video;
 mod vplates;
 mod world_state;
+mod world_state_ui;
 
 use bevy::prelude::*;
 use blob_shadow::BlobShadowPlugin;
@@ -190,6 +194,7 @@ use ui_gossip::UiGossipPlugin;
 use ui_guild::UiGuildPlugin;
 use ui_item_text::UiItemTextPlugin;
 use ui_items::UiItemsPlugin;
+use ui_layout::UiLayoutPlugin;
 use ui_logout::UiLogoutPlugin;
 use ui_loot::UiLootPlugin;
 use ui_loot_roll::UiLootRollPlugin;
@@ -211,6 +216,7 @@ use ui_shapeshift::UiShapeshiftPlugin;
 use ui_social::UiSocialPlugin;
 use ui_spellbook::UiSpellbookPlugin;
 use ui_talent::UiTalentPlugin;
+use ui_talent_wipe::UiTalentWipePlugin;
 use ui_taxi::UiTaxiPlugin;
 use ui_text::UiTextPlugin;
 use ui_tooltip::UiTooltipPlugin;
@@ -535,6 +541,8 @@ pub fn run(build: BuildId) -> AppExit {
     // The shared AreaTable catalog + the ZONE_CHANGED event family / zone-text host globals
     // behind GetZoneText & co. (the zone-entry splash arc, decision 0287).
     .add_plugins(area::AreaPlugin)
+    .add_plugins(area_poi::AreaPoiPlugin)
+    .add_plugins(world_state_ui::WorldStateUiPlugin)
     // The `AreaTrigger.dbc` volumes + the per-frame containment check that reports walking into
     // one (`CMSG_AREATRIGGER`) — the client's whole part in portals, instance entrances and
     // explore objectives; the server owns what each trigger means.
@@ -624,6 +632,11 @@ pub fn run(build: BuildId) -> AppExit {
     // talent seam, and drains learn clicks into CMSG_LEARN_TALENT. After UiActionPlugin
     // (shares its `Spells` catalog), beside the spellbook it mirrors.
     .add_plugins(UiTalentPlugin)
+    // Unlearning them again (decision 1580): the class trainer's respec question, its
+    // CONFIRM_TALENT_WIPE dialog, and the answer that is the only packet in the flow which
+    // unlearns anything. Beside UiTalentPlugin for the subject, but it is UiBinderPlugin's twin
+    // in shape — a guid-carrying question over an already-closed gossip menu.
+    .add_plugins(UiTalentWipePlugin)
     // The stance/shapeshift bar feed (wow-re shapeshift-bar-api.md): builds the form list from
     // PlayerActions.spells per the byte-verified admission/order, drives StanceBar.xml through
     // the engine's shapeshift seam, and drains its clicks (cancel-if-active else cast). After
@@ -709,6 +722,11 @@ pub fn run(build: BuildId) -> AppExit {
     // QuestLogFrame.xml over the Era quest-log API.
     .add_plugins(UiQuestLogPlugin)
     .add_plugins(UiChatPlugin)
+    // The layout cache: the geometry of every window the player has dragged or resized, restored
+    // at world entry and written back a quiet second after the last drag
+    // (`benilla-config/layout/<realm>-<character>.txt`). The consumer of the engine's userPlaced
+    // bit, which nothing read before it.
+    .add_plugins(UiLayoutPlugin)
     // Print screen (decision 1487): the SCREENSHOT binding's engine half — one PNG per
     // `Screenshot()` call into `benilla-config/Screenshots/` (never the install — decision 1486),
     // answered to the UI as SCREENSHOT_SUCCEEDED/FAILED so the status text can never be in the

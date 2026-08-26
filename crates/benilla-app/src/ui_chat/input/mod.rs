@@ -127,9 +127,11 @@ pub(super) fn emote_target(selection: &Selection, me: Option<Entity>) -> u64 {
 /// - `world` feeds **`/liquid`**, the swim diagnostic (decision 0634 follow-up): the interior
 ///   claim is what decides which liquid surfaces the swim query may see, and it arrives with the
 ///   query rather than beside it.
-/// - `stores`/`self_store`/`factions`/`reputations` feed **`/reaction`**, the attackability
-///   diagnostic (decision 0637): the exact inputs [`crate::target::ring_reaction`] judges on, so
-///   "why is this unit not attackable" is one command instead of a guess.
+/// - `stores`/`self_store`/`factions`/`reputations`/`kinds` feed **`/reaction`**, the
+///   attackability diagnostic (decision 0637): the exact inputs [`crate::target::ring_reaction`]
+///   judges on, so "why is this unit not attackable" is one command instead of a guess — and
+///   with them the V-plate CATEGORY, which turns on a different predicate entirely
+///   ([`crate::target::ring::plate_is_friendly`]) and so cannot be read off the rank.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(super) struct ChatProbes<'w, 's> {
     camera: Query<
@@ -148,6 +150,16 @@ pub(super) struct ChatProbes<'w, 's> {
     /// `/reaction <name>`'s resolve — so a scripted probe can ask about a player it has not
     /// clicked (the two-client duel run has no way to select the other side).
     guids: Res<'w, crate::net::GuidIndex>,
+    /// The subject's [`benilla_protocol::EntityKind`] — the plate gate's own player test, so the
+    /// diagnostic reports the branch the gate actually took rather than a second guess at it.
+    kinds: Query<'w, 's, &'static crate::net::NetEntity>,
+    /// **`/partytest raid`** (decision 1549): the synthetic raid seats US as its leader, and
+    /// "leader" on this wire is a guid. Here rather than as a 17th drain parameter for the
+    /// reason this struct exists at all — the drain is at Bevy's 16-param ceiling.
+    self_guid: Res<'w, crate::net::SelfGuid>,
+    /// The map `/partytest ping` stamps its synthetic ping with — a ping carries no map on the
+    /// wire either, so "the one we are standing on" is the client's answer in both paths.
+    map: Option<Res<'w, benilla_world::world_map::CurrentMap>>,
 }
 
 /// Everything the drain **queues into another subsystem's one setter** rather than applying itself,
@@ -167,6 +179,12 @@ pub(super) struct ChatOut<'w> {
     target: MessageWriter<'w, crate::target::TargetByNameRequest>,
     assist: MessageWriter<'w, crate::target::AssistRequest>,
     follow: MessageWriter<'w, crate::player::FollowRequest>,
+    /// **`/partytest ping`** (decision 1596) — the minimap ping's setter. The LOCAL leg needs no
+    /// instrument (click the map), but a *group member's* ping otherwise needs a second client
+    /// logged in and standing somewhere else; this seats one as if Alice had sent it, through the
+    /// same `seat` the wire arm calls, so the remote leg — the `partyN` token, the marker, the
+    /// pin holding while you walk — is exercisable solo.
+    ping: ResMut<'w, crate::minimap::MinimapPing>,
 }
 
 // One parameter per concern — the chat drain fans out to every command's consumer.
@@ -204,6 +222,9 @@ pub(super) fn drain_chat_input(
         factions,
         reputations,
         guids,
+        kinds,
+        self_guid,
+        map,
     } = &probes;
     let Some(mut script) = script else {
         return;
@@ -385,10 +406,13 @@ pub(super) fn drain_chat_input(
                     Some(n) => crate::ui_duel::streamed_player_named(n, guids, &names),
                     None => selection.guid,
                 };
-                let target_store = subject_guid
-                    .and_then(|g| guids.0.get(&g).copied())
-                    .and_then(|e| stores.get(e).ok());
+                let subject_entity = subject_guid.and_then(|g| guids.0.get(&g).copied());
+                let target_store = subject_entity.and_then(|e| stores.get(e).ok());
                 let own_store = self_store.iter().next();
+                // The plate gate's own player test, read the same way it reads it.
+                let is_player = subject_entity
+                    .and_then(|e| kinds.get(e).ok())
+                    .is_some_and(|n| n.kind == benilla_protocol::EntityKind::Player);
                 let mut lines = Vec::new();
                 let describe = |label: &str, s: Option<&crate::net::ObjectStore>| match s {
                     Some(s) => format!(
@@ -436,6 +460,47 @@ pub(super) fn drain_chat_input(
                         own_store
                     )
                 ));
+                // The V-plate CATEGORY, which is a **different predicate** from the rank above
+                // (`CanAttack` player→unit, plus `CanCooperate` for a player subject — decision
+                // 1530) and so cannot be read off it. Both legs are printed, with the faction-group
+                // masks they compare: a player in the wrong bucket is a mask disagreement roughly
+                // every time, and the mask is invisible everywhere else in the client. A GM-mode
+                // character is mask 0 on a vmangos realm (`.gm on` → faction template 35), which is
+                // exactly how a friendly player ends up with an enemy plate.
+                let mask = |s| {
+                    crate::target::ring::faction_group_mask(factions.as_deref(), s)
+                        .map_or("none".to_string(), |m| m.to_string())
+                };
+                let friendly = crate::target::ring::plate_is_friendly(
+                    factions.as_deref(),
+                    reputations,
+                    target_store,
+                    own_store,
+                    is_player,
+                );
+                lines.push(format!(
+                    "reaction: plate is_player {is_player} · faction-group mask self {} \
+                     target {} · can_cooperate {} · can_attack(player→unit) {}",
+                    mask(own_store),
+                    mask(target_store),
+                    crate::target::ring::can_cooperate_with_player(
+                        factions.as_deref(),
+                        target_store,
+                        own_store
+                    ),
+                    crate::target::ring::can_attack_from_player(
+                        factions.as_deref(),
+                        reputations,
+                        target_store,
+                        own_store,
+                        is_player,
+                    ),
+                ));
+                lines.push(format!(
+                    "reaction: PLATE CATEGORY {} — this unit plates under {}",
+                    if friendly { "FRIENDLY" } else { "ENEMY" },
+                    if friendly { "SHIFT-V" } else { "V" },
+                ));
                 for line in lines {
                     // Also to the log: a scripted two-client run reads stdout, not the feed.
                     info!("{line}");
@@ -447,7 +512,42 @@ pub(super) fn drain_chat_input(
             }
             ParsedChat::PartyTest { arg } => match arg.as_str() {
                 "off" => group.clear_session(),
+                // The raid grid's instrument (decision 1549) — 25 synthetic rows, us leading.
+                "raid" => {
+                    for line in crate::ui_party::synthetic_raid(&mut group, &mut names, self_guid.0)
+                    {
+                        chat_log.push_event(super::event::ChatEvent::text_only(
+                            super::event::ChatEventKind::System,
+                            line,
+                        ));
+                    }
+                }
                 "invite" => group.pending_invite = Some("Partner".to_string()),
+                // A group member's ping, without the group member (decision 1596). 35 yd
+                // north-east: off both axes so a mirrored sign is obvious, and inside every
+                // outdoor view radius (the tightest is 66.7 yd) — indoors at the two tightest
+                // zooms it is off the disc, which is itself worth seeing (the marker hides and
+                // the ping survives, so walking back brings it into view).
+                "ping" => {
+                    let line = if let Ok((_, _, tf)) = self_player.single() {
+                        let w = benilla_assets::coords::bevy_to_wow(tf.translation());
+                        // +x is north, −y is east (0203's north-up mapping).
+                        let at = (w[0] + 24.75, w[1] - 24.75);
+                        chat_out
+                            .ping
+                            .seat(at, map.as_ref().map_or(0, |m| m.0), 0xF001);
+                        format!(
+                            "partytest: Alice pinged ({:.0}, {:.0}) — 35 yd NE, party1, 5 s",
+                            at.0, at.1
+                        )
+                    } else {
+                        "partytest: no player position — cannot place a ping".to_string()
+                    };
+                    chat_log.push_event(super::event::ChatEvent::text_only(
+                        super::event::ChatEventKind::System,
+                        line,
+                    ));
+                }
                 // Serverless mark eyeball: skull the current target on the LOCAL board (the
                 // real send round-trips through the server's echo, which /partytest lacks).
                 "mark" => {
@@ -876,7 +976,174 @@ fn chattest_battery(log: &mut super::feed::ChatLog) {
     for e in battery {
         log.push_event(e);
     }
+    combat_log_battery(log);
     info!("chattest: battery queued");
+}
+
+/// The combat-log half of `/chattest` (B297): one synthetic line of every family, through the real
+/// [`super::combat`] composer and the real drain — so the whole `COMBAT_*`/`SPELL_*` block's
+/// wording, colours and window routing verify in one screen without a fight.
+///
+/// It exists because the alternative is a live combat probe, and unattended ones are out (the
+/// director's standing rule). The lines are driven with **guid 0 on both endpoints and literal
+/// names in the fills**, so the drain's name resolve is a no-op and nothing here touches the wire;
+/// everything downstream of that — the family's template lookup, the slot fill, the chat type, the
+/// route, the `CHAT_MSG_*` fire an addon sees — is the production path exactly.
+///
+/// The chat TYPES are picked to show the block's spread rather than one row: your own melee and
+/// spells, your pet, a hostile player, and a creature hitting you (which is the one that is red).
+fn combat_log_battery(log: &mut super::feed::ChatLog) {
+    use super::combat::{self, Family, Fills, PendingCombat, Variant};
+    use super::event::ChatEventKind as K;
+
+    let fills = |amount: i64, school: Option<u8>, power: Option<u32>| Fills {
+        attacker: "Gnoll Brute".into(),
+        victim: "Target Dummy".into(),
+        spell: "Fireball".into(),
+        school,
+        power,
+        amount,
+        amount2: amount / 3,
+        power2: power,
+    };
+    let line = |kind: K, family: Family, variant: Variant, f: Fills| PendingCombat {
+        kind,
+        family,
+        variant,
+        subject: 0,
+        object: 0,
+        fills: f,
+        tries: 0,
+    };
+    let battery = [
+        // Your own melee, plain and crit, and the school form.
+        line(
+            K::CombatSelfHits,
+            combat::COMBATHIT,
+            Variant::SelfOther,
+            fills(120, None, None),
+        ),
+        line(
+            K::CombatSelfHits,
+            combat::COMBATHITCRIT,
+            Variant::SelfOther,
+            fills(240, None, None),
+        ),
+        line(
+            K::CombatSelfHits,
+            combat::COMBATHITSCHOOL,
+            Variant::SelfOther,
+            fills(35, Some(2), None),
+        ),
+        line(
+            K::CombatSelfMisses,
+            combat::MISSED,
+            Variant::SelfOther,
+            fills(0, None, None),
+        ),
+        // A creature hitting you — the red rows, and the ones a player notices first.
+        line(
+            K::CombatCreatureVsSelfHits,
+            combat::COMBATHIT,
+            Variant::OtherSelf,
+            fills(87, None, None),
+        ),
+        line(
+            K::CombatCreatureVsSelfMisses,
+            combat::VSDODGE,
+            Variant::OtherSelf,
+            fills(0, None, None),
+        ),
+        line(
+            K::CombatCreatureVsSelfMisses,
+            combat::VSBLOCK,
+            Variant::OtherSelf,
+            fills(0, None, None),
+        ),
+        line(
+            K::CombatCreatureVsSelfMisses,
+            combat::VSPARRY,
+            Variant::OtherSelf,
+            fills(0, None, None),
+        ),
+        // Your own spells: the gold pair, and the outcomes that are not damage.
+        line(
+            K::SpellSelfDamage,
+            combat::SPELLLOGSCHOOL,
+            Variant::SelfOther,
+            fills(412, Some(2), None),
+        ),
+        line(
+            K::SpellSelfDamage,
+            combat::SPELLLOGCRITSCHOOL,
+            Variant::SelfOther,
+            fills(830, Some(2), None),
+        ),
+        line(
+            K::SpellSelfDamage,
+            combat::SPELLMISS,
+            Variant::SelfOther,
+            fills(0, None, None),
+        ),
+        line(
+            K::SpellSelfDamage,
+            combat::SPELLRESIST,
+            Variant::SelfOther,
+            fills(0, None, None),
+        ),
+        line(
+            K::SpellSelfBuff,
+            combat::HEALED,
+            Variant::SelfOther,
+            fills(560, None, None),
+        ),
+        line(
+            K::SpellSelfBuff,
+            combat::POWERGAIN,
+            Variant::SelfSelf,
+            fills(90, None, Some(0)),
+        ),
+        // Your pet, a hostile player, and the periodic + shield rows.
+        line(
+            K::CombatPetHits,
+            combat::COMBATHIT,
+            Variant::OtherOther,
+            fills(64, None, None),
+        ),
+        line(
+            K::SpellHostilePlayerDamage,
+            combat::SPELLLOGSCHOOL,
+            Variant::OtherSelf,
+            fills(305, Some(5), None),
+        ),
+        line(
+            K::SpellPeriodicSelfDamage,
+            combat::PERIODICAURADAMAGE,
+            Variant::SelfOther,
+            fills(48, Some(5), None),
+        ),
+        line(
+            K::SpellPeriodicSelfBuffs,
+            combat::PERIODICAURAHEAL,
+            Variant::SelfSelf,
+            fills(75, None, None),
+        ),
+        line(
+            K::SpellDamageShieldsOnSelf,
+            combat::DAMAGESHIELD,
+            Variant::SelfOther,
+            fills(22, Some(1), None),
+        ),
+        line(
+            K::SpellSelfBuff,
+            combat::SPELLPOWERLEECH,
+            Variant::SelfOther,
+            fills(150, None, Some(0)),
+        ),
+    ];
+    for l in battery {
+        log.push_combat(l);
+    }
 }
 
 /// The send-side emote **posture-eligibility gate** (wow-re `object-layer/scratch/emote-posture-
@@ -884,10 +1151,34 @@ fn chattest_battery(log: &mut super::feed::ChatLog) {
 /// site that reads an `Emotes.dbc` `EmoteFlags` — called from `DoEmote` (`0x5ef560`) *before*
 /// `CMSG_TEXT_EMOTE` is built, so a suppressed emote sends no packet and plays no local anim at all
 /// (a seated `/bow` self-censors; the server round-trip never happens). Byte-verified predicate,
-/// exactly these four tests in the note's site order — the fifth flag the note decodes (`0x4000`,
-/// "requires standing still") only sets an *out* param the client acts on while fear/confuse-
-/// controlled, which benilla doesn't model, so it's deliberately not implemented here. `true` =
-/// eligible (send + play); `false` = suppress both.
+/// exactly these four tests in the note's site order. `true` = eligible (send + play); `false` =
+/// suppress both.
+///
+/// # The fifth flag, `0x4000` — NOT built, and the reason recorded here was WRONG
+///
+/// This doc used to say `0x4000` ("requires standing still") *"only sets an out param the client
+/// acts on while fear/confuse-controlled, which benilla doesn't model"*. A §5 trio carve of the
+/// neighbouring stand-state gate re-read the leg and **inverted that polarity**
+/// (wow-re `standstate-movement-trigger.md` §5.6, 2026-08-23; decision 1582). The bytes:
+///
+/// - `0x47dbab` tests `EmoteFlags & 0x4000`, and if set, `0x47dbb3` tests the live `CMovement`
+///   word against **`0x20ff`** — the four direction bits, the two turn bits, the two pitch bits and
+///   `FALLING` — writing `*out = 1`. Pointedly **not** `SWIMMING`.
+/// - `DoEmote` then reads that out-param at `0x5ef5d0` and, when `0x5fa550` returns non-zero,
+///   raises message `0x139` = **`ERR_NOEMOTEWHILERUNNING`** ("You can't do that while moving!") and
+///   **aborts**: no emote packet, no `SetStandState`.
+/// - `0x5fa550` is `IsSelfControlled`, not "is fear/confuse-controlled" — it returns **1** for an
+///   ordinary player and **0** while `UNIT_FIELD_FLAGS & 0xc00004` (DISABLE_MOVE / CONFUSED /
+///   FLEEING). So the toast fires for the **ordinary moving player** and is *suppressed* while
+///   feared. That is the exact reversal of what this comment claimed.
+///
+/// It stays unbuilt — deliberately, and as a named gap rather than a settled reading: implementing
+/// it puts a red error line on screen for every emote typed while moving, turning, pitching or
+/// falling, which is a visible behaviour change for the director to weigh rather than a bug fix to
+/// slip in. What it is **not** is a water gate: `0x20ff` carries no `SWIMMING`, so it has nothing
+/// to do with B155 and could never have covered it (`super::super::tests::
+/// the_posture_emotes_carry_no_swim_suppression_flag` is the data half of that same negative). The
+/// posture path's water refusal lives in [`crate::player::state`]'s `stand_state_refused`.
 pub(super) fn emote_send_eligible(emote_flags: u32, stand_state: u8, swimming: bool) -> bool {
     // `0x0400`: unconditional suppress (client `0x47db58`).
     if emote_flags & 0x0400 != 0 {

@@ -4,11 +4,11 @@ use crate::layout::{LayoutInput, LayoutSolver, Rect};
 use crate::widget::{FrameHandle, RegionHandle, WidgetArena};
 
 use super::{
-    auction, backdrop, bank, char_stats, container, craft, cursor, death, duel, follow, gossip,
-    guild, inspect, item_text, loot, loot_roll, macros, mail, merchant, party, pvp, quest,
-    quest_log, reputation, session, simplehtml, skills, slider, social, spellbook, taxi, trade,
-    tradeskill, trainer, weapon_enchant, ActionSlot, AuraState, FontObject, ItemTemplateView,
-    PlayerReqState, RegionData, ScriptValue, SoundRequest, UnitState,
+    auction, backdrop, bank, char_stats, chat_window, colorselect, container, craft, cursor, death,
+    duel, follow, gossip, guild, inspect, item_text, loot, loot_roll, macros, mail, merchant,
+    party, pvp, quest, quest_log, reputation, session, simplehtml, skills, slider, social,
+    spellbook, taxi, trade, tradeskill, trainer, weapon_enchant, ActionSlot, AuraState, FontObject,
+    ItemTemplateView, PlayerReqState, RegionData, ScriptValue, SoundRequest, UnitState,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -401,6 +401,12 @@ pub(crate) struct Model {
     /// Party/loot intents (`AcceptGroup`/`InviteToParty`/`SetLootMethod`/…) queued since the
     /// app's last [`super::UiScript::take_party_requests`] drain — the outbound seam ([`party`]).
     pub(crate) party_requests: Vec<party::PartyRequest>,
+    /// The saved raid lockouts the Raid tab's info panel reads (decision 1549), pushed by the app
+    /// from `SMSG_RAID_INSTANCE_INFO`. Its own field rather than a [`party::PartyState`] member
+    /// because it arrives on its own packet and survives every roster change.
+    pub(crate) saved_instances: Vec<party::SavedInstanceInfo>,
+    /// `SetRaidRosterSelection`'s cursor — a client-side raid row index, never sent anywhere.
+    pub(crate) raid_selection: i64,
     /// The social snapshot the app pushes (friends, ignores, the last `/who` — decision 0668):
     /// `GetNumFriends`/`GetFriendInfo`/`GetWhoInfo`/… read it ([`social`]). Already
     /// display-resolved (names, class/zone names) because the reference resolves them
@@ -430,6 +436,20 @@ pub(crate) struct Model {
     /// [`super::UiScript::take_open_chat_requests`] drain — `tell_requests`' sibling, one step
     /// less resolved: a name there, a whole draft line here ([`chat_window`] registers the global).
     pub(crate) open_chat_requests: Vec<String>,
+    /// Per-chat-window **look** — background tint, background alpha, font size — index 0 =
+    /// `ChatFrame1` (decision 1589, [`chat_window`]). The engine's own per-window record narrowed
+    /// to the three fields the tab menu's Display block can move; the host seeds it from the
+    /// player's saved file and persists what Lua writes back.
+    pub(crate) chat_window_looks: [chat_window::ChatWindowLook; chat_window::NUM_CHAT_WINDOWS],
+    /// The 0-based window indices whose look Lua moved since the app's last
+    /// [`super::UiScript::take_chat_window_changes`] drain — the persist cue. A set, so a slider
+    /// drag costs one entry however many steps it took.
+    pub(crate) chat_window_changes: HashSet<usize>,
+    /// Whether a **user-placed** frame's geometry moved since the app's last
+    /// [`super::UiScript::take_user_placed_change`] drain — the layout cache's persist cue
+    /// ([`super::layout_cache`]). One bit rather than a set of handles, because the file is
+    /// rewritten whole either way; set by the move/resize pumps and by `SetUserPlaced` itself.
+    pub(crate) user_placed_changed: bool,
     /// The player's default chat language name, app-resolved from `ChrRaces.BaseLanguage` ×
     /// `Languages.dbc` ([`super::UiScript::set_default_language`]). `None` = the reference's
     /// no-player-object state, where `GetDefaultLanguage()` returns **zero Lua values**
@@ -621,6 +641,16 @@ pub(crate) struct Model {
     /// `LearnTalent(tab, index)` clicks queued since the app's last
     /// [`super::UiScript::take_talent_learns`] drain.
     pub(crate) talent_learns: Vec<(u32, u32)>,
+    /// `ConfirmTalentWipe()` calls queued since the app last drained them — each is one outbound
+    /// `MSG_TALENT_WIPE_CONFIRM`. A COUNT for [`Self::binder_confirms`]'s reason: the app holds
+    /// the trainer's guid, so the intent carries no payload of its own (decision 1580).
+    pub(crate) talent_wipe_confirms: u32,
+    /// Is a trainer's respec question still live and in range — the answer
+    /// `CheckTalentMasterDist()` gives, pushed by the app each frame
+    /// ([`super::UiScript::set_talent_master_pending`]). The CONFIRM_TALENT_WIPE dialog polls it
+    /// from OnUpdate and hides itself when it goes false; the binder question's twin, and the same
+    /// range gate stands behind both (decision 1580).
+    pub(crate) talent_master_pending: bool,
 
     /// The stance/shapeshift bar's form list (bar order) the app pushes — the
     /// `GetNumShapeshiftForms`/`GetShapeshiftFormInfo` family reads it ([`super::shapeshift`]).
@@ -770,6 +800,10 @@ pub(crate) struct Model {
     /// like a scrollbar dragging in the real client, no Lua involved). `None` between drags
     /// ([`slider::SliderDrag`]).
     pub(crate) slider_drag: Option<slider::SliderDrag>,
+    /// The in-flight ColorSelect drag — the colour picker's wheel/value-strip twin of
+    /// [`Self::slider_drag`], held from press to release. The widget keeps two independent capture
+    /// flags rather than one target ([`colorselect::ColorDrag`]).
+    pub(crate) color_drag: Option<colorselect::ColorDrag>,
 
     /// The open gossip menu the app pushes (`None` = no menu), the `SelectGossipOption` intents it
     /// drains, and whether `CloseGossip` was called — the gossip seam ([`gossip`]).
@@ -1132,11 +1166,12 @@ pub(crate) struct Model {
     pub(crate) dressup_intents: Vec<super::dressup::DressUpIntent>,
     /// The dressing-room pane's bake yaw, the fourth of those scalars.
     pub(crate) dressup_yaw: f32,
-    /// Unit token → squared distance from the player, for every popup token the app resolved to a
-    /// live inspectable player this frame — the input to both verified range predicates
-    /// (`CanInspect`, `CheckInteractDistance`). Absent token = in range (see
-    /// [`UiScript::set_inspect_reach`]).
-    pub(crate) inspect_reach: HashMap<String, f64>,
+    /// Unit token (lowercase) → what the app resolved about it this frame, for **every** token
+    /// that named a **live unit object**, creature as readily as player — the input to both
+    /// verified range predicates (`CanInspect`, `CheckInteractDistance`). An absent token is one
+    /// the object manager holds nothing for, and both answer `nil` there (see
+    /// [`UiScript::set_unit_reach`] and [`super::UnitReach`]).
+    pub(crate) unit_reach: HashMap<String, super::UnitReach>,
 
     /// The skills-pane snapshot the app pushes ([`skills::SkillsState`], decision 0437 phase 4) and
     /// the synthesized display tree built from it ([`skills::UiScript::set_skills`]) — the skills
@@ -1181,6 +1216,9 @@ pub(crate) struct Model {
     /// The world-map seam ([`worldmap`](super::worldmap)): the pushed catalog/feed + the
     /// engine-owned selection.
     pub(crate) worldmap: super::worldmap::WorldMapState,
+    /// The always-up world-state readout's rows ([`worldstate`](super::worldstate)), already
+    /// gated and resolved app-side.
+    pub(crate) worldstate: super::worldstate::WorldStateUiState,
     /// Events (name + args) queued by Lua bindings (`SetMapZoom` → `WORLD_MAP_UPDATE`;
     /// `PickupContainerItem`/`ClearCursor`/… → `CURSOR_UPDATE`/`ITEM_LOCK_CHANGED`/
     /// `DELETE_ITEM_CONFIRM`, decision 0216 §4/§5) to fire at the next
@@ -1192,6 +1230,20 @@ pub(crate) struct Model {
     /// saw (UI space: logical px, y-up — the same frame `resolve` rects live in). Behind Lua's
     /// `GetCursorPosition()`; the reference world map polls it every OnUpdate for hover/click math.
     pub(crate) cursor_pos: (f32, f32),
+
+    /// A `Minimap:PingLocation(x, y)` call, parked for the app to drain **in the same frame**
+    /// ([`UiScript::take_minimap_ping_request`]): centre-relative offsets in **UI units**
+    /// (x right, y up — `GetCursorPosition`'s own space, which is NOT the window-pixel space
+    /// the app's minimap geometry lives in; the app applies the 0582 seam scale on the way in,
+    /// and getting that wrong is decision 1596's first root cause).
+    pub(crate) minimap_ping_request: Option<(f32, f32)>,
+    /// The live minimap ping's **normalized** offsets from the widget centre (fractions of the
+    /// widget side, x right / y up — the `MINIMAP_PING` event's arg2/arg3 space), republished
+    /// by the app every frame a ping is live and cleared when the ping ends. Behind
+    /// `Minimap:GetPingPosition()`. There is exactly one ping, so it lives here rather than on
+    /// each Minimap widget's [`KindState`](crate::widget::KindState) — one write, one read,
+    /// no arena walk (decision 1596).
+    pub(crate) minimap_ping: Option<(f32, f32)>,
     /// The realm this session is on, behind `GetRealmName()` (decision 1195). `""` until the app
     /// pushes one — the glue screen's own answer, and never `nil`, because the corpus idiom is
     /// `db[GetRealmName()] = …` at file scope and a nil index errors one call deeper.
@@ -1352,6 +1404,8 @@ impl Model {
             joined_channels: Vec::new(),
             party: party::PartyState::default(),
             party_requests: Vec::new(),
+            saved_instances: Vec::new(),
+            raid_selection: 0,
             social: social::SocialState::default(),
             social_requests: Vec::new(),
             guild: guild::GuildState::default(),
@@ -1359,6 +1413,10 @@ impl Model {
             guild_requests: Vec::new(),
             tell_requests: Vec::new(),
             open_chat_requests: Vec::new(),
+            chat_window_looks: [chat_window::ChatWindowLook::DEFAULT;
+                chat_window::NUM_CHAT_WINDOWS],
+            chat_window_changes: HashSet::new(),
+            user_placed_changed: false,
             default_language: None,
             duel_requests: Vec::new(),
             follow_requests: Vec::new(),
@@ -1402,6 +1460,8 @@ impl Model {
             spell_stop_targeting: false,
             talents: super::talent::TalentUiState::default(),
             talent_learns: Vec::new(),
+            talent_wipe_confirms: 0,
+            talent_master_pending: false,
             shapeshift_forms: Vec::new(),
             shapeshift_casts: Vec::new(),
             pet_bar: super::pet::PetBarState::default(),
@@ -1434,6 +1494,7 @@ impl Model {
             moving: None,
             sizing: None,
             slider_drag: None,
+            color_drag: None,
             gossip: None,
             gossip_selects: Vec::new(),
             gossip_close: false,
@@ -1535,8 +1596,11 @@ impl Model {
             quest_log_watched: Vec::new(),
             server_unix_time: None,
             worldmap: super::worldmap::WorldMapState::default(),
+            worldstate: super::worldstate::WorldStateUiState::default(),
             pending_events: Vec::new(),
             cursor_pos: (0.0, 0.0),
+            minimap_ping_request: None,
+            minimap_ping: None,
             chat_sends: Vec::new(),
             addon_sends: Vec::new(),
             played_time_asks: 0,
@@ -1579,7 +1643,7 @@ impl Model {
             pet_paperdoll_yaw: 0.0,
             dressup_intents: Vec::new(),
             dressup_yaw: 0.0,
-            inspect_reach: HashMap::new(),
+            unit_reach: HashMap::new(),
             chat_input: Vec::new(),
             skills: skills::SkillsState::default(),
             skills_groups: Vec::new(),

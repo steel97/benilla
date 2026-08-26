@@ -158,6 +158,10 @@ pub use weapon_impact::{
 };
 mod sheathe;
 pub use sheathe::{load_sheathe_sound_catalog, SheatheSoundCatalog, SheatheSounds};
+mod weapon_swing;
+pub use weapon_swing::{load_weapon_swing_catalog, WeaponSwingCatalog};
+mod material;
+pub use material::{load_material_catalog, MaterialCatalog};
 mod wmo_area;
 pub use wmo_area::{load_wmo_area_catalog, WmoArea, WmoAreaCatalog};
 mod spells;
@@ -252,6 +256,8 @@ pub use world_map_continent::{
 };
 mod area_poi;
 pub use area_poi::{load_area_poi_catalog, AreaPoi, AreaPoiCatalog};
+mod world_state_ui;
+pub use world_state_ui::{load_world_state_ui_catalog, WorldStateUiCatalog, WorldStateUiRow};
 mod area_table;
 pub use area_table::{load_area_table_catalog, AreaTableCatalog, AreaTableRow};
 mod chat_channels;

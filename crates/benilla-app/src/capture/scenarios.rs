@@ -66,6 +66,13 @@ pub(super) enum UiFixture {
     /// render): slot icons, the attribute/resistance panes with buff coloring, melee + ranged
     /// blocks, the ammo count, the level line.
     Character,
+    /// The shared **StaticPopup** plate, shown as the group-invite dialog (`PARTY_INVITE`).
+    ///
+    /// Every other StaticPopup customer in the tree raises its dialog over another window's opaque
+    /// art, where a missing backdrop is invisible; the invite is the one that floats over the
+    /// WORLD, which is exactly why its interior is where the plate's presence can be read at all
+    /// (report B319). Nothing captured the StaticPopup plate before this.
+    PartyInvite,
     /// A V-key nameplate over a synthetic Timber Wolf (the reference client's own screenshot
     /// subject: entry 69, level 2, faction 32, display 604) — the plate look-pass instrument.
     /// At the 1024×768 window this scenario forces, one gx unit = 1280 px, so the 0.1 × 0.025
@@ -99,6 +106,11 @@ pub(super) enum UiFixture {
     /// capture checks the header (left-flush, Say-white), the typed text past the live insets,
     /// and the three-piece input border.
     ChatEdit,
+    /// The chat dock **hovered**: revealed, the Combat Log selected, and the cursor parked on the
+    /// unselected GENERAL tab — the first capture scenario that exercises a hover state at all,
+    /// which decision 0254 recorded as the gap that left its own lane uncovered. `$WOW_TABHOVER`
+    /// swings it through the four alternate dock states (see `fixtures.rs`).
+    ChatTabHover,
     /// The social pane (`FriendsFrame`), opened through the live toggle — the instrument for B264
     /// (decision 1298). Its `BenillaFriendsDropDown` host is declared with no anchors, exactly as
     /// the reference's own `FriendsDropDown` is; while an unpositioned owner stood in a zero rect
@@ -122,6 +134,16 @@ pub(super) enum UiFixture {
     /// read the CVar registration defaults (hermetic capture = no config file), so the pixels
     /// move only with the window, the atlas seam, or a registered default.
     OptionsGraphics,
+    /// The Options window ON THE CHAT PAGE (decision 1589 — B246's "no chat section in options").
+    /// The page 1.12 calls `CHAT_LABEL`: four checkbox rows over three stores at once (a saved
+    /// variable, three CVars), which is what makes it worth a baseline of its own — the row art is
+    /// the Audio page's, but the page is the first to mix stores in one column.
+    OptionsChat,
+    /// The **colour picker with its wheel** (decision 1592): the hue disc and the brightness strip,
+    /// both generated art with no BLP behind them, plus the two markers riding on them. Seeded at a
+    /// known colour so the markers sit somewhere checkable rather than at the default white's
+    /// centre. The one fixture whose subject is pixels this client computes.
+    ColorPicker,
     /// The Graphics page with the Environment Detail MENU OPEN (0992) — the dropdown-list look
     /// instrument: the shared DropDownList1 at the window's effective scale (the kit's uiScale
     /// correction), three entries with High checked, the kit's dialog backdrop.
@@ -884,6 +906,16 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 720,
         ui: None,
     },
+    // The group-invite dialog over open world — the shared StaticPopup plate's only look-pass.
+    // Run with `WOW_CAPTURE_UI=1 WOW_CAPTURE=ui-partyinvite`.
+    Scenario {
+        name: "ui-partyinvite",
+        map: MAP_AZEROTH,
+        eye: GROUND_EYE,
+        look: GROUND_LOOK,
+        minute: 720,
+        ui: Some(UiFixture::PartyInvite),
+    },
     // The re-skinned main action bar (no window fixture — the bar loads by default under
     // WOW_CAPTURE_UI=1, and `demo_unit_feed` seeds the action slots + player XP). The bar is 1024
     // wide + 128px end caps, so this fixture takes a WIDER, shorter window (see main.rs's per-capture
@@ -959,6 +991,17 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 720,
         ui: Some(UiFixture::ChatEdit),
     },
+    // The hovered chat dock — the tab plate + its ADD highlight over the world, which is the
+    // pair the UI-over-world composite space decides. Run with
+    // `WOW_CAPTURE_UI=1 WOW_CAPTURE=ui-chat-tabhover`.
+    Scenario {
+        name: "ui-chat-tabhover",
+        map: MAP_AZEROTH,
+        eye: GROUND_EYE,
+        look: GROUND_LOOK,
+        minute: 720,
+        ui: Some(UiFixture::ChatTabHover),
+    },
     // The social pane, for the stray-dropdown regression (B264, decision 1298). Run with
     // `WOW_CAPTURE_UI=1 WOW_CAPTURE=ui-social`.
     Scenario {
@@ -998,6 +1041,26 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         look: GROUND_LOOK,
         minute: 720,
         ui: Some(UiFixture::OptionsGraphics),
+    },
+    // The same window on the CHAT page (1589). Run with
+    // `WOW_CAPTURE_UI=1 WOW_CAPTURE=ui-options-chat`.
+    Scenario {
+        name: "ui-options-chat",
+        map: MAP_AZEROTH,
+        eye: GROUND_EYE,
+        look: GROUND_LOOK,
+        minute: 720,
+        ui: Some(UiFixture::OptionsChat),
+    },
+    // The colour picker, wheel and all (1592). Run with
+    // `WOW_CAPTURE_UI=1 WOW_CAPTURE=ui-color-picker`.
+    Scenario {
+        name: "ui-color-picker",
+        map: MAP_AZEROTH,
+        eye: GROUND_EYE,
+        look: GROUND_LOOK,
+        minute: 720,
+        ui: Some(UiFixture::ColorPicker),
     },
     // The Graphics page with the Environment Detail dropdown OPEN (0992). Run with
     // `WOW_CAPTURE_UI=1 WOW_CAPTURE=ui-options-worlddetail`.

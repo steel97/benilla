@@ -30,6 +30,17 @@ BasicControls.xml
 # slot calls these, ours and third-party alike: their absence is what left the director's Bagnon
 # window with a title, a gold line and no bag slots at all (see the file's own header).
 ItemButtonTemplate.xml
+# The reference's money-frame kit: MoneyFrameTemplate/SmallMoneyFrameTemplate + MoneyTypeInfo
+# + the MoneyFrame_* API. Needs only Fonts (NumberFontNormal/NumberFontNormalLarge) — and it must
+# come BEFORE UiPanels.xml, because the shared StaticPopup's coin row is a child frame declaring
+# `inherits="SmallMoneyFrameTemplate"`, which is resolved at LOAD (decision 1580). That is the
+# reference's own order too (FrameXML.toc: MoneyFrame.xml l.10, StaticPopup.xml l.23); this file
+# used to sit 140 lines lower, beside the other shared widget kits, which was only ever tenable
+# while nothing above it showed coins. AuctionFrame far below is laid out on it as well (its price
+# columns need a money TYPE, which the other kit has no notion of); our other eight coin displays
+# still run on MerchantFrame.xml's BenillaMoney_* slot kit, and MoneyFrame.xml's header is where
+# the two are reconciled.
+MoneyFrame.xml
 # The UIPanel slot manager (decision 0084 §2): script-only, no frames of its own — must load
 # before any panel frame (Gossip/Merchant today) so ShowUIPanel/HideUIPanel already exist
 # when those frames' OnLoad/OnEvent reference them.
@@ -92,6 +103,11 @@ EnchantConfirm.xml
 # Not GossipFrame's, and the wire is why — the server closes the gossip menu BEFORE it asks, so
 # this dialog is free-standing by the time it shows. Needs only UiPanels.xml, far above.
 BinderConfirm.xml
+# The class trainer's respec confirm + its event driver (decision 1580): the binder confirm's twin
+# one line up, free-standing for the identical reason — the server closes the gossip menu before it
+# asks. The only entry in the registry that raises a money frame, so it needs MoneyFrame.xml (far
+# above, ahead of UiPanels.xml) as well as the StaticPopup engine itself.
+TalentWipeConfirm.xml
 # The shared CooldownFrame_SetTimer (the ref's Cooldown.lua file split) — before its
 # consumers (ActionBar's buttons, the multibars, the stance bar, BagFrame's slots).
 Cooldown.xml
@@ -168,14 +184,6 @@ UIPanelTemplates.xml
 # UICheckButtonTemplate and UIPanelButtonTemplate. Not benilla's own options window
 # (OptionsFrame.xml, far below): these are the shared names addons build panels out of.
 OptionsFrameTemplates.xml
-# The reference's money-frame kit: MoneyFrameTemplate/SmallMoneyFrameTemplate + MoneyTypeInfo
-# + the MoneyFrame_* API. Needs only Fonts (NumberFontNormal/NumberFontNormalLarge). AuctionFrame
-# below is laid out on it (its price columns need a money TYPE, which the other kit has no notion
-# of); our other eight coin displays still run on MerchantFrame.xml's BenillaMoney_* slot kit, and
-# MoneyFrame.xml's header is where the two are reconciled. Seated beside the scroll kit (the other
-# shared widget kit) and ahead of every window that shows coins, which is where the reference's own
-# TOC puts it too.
-MoneyFrame.xml
 # The shared colour dialog + its opacity slider (`ColorPickerFrame`, `OpacitySliderFrame`,
 # `ColorPickerOkayButton`, `ColorPickerCancelButton`). Last of the "shared FrameXML surface with no
 # benilla consumer yet" cluster that runs from UIPanelTemplates.xml down — the same posture as
@@ -202,6 +210,11 @@ CastingBar.xml
 # MIRROR_TIMER_* events `crate::ui_mirror` fires. Needs only Fonts (GameFontHighlight)
 # before it; kept beside the cast bar, whose border art it shares.
 MirrorTimer.xml
+# The always-up world-state readout (decision 1586, report B190): the tower/flag/base counters an
+# outdoor-PvP zone or a battleground shows at top-centre, driven by the UPDATE_WORLD_STATES event
+# `crate::world_state_ui` fires. Needs Fonts (GameFontNormalSmall) and GameTooltip; sits beside the
+# mirror timers, which share its top-centre lane.
+WorldStateFrame.xml
 # The player buff/debuff bar (decisions 0255/0257 — the player aura arc): the HUD row of
 # aura icons under the minimap, driven by the UnitAura feed (`crate::ui_aura`). Needs Fonts
 # (its FontStrings) and ActionBar's `BENILLA_FALLBACK_ICON` global (both already loaded).
@@ -303,6 +316,10 @@ TalentFrame.xml
 # GameTooltip (the newbie tips) and UIDropDownMenu (the who list's variable column) —
 # all loaded above.
 FriendsFrame.xml
+# The social window's fourth tab, in its own file because RaidFrame is a child of FriendsFrame and
+# a child cannot be declared before its parent — the reference splits it the same way and for the
+# same reason (its FrameXML.toc has RaidFrame.xml on the very next line). Decision 1549.
+RaidFrame.xml
 GossipFrame.xml
 MerchantFrame.xml
 # The mail window (decision 0544 P1/P2): the mailbox inbox, open-letter, and send tab over

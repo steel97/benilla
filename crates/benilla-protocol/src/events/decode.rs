@@ -68,6 +68,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::LearnedSpell { spell_id } => vec![SessionEvent::SpellLearned {
             spell_id: u32::from(spell_id),
         }],
+        ServerPacket::RemovedSpell { spell_id } => vec![SessionEvent::SpellRemoved {
+            spell_id: u32::from(spell_id),
+        }],
         ServerPacket::SupercededSpell {
             old_spell_id,
             new_spell_id,
@@ -463,6 +466,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             vec![SessionEvent::RaidTargetList { entries }]
         }
         ServerPacket::ReadyCheckRequest => vec![SessionEvent::ReadyCheckRequest],
+        ServerPacket::RaidInstanceInfo { entries } => {
+            vec![SessionEvent::RaidInstanceInfo { entries }]
+        }
         ServerPacket::ReadyCheckAnswer { guid, ready } => {
             vec![SessionEvent::ReadyCheckAnswer { guid, ready }]
         }
@@ -608,6 +614,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         }
         ServerPacket::BindPoint { area, .. } => vec![SessionEvent::BindPoint { area }],
         ServerPacket::BinderConfirm { binder } => vec![SessionEvent::BinderConfirm { binder }],
+        ServerPacket::TalentWipeConfirm { trainer, cost } => {
+            vec![SessionEvent::TalentWipeConfirm { trainer, cost }]
+        }
         ServerPacket::PlayerBound { binder, area } => {
             vec![SessionEvent::PlayerBound { binder, area }]
         }

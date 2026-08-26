@@ -118,8 +118,9 @@ pub use group::{
     group_invite, group_raid_convert, group_set_leader, group_swap_sub_group, group_uninvite,
     group_uninvite_guid, loot_method, member_status, minimap_ping, party_member_mask,
     party_operation, party_result, raid_target_request, raid_target_set, ready_check_answer,
-    ready_check_start, request_party_member_stats, GroupLootInfo, GroupMemberEntry,
-    PartyMemberStatsInfo, RaidTargetUpdate, ReadyCheck, GROUP_MEMBER_ASSISTANT,
+    ready_check_start, request_party_member_stats, request_raid_info, GroupLootInfo,
+    GroupMemberEntry, PartyMemberStatsInfo, RaidInstanceEntry, RaidTargetUpdate, ReadyCheck,
+    GROUP_MEMBER_ASSISTANT,
 };
 pub use guild::{
     guild_accept, guild_add_rank, guild_command, guild_command_error, guild_create, guild_decline,
@@ -166,7 +167,9 @@ pub use pet::{
     PET_TYPE_SPELL_LAST, PET_UNUSABLE_UNIT_FLAGS,
 };
 pub use pose::{set_sheathed, stand_state_change};
-pub use progression::{learn_talent, ExplorationXp, LevelUpInfo, XpGain};
+pub use progression::{
+    learn_talent, talent_wipe_confirm, ExplorationXp, LevelUpInfo, TalentWipeConfirm, XpGain,
+};
 pub use pvp::{inspect_honor_stats, InspectHonorStats, PvpCredit};
 pub use quest::{
     dialog_status, quest_query, questgiver_accept_quest, questgiver_choose_reward,

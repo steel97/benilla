@@ -1088,6 +1088,12 @@ pub(crate) enum ClientCommand {
     /// the question. Answered by `SMSG_BINDPOINTUPDATE` + `SMSG_PLAYERBOUND` once the innkeeper's
     /// Bind cast lands; declining sends nothing.
     BinderActivate { binder: u64 },
+    /// Unlearn every talent (`MSG_TALENT_WIPE_CONFIRM` outbound, decision 1580): the
+    /// `CONFIRM_TALENT_WIPE` dialog's Accept, carrying the guid the trainer's question asked with.
+    /// This is the ONLY packet in the flow that resets anything — selecting the gossip line just
+    /// raises the question. Answered by the un-learn of every rank spell plus the refreshed
+    /// `PLAYER_CHARACTER_POINTS1`; declining sends nothing.
+    TalentWipeConfirm { trainer: u64 },
     /// Open the bank (`CMSG_BANKER_ACTIVATE`, decision 0604): the direct opener a right-click on
     /// a pure banker (bit 8 the lowest service bit) uses — a gossip-flagged banker routes through
     /// the gossip menu instead, whose bank option makes the server volunteer the same answer.
@@ -1457,6 +1463,25 @@ pub(crate) enum ClientCommand {
     /// submenu, decision 0434 §5): wire `icon` 0..7, `guid` 0 clears that icon's slot. Leader/
     /// assistant only server-side; echoes back as the delta form.
     SetRaidTarget { icon: u8, guid: u64 },
+    /// `MSG_MINIMAP_PING` (a minimap click, decision 1596): raw world `(x, y)`. The server relays
+    /// them verbatim to the rest of the group and does nothing at all when we are solo — which is
+    /// why the marker is drawn locally at click time rather than awaited off the wire.
+    MinimapPing { x: f32, y: f32 },
+    // ── The raid-management family (decision 1549's Raid tab) ─────────────────────────────────
+    /// Move a raid member to another subgroup (`CMSG_GROUP_CHANGE_SUB_GROUP`): the member's NAME
+    /// and the **0-based** subgroup the wire wants. Leader/assistant only; echoes as a fresh
+    /// `SMSG_GROUP_LIST`.
+    GroupChangeSubGroup { name: String, group: u8 },
+    /// Trade two raid members' subgroups (`CMSG_GROUP_SWAP_SUB_GROUP`, two names).
+    GroupSwapSubGroup { name: String, other: String },
+    /// Grant or revoke the raid-assistant flag (`CMSG_GROUP_ASSISTANT_LEADER`, leader only).
+    GroupAssistantLeader { guid: u64, grant: bool },
+    /// Start a ready check (`MSG_RAID_READY_CHECK`, empty body — leader only).
+    ReadyCheckStart,
+    /// Answer a ready check (`MSG_RAID_READY_CHECK`, one byte).
+    ReadyCheckAnswer { ready: bool },
+    /// Ask for our saved raid lockouts (`CMSG_REQUEST_RAID_INFO`) — the Raid Info panel.
+    RequestRaidInfo,
     // ── The duel family (decision 0633; writer bodies in benilla-protocol
     //    `world/writer/duel.rs`). Challenging is a `CastSpell` of the duel spell, not a verb here.
     /// Accept a duel challenge (`CMSG_DUEL_ACCEPTED`) — the popup's Accept, and the challenger's

@@ -214,6 +214,14 @@ pub enum ServerPacket {
     BinderConfirm {
         binder: u64,
     },
+    /// `MSG_TALENT_WIPE_CONFIRM` (inbound) — a class trainer is *asking* whether to unlearn every
+    /// talent, and what it will cost (decision 1580). The twin of [`Self::BinderConfirm`] in every
+    /// respect: nothing is unlearned until the same opcode goes back out carrying `trainer`.
+    /// `trainer == 0` is vmangos's "you have no talents to reset" refusal, not a question.
+    TalentWipeConfirm {
+        trainer: u64,
+        cost: u32,
+    },
     /// `SMSG_PLAYERBOUND` — the bind took: who bound us and the AreaTable id we are now bound in.
     /// Arrives beside [`Self::BindPoint`], which carries the same area id plus the position; this
     /// one exists for the "X is now your home" acknowledgement.
@@ -451,6 +459,12 @@ pub enum ServerPacket {
     /// `SMSG_LEARNED_SPELL` — a spell was added to the book after login (trainer/quest/level-up;
     /// layout in [`super::spellbook::read_learned_spell`]). The first post-login spell-book mutation (0237).
     LearnedSpell {
+        spell_id: u16,
+    },
+    /// `SMSG_REMOVED_SPELL` — the server took a spell out of the book (layout in
+    /// [`super::spellbook::read_removed_spell`]). One per spell: a talent wipe sends a burst of
+    /// them, one for every rank of every talent (decision 1584).
+    RemovedSpell {
         spell_id: u16,
     },
     /// `SMSG_SUPERCEDED_SPELL` — a rank-up replaced its predecessor in the book + action bar
@@ -958,6 +972,11 @@ pub enum ServerPacket {
         guid: u64,
         ready: u8,
     },
+    /// `SMSG_RAID_INSTANCE_INFO` — our saved raid lockouts, answering `CMSG_REQUEST_RAID_INFO`
+    /// (decision 1549). Empty is the ordinary answer for a character bound to nothing.
+    RaidInstanceInfo {
+        entries: Vec<super::group::RaidInstanceEntry>,
+    },
     /// `SMSG_DUEL_REQUESTED` — a duel challenge. Sent to challenger and challenged alike; which
     /// one we are is `challenger == our guid` (decision 0633).
     DuelRequested {
@@ -1256,6 +1275,7 @@ impl ServerPacket {
             ServerPacket::BindPoint { .. } => "SMSG_BINDPOINTUPDATE".into(),
             ServerPacket::BinderConfirm { .. } => "SMSG_BINDER_CONFIRM".into(),
             ServerPacket::PlayerBound { .. } => "SMSG_PLAYERBOUND".into(),
+            ServerPacket::TalentWipeConfirm { .. } => "MSG_TALENT_WIPE_CONFIRM".into(),
             ServerPacket::SetProficiency { .. } => "SMSG_SET_PROFICIENCY".into(),
             ServerPacket::InitializeFactions { .. } => "SMSG_INITIALIZE_FACTIONS".into(),
             ServerPacket::SetFactionStanding { .. } => "SMSG_SET_FACTION_STANDING".into(),
@@ -1289,6 +1309,7 @@ impl ServerPacket {
             ServerPacket::InitialSpells { .. } => "SMSG_INITIAL_SPELLS".into(),
             ServerPacket::ActionButtons { .. } => "SMSG_ACTION_BUTTONS".into(),
             ServerPacket::LearnedSpell { .. } => "SMSG_LEARNED_SPELL".into(),
+            ServerPacket::RemovedSpell { .. } => "SMSG_REMOVED_SPELL".into(),
             ServerPacket::SupercededSpell { .. } => "SMSG_SUPERCEDED_SPELL".into(),
             ServerPacket::CastResult { .. } => "SMSG_CAST_RESULT".into(),
             ServerPacket::PetSpells(_) => "SMSG_PET_SPELLS".into(),
@@ -1404,6 +1425,7 @@ impl ServerPacket {
             ServerPacket::ReadyCheckRequest | ServerPacket::ReadyCheckAnswer { .. } => {
                 "MSG_RAID_READY_CHECK".into()
             }
+            ServerPacket::RaidInstanceInfo { .. } => "SMSG_RAID_INSTANCE_INFO".into(),
             ServerPacket::DuelRequested { .. } => "SMSG_DUEL_REQUESTED".into(),
             ServerPacket::DuelOutOfBounds => "SMSG_DUEL_OUTOFBOUNDS".into(),
             ServerPacket::DuelInBounds => "SMSG_DUEL_INBOUNDS".into(),

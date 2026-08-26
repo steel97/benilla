@@ -57,6 +57,25 @@ pub(super) fn learned_spell(spell_id: u32, actions: &mut PlayerActions) {
     }
 }
 
+/// A spell taken back out of the book (`SMSG_REMOVED_SPELL`, decision 1584) — the inverse of
+/// [`learned_spell`] above, and the packet a **talent wipe** arrives as: vmangos's `ResetTalents`
+/// walks every talent of the class and calls `RemoveSpell` on every rank, each of which tails into
+/// `Player::SendSpellRemoved`. Until this arm existed all of them were dropped, so the respec's
+/// only visible effect was the points coming back — the talent window went on drawing the ranks it
+/// had, because [`crate::ui_talent`] derives rank from exactly this set.
+///
+/// The insert's mirror image, and deliberately no more than that: the spellbook, talent and pet
+/// feeds all diff `spells` and fire their own refresh events, and
+/// [`crate::ui_action::LearnedAbilities`] re-derives off the same change (the reference's own
+/// unlearn write site, `0x4b2c50`). What happens to a **bar button** still pointing at the removed
+/// spell is a separate law this arm deliberately does not invent — see 1584's scope note.
+pub(super) fn removed_spell(spell_id: u32, actions: &mut PlayerActions) {
+    debug!("net: removed spell {spell_id}");
+    if actions.spells.remove(&spell_id) {
+        actions.dirty = true;
+    }
+}
+
 /// A rank-up (`SMSG_SUPERCEDED_SPELL`): the new rank replaces the old **in the book** (decision
 /// 0237). The server sends no fresh `SMSG_ACTION_BUTTONS` for this (VERIFIED vmangos
 /// `Player::learnSpell` — the `supercededOld` path touches only the spell store), so the bar has to
@@ -91,9 +110,16 @@ pub(super) fn cast_result(
     auto_repeat: &mut AutoRepeatActive,
     spells: Option<&Spells>,
     net: &crate::net::NetCommands,
+    // The `modalNextSpell` chain's outbox (`0x6e74aa`) — filled here, sent by the one cast path.
+    chain: &mut crate::ui_action::ChainCasts,
     seq: u64,
 ) {
     debug!("net: cast result — spell {spell_id} success={success} reason={reason:?}");
+    // **Is this the reply to the cast we have outstanding?** (`0x6e7408 cmp ecx,[0xceca88]`.) Read
+    // BEFORE either arm touches the guard, because both the failure arm's clear below and the
+    // chain's own clear are the reference's ONE `0x6e741a call 0x6e4940(0x1c)` — the in-flight slot
+    // is finished on either outcome, and only then is column 38 read.
+    let in_flight = pending.committed(Instant::now()) == Some(spell_id);
     if !success {
         // The cast-fail cooldown edges (the client's `HandleCastFailed 0x6e1a00`, wow-re
         // `wave-cooldown.md` + the 2026-07-10 §5): a plain interactive-cast failure clears ONLY
@@ -177,6 +203,40 @@ pub(super) fn cast_result(
                 kind: CastEventKind::Fail,
                 seq,
             });
+        }
+    }
+    // **The `modalNextSpell` chain — how a hunter starts shooting** (`HandleCastResult 0x6e7330`
+    // @ `0x6e7408`–`0x6e74aa`; wow-re `spell/scratch/modalnext-chain-cast.md`, decision 1597).
+    //
+    // The reply to our in-flight cast finishes that cast's slot and then reads **column 38** of
+    // the spell it names. Non-zero, and not already the running repeat ⇒ the client casts it,
+    // itself, at the null target guid. Every hunter shot's column 38 is **75, Auto Shot** — so
+    // casting Serpent Sting starts Auto Shot one round-trip later, with no input and no addon.
+    //
+    // Three details, each load-bearing:
+    // - **It fires on SUCCESS as well as failure.** `0x6e7356 cmp [ebp+0xf],0x2` / `0x6e735a jne`
+    //   sends a non-failure result *straight* to the block the failure path falls into at
+    //   `0x6e73eb`. That is the whole reason it was missed: the success arm of this handler used
+    //   to do nothing at all here, and a successful sting is the ordinary case.
+    // - **The slot is cleared first.** The reference's `0x6e741a` finishes the in-flight cast
+    //   before chaining, and it must: `TryCast`'s own IsCasting rung (`0x6e4d97`, our reason
+    //   `0x61`) would refuse the chained cast otherwise. Ours is [`PendingCast`], cleared here on
+    //   both outcomes for the matching spell — where before, success left it to `SPELL_GO`.
+    //   vmangos sends `SMSG_CAST_RESULT` before `SMSG_SPELL_GO` (`Spell::cast`: `SendCastResult`
+    //   at 3669, `SendSpellGo` at 3703), so the guard is still armed when we get here.
+    // - **Equal means re-arm, not re-cast** (`0x6e745b`'s equal branch → `0x6e745d`): a second
+    //   sting while Auto Shot is already running must NOT re-cast it, or every special shot would
+    //   restart the repeat and reset its swing timer. We have no pending-record to refresh, so the
+    //   equal branch is simply "send nothing" — the same observable.
+    if in_flight {
+        pending.clear_if(spell_id);
+        if let Some(next) = spells
+            .and_then(|s| s.catalog.get(spell_id))
+            .map(|d| d.modal_next_spell)
+            .filter(|&next| next != 0 && Some(next) != auto_repeat.0)
+        {
+            debug!("net: cast result {spell_id} chains modalNextSpell {next}");
+            chain.0.push(next);
         }
     }
 }
@@ -330,6 +390,13 @@ pub(super) fn spell_go(
         &crate::net::NetCommands,
         &mut crate::ui_pet::PetBar,
     ),
+    // The GO-deferred melee auto-attack start's write set (`0x6e83c0`, the arm below), plus the
+    // attack lock it gates on: our server-echoed `Engaged`, the ref's `[player+0xc48]`.
+    attack_ctx: (
+        &mut crate::ui_action::AutoRepeatActive,
+        &mut MessageWriter<crate::creature_anim::SheathRequest>,
+        bool,
+    ),
     seq: u64,
 ) {
     debug!(
@@ -339,6 +406,23 @@ pub(super) fn spell_go(
         hits.len(),
         misses.len()
     );
+    // **The interact chain's third link** (tag `use`, the same one `target::click` writes): the cast
+    // the server answered a `CMSG_GAMEOBJ_USE` with. `caster_indexed=false` is the load-bearing
+    // case — every impact, sound and effect model below hangs off `index.0.get(&caster)`, so a
+    // caster we never streamed drops the whole visual silently. A GameObject IS the caster for a
+    // SPELLCASTER-type object (vmangos leaves `spellCaster = this` for type 22), which is why this
+    // reads the index rather than assuming a unit.
+    if benilla_assets::trace::enabled_for("use") {
+        benilla_assets::trace::line(
+            "use",
+            &format!(
+                "SPELL_GO spell={spell_id} caster={caster:#x} caster_indexed={} hits={} misses={}",
+                index.0.contains_key(&caster),
+                hits.len(),
+                misses.len()
+            ),
+        );
+    }
     // A cast that names a GameObject (an open-lock cast on a chest / locked door) hands off to the GO
     // animation driver, which gates on the open-lock effect and opens the lid on the cast going off
     // (decision 0250). Independent of the caster being streamed to us — an observed open still animates.
@@ -346,6 +430,7 @@ pub(super) fn spell_go(
         go_lid.write(crate::go_anim::GoLidOpen { go_guid, spell_id });
     }
     let (cooldowns, spells, items, net_commands, pet_bar) = cooldown_ctx;
+    let (auto_repeat, sheath, engaged) = attack_ctx;
     let now = Instant::now();
     let display = spells.and_then(|s| s.catalog.get(spell_id));
     // **A chest's loot-target arm** (wow-re `loot-anim-leg.md` §6, byte-verified §5 trio; decision
@@ -403,6 +488,44 @@ pub(super) fn spell_go(
         // The queued on-next-swing strike fired on this swing — the queue (and its checked
         // ring) opens exactly here, like the ref's inflight finish on the matching GO.
         queued_melee.clear_if(spell_id);
+
+        // **The GO-deferred melee auto-attack start** (`HandleSpellGo 0x6e7a70` @ `0x6e83c0`,
+        // wow-re `combat-feel-law.md` §A3; bytes re-read for decision 1593). This is the exact
+        // complement of the send-time tail in [`crate::ui_action::cast_send`]: a spell carrying
+        // `AttributesEx2 & 0x100000` has its optimistic start *suppressed* there and armed here
+        // instead, so the swing begins only once the server confirms the strike landed. That is
+        // the whole 5875 stealth-opener class — Backstab, Garrote, Ambush, Cheap Shot, Shred,
+        // Ravage, Pounce — plus Judgement, none of which started an auto-attack in benilla at all
+        // before this (the deferred path was left unbuilt on a ten-row proof by absence; the real
+        // file carries the bit on 36 rows, censused in `benilla-formats`' `catalog_tests`).
+        //
+        // **The target** is the reference's, verbatim (`0x6e83e9`–`0x6e83fe`): `hits[0]` when the
+        // GO carries a hit list, else the null pair — which `0x612df0` resolves to the current
+        // selection and, failing that, acquires as the nearest hostile. We take the packet's own
+        // target guid as that fallback and stop there: the acquire-nearest leg is `target::scan`'s
+        // and reaching it from here would target something the player never named. A hostile
+        // single-target strike always fills the hit list, so the fallback is the quiet case.
+        //
+        // **The gate** is `[player+0xc48] == 0` (`0x6e83e7`) — already swinging, nothing happens,
+        // which is also what keeps the auto-repeat cancel in `start_attack_local`'s tail from
+        // firing on every strike of a fight.
+        if display.is_some_and(|d| d.initiates_auto_attack_at_go()) && !engaged {
+            if let (Some(&me), Some(guid)) =
+                (index.0.get(&caster), hits.first().copied().or(target))
+            {
+                debug!("net: spell go {spell_id} — deferred auto-attack start at {guid:#x}");
+                crate::creature_anim::start_attack_local(
+                    me,
+                    guid,
+                    engaged,
+                    false,
+                    auto_repeat,
+                    sheath,
+                    commands,
+                    net_commands,
+                );
+            }
+        }
 
         // Our own launch starts the cast's cooldown locally, at the GO — byte-VERIFIED (the
         // 2026-07-10 wow-re follow-up, `wave-handlers.md` ADDENDUM): `HandleSpellGo 0x6e7a70`'s
@@ -929,6 +1052,7 @@ mod tests {
             .add_message::<SpellGoTargets>()
             .add_message::<CombatTextSpawn>()
             .add_message::<GoLidOpen>()
+            .add_message::<crate::creature_anim::SheathRequest>()
             .init_resource::<GuidIndex>()
             .init_resource::<SelfGuid>()
             .init_resource::<CastBarFeed>()
@@ -977,7 +1101,8 @@ mod tests {
                           mut go_lid: MessageWriter<GoLidOpen>,
                           mut cooldowns: ResMut<Cooldowns>,
                           mut pet_bar: ResMut<crate::ui_pet::PetBar>,
-                          mut items: ResMut<crate::items::Items>| {
+                          mut items: ResMut<crate::items::Items>,
+                          mut sheath: MessageWriter<crate::creature_anim::SheathRequest>| {
                         let net_commands = crate::net::NetCommands(tx.clone());
                         spell_go(
                             10,
@@ -1009,6 +1134,11 @@ mod tests {
                                 &mut items,
                                 &net_commands,
                                 &mut pet_bar,
+                            ),
+                            (
+                                &mut crate::ui_action::AutoRepeatActive::default(),
+                                &mut sheath,
+                                false,
                             ),
                             1,
                         );
@@ -1089,6 +1219,7 @@ mod tests {
                 .add_message::<SpellGoTargets>()
                 .add_message::<CombatTextSpawn>()
                 .add_message::<GoLidOpen>()
+                .add_message::<crate::creature_anim::SheathRequest>()
                 .init_resource::<GuidIndex>()
                 .init_resource::<SelfGuid>()
                 .init_resource::<CastBarFeed>()
@@ -1127,7 +1258,8 @@ mod tests {
                           mut go_lid: MessageWriter<GoLidOpen>,
                           mut cooldowns: ResMut<Cooldowns>,
                           mut pet_bar: ResMut<crate::ui_pet::PetBar>,
-                          mut items: ResMut<crate::items::Items>| {
+                          mut items: ResMut<crate::items::Items>,
+                          mut sheath: MessageWriter<crate::creature_anim::SheathRequest>| {
                         let net_commands = crate::net::NetCommands(tx.clone());
                         spell_go(
                             caster,
@@ -1159,6 +1291,11 @@ mod tests {
                                 &mut items,
                                 &net_commands,
                                 &mut pet_bar,
+                            ),
+                            (
+                                &mut crate::ui_action::AutoRepeatActive::default(),
+                                &mut sheath,
+                                false,
                             ),
                             1,
                         );
@@ -1214,6 +1351,7 @@ mod tests {
             .add_message::<SpellGoTargets>()
             .add_message::<CombatTextSpawn>()
             .add_message::<GoLidOpen>()
+            .add_message::<crate::creature_anim::SheathRequest>()
             .init_resource::<GuidIndex>()
             .init_resource::<SelfGuid>()
             .init_resource::<CastBarFeed>()
@@ -1263,7 +1401,8 @@ mod tests {
                       mut go_lid: MessageWriter<GoLidOpen>,
                       mut cooldowns: ResMut<Cooldowns>,
                       mut pet_bar: ResMut<crate::ui_pet::PetBar>,
-                      mut items: ResMut<crate::items::Items>| {
+                      mut items: ResMut<crate::items::Items>,
+                      mut sheath: MessageWriter<crate::creature_anim::SheathRequest>| {
                     let net_commands = crate::net::NetCommands(tx.clone());
                     spell_go(
                         10,
@@ -1295,6 +1434,11 @@ mod tests {
                             &mut items,
                             &net_commands,
                             &mut pet_bar,
+                        ),
+                        (
+                            &mut crate::ui_action::AutoRepeatActive::default(),
+                            &mut sheath,
+                            false,
                         ),
                         1,
                     );
@@ -1395,6 +1539,7 @@ mod tests {
                             &mut auto_repeat,
                             None,
                             &net,
+                            &mut crate::ui_action::ChainCasts::default(),
                             1,
                         );
                     },
@@ -1437,6 +1582,374 @@ mod tests {
             sent.iter()
                 .any(|c| matches!(c, crate::net::ClientCommand::CancelAutoRepeat)),
             "the cancel acks the server (CMSG_CANCEL_AUTO_REPEAT_SPELL, the 0x6ea0c6 send)"
+        );
+    }
+
+    /// `SMSG_REMOVED_SPELL` shrinks the book and dirties the feeds (decision 1584) — the packet a
+    /// talent wipe arrives as, one per rank of every talent. The dirty flag is a real EDGE, not a
+    /// blanket set: a wipe sends removals for ranks the character never learned too (vmangos walks
+    /// the whole class tree), and a repaint per no-op would be a repaint per talent in the game.
+    #[test]
+    fn a_removal_shrinks_the_book_and_dirties_the_feeds() {
+        let mut actions = PlayerActions::default();
+        actions.spells.extend([14522, 14788, 14789]);
+
+        removed_spell(14788, &mut actions);
+        assert!(!actions.spells.contains(&14788));
+        assert!(actions.dirty);
+
+        actions.dirty = false;
+        removed_spell(14788, &mut actions);
+        assert!(!actions.dirty, "a spell we never knew is not a repaint");
+    }
+    /// **The GO-deferred auto-attack start** (`HandleSpellGo` @ `0x6e83c0`, decision 1593) — the
+    /// half of `combat-feel-law.md` §A3 benilla shipped without, because ten hand-picked warrior
+    /// rows were read as a census of `AttributesEx2 & 0x100000`. The real file carries the bit on
+    /// 36, so the class that never started an auto-attack here is every stealth opener and
+    /// positional strike: Backstab, Garrote, Ambush, Cheap Shot, Shred, Ravage, Pounce, Judgement.
+    ///
+    /// Four things, and each is a way this arm could be subtly wrong:
+    /// - a bit20 spell's own GO sends `CMSG_ATTACKSWING` **at the GO's first hit target**
+    ///   (`0x6e83e9`: `hits[0]`, not the packet's target field, and not our selection);
+    /// - a spell without the bit sends nothing — **bug B280's own control**: the hunter's instant
+    ///   shots carry Ex2 bit **17** (`DO_NOT_RESET_COMBAT_TIMERS`), not bit 20, so casting Serpent
+    ///   Sting starts no attack of either kind, which is what 0994 §4 recorded;
+    /// - already swinging sends nothing (`0x6e83e7`'s `[player+0xc48]` gate) — which is also what
+    ///   keeps the start's own auto-repeat cancel off every strike of a fight;
+    /// - somebody else's Backstab going off sends nothing (the handler's self gate).
+    #[test]
+    fn a_go_deferred_spell_swings_at_its_first_hit_and_the_hunter_shots_do_not() {
+        use crate::combat_text::CombatTextSpawn;
+        use crate::creature_anim::{Casting, Engaged};
+        use crate::go_anim::GoLidOpen;
+        use crate::net::{ClientCommand, Guid, SelfPlayer};
+        use bevy::ecs::system::RunSystemOnce;
+
+        const BACKSTAB: u32 = 53;
+        const SERPENT_STING: u32 = 1978;
+        let spell = |name: &str, ex2: u32| benilla_formats::SpellDisplay {
+            name: name.into(),
+            attributes_ex2: ex2,
+            ..Default::default()
+        };
+        let make_spells = || crate::ui_action::Spells {
+            catalog: benilla_formats::SpellCatalog::from_displays(
+                [
+                    // The real 5875 words for the two: Backstab Ex2 0x100000, Serpent Sting
+                    // Ex2 0x20000 (bit 17, one bit below — the whole distinction).
+                    (BACKSTAB, spell("Backstab", 0x0010_0000)),
+                    (SERPENT_STING, spell("Serpent Sting", 0x0002_0000)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            forms: Default::default(),
+            ranges: Default::default(),
+            cast_times: Default::default(),
+            durations: Default::default(),
+            radii: Default::default(),
+        };
+
+        // `caster` casts `spell_id`, landing on 20; `engaged` is our mirror of `[+0xc48]`.
+        // Returns every command the seam put on the wire.
+        let fire = |caster: u64, spell_id: u32, engaged: bool| -> Vec<ClientCommand> {
+            let mut app = App::new();
+            app.add_message::<CastEvent>()
+                .add_message::<SpellGoTargets>()
+                .add_message::<CombatTextSpawn>()
+                .add_message::<GoLidOpen>()
+                .add_message::<crate::creature_anim::SheathRequest>()
+                .init_resource::<GuidIndex>()
+                .init_resource::<SelfGuid>()
+                .init_resource::<CastBarFeed>()
+                .init_resource::<PendingCast>()
+                .init_resource::<QueuedMeleeSpell>()
+                .init_resource::<Cooldowns>()
+                .init_resource::<crate::ui_pet::PetBar>()
+                .init_resource::<crate::items::Items>();
+            let self_e = app
+                .world_mut()
+                .spawn((Guid(10), SelfPlayer, ObjectStore::default()))
+                .id();
+            if engaged {
+                app.world_mut().entity_mut(self_e).insert(Engaged);
+            }
+            let other_e = app
+                .world_mut()
+                .spawn((Guid(11), ObjectStore::default()))
+                .id();
+            {
+                let mut index = app.world_mut().resource_mut::<GuidIndex>();
+                index.0.insert(10, self_e);
+                index.0.insert(11, other_e);
+            }
+            app.world_mut().resource_mut::<SelfGuid>().0 = Some(10);
+
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let spells = make_spells();
+            app.world_mut()
+                .run_system_once(
+                    move |mut commands: Commands,
+                          index: Res<GuidIndex>,
+                          casting: Query<&Casting>,
+                          mut cast_events: MessageWriter<CastEvent>,
+                          mut go_targets: MessageWriter<SpellGoTargets>,
+                          self_guid: Res<SelfGuid>,
+                          stores: Query<&mut ObjectStore>,
+                          mut cast_bar: ResMut<CastBarFeed>,
+                          mut pending: ResMut<PendingCast>,
+                          mut queued_melee: ResMut<QueuedMeleeSpell>,
+                          mut text: MessageWriter<CombatTextSpawn>,
+                          mut go_lid: MessageWriter<GoLidOpen>,
+                          mut cooldowns: ResMut<Cooldowns>,
+                          mut pet_bar: ResMut<crate::ui_pet::PetBar>,
+                          mut items: ResMut<crate::items::Items>,
+                          mut sheath: MessageWriter<crate::creature_anim::SheathRequest>| {
+                        let net_commands = crate::net::NetCommands(tx.clone());
+                        spell_go(
+                            caster,
+                            spell_id,
+                            0,
+                            vec![20],
+                            vec![],
+                            // The packet's own target field is deliberately a DIFFERENT guid: the
+                            // arm must take `hits[0]`, and this is what catches it reading here.
+                            Some(99),
+                            None,
+                            None,
+                            None,
+                            None,
+                            &mut commands,
+                            &index,
+                            &casting,
+                            &mut cast_events,
+                            &mut go_targets,
+                            &self_guid,
+                            &stores,
+                            &mut cast_bar,
+                            &mut pending,
+                            &mut queued_melee,
+                            &mut text,
+                            &mut go_lid,
+                            &mut crate::ui_loot::LootLatch::default(),
+                            (
+                                &mut cooldowns,
+                                Some(&spells),
+                                &mut items,
+                                &net_commands,
+                                &mut pet_bar,
+                            ),
+                            (
+                                &mut crate::ui_action::AutoRepeatActive::default(),
+                                &mut sheath,
+                                engaged,
+                            ),
+                            1,
+                        );
+                    },
+                )
+                .unwrap();
+            rx.try_iter().collect()
+        };
+
+        let swings = |cmds: &[ClientCommand]| {
+            cmds.iter()
+                .filter_map(|c| match c {
+                    ClientCommand::AttackSwing { guid } => Some(*guid),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            swings(&fire(10, BACKSTAB, false)),
+            vec![20],
+            "a bit20 spell's own GO starts the swing at its first hit target"
+        );
+        assert!(
+            swings(&fire(10, SERPENT_STING, false)).is_empty(),
+            "Serpent Sting carries Ex2 bit 17, not bit 20 — it starts nothing (B280 / 0994 §4)"
+        );
+        assert!(
+            swings(&fire(10, BACKSTAB, true)).is_empty(),
+            "already swinging: `0x6e83e7`'s attack-lock gate refuses"
+        );
+        assert!(
+            swings(&fire(11, BACKSTAB, false)).is_empty(),
+            "somebody else's Backstab is not our attack-start"
+        );
+    }
+    /// **The `modalNextSpell` chain** (`HandleCastResult 0x6e7330` @ `0x6e7408`–`0x6e74aa`,
+    /// decision 1597) — how a hunter starts shooting, and the fix for bug B280.
+    ///
+    /// The reply to our in-flight cast reads **`Spell.dbc` column 38** of the spell it names and,
+    /// if that is non-zero and is not already the running repeat, the client casts it itself. Every
+    /// hunter shot's column 38 is 75 (Auto Shot). Five things, each a way this could be wrong:
+    /// - a successful sting chains — **the success arm is the ordinary case**, and it is the one
+    ///   this handler used to ignore entirely (`0x6e735a jne` sends a non-failure straight to the
+    ///   chain block);
+    /// - a *failed* sting chains too (both paths converge at `0x6e73eb`);
+    /// - the in-flight guard is cleared before the chain, or `TryCast`'s IsCasting rung (our `0x61`)
+    ///   would refuse the chained cast;
+    /// - Auto Shot already running ⇒ **nothing** is sent (`0x6e745b`'s equal branch), so a second
+    ///   shot never restarts the repeat or resets its swing timer;
+    /// - a reply for a spell we do not have in flight is not ours to chain from (`0x6e7408`).
+    #[test]
+    fn a_hunter_shots_cast_result_chains_auto_shot_exactly_once() {
+        use crate::net::{Guid, SelfPlayer};
+        use bevy::ecs::system::RunSystemOnce;
+
+        const SERPENT_STING: u32 = 1978;
+        const AUTO_SHOT: u32 = 75;
+
+        let spells = || crate::ui_action::Spells {
+            catalog: benilla_formats::SpellCatalog::from_displays(
+                [
+                    (
+                        SERPENT_STING,
+                        benilla_formats::SpellDisplay {
+                            name: "Serpent Sting".into(),
+                            // The shipped 5875 row: ranged slot, and column 38 = 75.
+                            attributes: 0x0001_0002,
+                            attributes_ex2: 0x0002_0000,
+                            modal_next_spell: AUTO_SHOT,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        AUTO_SHOT,
+                        benilla_formats::SpellDisplay {
+                            name: "Auto Shot".into(),
+                            attributes: 0x0005_0012,
+                            attributes_ex2: 0x20,
+                            // Auto Shot's own column 38 is 0 — this is what makes the chain
+                            // exactly one hop instead of a loop.
+                            modal_next_spell: 0,
+                            ..Default::default()
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            forms: Default::default(),
+            ranges: Default::default(),
+            cast_times: Default::default(),
+            durations: Default::default(),
+            radii: Default::default(),
+        };
+
+        // One CAST_RESULT for `spell_id`, with `in_flight` armed as the outstanding cast and
+        // `running` as the live auto-repeat. Returns (what got queued, is the guard still armed).
+        let fire = |spell_id: u32, success: bool, in_flight: Option<u32>, running: Option<u32>| {
+            let mut app = App::new();
+            app.add_message::<CastEvent>()
+                .init_resource::<GuidIndex>()
+                .init_resource::<SelfGuid>()
+                .init_resource::<CastErrors>()
+                .init_resource::<CastBarFeed>()
+                .init_resource::<PendingCast>()
+                .init_resource::<QueuedMeleeSpell>()
+                .init_resource::<Cooldowns>()
+                .init_resource::<AutoRepeatActive>()
+                .init_resource::<crate::ui_action::ChainCasts>();
+            let self_e = app.world_mut().spawn((Guid(10), SelfPlayer)).id();
+            app.world_mut()
+                .resource_mut::<GuidIndex>()
+                .0
+                .insert(10, self_e);
+            app.world_mut().resource_mut::<SelfGuid>().0 = Some(10);
+            app.world_mut().resource_mut::<AutoRepeatActive>().0 = running;
+            if let Some(id) = in_flight {
+                app.world_mut()
+                    .resource_mut::<PendingCast>()
+                    // `guards: false` — a hunter shot is `Attributes & 0x2` ranged, so it is
+                    // recorded as committed and does NOT occupy the refusal. Arming it the other
+                    // way would hide the very regression this test exists for (1601).
+                    .arm(id, Instant::now(), false);
+            }
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let cat = spells();
+            app.world_mut()
+                .run_system_once(
+                    move |mut commands: Commands,
+                          self_guid: Res<SelfGuid>,
+                          index: Res<GuidIndex>,
+                          mut cast_errors: ResMut<CastErrors>,
+                          casting: Query<&Casting>,
+                          mut cast_events: MessageWriter<CastEvent>,
+                          mut cast_bar: ResMut<CastBarFeed>,
+                          mut pending: ResMut<PendingCast>,
+                          mut queued_melee: ResMut<QueuedMeleeSpell>,
+                          mut cooldowns: ResMut<Cooldowns>,
+                          mut auto_repeat: ResMut<AutoRepeatActive>,
+                          mut chain: ResMut<crate::ui_action::ChainCasts>| {
+                        let net = crate::net::NetCommands(tx.clone());
+                        cast_result(
+                            spell_id,
+                            success,
+                            if success { None } else { Some(0x1b) },
+                            None,
+                            &mut commands,
+                            &self_guid,
+                            &index,
+                            &mut cast_errors,
+                            &casting,
+                            &mut cast_events,
+                            &mut cast_bar,
+                            &mut pending,
+                            &mut queued_melee,
+                            &mut cooldowns,
+                            &mut auto_repeat,
+                            Some(&cat),
+                            &net,
+                            &mut chain,
+                            1,
+                        );
+                    },
+                )
+                .unwrap();
+            let queued = app
+                .world()
+                .resource::<crate::ui_action::ChainCasts>()
+                .0
+                .clone();
+            let still_armed = app
+                .world()
+                .resource::<PendingCast>()
+                .in_flight(Instant::now());
+            (queued, still_armed)
+        };
+
+        // The ordinary case: the sting lands, and Auto Shot follows by itself.
+        assert_eq!(
+            fire(SERPENT_STING, true, Some(SERPENT_STING), None),
+            (vec![AUTO_SHOT], false),
+            "a successful sting chains Auto Shot, and clears the in-flight guard first"
+        );
+        // And a failed one does too — both results converge on the same block.
+        assert_eq!(
+            fire(SERPENT_STING, false, Some(SERPENT_STING), None).0,
+            vec![AUTO_SHOT],
+            "a FAILED sting chains it as well (`0x6e735a jne` → the same `0x6e73eb`)"
+        );
+        // Already shooting: re-arm, never re-cast.
+        assert_eq!(
+            fire(SERPENT_STING, true, Some(SERPENT_STING), Some(AUTO_SHOT)).0,
+            Vec::<u32>::new(),
+            "Auto Shot already running: the equal branch sends nothing"
+        );
+        // Auto Shot's own replies terminate the chain.
+        assert_eq!(
+            fire(AUTO_SHOT, true, Some(AUTO_SHOT), Some(AUTO_SHOT)).0,
+            Vec::<u32>::new(),
+            "Auto Shot's own column 38 is 0 — no second hop"
+        );
+        // Not our in-flight cast (a proc's result, a stale reply): not ours to chain from.
+        assert_eq!(
+            fire(SERPENT_STING, true, Some(133), None).0,
+            Vec::<u32>::new(),
+            "a reply for a spell we do not have in flight chains nothing"
         );
     }
 }

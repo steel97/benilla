@@ -127,6 +127,10 @@ struct ModelRow {
     footprint_width: f32,
     /// `collisionHeight` (field 15), raw model units — see [`CreatureCatalog::collision_height`].
     collision_height: f32,
+    /// `FoleyMaterialID` (field 10) — a `Material.dbc` id, and the whole of a *creature's* armor
+    /// foley (see [`CreatureCatalog::foley_material`]). `[unit+0xb3c]` is this row, and the
+    /// reference reads it at `+0x28`, which is field 10 on the 16-field 5875 record.
+    foley_material: u32,
     /// `FootstepShakeSize` (field 11) and `DeathThudShakeSize` (field 12) — **`CameraShakes.dbc`
     /// row ids**, 0 on a model that shakes nothing. Only 25 of the 430 shipped rows carry a
     /// footstep shake, and the set is exactly the thumping-giant list (Ancients, kodos, sea and
@@ -241,6 +245,27 @@ impl CreatureCatalog {
     pub fn collision_height(&self, display_id: u32) -> Option<f32> {
         let row = self.display.get(&display_id)?;
         Some(self.models.get(&row.model_id)?.collision_height)
+    }
+
+    /// The display's **foley material** — a `Material.dbc` id, the creature half of the footfall
+    /// rustle (`0x623610`: `[[unit+0xb3c]+0x28]` handed straight to `0x4584e0`). A *player* does
+    /// not come through here at all: its own override reads the equipped chest instead
+    /// (`0x62fa30`), so this is the answer for creatures — and, for a player wearing a
+    /// non-character display, the body it is actually wearing.
+    ///
+    /// `None` when either DBC lookup misses. `Some(0)` is the real "no material" the data
+    /// carries, and resolves to silence at [`crate::MaterialCatalog::foley_kit`].
+    ///
+    /// **In shipped 5875 data this column is 0 in every one of the 430 rows**, in both the base
+    /// archive's 333-row copy and the patched 430 (`tests::no_shipped_model_carries_a_foley`).
+    /// The creature branch of the foley is therefore inert against the real client's own files:
+    /// the armor rustle you hear is the *player* override's, and no NPC has one. Kept because it
+    /// is the reference's own path and one map lookup, and because a server shipping patched
+    /// DBCs would light it up — not because it does anything today. A future reader finding this
+    /// silent has found the data, not a bug.
+    pub fn foley_material(&self, display_id: u32) -> Option<u32> {
+        let row = self.display.get(&display_id)?;
+        Some(self.models.get(&row.model_id)?.foley_material)
     }
 
     /// Does this display's model **breathe** — i.e. may it wear the `$BTH` hardcoded effects
@@ -416,6 +441,7 @@ pub fn load_creature_catalog(chain: &mut Chain) -> Result<CreatureCatalog> {
                         footprint_length: f32_at(r, 7).unwrap_or(0.0),
                         footprint_width: f32_at(r, 8).unwrap_or(0.0),
                         collision_height: f32_at(r, 15).unwrap_or(0.0),
+                        foley_material: u32_at(r, 10).unwrap_or(0),
                         footstep_shake: u32_at(r, 11).unwrap_or(0),
                         death_thud_shake: u32_at(r, 12).unwrap_or(0),
                     },
@@ -721,6 +747,44 @@ mod tests {
         );
     }
 
+    /// **The creature foley is dead data in 5875.** Every `CreatureModelData` row ships
+    /// `FoleyMaterialID = 0`, so `0x623610`'s branch resolves to silence for every NPC in the
+    /// game and the armor rustle is the player override's alone. Pinned as a test rather than a
+    /// comment because it is a *negative* that a future reader will otherwise re-derive by
+    /// wondering why NPCs are quiet — and because a shipped file that ever grows a nonzero here
+    /// should make this fail loudly rather than change the soundscape silently.
+    ///
+    /// The row alignment this rests on is checked in the same pass: field 11 (footstep shake)
+    /// is nonzero on exactly the 25 thumping-giant rows [`ModelRow`] documents, which would not
+    /// hold if the schema had slipped a column. Skips without client data.
+    #[test]
+    fn no_shipped_model_carries_a_foley() {
+        let data = crate::wow_data_or_skip!();
+        let mut chain = crate::open_chain(&data).expect("open chain");
+        let cat = load_creature_catalog(&mut chain).expect("creature catalog");
+
+        assert!(!cat.models.is_empty(), "models loaded");
+        let foleyed: Vec<u32> = cat
+            .models
+            .iter()
+            .filter(|(_, m)| m.foley_material != 0)
+            .map(|(&id, _)| id)
+            .collect();
+        assert!(
+            foleyed.is_empty(),
+            "shipped data grew a creature foley material: models {foleyed:?}"
+        );
+
+        // The alignment guard: the neighbouring column is NOT uniformly zero, so a zero at
+        // field 10 is the data's own answer and not a schema that slid.
+        let shakers = cat
+            .models
+            .values()
+            .filter(|m| m.footstep_shake != 0)
+            .count();
+        assert_eq!(shakers, 25, "footstep-shake rows (schema alignment guard)");
+    }
+
     #[test]
     fn collision_height_is_the_m2_collision_box() {
         let data = crate::wow_data_or_skip!();
@@ -777,6 +841,131 @@ mod tests {
         assert!(
             nelf > gnome * 2.0,
             "a night elf is over twice a gnome ({nelf} vs {gnome}) — the whole point of the plumb"
+        );
+    }
+
+    /// **Why the collision-prism FLOOR is invisible on shipped data** — and therefore why its
+    /// absence hid until a server override went looking for it (B311's triage, decision 1568).
+    ///
+    /// The real client's prism height is `CollisionHeight × max(SCALE_X, CreatureDisplayInfo.scale)`
+    /// (`0x60b312` → `0x617501`). vmangos folds `modelScale × displayScale` into `SCALE_X`, so the
+    /// floor can only bite where `modelScale < 1` would drag the product under the display column —
+    /// and **no shipped row scales below 1.0**. So on stock data `max` always picks `SCALE_X`, our
+    /// old `× SCALE_X` was bit-identical, and only a `creature_template.display_scale` override or
+    /// a shrink aura can separate the two.
+    #[test]
+    fn no_shipped_model_scales_below_one_so_the_prism_floor_is_inert_at_rest() {
+        let data = crate::wow_data_or_skip!();
+        let mut chain = crate::open_chain(&data).expect("open chain");
+        let cat = load_creature_catalog(&mut chain).expect("load creature catalog");
+
+        let under: Vec<_> = cat
+            .models
+            .iter()
+            .filter(|(_, m)| m.scale < 1.0)
+            .map(|(id, m)| (*id, m.scale))
+            .collect();
+        assert!(
+            under.is_empty(),
+            "a sub-1 modelScale would make the floor bite at rest: {under:?}"
+        );
+        // Not vacuous: the column is really read, and really varies.
+        assert!(
+            cat.models.values().any(|m| m.scale > 1.0),
+            "some row scales above 1.0, or this is asserting on a zeroed column"
+        );
+    }
+
+    /// **The shapeshift divergence, pinned in numbers** (decision 1574). The reference derives the
+    /// collision prism from `UNIT_FIELD_NATIVEDISPLAYID`, so a druid in a form keeps the druid's
+    /// depth lines. This asserts the two readings really differ on shipped data, and by how much —
+    /// a doc claiming "up to 0.72 yd" is worth nothing if the DBC rows drift under it.
+    ///
+    /// `h = collisionHeight × max(SCALE_X, CreatureDisplayInfo.scale)` on the row named. Player
+    /// `SCALE_X` starts at `modelScale × CDI.scale` and a shapeshift multiplies it by the form's
+    /// own factor (vmangos `GetShapeshiftDisplayInfo`: 1.0 for bear/moonkin/tree, 0.80 for
+    /// cat/travel/aquatic) — both live-confirmed by decision 0695's own probe (tauren bear
+    /// `h = 2.083 × 1.35`, tauren cat `SCALE_X 1.35 → 1.08`).
+    #[test]
+    fn a_shapeshift_moves_the_collision_prism_and_the_native_row_is_what_stops_it() {
+        let data = crate::wow_data_or_skip!();
+        let mut chain = crate::open_chain(&data).expect("open chain");
+        let cat = load_creature_catalog(&mut chain).expect("load creature catalog");
+
+        let h = |display: u32, scale_x: f32| {
+            let col = cat.collision_height(display).expect("collision height");
+            let s = cat.display_scale(display).expect("display scale");
+            col * scale_x.max(s)
+        };
+
+        // (label, native display, form display, native SCALE_X, the form's scale factor)
+        let cases: &[(&str, u32, u32, f32, f32)] = &[
+            ("NElf M → cat", 55, 892, 1.0, 0.80),
+            ("NElf M → bear", 55, 2281, 1.0, 1.0),
+            ("Tauren M → moonkin", 59, 15375, 1.35, 1.0),
+            ("Tauren M → bear", 59, 2289, 1.35, 1.0),
+        ];
+        let mut worst: f32 = 0.0;
+        for &(label, native, form, native_scale_x, factor) in cases {
+            let scale_x = native_scale_x * factor;
+            let (reference, ours_before) = (h(native, scale_x), h(form, scale_x));
+            let swim_delta = 0.75 * (ours_before - reference);
+            assert!(
+                swim_delta.abs() > 0.05,
+                "{label}: the two readings must actually differ, else this test asserts nothing                  (reference {reference}, form-derived {ours_before})"
+            );
+            worst = worst.max(swim_delta.abs());
+        }
+        assert!(
+            (worst - 0.72).abs() < 0.02,
+            "worst swim-line divergence is {worst} yd, the doc says 0.72"
+        );
+
+        // The direction flips with the form, which is why this can't be waved off as a constant
+        // offset: a night elf cat swims too EARLY, a tauren moonkin far too LATE.
+        assert!(h(892, 0.80) < h(55, 0.80), "NElf cat: form row is shorter");
+        assert!(
+            h(15375, 1.35) > h(59, 1.35),
+            "Tauren moonkin: form row is taller"
+        );
+
+        // 0695's own live probe, reproduced from the DBCs: tauren bear h = 2.083 × 1.35.
+        assert!(
+            (h(2289, 1.35) - 2.083 * 1.35).abs() < 5e-3,
+            "tauren bear form-derived h should reproduce 0695's observed 2.812"
+        );
+    }
+
+    /// **The Shore Strider, pinned** (B311, decision 1568). The reported giant's own chain and
+    /// numbers, recorded so nobody re-suspects the height: display 4945 → `CreatureModelData` 35,
+    /// `Creature\SeaGiant\SeaGiant.mdx`, column 2.083 over a display scale of 1.75 and a
+    /// `modelScale` of 1.0. Its prism is `2.083 × 1.75 = 3.645` yd under **both** the old
+    /// `× SCALE_X` reading and the corrected `× max(SCALE_X, displayScale)` — identical to the
+    /// float — so the height was never why it glided. The cause was the missing
+    /// `UNIT_FIELD_FLAGS` enter gate; this row is the control that says so.
+    #[test]
+    fn the_shore_strider_prism_is_the_same_under_both_readings() {
+        let data = crate::wow_data_or_skip!();
+        let mut chain = crate::open_chain(&data).expect("open chain");
+        let cat = load_creature_catalog(&mut chain).expect("load creature catalog");
+
+        let m = cat.model(4945).expect("display 4945 resolves");
+        assert_eq!(m.model_path, "Creature\\SeaGiant\\SeaGiant.mdx");
+        let column = cat.collision_height(4945).expect("collision height");
+        let display_scale = cat.display_scale(4945).expect("display scale");
+        assert!((column - 2.083).abs() < 5e-4, "column is {column}");
+        assert!(
+            (display_scale - 1.75).abs() < 5e-4,
+            "CreatureDisplayInfo.scale is {display_scale}"
+        );
+        // vmangos ships `creature_template.display_scale = 0` for entry 5359, so SCALE_X is the
+        // folded `modelScale × displayScale` = 1.0 × 1.75.
+        let scale_x = m.scale;
+        assert!((scale_x - 1.75).abs() < 5e-4, "folded SCALE_X is {scale_x}");
+        assert_eq!(
+            column * scale_x,
+            column * scale_x.max(display_scale),
+            "the floor is inert on this row — the height was not the bug"
         );
     }
 }

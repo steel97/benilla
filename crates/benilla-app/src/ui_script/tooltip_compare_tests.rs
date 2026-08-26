@@ -34,6 +34,7 @@ fn harness() -> UiScript {
     s.set_screen_size(1024.0, 768.0);
     for f in [
         "Fonts.xml",
+        "MoneyFrame.xml",
         "UiPanels.xml",
         "UIParent.xml",
         "GameTooltip.xml",
@@ -54,6 +55,7 @@ fn harness() -> UiScript {
 fn seed_items(s: &mut UiScript) {
     let mut inv: InventorySlots = Default::default();
     inv[1] = Some(InvSlotView {
+        already_bound: false,
         bar_placeable: true,
         durability: None,
         flags: 0,
@@ -98,6 +100,7 @@ fn seed_items(s: &mut UiScript) {
     slots.insert(
         1,
         ContainerSlot {
+            already_bound: false,
             bar_placeable: true,
             durability: None,
             texture: Some("Interface\\Icons\\INV_Helmet_02".into()),
@@ -255,6 +258,7 @@ fn doll_hover_renders_the_live_instance_and_never_self_compares() {
     // Break the equipped helm: instance pair (0, 40); the template stays authored-full.
     let mut inv: InventorySlots = Default::default();
     inv[1] = Some(InvSlotView {
+        already_bound: false,
         bar_placeable: true,
         durability: Some((0, 40)),
         flags: 0,

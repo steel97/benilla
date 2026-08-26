@@ -21,8 +21,19 @@
 use std::collections::HashMap;
 
 use benilla_ui::script::{
-    InspectView, InvSlotView, InventorySlots, QuadContent, SoundRequest, UiScript, UnitState,
+    InspectView, InvSlotView, InventorySlots, QuadContent, SoundRequest, UiScript, UnitReach,
+    UnitState,
 };
+
+/// A reach entry for a live, inspectable unit at squared distance `d2` — the ordinary case. The
+/// `inspectable` half is `CanInspect`'s alone (the app folds vmangos's non-distance refusals into
+/// it); every test in this file is about distance, so it stays true.
+fn reach(dist_sq: f64) -> UnitReach {
+    UnitReach {
+        dist_sq,
+        inspectable: true,
+    }
+}
 
 /// Load one shipped `assets/ui/<file>` into `s`, panicking on any loader error.
 fn load_xml(s: &UiScript, file: &str) {
@@ -115,6 +126,7 @@ fn armed() -> UiScript {
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
     load_xml(&s, "Fonts.xml");
+    load_xml(&s, "MoneyFrame.xml");
     load_xml(&s, "UiPanels.xml");
     load_xml(&s, "GameTooltip.xml");
     // Before InspectFrame.xml, and required rather than tidy: this window's honor page inherits
@@ -125,7 +137,7 @@ fn armed() -> UiScript {
     s.set_unit("target", Some(target_unit()));
     s.set_inspect(Some(inspect_view("target")));
     // 4 yards away (d² = 16) — comfortably inside the verified 100.0.
-    s.set_inspect_reach(HashMap::from([("target".to_string(), 16.0)]));
+    s.set_unit_reach(HashMap::from([("target".to_string(), reach(16.0))]));
     s
 }
 
@@ -134,6 +146,7 @@ fn armed() -> UiScript {
 fn shipped_inspect_frame_loads_clean() {
     let s = UiScript::new().unwrap();
     load_xml(&s, "Fonts.xml");
+    load_xml(&s, "MoneyFrame.xml");
     load_xml(&s, "UiPanels.xml");
     load_xml(&s, "GameTooltip.xml");
     // Before InspectFrame.xml, and required rather than tidy: this window's honor page inherits
@@ -163,7 +176,7 @@ fn shipped_inspect_frame_loads_clean() {
 fn inspect_unit_refuses_out_of_range() {
     let mut s = armed();
     // 11 yards (d² = 121) — past the verified 100.0 threshold.
-    s.set_inspect_reach(HashMap::from([("target".to_string(), 121.0)]));
+    s.set_unit_reach(HashMap::from([("target".to_string(), reach(121.0))]));
 
     s.run(r#"InspectUnit("target")"#).unwrap();
     assert!(s.errors().is_empty(), "errors: {:?}", s.errors());
@@ -178,7 +191,7 @@ fn inspect_unit_refuses_out_of_range() {
     );
 
     // Step inside the threshold: the same call now opens and requests.
-    s.set_inspect_reach(HashMap::from([("target".to_string(), 99.9)]));
+    s.set_unit_reach(HashMap::from([("target".to_string(), reach(99.9))]));
     s.run(r#"InspectUnit("target")"#).unwrap();
     assert!(
         s.eval::<bool>("return BenillaInspectFrame:IsVisible()")
@@ -205,7 +218,7 @@ fn range_predicates_transcribe_the_verified_thresholds() {
         (100.0, true, false),
         (100.1, false, false),
     ] {
-        s.set_inspect_reach(HashMap::from([("target".to_string(), d2)]));
+        s.set_unit_reach(HashMap::from([("target".to_string(), reach(d2))]));
         assert_eq!(
             s.eval::<bool>(r#"return CanInspect("target") ~= nil"#)
                 .unwrap(),
@@ -220,7 +233,7 @@ fn range_predicates_transcribe_the_verified_thresholds() {
         );
     }
     // Type 4 is the 30-yard row (900.0) — the table is indexed, not hardcoded to one distance.
-    s.set_inspect_reach(HashMap::from([("target".to_string(), 899.0)]));
+    s.set_unit_reach(HashMap::from([("target".to_string(), reach(899.0))]));
     assert!(s
         .eval::<bool>(r#"return CheckInteractDistance("target", 4) ~= nil"#)
         .unwrap());
@@ -229,10 +242,59 @@ fn range_predicates_transcribe_the_verified_thresholds() {
             .unwrap(),
         "the same distance is out of range for the 10-yard type"
     );
-    // An unknown token never grays a row (missing data must not gate).
-    assert!(s
-        .eval::<bool>(r#"return CheckInteractDistance("party3", 1) ~= nil"#)
-        .unwrap());
+    // **A token the object manager holds no unit for answers nil — the null-object arm** (report
+    // B316, wow-re `dist2-null-unit-arm.md` VERIFIED). This is the party member outside the local
+    // area: the roster wire gives them a GUID, so the token resolves, and the object lookup then
+    // misses silently. It used to answer 1, which lit every distance row for exactly the member
+    // who was furthest away.
+    assert!(
+        s.eval::<bool>(r#"return CheckInteractDistance("party3", 1) == nil"#)
+            .unwrap(),
+        "a token with no live unit is out of range, not in"
+    );
+    assert!(
+        s.eval::<bool>(r#"return CanInspect("party3") == nil"#)
+            .unwrap(),
+        "…and CanInspect agrees, through its own null-`this` tail"
+    );
+
+    // The `type` argument's three degenerate arms, each the binary's own answer.
+    s.set_unit_reach(HashMap::from([("target".to_string(), reach(1.0))]));
+    for bad in ["0", "5", "-1", "0.5"] {
+        assert!(
+            s.eval::<bool>(&format!(
+                r#"return CheckInteractDistance("target", {bad}) == nil"#
+            ))
+            .unwrap(),
+            "type {bad} is outside the table (unsigned compare on trunc(type) − 1)"
+        );
+    }
+    // …but a fractional type INSIDE the range truncates toward zero and answers its row.
+    assert!(
+        s.eval::<bool>(r#"return CheckInteractDistance("target", 1.9) ~= nil"#)
+            .unwrap(),
+        "1.9 chops to 1"
+    );
+    // A missing `type` is a usage ERROR, not nil — the reference's `luaL_error`, which longjmps.
+    assert!(
+        s.eval::<bool>(r#"return CheckInteractDistance("target") ~= nil"#)
+            .is_err(),
+        "no distIndex is a script error"
+    );
+
+    // The token is CASE-FOLDED, like every compare in the resolver both predicates reach their
+    // unit through (`_strnicmp`, 1247) — the same fold `UnitName("Target")` already gets. An
+    // addon that capitalises must not be told the unit is out of range.
+    assert!(
+        s.eval::<bool>(r#"return CheckInteractDistance("TARGET", 1) ~= nil"#)
+            .unwrap(),
+        "an upper-case token names the same unit"
+    );
+    assert!(
+        s.eval::<bool>(r#"return CanInspect("Target") ~= nil"#)
+            .unwrap(),
+        "…for both predicates"
+    );
 }
 
 /// **The doll shows THEIR gear, not ours.** Both sources are fed, with different items in the same

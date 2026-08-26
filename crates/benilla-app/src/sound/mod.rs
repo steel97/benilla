@@ -25,13 +25,16 @@ mod greeting;
 mod hal_overload;
 pub(crate) mod interior;
 mod kit;
+mod limiter;
 mod liquid_loop;
 mod math;
+mod meter;
 mod missile;
 mod mix_tap;
 mod mixer;
 mod money;
 mod mount;
+mod probe;
 mod reverb;
 mod sheathe;
 mod spell;
@@ -118,6 +121,14 @@ pub(crate) struct SoundConfig {
     /// (1109) ride under the entry cover exactly as the real client's does: its amp is applied
     /// once at start, and a playing stream never passes back through the kit starters.
     pub world_hold: bool,
+    /// The **output limiter** — benilla's own `SoundOutputLimiter` CVar (decision 1551), default
+    /// **on**. Not a 1.12 CVar: the reference has no such DSP and does not need one, because it
+    /// hands its whole audible mix to FMOD 3 and carries its headroom elsewhere (the SFX-bus
+    /// auto-duck, wow-re `benilla-pins.md` B15). benilla sums into f32 and kira answers an
+    /// over-scale sum with a hard clamp, which is audible distortion the moment two full-scale
+    /// kits overlap — see [`limiter`] for the measured arithmetic. This exists so the fix can be
+    /// A/B'd against what it fixed: `/run SetCVar("SoundOutputLimiter", 0)` applies live.
+    pub limiter: bool,
 }
 
 impl SoundConfig {
@@ -148,6 +159,7 @@ impl Default for SoundConfig {
             ambience_enabled: true,
             reverb: false,
             world_hold: false,
+            limiter: true,
         }
     }
 }
@@ -176,6 +188,34 @@ pub(crate) struct SoundOutput {
     pub(crate) mixer: Option<Mixer>,
     /// Live kit channels, owned and pumped by [`kit::pump_channels`].
     pub(crate) channels: Vec<kit::ActiveChannel>,
+    /// The measuring-mode recorder, when `$WOW_SOUND_PROBE` armed one (decision 1556). It rides
+    /// here rather than in a resource of its own so the kit player — which already holds `out` —
+    /// can stamp every play on the capture's timeline with no new plumbing.
+    pub(crate) probe: Option<probe::Probe>,
+    /// Live **stream** voices, reported by their owners each frame ([`zone`], [`glue`]).
+    ///
+    /// These count against the same ceiling as everything else ([`kit::SOFTWARE_CHANNELS`]): the
+    /// reference's music, ambience and liquid loops all land on its uncapped bus 0 and occupy
+    /// FMOD channels exactly like a sword swing does. Two fields rather than one counter because
+    /// each owner **rewrites its own** every frame from its own live handles — a shared counter
+    /// with two writers drifts the first time a fade is interrupted, and a voice budget that
+    /// drifts is worse than none.
+    pub(crate) zone_streams: usize,
+    pub(crate) glue_streams: usize,
+    /// One-shots that lost their slot to a louder newcomer, and plays refused because nothing
+    /// live was quieter than them (decision 1557). Reported by the probe.
+    pub(crate) voices_stolen: u64,
+    pub(crate) voices_denied: u64,
+    /// Same-kit copies dropped by [`kit::SAME_KIT_MAX`] (decision 1560).
+    pub(crate) copies_dropped: u64,
+}
+
+impl SoundOutput {
+    /// Everything the device is currently mixing — kit channels plus the held streams. This is
+    /// the number [`kit::SOFTWARE_CHANNELS`] bounds.
+    pub(crate) fn live_voices(&self) -> usize {
+        self.channels.len() + self.zone_streams + self.glue_streams
+    }
 }
 
 /// The 3D-audio listener pose for this frame — the single authority every sound system reads, in
@@ -188,6 +228,57 @@ pub(crate) struct SoundOutput {
 /// *facing* about world-up (`Quat::from_rotation_y(face_yaw)`), so panning tracks where the body
 /// faces, NOT where the camera looks. The camera eye + basis are the fallback (the client's
 /// `=0` path): pre-login, in free-fly (`detached`), or before the body attaches.
+/// `Material.dbc` — a shared sound fact with two consumers: the armor foley off `$FSD`
+/// ([`footsteps`]) and, through the same table's `Flags` column, both the metal/wood split of
+/// every weapon impact and the armor slot a player victim presents ([`combat`]). Loaded once
+/// here rather than in either, because a second loader over one DBC is how a schema drifts.
+#[derive(Resource)]
+pub(crate) struct Materials(pub(crate) benilla_formats::MaterialCatalog);
+
+fn load_materials(mut commands: Commands, assets: Option<Res<benilla_assets::WorldAssets>>) {
+    use benilla_assets::LockRecover;
+    let Some(assets) = assets else { return };
+    let loaded = {
+        let mut chain = assets.chain.lock_recover();
+        benilla_formats::load_material_catalog(&mut chain)
+    };
+    match loaded {
+        Ok(cat) => {
+            info!("sound: {} material rows", cat.len());
+            commands.insert_resource(Materials(cat));
+        }
+        Err(e) => warn!("sound: materials failed to load: {e:#}"),
+    }
+}
+
+/// **The material of the body you are wearing** — the chest item's `Material` id, or `None`.
+///
+/// Two sounds ask this, and both ask it the reference's way, through `[player+0x1d38]` element 4
+/// (`EQUIPMENT_SLOT_CHEST`): the armor foley ([`footsteps`], `0x62fa30`) and the impact slot a
+/// player victim presents ([`combat`], `0x62fb70`). Shared rather than written twice, because
+/// they are one question with one answer and the reach is the subtle part.
+///
+/// **That reach is self-only, and not by our choice.** The array's count is written 113 when the
+/// object's guid matches the local player's and 0 otherwise (`0x5dd454`), so in the reference no
+/// other player has a chest material at all. benilla lands there for free: `PLAYER_FIELD_INV_SLOT_*`
+/// is a private descriptor field the server sends only to you, so `player_inv_slot` returns
+/// `None` for everyone else. Callers therefore need no "is this me" test of their own — but they
+/// must ask it of a store that IS the player's.
+///
+/// `None` covers every one of the reference's own misses: no store, an empty chest, the item
+/// object not streamed, and a template still in flight (asked once, answered next frame).
+pub(super) fn worn_chest_material(
+    store: Option<&crate::net::ObjectStore>,
+    items: &mut crate::items::Items,
+    net: &crate::net::NetCommands,
+) -> Option<u32> {
+    /// Index 4 of the inv-slot array — `0x62fa50`/`0x62fb86` read the fifth 8-byte guid.
+    const EQUIPMENT_SLOT_CHEST: u8 = 4;
+    let guid = store?.0.player_inv_slot(EQUIPMENT_SLOT_CHEST)?;
+    let entry = items.object(guid)?.object_entry()?;
+    Some(items.held(entry, net)?.material)
+}
+
 #[derive(Resource)]
 pub(crate) struct AudioListener {
     pub(crate) pos: Vec3,
@@ -233,11 +324,19 @@ impl Plugin for SoundPlugin {
         let silent = ["WOW_NOSOUND", "WOW_CAPTURE"]
             .into_iter()
             .find(|v| std::env::var_os(v).is_some());
+        // Resolved before the mixer: the probe's taps are main-track effects and a kira main
+        // track is build-time-only, so "are we recording?" has to be answered before the device
+        // opens, not when the director presses the key.
+        let probe_dir = if silent.is_some() {
+            None
+        } else {
+            probe::output_dir()
+        };
         let mixer = if let Some(var) = silent {
             info!("${var} set — audio disabled");
             None
         } else {
-            match Mixer::new() {
+            match Mixer::new(probe_dir.as_deref()) {
                 Ok(m) => Some(m),
                 Err(e) => {
                     warn!("no audio device — running silent: {e:#}");
@@ -245,13 +344,32 @@ impl Plugin for SoundPlugin {
                 }
             }
         };
+        let probe = probe_dir.zip(mixer.as_ref()).and_then(|(dir, m)| {
+            let Some(rate) = m.sample_rate() else {
+                warn!("sound probe: device sample rate unknown — not recording");
+                return None;
+            };
+            Some(probe::Probe::start(dir, rate, m.audio_pos()))
+        });
         app.insert_non_send_resource(SoundOutput {
             mixer,
             channels: Vec::new(),
+            probe,
+            zone_streams: 0,
+            glue_streams: 0,
+            voices_stolen: 0,
+            voices_denied: 0,
+            copies_dropped: 0,
         })
         .init_resource::<SoundConfig>()
         .init_resource::<AudioListener>()
         .add_systems(Startup, hal_overload::setup)
+        // `Material.dbc` — shared by the foley and the melee impact, so it loads here rather
+        // than inside either consumer.
+        .add_systems(
+            Startup,
+            load_materials.after(benilla_assets::AssetSet::Open),
+        )
         // The cover's audio hold (see [`SoundConfig::world_hold`]): fed in PreUpdate so every
         // trigger system this frame — whatever stage it runs in — reads one answer.
         .add_systems(PreUpdate, feed_world_hold)
@@ -267,6 +385,7 @@ impl Plugin for SoundPlugin {
                 hal_overload::poll,
             ),
         );
+        probe::plugin(app);
         kit::plugin(app);
         liquid_loop::plugin(app);
         zone::plugin(app);
@@ -340,15 +459,20 @@ fn toggle_mute(keys: Res<ButtonInput<KeyCode>>, mut config: ResMut<SoundConfig>)
 fn apply_master_volume(
     mut out: NonSendMut<SoundOutput>,
     config: Res<SoundConfig>,
-    mut last: Local<Option<(bool, f32)>>,
+    mut last: Local<Option<(bool, f32, bool)>>,
 ) {
-    let cur = (config.enabled && !config.muted, config.master);
+    let cur = (
+        config.enabled && !config.muted,
+        config.master,
+        config.limiter,
+    );
     if *last == Some(cur) {
         return;
     }
     *last = Some(cur);
     if let Some(mixer) = out.mixer.as_mut() {
         mixer.set_master(if cur.0 { cur.1 } else { 0.0 });
+        mixer.set_limiter(cur.2);
     }
 }
 
@@ -378,7 +502,17 @@ fn poll_mix_health(
     mut exit: MessageReader<bevy::app::AppExit>,
     mut since_report: Local<std::time::Duration>,
     mut last_overruns: Local<u64>,
+    mut last_refused: Local<u64>,
+    mut peak_voices: Local<usize>,
 ) {
+    // While a probing run records, it owns the meters: [`meter::MixLevel::take`] is
+    // reset-on-read, so two consumers would each see a fraction of the truth and both would
+    // under-report. The probe says everything this says, twenty times a second and to a file
+    // (decision 1556).
+    if out.probe.is_some() {
+        return;
+    }
+    *peak_voices = (*peak_voices).max(out.channels.len());
     let Some(mixer) = out.mixer.as_mut() else {
         return;
     };
@@ -394,6 +528,9 @@ fn poll_mix_health(
     }
     *since_report = std::time::Duration::ZERO;
     let peak = mixer.take_health_peak();
+    let level = mixer.take_level();
+    let rate = mixer.sample_rate();
+    let voices = std::mem::take(&mut *peak_voices);
     let new_overruns = health.overruns - *last_overruns;
     *last_overruns = health.overruns;
     if new_overruns > 0 {
@@ -406,4 +543,58 @@ fn poll_mix_health(
     } else {
         debug!("audio: mix load peak {:.0}% of budget", peak * 100.0);
     }
+    let new_refused = health.voices_refused - *last_refused;
+    *last_refused = health.voices_refused;
+    if new_refused > 0 {
+        warn!(
+            "audio: {new_refused} 3D sound(s) never played — the spatial-voice arena was full. \
+             These are sounds the player should have heard; the ceiling is ours to raise \
+             (`SPATIAL_VOICE_CAPACITY`), not the game's to work around.",
+        );
+    }
+    report_level(level, voices, rate);
+}
+
+/// The level half of the report (decision 1551) — the amplitude story none of the timing meters
+/// can tell. A mix that asks for more than full scale is not a maybe either: the sum did not fit,
+/// and without the limiter kira's `clamp` would have squared it off. The line names what the game
+/// asked for, how long it was over, what the limiter had to pull, and how many voices were live —
+/// which together say *why* (thirty voices at once is a different bug from one voice at 4×).
+fn report_level(level: meter::LevelReading, voices: usize, rate: Option<u32>) {
+    // Ahead of the level story on purpose: a non-finite sample is not a loud mix, it is a broken
+    // one, and it is invisible to every other counter we have — including the limiter's own
+    // `peak > CEILING` test, which a NaN passes straight through into the driver (see [`meter`]).
+    if level.nonfinite > 0 {
+        error!(
+            "audio: {} non-finite (NaN/inf) sample(s) reached the mix. This is a defect upstream \
+             of the output — the limiter cannot catch it, and it is broadband noise at whatever \
+             the hardware makes of the bits.",
+            level.nonfinite,
+        );
+    }
+    if level.over == 0 {
+        debug!(
+            "audio: mix peak {:.2} of full scale, {voices} voice(s) at most",
+            level.peak,
+        );
+        return;
+    }
+    // Two samples per frame; an unprobeable device leaves the duration out rather than guessing
+    // a time axis (the same rule the mix tap follows).
+    let over = match rate {
+        Some(r) => format!(
+            "for ~{:.0} ms",
+            level.over as f64 / 2.0 / f64::from(r) * 1000.0
+        ),
+        None => format!("across {} samples", level.over),
+    };
+    warn!(
+        "audio: the mix asked for {:.2}x full scale ({:+.1} dBFS) {over} of the last {}s, with \
+         {voices} voice(s) live at most; the limiter pulled up to {:.1} dB to hold it under. \
+         Without it that is hard clipping — the \"dirty, like a speaker breaking\" report.",
+        level.peak,
+        20.0 * level.peak.max(1e-6).log10(),
+        MIX_HEALTH_REPORT.as_secs(),
+        20.0 * level.reduction.max(1e-6).log10(),
+    );
 }

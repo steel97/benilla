@@ -188,17 +188,21 @@ impl UiScript {
         editbox::drag_update(&self.lua, x, y);
         let new_id = self.hit_test(x, y);
         #[allow(clippy::type_complexity)]
-        let (old_id, drag_start, boundary_crossed, slider_change): (
+        let (old_id, drag_start, boundary_crossed, slider_change, color_change): (
             Option<u32>,
             Option<(u32, String)>,
             bool,
             Option<(u32, f32)>,
+            Option<(u32, f64, f64, f64)>,
         ) = {
             let mut model = self.model_mut();
             model.cursor_pos = (x, y);
             // Advance an in-flight Slider thumb drag first — dragging within one frame crosses no
             // hover boundary, so this must run before the early return below (decision 0250 §5).
             let slider_change = super::slider::drag_move(&mut model, x, y);
+            // The colour picker's wheel/strip drag, for the identical reason — and it fires on
+            // every move, not only on a change (the widget has no change-gate).
+            let color_change = super::colorselect::drag_move(&mut model, x, y);
             // A frame in flight from `StartMoving()` follows the cursor here for the same reason
             // (`object::movable`): the frame moves *under* the cursor, so the hover boundary never
             // crosses and a pump behind the early return would only ever advance when the cursor
@@ -208,7 +212,8 @@ impl UiScript {
             let drag_start = cursor::maybe_start_drag(&mut model, (x, y));
             let new_handle = new_id.and_then(|id| model.id_to_frame.get(&id).copied());
             if new_handle == model.mouseover {
-                (None, drag_start, false, slider_change) // no boundary crossed
+                // no boundary crossed
+                (None, drag_start, false, slider_change, color_change)
             } else {
                 // Fire OnLeave only if the frame we're leaving is still live.
                 let old_id = model.mouseover.and_then(|h| {
@@ -220,7 +225,7 @@ impl UiScript {
                         .flatten()
                 });
                 model.mouseover = new_handle;
-                (old_id, drag_start, true, slider_change)
+                (old_id, drag_start, true, slider_change, color_change)
             }
         };
         // The thumb-drag value change fires OnValueChanged (outside the borrow) — the scrollbar's
@@ -232,6 +237,11 @@ impl UiScript {
                 "OnValueChanged",
                 vec![Value::Number(f64::from(value))],
             ) {
+                self.push_error(e);
+            }
+        }
+        if let Some((id, r, g, b)) = color_change {
+            if let Err(e) = super::colorselect::fire_by_id(&self.lua, id, r, g, b) {
                 self.push_error(e);
             }
         }
@@ -285,7 +295,9 @@ impl UiScript {
 
     /// A mouse button transition at `(x, y)`: `button` is the WoW name (`"LeftButton"`,
     /// `"RightButton"`, …), `down` is press vs release. Fires `OnMouseDown(self, button)` on press or
-    /// `OnMouseUp(self, button)` on release, on the captured frame.
+    /// `OnMouseUp(self, button)` on release. **The press fires on the hit frame and the release on
+    /// the frame that took the press** — the client's mouse capture (`root+0x80`); see the dispatch
+    /// itself for the bytes and for the stuck-resize it prevents.
     ///
     /// Separately, `OnClick` fires per the hit frame's `RegisterForClicks` set
     /// ([`button::wants_click`]): a **press** fires immediately when the frame registered
@@ -352,6 +364,18 @@ impl UiScript {
         {
             self.model_mut().moving = None;
         }
+        // The capture this release belongs to — read HERE because the borrow below *drains*
+        // `mouse_down_on` for this button. See the `OnMouseUp` dispatch further down for why the
+        // press target rather than the hit frame.
+        let captured_id: Option<u32> = if down {
+            None
+        } else {
+            let model = self.model_ref();
+            model
+                .mouse_down_on
+                .get(button)
+                .and_then(|h| model.frame_to_id.get(h).copied())
+        };
         // The session clock, read before the borrow below — the double-click detector's only input
         // beyond the hit ([`Model::last_click`]). Same `GetTime()` seconds every script sees.
         let now = self.now();
@@ -368,12 +392,22 @@ impl UiScript {
         // "<Button>ButtonDown"; a release fires it when press+release landed on the same frame AND
         // it registered "<Button>ButtonUp" — UNLESS a started drag is being resolved instead.
         #[allow(clippy::type_complexity)]
-        let (click_id, drag_release, world_dropped, slider_jump, double_id): (
+        let (
+            click_id,
+            drag_release,
+            world_dropped,
+            slider_jump,
+            double_id,
+            abandoned,
+            color_jump,
+        ): (
             Option<u32>,
             Option<cursor::DragRelease>,
             bool,
             Option<(u32, f32)>,
             Option<u32>,
+            Option<crate::widget::FrameHandle>,
+            Option<(u32, f64, f64, f64)>,
         ) = {
             let mut model = self.model_mut();
             let hit_handle = hit_id.and_then(|id| model.id_to_frame.get(&id).copied());
@@ -386,6 +420,10 @@ impl UiScript {
                         model.mouse_down_on.remove(button);
                     }
                 }
+                // A press REPLACES any in-flight gesture, so a started one has to be ended first
+                // — `abandon_drag`'s own doc carries why a silent drop is a stuck UI rather than a
+                // cancelled drag. Its `OnDragStop` fires below, outside this borrow.
+                let abandoned = cursor::abandon_drag(&mut model);
                 cursor::arm_drag(&mut model, hit_handle, button, (x, y));
                 // A left press on a Slider begins the engine drag (0250 §5): a thumb press grabs
                 // it in place; a track press seats the thumb under the cursor first (the returned
@@ -396,16 +434,27 @@ impl UiScript {
                 } else {
                     None
                 };
+                // A left press inside a ColorSelect's wheel or value strip captures the colour
+                // drag AND jumps the colour to the click point in the same call — the widget's
+                // press handler invokes its own cursor-position handler before returning
+                // (`0x78bf70 call [eax+0x3c]`), so there is no such thing as a press that only
+                // arms.
+                let color_jump = if button == "LeftButton" {
+                    super::colorselect::begin_drag(&mut model, hit_handle, x, y)
+                } else {
+                    None
+                };
                 let wants = format!("{button}Down");
                 let click = hit_handle
                     .filter(|&h| button::wants_click(&model, h, &wants))
                     .and(hit_id);
-                (click, None, false, jump, None)
+                (click, None, false, jump, None, abandoned, color_jump)
             } else {
                 let pressed = model.mouse_down_on.remove(button);
                 // A left release ends any in-flight thumb drag (decision 0250 §5).
                 if button == "LeftButton" {
                     super::slider::end_drag(&mut model);
+                    super::colorselect::end_drag(&mut model);
                 }
                 let same_frame = matches!(
                     (pressed, hit_handle),
@@ -473,7 +522,7 @@ impl UiScript {
                 let double_id = double.and_then(|h| model.frame_to_id.get(&h).copied());
                 // Exclusive, not additive — the double leg is taken *instead of* the single one.
                 let click = if double_id.is_some() { None } else { click };
-                (click, release, dropped, None, double_id)
+                (click, release, dropped, None, double_id, None, None)
             }
         };
         // A track press's value jump fires OnValueChanged first (outside the borrow), the same
@@ -488,8 +537,53 @@ impl UiScript {
                 self.push_error(e);
             }
         }
+        // The press's colour jump fires OnColorSelect the same way.
+        if let Some((id, r, g, b)) = color_jump {
+            if let Err(e) = super::colorselect::fire_by_id(&self.lua, id, r, g, b) {
+                self.push_error(e);
+            }
+        }
+        // ── `OnMouseUp` goes to the frame that took the PRESS, not to whatever is under the
+        // cursor now — the mouse CAPTURE (`root+0x80`).
+        //
+        // The client's mouse-DOWN handler `0x7662c0` takes the pointer: "resolves target =
+        // root+0x80 (existing capture) else root+0x7c (hover frame) … then title-region drag or
+        // **capture**+OnMouseDown" (wow-re ledger `0x7662c0`).
+        //
+        // The **release** half is `0x766420`, and it is VERIFIED — wow-re
+        // `system/ui/scratch/mouseup-dispatch-law.md`, a §5 dispatched from this repo for exactly
+        // this line after it first landed on an extrapolation (decision 1599). It reads the capture
+        // and **nothing else**: `[mgr+0x80]` is snapshotted into `ebx` at entry (`0x76642b`),
+        // before anything, and `[mgr+0x7c]` — the hover frame — is **never read** anywhere in
+        // `[0x766420, 0x7664f0)`. One dispatch, `0x7664a4 call [eax+0x6c]`.
+        //
+        // So a press on A released over B fires `OnMouseUp` on **A**, and B gets nothing on the
+        // release edge. We already track exactly that capture — [`Model::mouse_down_on`], the press
+        // target per button, which `OnClick`'s same-frame rule reads — and firing `OnMouseUp` at
+        // the *hit* frame was the one place it went unused. This function's doc always said "on the
+        // captured frame"; the code did not.
+        //
+        // It is not a nicety: a chat window's resize grip is a 16×16 button that the drag pulls
+        // out from under the cursor the moment the size clamps at `SetMinResize`/`SetMaxResize`
+        // (the rebate plants the edge on the bound while the cursor keeps going). Its
+        // `OnMouseUp → FCF_StopResize` then never ran, and `Model::sizing` stayed held for the
+        // rest of the session — the stuck-drag failure `cursor::abandon_drag` exists to prevent on
+        // the other path.
+        //
+        // **A press that captured NOTHING fires nothing**, and this is the half the first version
+        // of this code got wrong: it fell back to the frame under the cursor, reading the DOWN
+        // handler's `+0x80`-else-`+0x7c` precedence as if the UP handler shared it. It does not —
+        // `0x766498 test ebx,ebx / je 0x7664cd` returns with no virtual call at all. The fallback
+        // was a divergence that let a press over open space deliver a release to whatever the
+        // cursor had wandered onto.
+        //
+        // (Two things the same §5 settled that are invisible from here: the capture is cleared at
+        // `0x7664bb`, **after** the dispatch — so a C++ consumer inside `OnMouseUp` still sees it,
+        // though no Lua binding reads it, `GetMouseFocus 0x48df40` being `+0x7c`; and the clear is
+        // gated on `evt+0x18 == 0`, the button mask *after* the event, so a **chorded** release
+        // fires `OnMouseUp` and keeps the capture for the button still held.)
         let script = if down { "OnMouseDown" } else { "OnMouseUp" };
-        if let Some(id) = hit_id {
+        if let Some(id) = if down { hit_id } else { captured_id } {
             if let Err(e) = event::fire_widget_handler(&self.lua, id, script, vec![btn.clone()]) {
                 self.push_error(e);
             }
@@ -545,24 +639,16 @@ impl UiScript {
                 editbox::drag_end(&self.lua);
             }
         }
+        // A gesture this press REPLACED gets its `OnDragStop` too, before anything the new press
+        // does: the handler on the other end has a `StopMovingOrSizing` in it, and until that runs
+        // the engine's one move slot is still held (see `cursor::abandon_drag`).
+        if let Some(source) = abandoned {
+            self.fire_drag_stop(source);
+        }
         // The drag trio's stop/receive pair, fired outside the model borrow above (only for a
         // gesture that actually started — see `cursor::DragRelease::started`).
         if let Some(release) = drag_release.filter(|r| r.started) {
-            let source_id = {
-                let model = self.model_ref();
-                model
-                    .arena
-                    .frame(release.source)
-                    .is_some()
-                    .then(|| model.frame_to_id.get(&release.source).copied())
-                    .flatten()
-            };
-            if let Some(id) = source_id {
-                if let Err(e) = event::fire_widget_handler(&self.lua, id, "OnDragStop", Vec::new())
-                {
-                    self.push_error(e);
-                }
-            }
+            self.fire_drag_stop(release.source);
             if let Some(id) = hit_id {
                 if let Err(e) =
                     event::fire_widget_handler(&self.lua, id, "OnReceiveDrag", Vec::new())
@@ -590,6 +676,26 @@ impl UiScript {
             }
         }
         hit_id.is_some() || world_dropped
+    }
+
+    /// Fire `OnDragStop` on a gesture's source — the ONE place that ends a started drag, so the
+    /// release path and the two abandon paths ([`cursor::abandon_drag`]) cannot drift apart.
+    /// A source that died between the press and here fires nothing.
+    pub(super) fn fire_drag_stop(&mut self, source: crate::widget::FrameHandle) {
+        let id = {
+            let model = self.model_ref();
+            model
+                .arena
+                .frame(source)
+                .is_some()
+                .then(|| model.frame_to_id.get(&source).copied())
+                .flatten()
+        };
+        if let Some(id) = id {
+            if let Err(e) = event::fire_widget_handler(&self.lua, id, "OnDragStop", Vec::new()) {
+                self.push_error(e);
+            }
+        }
     }
 
     /// A mouse-wheel spin at `(x, y)`: fires `OnMouseWheel(self, delta)` on the hit frame — or,

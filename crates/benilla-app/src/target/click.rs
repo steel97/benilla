@@ -196,6 +196,28 @@ pub(super) fn act_on_right_click(
     // no packet). The lock arm runs first in `0x5f3130`, and it does here too: a `Refuse` toasts
     // even when we are also out of range.
     if go_is_nearest(&hovered, &hovered_object) {
+        // **The interact chain's first link** (tag `use`). "I clicked it and nothing happened" spans
+        // three systems — this decision, the `CMSG_GAMEOBJ_USE` it sends, and the `SMSG_SPELL_GO`
+        // the server answers with — and until this line existed only the *taken* branches said
+        // anything, at `debug!`, which the hardcoded log filter keeps off. Both silent refusals are
+        // traced here: a `Point` cursor (the reference's highlightable no-op) and `unable` (the
+        // range gray, which suppresses the send with no toast). Pairs with the `fx` kit lines, so
+        // ONE run says which link is dead instead of one round-trip per link.
+        if benilla_assets::trace::enabled_for("use") {
+            let ty = hovered_object
+                .target
+                .and_then(|e| stores.get(e).ok())
+                .map_or(-1, |(s, _)| s.0.gameobject_type_id());
+            benilla_assets::trace::line(
+                "use",
+                &format!(
+                    "right-click go guid={:?} type={ty} cursor={:?} unable={}",
+                    hovered_object.guid.map(|g| format!("{g:#x}")),
+                    cursor.kind,
+                    cursor.unable
+                ),
+            );
+        }
         if cursor.kind != cursor_mode::CursorKind::Point {
             if let Some(guid) = hovered_object.guid {
                 let go = hovered_object
@@ -261,6 +283,12 @@ pub(super) fn act_on_right_click(
                     GoAction::OpenLock(_) | GoAction::OpenByKey { .. } if cursor.unable => {}
                     GoAction::Use => {
                         debug!("right-click gameobject use: {guid:#x}");
+                        if benilla_assets::trace::enabled_for("use") {
+                            benilla_assets::trace::line(
+                                "use",
+                                &format!("SEND CMSG_GAMEOBJ_USE guid={guid:#x}"),
+                            );
+                        }
                         let _ = seam.net.0.send(ClientCommand::GameObjUse { guid });
                     }
                     GoAction::OpenLock(spell_id) => {
@@ -725,20 +753,23 @@ pub(super) fn clear_target_requests(
 /// ([`scan::commit`]) — the app half of the reference's `TargetUnit` Lua shim. Callers: the player
 /// frame's left-click (`TargetUnit("player")`) and the party frames' (`TargetUnit("partyN")`,
 /// decision 0434 phase 5). Only tokens resolving to a STREAMED unit act: `"player"` → our avatar;
-/// `"target"` → the current selection (a dedup no-op); `"partyN"` → that roster slot when its
-/// entity is in range (an out-of-range member needs the guid-only selection the phase-4
+/// `"target"` → the current selection (a dedup no-op); `"partyN"`/`"raidN"` → that roster slot
+/// when its entity is in range (an out-of-range member needs the guid-only selection the phase-4
 /// out-of-range slice owns — until then the click no-ops, like the real client on a nonexistent
-/// unit); `"pet"` → the bar's cached pet guid (decision 0990, the pet frame's left click).
+/// unit); `"pet"` → the bar's cached pet guid (decision 0990, the pet frame's left click);
+/// `"targettarget"` → the selection's own `UNIT_FIELD_TARGET` (decision 1576, the ToT frame's).
 /// Everything else (mouseover/name) waits for its wire.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn target_unit_requests(
     script: Option<NonSendMut<UiScript>>,
-    mut selection: ResMut<Selection>,
-    mut seam: crate::creature_anim::AttackSeam,
-    self_q: Query<(Entity, &Guid, Has<Engaged>), With<SelfPlayer>>,
-    group: Res<crate::ui_party::GroupState>,
-    index: Res<crate::net::GuidIndex>,
-    pet: Res<crate::ui_pet::PetBar>,
+    // The one unit-token resolver (`crate::ui_unit::UnitTokens`) — the arms this drain used to
+    // spell out inline. It is shared with the reach feed precisely so `TargetUnit("target")` and
+    // `CheckInteractDistance("target", …)` can never mean two different units (B304).
+    tokens: crate::ui_unit::UnitTokens,
+    // The one SetSelection tail, shared with `/target` and `/assist` (decision 1583). It carries
+    // the classification too, which is why this drain no longer states one: hand-stating it here
+    // is exactly how a `false` that the binary refutes got written down.
+    mut commit: super::by_name::SelectCommit,
 ) {
     let Some(mut script) = script else {
         return;
@@ -747,41 +778,12 @@ pub(super) fn target_unit_requests(
     if requests.is_empty() {
         return;
     }
-    let me = self_q.single().ok();
-    let engaged = me.is_some_and(|(_, _, e)| e);
-    let self_guid = me.map(|(_, g, _)| g.0);
     for token in requests {
-        let resolved = match token.as_str() {
-            "player" => me.map(|(e, g, _)| (e, g.0)),
-            "target" => selection.target.zip(selection.guid),
-            // The pet resolves off the bar's cached guid, the same word `"pet"`'s snapshot and
-            // `UNIT_PET` read (`crate::ui_pet::feed_pet_unit`). An unstreamed pet no-ops, exactly
-            // as an out-of-range party member does.
-            "pet" => (pet.spells.pet_guid != 0)
-                .then(|| index.0.get(&pet.spells.pet_guid))
-                .flatten()
-                .map(|&e| (e, pet.spells.pet_guid)),
-            t => t
-                .strip_prefix("party")
-                .and_then(|n| n.parse::<usize>().ok())
-                .filter(|n| (1..=4).contains(n))
-                .and_then(|n| group.party_slots().nth(n - 1).map(|m| m.guid))
-                .and_then(|g| index.0.get(&g).map(|e| (*e, g))),
-        };
+        // Resolved before the commit borrows the selection mutably. An unstreamed unit — an
+        // out-of-range party member, a despawned pet — resolves to nothing and no-ops.
+        let resolved = tokens.resolve(&token, &commit.selection);
         if let Some((entity, guid)) = resolved {
-            // `new_attackable: false` on every arm, and it is correct rather than a shortcut:
-            // yourself and the current target reach the engaged-switch law's self exception and
-            // its dedup, and a party member or your own pet is a unit you cannot attack. So a
-            // switch fired from here can only ever STOP the swing — never re-point it.
-            scan::commit(
-                &mut selection,
-                &mut seam,
-                entity,
-                guid,
-                engaged,
-                self_guid,
-                false,
-            );
+            commit.commit(entity, guid);
         }
     }
 }

@@ -28,6 +28,7 @@ fn setup() -> UiScript {
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
     load_xml(&s, "Fonts.xml");
+    load_xml(&s, "MoneyFrame.xml");
     load_xml(&s, "UiPanels.xml");
     load_xml(&s, "DeathFrame.xml");
     s
@@ -394,7 +395,7 @@ fn corpse_map_position_binding() {
         .eval::<(f64, f64)>("return GetCorpseMapPosition()")
         .unwrap();
     assert_eq!((x, y), (0.0, 0.0), "no corpse ⇒ the (0,0) hide sentinel");
-    s.set_world_map_feed(None, None, 0.0, Some((0.25, 0.75)));
+    s.set_world_map_feed(None, None, 0.0, Some((0.25, 0.75)), Vec::new());
     let (x, y) = s
         .eval::<(f64, f64)>("return GetCorpseMapPosition()")
         .unwrap();

@@ -20,6 +20,7 @@ mod anim;
 mod auction;
 mod chat;
 mod combat;
+mod combat_chat;
 mod combat_log;
 mod death;
 mod group;
@@ -50,9 +51,9 @@ use quests::{
 };
 use spells::{
     action_buttons, aura_duration, cancel_auto_repeat, cast_result, channel_start, channel_update,
-    clear_cooldown, cooldown_cheat, cooldown_event, item_cooldown, learned_spell, spell_book,
-    spell_chain_targets, spell_cooldowns, spell_delayed, spell_failed_other, spell_go, spell_start,
-    superceded_spell,
+    clear_cooldown, cooldown_cheat, cooldown_event, item_cooldown, learned_spell, removed_spell,
+    spell_book, spell_chain_targets, spell_cooldowns, spell_delayed, spell_failed_other, spell_go,
+    spell_start, superceded_spell,
 };
 
 /// Which unit's cooldown store a wire cooldown packet addresses (decision 0982).
@@ -208,6 +209,11 @@ pub(super) fn apply_net_updates(
                 // parks the innkeeper's guid here and `crate::ui_binder` turns it into the
                 // CONFIRM_BINDER dialog, whose Accept is the only thing that binds anything.
                 ResMut<crate::ui_binder::BinderState>,
+                // The class trainer's pending respec question (decision 1580) — the inbound
+                // `MSG_TALENT_WIPE_CONFIRM` parks the trainer's guid + cost here and
+                // `crate::ui_talent_wipe` turns it into the CONFIRM_TALENT_WIPE dialog, whose
+                // Accept is the only thing that unlearns anything. The binder's twin above.
+                ResMut<crate::ui_talent_wipe::TalentWipeState>,
                 // The guard's directions marker (`SMSG_GOSSIP_POI`) and the map id it has to be
                 // stamped with — the wire carries no map field, so "where you were standing when
                 // the guard told you" is the client's to remember (`crate::poi_marker`).
@@ -220,6 +226,12 @@ pub(super) fn apply_net_updates(
                 // The auctioneer session (decision 1511) — the hello reply opens it, the three
                 // list results fill it, and `crate::ui_auction` feeds it to the window.
                 ResMut<crate::ui_auction::AuctionOpen>,
+                // Guild Member Alert (decision 1589) — the CVar knob the sign-on/sign-off pair's
+                // display condition reads; see `ui_guild::apply::event` for the four conjuncts.
+                Res<crate::ui_guild::GuildMemberNotify>,
+                // The minimap ping (decision 1596) — a group member's `MSG_MINIMAP_PING` seats the
+                // world point here and the minimap renderer derives everything else from it.
+                ResMut<crate::minimap::MinimapPing>,
             ),
         ),
     ),
@@ -230,11 +242,20 @@ pub(super) fn apply_net_updates(
     // the container feed to pick up).
     mut ui_actions: (
         ResMut<crate::ui_action::PlayerActions>,
-        // Nested pair (the tuple is at the 16-param ceiling): the cast + mount error queues,
-        // both drained into the red error line by `ui_action::feed_actions`.
+        // Nested group (the tuple is at the 16-param ceiling): the cast + mount error queues,
+        // both drained into the red error line by `ui_action::feed_actions`, plus the
+        // FactionTemplate catalog the combat log's friend/foe split reads (B297). The catalog has
+        // nothing to do with the other two — it rides here purely because this is where the
+        // ceiling left room. Absent if the DBC failed to load, which degrades an unresolved unit
+        // to the friendly side of the classifier rather than dropping its lines.
         (
             ResMut<crate::ui_action::CastErrors>,
             ResMut<crate::ui_action::MountErrors>,
+            Option<Res<crate::target::ring::Factions>>,
+            // The `modalNextSpell` chain's outbox (1597) — `cast_result` fills it, the ui_action
+            // drain sends it through the one cast path. Rides here for the same reason the
+            // catalog does: this is where the ceiling left room.
+            ResMut<crate::ui_action::ChainCasts>,
         ),
         ResMut<crate::ui_items::EquipErrors>,
         ResMut<crate::ui_merchant::MerchantErrors>,
@@ -295,6 +316,11 @@ pub(super) fn apply_net_updates(
             // The GO one-shot Custom play (`SMSG_GAMEOBJECT_CUSTOM_ANIM` — the bobber's bite
             // splash, decision 1086), the step-8 sibling of the `GoLidOpen` writer above.
             MessageWriter<crate::go_anim::GoCustomAnim>,
+            // Are *we* already swinging? The ref's `[player+0xc48]`, mirrored by the
+            // server-echoed [`crate::creature_anim::Engaged`] — read by the GO handler's deferred
+            // auto-attack start (`0x6e83e7`, decision 1593). Filter-only, so it conflicts with
+            // nothing else in this drain.
+            Query<(), (With<crate::creature_anim::Engaged>, With<SelfPlayer>)>,
         ),
     ),
     // The aura feed's duration side-table + the clock to stamp arrivals (decisions 0255/0257): the
@@ -374,10 +400,13 @@ pub(super) fn apply_net_updates(
                 mut played_time_answer,
                 mut guild,
                 mut binder,
+                mut talent_wipe,
                 mut poi_marker,
                 current_map,
                 mut inspect_honor,
                 mut auction_open,
+                guild_notify,
+                mut ping,
             ),
         ),
     ) = caches;
@@ -406,6 +435,23 @@ pub(super) fn apply_net_updates(
     // `UnitSpeeds` insert is a Command, so a `SMSG_FORCE_*_SPEED_CHANGE` arriving later in this
     // same drain could not land on top of it. Both stage here in packet order (decision 1478).
     let mut speed_stage = objects::SpeedStage::default();
+    // The combat log's classification inputs (B297). Built per use rather than once: the arms
+    // around these ones take `&mut` to `index`, `group` and `reputations`, so a borrow held across
+    // the whole drain would not compile. `macro_rules!` here is hygienic against the locals it
+    // names because it is defined after them, so this is one expression in seven call sites rather
+    // than seven copies of six fields.
+    macro_rules! chat_ctx {
+        () => {
+            combat_chat::ChatCtx {
+                self_guid: &self_guid,
+                group: Some(&group),
+                index: &index,
+                factions: ui_actions.1 .2.as_deref(),
+                reputations: &reputations,
+                spells: ui_actions.11.as_deref(),
+            }
+        };
+    }
     for ev in events.0.try_iter() {
         match ev {
             SessionEvent::LoginStage { stage } => session::login_stage(stage, &mut login_stages),
@@ -681,6 +727,17 @@ pub(super) fn apply_net_updates(
                 });
             }
             SessionEvent::BinderConfirm { binder: npc } => binder.ask(npc),
+            // A zero trainer guid is vmangos's "you have no talents to reset" refusal, not a
+            // question — there is nothing to ask about, so nothing goes on screen (decision 1580;
+            // `crate::ui_talent_wipe`'s header carries why the reference instead re-sends here).
+            SessionEvent::TalentWipeConfirm { trainer, cost } => {
+                if trainer == 0 {
+                    debug!("net: talent wipe refused (no talents to reset) — no dialog");
+                } else {
+                    debug!("net: trainer {trainer:#x} asks to wipe talents for {cost} copper");
+                    talent_wipe.ask(trainer, cost);
+                }
+            }
             SessionEvent::PlayerBound { binder: npc, area } => {
                 debug!("net: bound to area {area} by {npc:#x}");
                 crate::ui_binder::apply::bound(
@@ -780,6 +837,7 @@ pub(super) fn apply_net_updates(
             } => spell_book(spell_ids, cooldowns, &mut ui_actions.0, &mut ui_actions.10),
             SessionEvent::ActionButtons { buttons } => action_buttons(buttons, &mut ui_actions.0),
             SessionEvent::SpellLearned { spell_id } => learned_spell(spell_id, &mut ui_actions.0),
+            SessionEvent::SpellRemoved { spell_id } => removed_spell(spell_id, &mut ui_actions.0),
             SessionEvent::SpellSuperceded {
                 old_spell_id,
                 new_spell_id,
@@ -807,6 +865,7 @@ pub(super) fn apply_net_updates(
                 &mut ui_actions.12,
                 ui_actions.11.as_deref(),
                 &net_commands,
+                &mut ui_actions.1 .3,
                 play_seq.next(),
             ),
             SessionEvent::InventoryFailure {
@@ -889,6 +948,8 @@ pub(super) fn apply_net_updates(
                 members,
                 leader,
                 loot,
+                &mut names,
+                &net_commands,
             ),
             SessionEvent::PartyCommandResult {
                 operation,
@@ -900,11 +961,22 @@ pub(super) fn apply_net_updates(
             }
             SessionEvent::RaidTargetSet { icon, guid } => group.apply_raid_target(icon, guid),
             SessionEvent::RaidTargetList { entries } => group.apply_raid_target_list(&entries),
-            // Ping + ready-check are removed for now (decision 0460); the protocol still decodes
-            // the wire, but the client ignores it until those features return.
-            SessionEvent::MinimapPing { .. }
-            | SessionEvent::ReadyCheckRequest
-            | SessionEvent::ReadyCheckAnswer { .. } => {}
+            // The ready check came back with the Raid tab (decision 1549): the open form bumps
+            // the ticket the feed turns into a `READY_CHECK` edge. The ANSWER form is still
+            // ignored — the reference has no per-member answer surface in 1.12 (the raid pane
+            // shows no ready column; only later clients do), so there is nothing to show and
+            // storing it would be state with no reader.
+            SessionEvent::ReadyCheckRequest => group.apply_ready_check(),
+            SessionEvent::RaidInstanceInfo { entries } => group.apply_raid_instance_info(entries),
+            // A group member pinged (decision 1596). The wire carries raw world floats and the
+            // relay is stateless in the reference too — we seat them as the pin and the minimap
+            // derives the rest. `map` is the map we are standing on: the server only relays a ping
+            // between people who are grouped, and a ping from another map would be dropped by the
+            // renderer's own map test anyway.
+            SessionEvent::MinimapPing { guid, x, y } => {
+                ping.seat((x, y), current_map.as_ref().map_or(0, |m| m.0), guid);
+            }
+            SessionEvent::ReadyCheckAnswer { .. } => {}
             // ── The duel family (decision 0633): the session mirror + the two DisplayError
             // lines the handlers emit inline; the Era events fire off the mirror's edges in
             // `ui_duel::feed_duel`, and the countdown ticks in its own system ──
@@ -969,10 +1041,17 @@ pub(super) fn apply_net_updates(
             }
             SessionEvent::GuildRoster(roster) => crate::ui_guild::apply::roster(&mut guild, roster),
             // The sign-on/sign-off pair's trailing guid exists for exactly one purpose — the
-            // ignore check that suppresses their line — which is why this arm reads `social`.
-            SessionEvent::GuildEvent(notice) => {
-                crate::ui_guild::apply::event(&mut guild, &mut chat_log, &social, notice)
-            }
+            // four-conjunct display condition on their line — which is why this arm reads
+            // `social`, the notify knob and our own guid (decision 1589; the condition and its
+            // byte addresses are on `ui_guild::apply::event`).
+            SessionEvent::GuildEvent(notice) => crate::ui_guild::apply::event(
+                &mut guild,
+                &mut chat_log,
+                &social,
+                &guild_notify,
+                self_guid.0,
+                notice,
+            ),
             SessionEvent::GuildCommandResult(result) => {
                 crate::ui_guild::apply::command_result(&mut guild, &mut chat_log, result)
             }
@@ -1060,67 +1139,98 @@ pub(super) fn apply_net_updates(
             SessionEvent::AiReaction { unit, reaction } => {
                 combat::ai_reaction(unit, reaction, &index, &mut audio.11)
             }
-            SessionEvent::AttackerState(s) => combat::attacker_state(
-                s,
-                &index,
-                &self_guid,
-                &mut audio.3,
-                &mut audio.8,
-                &mut audio.15 .1,
-                &mut audio.15 .2,
-                play_seq.next(),
-            ),
-            SessionEvent::SpellDamageLog(s) => combat_log::spell_damage_log(
-                s,
-                &index,
-                &self_guid,
-                &stores,
-                ui_actions.11.as_deref(),
-                &mut audio.7,
-                &mut audio.15 .0,
-                &mut audio.15 .1,
-            ),
-            SessionEvent::PeriodicAuraLog(s) => combat_log::periodic_aura_log(
-                s,
-                &index,
-                &self_guid,
-                &stores,
-                ui_actions.11.as_deref(),
-                &mut audio.7,
-                &mut audio.15 .0,
-                &mut audio.15 .1,
-                &mut names,
-                &net_commands,
-            ),
-            SessionEvent::SpellHealLog(s) => combat_log::spell_heal_log(
-                s,
-                &index,
-                &self_guid,
-                &mut audio.15 .0,
-                &mut audio.15 .1,
-                &mut names,
-                &net_commands,
-            ),
+            SessionEvent::AttackerState(s) => {
+                combat_chat::attacker_state(s, &chat_ctx!(), &stores, &transforms, &mut chat_log);
+                combat::attacker_state(
+                    s,
+                    &index,
+                    &self_guid,
+                    &mut audio.3,
+                    &mut audio.8,
+                    &mut audio.15 .1,
+                    &mut audio.15 .2,
+                    play_seq.next(),
+                )
+            }
+            SessionEvent::SpellDamageLog(s) => {
+                combat_chat::spell_damage_log(s, &chat_ctx!(), &stores, &transforms, &mut chat_log);
+                combat_log::spell_damage_log(
+                    s,
+                    &index,
+                    &self_guid,
+                    &stores,
+                    ui_actions.11.as_deref(),
+                    &mut audio.7,
+                    &mut audio.15 .0,
+                    &mut audio.15 .1,
+                )
+            }
+            SessionEvent::PeriodicAuraLog(s) => {
+                combat_chat::periodic_aura_log(
+                    &s,
+                    &chat_ctx!(),
+                    &stores,
+                    &transforms,
+                    &mut chat_log,
+                );
+                combat_log::periodic_aura_log(
+                    s,
+                    &index,
+                    &self_guid,
+                    &stores,
+                    ui_actions.11.as_deref(),
+                    &mut audio.7,
+                    &mut audio.15 .0,
+                    &mut audio.15 .1,
+                    &mut names,
+                    &net_commands,
+                )
+            }
+            SessionEvent::SpellHealLog(s) => {
+                combat_chat::spell_heal_log(s, &chat_ctx!(), &stores, &transforms, &mut chat_log);
+                combat_log::spell_heal_log(
+                    s,
+                    &index,
+                    &self_guid,
+                    &mut audio.15 .0,
+                    &mut audio.15 .1,
+                    &mut names,
+                    &net_commands,
+                )
+            }
             SessionEvent::SpellEnergizeLog(s) => {
+                combat_chat::spell_energize_log(
+                    s,
+                    &chat_ctx!(),
+                    &stores,
+                    &transforms,
+                    &mut chat_log,
+                );
                 combat_log::spell_energize_log(s, &self_guid, &mut audio.15 .1)
             }
-            SessionEvent::DamageShield(s) => combat_log::damage_shield(
-                s,
-                &index,
-                &self_guid,
-                &stores,
-                &mut audio.7,
-                &mut audio.15 .0,
-            ),
-            SessionEvent::SpellLogMiss(s) => combat_log::spell_log_miss(
-                s,
-                &index,
-                &self_guid,
-                &stores,
-                &mut audio.7,
-                &mut audio.15 .0,
-                &mut audio.15 .1,
-            ),
+            SessionEvent::DamageShield(s) => {
+                combat_chat::damage_shield(s, &chat_ctx!(), &stores, &transforms, &mut chat_log);
+                combat_log::damage_shield(
+                    s,
+                    &index,
+                    &self_guid,
+                    &stores,
+                    &mut audio.7,
+                    &mut audio.15 .0,
+                )
+            }
+            SessionEvent::SpellLogMiss(s) => {
+                combat_chat::spell_log_miss(&s, &chat_ctx!(), &stores, &transforms, &mut chat_log);
+                combat_log::spell_log_miss(
+                    s,
+                    &index,
+                    &self_guid,
+                    &stores,
+                    &mut audio.7,
+                    &mut audio.15 .0,
+                    &mut audio.15 .1,
+                )
+            }
             SessionEvent::XpGain(x) => {
                 combat_log::xp_gain(x, &index, &self_guid, &mut audio.7, &mut chat_log)
             }
@@ -1199,6 +1309,11 @@ pub(super) fn apply_net_updates(
                     &mut items,
                     &net_commands,
                     &mut pet_bar,
+                ),
+                (
+                    &mut ui_actions.12,
+                    &mut audio.15 .2,
+                    !audio.15 .4.is_empty(),
                 ),
                 play_seq.next(),
             ),
