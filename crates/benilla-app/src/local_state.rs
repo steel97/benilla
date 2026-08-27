@@ -268,6 +268,27 @@ pub(crate) fn screenshots_dir() -> Option<PathBuf> {
     home().map(|h| h.join("Screenshots"))
 }
 
+/// `benilla-config/Diagnostics/` — where the stuck-thread self-sampler drops its profiles
+/// ([`crate::perf::stall`]).
+///
+/// **This was `~/Library/Logs/benilla/` until 2026-08-27, hand-built from `$HOME`** — a platform
+/// log directory, which is the exact shape the one-folder rule names as forbidden ("never a
+/// hand-built path, never a platform config dir"). It had been that way since decision 0713, and it
+/// went unnoticed because the sampler only writes when something is already wrong, so the stray
+/// folder appeared on the bad days and nobody was looking at paths on a bad day. It surfaced while
+/// proving out the MSAA clamp (1631): three probe runs stalled, and the stall lines named a
+/// directory that had no business existing.
+///
+/// It resolves through [`home`] like every other resident, which costs the sampler its capture
+/// runs (`home` answers `None` there, deliberately) and is the right trade: a `WOW_CAPTURE` run is
+/// bounded by the harness timeout and already has the probe backstop's `_exit(0)`, while the runs
+/// this instrument was built for — the director's, and the long probe rounds — keep it. The
+/// alternative, an ungated second accessor, would put "which paths are exempt from hermetic?" back
+/// into someone's head, which is what the single rule exists to prevent.
+pub(crate) fn diagnostics_dir() -> Option<PathBuf> {
+    home().map(|h| h.join("Diagnostics"))
+}
+
 /// Make an arbitrary realm/character name safe as one path component: anything outside
 /// `[A-Za-z0-9_]` becomes `_`, so a realm called `Hydraxian Waterlords` or one with a slash cannot
 /// escape the folder or collide with the path separator.
@@ -341,7 +362,9 @@ mod tests {
     /// this one owns is 0954's layout table, unchanged by 1175's move.
     #[test]
     fn the_home_law_override_then_the_residents_and_hermetic_captures() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = std::env::temp_dir().join(format!("benilla-ls-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -438,7 +461,9 @@ mod tests {
     /// changed.
     #[test]
     fn the_state_folder_no_longer_depends_on_finding_the_install() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _c = EnvGuard::unset("WOW_CAPTURE");
         let _h = EnvGuard::unset("BENILLA_HOME");
         let _d = EnvGuard::set("WOW_DATA", "/nonexistent/benilla-test/Data");
@@ -462,7 +487,9 @@ mod tests {
     /// whether it runs in the primary or in a slot.
     #[test]
     fn the_state_folder_lands_where_the_build_says() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _c = EnvGuard::unset("WOW_CAPTURE");
         let _h = EnvGuard::unset("BENILLA_HOME");
         let h = home().expect("home() always resolves outside a capture");
@@ -498,7 +525,9 @@ mod tests {
 
     #[test]
     fn write_atomic_creates_dirs_and_replaces_whole_files() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = std::env::temp_dir().join(format!("benilla-wa-{}", std::process::id()));
         std::fs::remove_dir_all(&tmp).ok();
         let path = tmp.join("nested/config.toml");

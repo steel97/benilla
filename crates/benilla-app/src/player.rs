@@ -84,8 +84,8 @@ use state::{
     MoveSpeed, PlayerRide, AIR_NUDGE_SPEED, FALL_FAR_DROP, FALL_FAR_TIME, FOOT_CONE_HEIGHT,
     GROUND_COS, GROUND_PROBE, JUMP_SPEED, LAND_PROBE, MOUSELOOK_PITCH_CLAMP, RUN_BACK_RATIO,
     SKIN_WIDTH, STATIONARY_CHASE_RATE, STEP_SLOPE_RATIO, STEP_SNAP_SLACK, STEP_UP_ADVANCE,
-    STEP_UP_HEIGHT, TURN_RATE, TURN_RATE_MOVING, WEDGE_MIN_FALL, WEDGE_STALL_RATIO,
-    WEDGE_STILL_FRAMES,
+    STEP_UP_HEIGHT, TURN_RATE, TURN_RATE_MOVING, WATER_WALK_PITCH_FLOOR, WEDGE_MIN_FALL,
+    WEDGE_STALL_RATIO, WEDGE_STILL_FRAMES,
 };
 // `SETTLE_TIMEOUT` is `pub(crate)`: the settle release lives in the terrain streamer (decision
 // 0737 — residency releases the hold, not ground contact), which owns the deadline push while the
@@ -209,125 +209,132 @@ impl Plugin for PlayerPlugin {
                     .before(control)
                     .run_if(in_state(crate::char_select::ClientState::InWorld)),
             );
-        app.add_systems(Startup, setup::setup_player.after(AssetSet::Open))
-            // The world camera renders only when the world can be seen (decision 0540): in world,
-            // or under the opaque loading screen (whose covered render is what compiles the
-            // world's pipelines before the first visible frame). At the glue screens the fully
-            // streamed world otherwise burns real GPU time behind an opaque fullscreen scene.
-            .add_systems(Update, setup::gate_world_camera)
-            // In capture mode the harness ([`crate::capture`]) pins the camera (and thus the stream
-            // focus), so `control` must not also drive it — gate it off when capturing. In-world
-            // only (decision 0193): at the character-select glue screen the controller must not
-            // grab the cursor, fly the camera, or queue movement sends behind the overlay.
-            .add_systems(
-                Update,
-                control
-                    .in_set(PlayerControlSet)
-                    .in_set(WorldStage::Input)
-                    .run_if(not(resource_exists::<crate::run_mode::CaptureMode>))
-                    .run_if(in_state(crate::char_select::ClientState::InWorld)),
-            )
-            // The posture setter's queue (the `/sit` family — decision 0881; `control` is the sole
-            // executor, like the sheath queue).
-            .add_message::<StandStateRequest>()
-            // Land-here ([`land`]): the ask, and the re-attach when the server's teleport lands.
-            // Before `control` so the frame that applies the teleport is the frame that takes
-            // third-person control back — `control` reads `detached` after this has cleared it.
-            .add_message::<land::LandHere>()
-            .add_systems(
-                Update,
-                land::land_here
-                    .in_set(WorldStage::Input)
-                    .before(control)
-                    .run_if(in_state(crate::char_select::ClientState::InWorld)),
-            )
-            // (The two scripted probe drivers that used to sit here — `WOW_PROBE_LOOK`'s
-            // mouse-turn and `WOW_PROBE_CAM`'s camera park — are the harness's now, and register
-            // themselves against `control` from there: decision 1174 moved every instrument out of
-            // this module so a player build carries none of them.)
-            // A server-authored spline (Charge/knockback/taxi) driving our own player is mirrored into
-            // `Player` here, *before* `control` reads `pos` to seat the camera and skip input. Same
-            // gates as `control` (not while capturing; in-world only).
-            .add_systems(
-                Update,
-                server_ride::drive_self_ride
-                    .in_set(WorldStage::Input)
-                    .before(control)
-                    .run_if(not(resource_exists::<crate::run_mode::CaptureMode>))
-                    .run_if(in_state(crate::char_select::ClientState::InWorld)),
-            )
-            // A session END releases the avatar — a confirmed `/logout`, or a lost session
-            // (decision 1262): the streamed entity is despawned by the net drain either way, and
-            // dropping `active` re-arms the take-control latch for the next login (possibly a
-            // different character). Ungated — the message lands as the state flips.
-            .add_systems(
-                Update,
-                wire_in::release_on_session_end.in_set(WorldStage::Input),
-            )
-            // Which body the client drives at all (decision 1277). Strictly before everything that
-            // reads the marker — the controller, and the collision-height mirror below.
-            .add_systems(
-                Update,
-                embody::maintain_embodiment
-                    .in_set(WorldStage::Input)
-                    .before(control)
-                    .before(mirror_mover_collision_height),
-            )
-            // Mirror the driven body's collision height onto `Player` for the swim arm (decision
-            // 0645). A *continuous* sync rather than a one-shot at take-control, for the reason the
-            // take-control branch itself records: a cross-map worldport re-streams the entity, so
-            // anything latched on that edge is lost on transfer — and a possession swaps it for a
-            // body of an entirely different size. Before `control`, which is where the swim depth
-            // lines are evaluated.
-            .add_systems(
-                Update,
-                mirror_mover_collision_height
-                    .in_set(WorldStage::Input)
-                    .before(control),
-            )
-            // The camera shake (B298, decision 1540) lands on the camera AFTER `control` has
-            // seated it: the applier adds its offset to the pose `seat_camera` just wrote, so the
-            // eye it measures the distance falloff against is the un-shaken one. `control` is at
-            // Bevy's 16-param ceiling, so the offset cannot be threaded into it as a resource —
-            // and running after is the better shape anyway.
-            .add_systems(
-                Update,
-                crate::camera_shake::apply_camera_shake
-                    .in_set(WorldStage::Input)
-                    .after(control)
-                    // Gated off in capture mode alongside `control`, and for the same reason a
-                    // capture keeps the doodad rail static: a pinned camera that a passing kodo
-                    // could nudge is not a regression baseline any more.
-                    .run_if(not(resource_exists::<crate::run_mode::CaptureMode>)),
-            )
-            // `/follow` (decision 0890): steer the facing and decide this tick's synthesized forward
-            // input immediately BEFORE the controller, which folds the flag into its forward axis.
-            // The player's own turn input therefore runs after us and wins, which is exactly what
-            // makes the turn-away cancel reachable.
-            .add_systems(
-                Update,
-                follow::steer_follow
-                    .in_set(WorldStage::Input)
-                    .before(control)
-                    .run_if(in_state(crate::char_select::ClientState::InWorld)),
-            )
-            // The self-avatar zoom-in fade rides the same `MeshTag`/material channel as the interior
-            // classifier + the appear/despawn fades, so it must run *after* both to win the frame while
-            // fading (and yield to them otherwise). It also writes `Visibility` (the first-person
-            // hide), so it must run after the model-`Visibility` authority
-            // (`debug_panel::apply_model_visibility`) too — otherwise whichever system Bevy's
-            // arbitrary sort ran last would win, and the authority could re-show the body in
-            // first-person. First-person correctness outranks the dev creature-toggle for these few
-            // submeshes. Gated off in capture mode alongside `control` (whose per-frame
-            // `self_fade_alpha` it consumes), so a pinned capture never hides the avatar.
-            .add_systems(
-                Update,
-                apply_self_model_fade
-                    .after(benilla_world::interior::classify_entity_interior)
-                    .after(benilla_world::model_fade::apply_render_fade)
-                    .after(benilla_world::model_render::ModelVisSet)
-                    .run_if(not(resource_exists::<crate::run_mode::CaptureMode>)),
-            );
+        app.add_systems(
+            Startup,
+            // AFTER the config fold, not merely after the assets: the camera reads `gxMultisample`
+            // once, at spawn (1629), so a player's setting has to be in the resource by now.
+            setup::setup_player
+                .after(AssetSet::Open)
+                .after(crate::cvars::CvarLoad),
+        )
+        // The world camera renders only when the world can be seen (decision 0540): in world,
+        // or under the opaque loading screen (whose covered render is what compiles the
+        // world's pipelines before the first visible frame). At the glue screens the fully
+        // streamed world otherwise burns real GPU time behind an opaque fullscreen scene.
+        .add_systems(Update, setup::gate_world_camera)
+        // In capture mode the harness ([`crate::capture`]) pins the camera (and thus the stream
+        // focus), so `control` must not also drive it — gate it off when capturing. In-world
+        // only (decision 0193): at the character-select glue screen the controller must not
+        // grab the cursor, fly the camera, or queue movement sends behind the overlay.
+        .add_systems(
+            Update,
+            control
+                .in_set(PlayerControlSet)
+                .in_set(WorldStage::Input)
+                .run_if(not(resource_exists::<crate::run_mode::CaptureMode>))
+                .run_if(in_state(crate::char_select::ClientState::InWorld)),
+        )
+        // The posture setter's queue (the `/sit` family — decision 0881; `control` is the sole
+        // executor, like the sheath queue).
+        .add_message::<StandStateRequest>()
+        // Land-here ([`land`]): the ask, and the re-attach when the server's teleport lands.
+        // Before `control` so the frame that applies the teleport is the frame that takes
+        // third-person control back — `control` reads `detached` after this has cleared it.
+        .add_message::<land::LandHere>()
+        .add_systems(
+            Update,
+            land::land_here
+                .in_set(WorldStage::Input)
+                .before(control)
+                .run_if(in_state(crate::char_select::ClientState::InWorld)),
+        )
+        // (The two scripted probe drivers that used to sit here — `WOW_PROBE_LOOK`'s
+        // mouse-turn and `WOW_PROBE_CAM`'s camera park — are the harness's now, and register
+        // themselves against `control` from there: decision 1174 moved every instrument out of
+        // this module so a player build carries none of them.)
+        // A server-authored spline (Charge/knockback/taxi) driving our own player is mirrored into
+        // `Player` here, *before* `control` reads `pos` to seat the camera and skip input. Same
+        // gates as `control` (not while capturing; in-world only).
+        .add_systems(
+            Update,
+            server_ride::drive_self_ride
+                .in_set(WorldStage::Input)
+                .before(control)
+                .run_if(not(resource_exists::<crate::run_mode::CaptureMode>))
+                .run_if(in_state(crate::char_select::ClientState::InWorld)),
+        )
+        // A session END releases the avatar — a confirmed `/logout`, or a lost session
+        // (decision 1262): the streamed entity is despawned by the net drain either way, and
+        // dropping `active` re-arms the take-control latch for the next login (possibly a
+        // different character). Ungated — the message lands as the state flips.
+        .add_systems(
+            Update,
+            wire_in::release_on_session_end.in_set(WorldStage::Input),
+        )
+        // Which body the client drives at all (decision 1277). Strictly before everything that
+        // reads the marker — the controller, and the collision-height mirror below.
+        .add_systems(
+            Update,
+            embody::maintain_embodiment
+                .in_set(WorldStage::Input)
+                .before(control)
+                .before(mirror_mover_collision_height),
+        )
+        // Mirror the driven body's collision height onto `Player` for the swim arm (decision
+        // 0645). A *continuous* sync rather than a one-shot at take-control, for the reason the
+        // take-control branch itself records: a cross-map worldport re-streams the entity, so
+        // anything latched on that edge is lost on transfer — and a possession swaps it for a
+        // body of an entirely different size. Before `control`, which is where the swim depth
+        // lines are evaluated.
+        .add_systems(
+            Update,
+            mirror_mover_collision_height
+                .in_set(WorldStage::Input)
+                .before(control),
+        )
+        // The camera shake (B298, decision 1540) lands on the camera AFTER `control` has
+        // seated it: the applier adds its offset to the pose `seat_camera` just wrote, so the
+        // eye it measures the distance falloff against is the un-shaken one. `control` is at
+        // Bevy's 16-param ceiling, so the offset cannot be threaded into it as a resource —
+        // and running after is the better shape anyway.
+        .add_systems(
+            Update,
+            crate::camera_shake::apply_camera_shake
+                .in_set(WorldStage::Input)
+                .after(control)
+                // Gated off in capture mode alongside `control`, and for the same reason a
+                // capture keeps the doodad rail static: a pinned camera that a passing kodo
+                // could nudge is not a regression baseline any more.
+                .run_if(not(resource_exists::<crate::run_mode::CaptureMode>)),
+        )
+        // `/follow` (decision 0890): steer the facing and decide this tick's synthesized forward
+        // input immediately BEFORE the controller, which folds the flag into its forward axis.
+        // The player's own turn input therefore runs after us and wins, which is exactly what
+        // makes the turn-away cancel reachable.
+        .add_systems(
+            Update,
+            follow::steer_follow
+                .in_set(WorldStage::Input)
+                .before(control)
+                .run_if(in_state(crate::char_select::ClientState::InWorld)),
+        )
+        // The self-avatar zoom-in fade rides the same `MeshTag`/material channel as the interior
+        // classifier + the appear/despawn fades, so it must run *after* both to win the frame while
+        // fading (and yield to them otherwise). It also writes `Visibility` (the first-person
+        // hide), so it must run after the model-`Visibility` authority
+        // (`debug_panel::apply_model_visibility`) too — otherwise whichever system Bevy's
+        // arbitrary sort ran last would win, and the authority could re-show the body in
+        // first-person. First-person correctness outranks the dev creature-toggle for these few
+        // submeshes. Gated off in capture mode alongside `control` (whose per-frame
+        // `self_fade_alpha` it consumes), so a pinned capture never hides the avatar.
+        .add_systems(
+            Update,
+            apply_self_model_fade
+                .after(benilla_world::interior::classify_entity_interior)
+                .after(benilla_world::model_fade::apply_render_fade)
+                .after(benilla_world::model_render::ModelVisSet)
+                .run_if(not(resource_exists::<crate::run_mode::CaptureMode>)),
+        );
     }
 }
 
@@ -1251,7 +1258,16 @@ fn control(
         // swimmer is a real state and their Space does nothing at all (wow-re
         // `fall-steep-response.md` §10). The land leg's refusal lives in [`mover::step`],
         // the same handler's grounded arm.
-        let breach = swimming && want_jump && !player.modes.hover;
+        // **The wire's jump** — the `Jump(force = 0)` a `SetHover(true)` owes
+        // ([`Player::hover_launch`], decision 1620). It differs from Space in exactly one gate and
+        // that gate is the point: `0x7c6236 test eax,eax; je 0x7c6243` skips the hover refusal when
+        // `force` is 0, so this leg jumps a body that is *already* hovering — which is every body
+        // that just got granted hover. The two refusals it keeps are ROOT and FALLING
+        // (`0x7c625c test ah,0x30`); the seed select at `0x7c6261` is shared, so the swim/land
+        // choice is made below by the same two take-off sites Space uses.
+        let wire_jump = player.take_wire_jump();
+
+        let breach = swimming && (want_jump && !player.modes.hover || wire_jump);
         if breach {
             player.swimming = false;
         }
@@ -1310,11 +1326,42 @@ fn control(
             }
         }
 
-        // This frame's PRESENTED swim pitch — the persistent [`Player::swim_pitch`] while swimming
+        // This frame's PRESENTED swim pitch — the persistent [`Player::mover_pitch`] while swimming
         // (held even idle, the client's `CMovement+0x20`), except leveled by the 0499 surface
         // redirect when the rest-line cap bites. Feeds the body pose and the wire pitch tail (one
         // source — the pose and the stream can't disagree); the tail only serializes with the
         // SWIMMING flag, so the walking value is inert.
+        // **The mover pitch, set — in every mode, not just the swim one** ([`Player::mover_pitch`]
+        // = `CMovement+0x20`). HELD when unsteered (VERIFIED TU-B(c) — an idle floater keeps its
+        // pitch, never auto-levels), and steered by mouselook as a DIRECT set of the camera aim —
+        // **VERIFIED** (the camera-pitch §5, wow-re `swim-camera-pitch.md`, decision 0492, closing
+        // 0488's INTERIM and refuting the earlier no-camera-coupling census): the ref's mouse-move
+        // chain ends in `SetPitch 0x7c6f70`, an unconditional store — no integrator, no rate limit
+        // — clamped ±89° ([`MOUSELOOK_PITCH_CLAMP`], the byte constant; the ±π/2 clamp belongs to
+        // the unbound pitch-KEY integrator), with the velocity basis rebuilt in-call: the aim
+        // re-points travel the same frame, zero lag. (The ref's `fchs` negate is its own camera
+        // sign convention; ours maps aim-up to pitch-up already.) A left-drag camera orbit steers
+        // NOTHING — it moves the camera without turning the character (the walk rule at `move_fwd`
+        // above), so it must not bend the swim either (director-reported, 2026-07-18).
+        //
+        // It lived inside the swimming branch until decision 1616 (B322). Nothing on the ref's
+        // write path is swim-gated — not the mouse handler `0x514400`, not the applier `0x5103e0`,
+        // not the relay `0x515330`, not the enqueuer `0x6198a0`, and not `SetPitch`'s own store at
+        // `0x7c6f91`, which precedes the `test [esi+0x40],0x200000` that splits the two arms
+        // (`swim-camera-pitch.md` §7: "the mouse-look pitch push is swim-agnostic … on land too").
+        // Swimming gates only the *readers* — the travel basis, the body pose, the wire tail — and
+        // on land the field has two more, both water walking's: the trace-mask arm's third gate
+        // below, and `SetPitch`'s own dive-through complement.
+        //
+        // The push is **per mouse-move, not per frame** ([`Player::aim_pitch_seen`]): the ref's
+        // enqueue hangs off the mouse-MOTION event `0x400500cb`, so a still mouse pushes nothing
+        // and the other writers of the field — the wobble, StopSwim's levelling — survive.
+        if mouselook && cam.pitch != player.aim_pitch_seen {
+            player.aim_pitch_seen = cam.pitch;
+            player.mover_pitch = cam
+                .pitch
+                .clamp(-MOUSELOOK_PITCH_CLAMP, MOUSELOOK_PITCH_CLAMP);
+        }
         let mut swim_pitch = 0.0_f32;
         // The ground height the mover starts this frame at (pre-step feet Y). For a jump this is the
         // true takeoff height — the mover integrates one jump-tick upward *within* the step, so the
@@ -1338,23 +1385,6 @@ fn control(
             // `advance_airborne_arc` below snapshots it like any land jump.
             swim::breach_step(&mut player, &time, &collide, capsule)
         } else if swimming {
-            // The swim pitch: HELD when unsteered (VERIFIED TU-B(c) — an idle floater keeps its
-            // pitch, never auto-levels), and steered by mouselook as a DIRECT set of the camera
-            // aim — **VERIFIED** (the camera-pitch §5, wow-re `swim-camera-pitch.md`, decision
-            // 0492, closing 0488's INTERIM and refuting the earlier no-camera-coupling census):
-            // the ref's mouse-move chain ends in `SetPitch 0x7c6f70`, an unconditional store —
-            // no integrator, no rate limit — clamped ±89° ([`MOUSELOOK_PITCH_CLAMP`], the byte
-            // constant; the ±π/2 clamp belongs to the unbound pitch-KEY integrator), with the
-            // velocity basis rebuilt in-call: the aim re-points travel the same frame, zero
-            // lag. (The ref's `fchs` negate is its own camera sign convention; ours maps aim-up
-            // to pitch-up already.) A left-drag camera orbit steers NOTHING — it moves the
-            // camera without turning the character (the walk rule at `move_fwd` above), so it
-            // must not bend the swim either (director-reported, 2026-07-18).
-            if mouselook {
-                player.swim_pitch = cam
-                    .pitch
-                    .clamp(-MOUSELOOK_PITCH_CLAMP, MOUSELOOK_PITCH_CLAMP);
-            }
             // The drunk porpoise (B210): while swimming and moving, the pitch increments by the
             // wobble ×4.0 every frame (`0x60aabc–0x60ab0a`: flag `0x200000` → `pitch +
             // wobble·[0x80306c]`, clamped, committed via the pitch pipeline `0x60de70`). Same
@@ -1362,18 +1392,18 @@ fn control(
             // The clamp is the callee `0x60aba0`'s FIXED ±π/2 bounds (`0x808acc`/`0x80c5e4`),
             // NOT the mouselook set's ±89° — the reference carries both (decision 1009 §C4).
             if drunk_wobble != 0.0 && translating {
-                player.swim_pitch = (player.swim_pitch
+                player.mover_pitch = (player.mover_pitch
                     + drunk_wobble * drunk::SWIM_PITCH_WOBBLE_SCALE)
                     .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
             }
-            swim_pitch = player.swim_pitch;
+            swim_pitch = player.mover_pitch;
             // The travel basis (`0x7c5880`, the client's swim velocity direction): the FORWARD axis
             // is the facing pitched by the swim pitch — `(cosP·horiz-fwd + sinP·up)` — so holding W
             // with the nose down dives (and aimed up, climbs — the smooth ascend, like the
             // ref's PitchUp+Forward); the STRAFE axis stays level. There is no vertical
             // thruster and Space adds nothing here (the verified basis has no separate vertical
             // input; Space's whole swim role is the jump-exit above).
-            let (sp, cp) = player.swim_pitch.sin_cos();
+            let (sp, cp) = player.mover_pitch.sin_cos();
             let fwd_axis = move_fwd * cp + Vec3::Y * sp;
             let v = fwd_axis * swim_fwd + move_right * swim_side;
             let dir3 = v.normalize_or_zero();
@@ -1412,7 +1442,7 @@ fn control(
             // `swim::cap_redirect`): when the rise capped at the rest line, the stroke went
             // level at full speed — present the *effective* pitch (body pose + wire tail
             // follow the motion, →0 pinned at the line), while the raw aim stays in
-            // `player.swim_pitch` so a later nose-down dives instantly.
+            // `player.mover_pitch` so a later nose-down dives instantly.
             if let Some(p) = out.surface_pitch {
                 swim_pitch = p;
             }
@@ -1426,16 +1456,24 @@ fn control(
         } else {
             // The kinematic mover step — walk/fall physics + the step-down snap (decisions
             // 0009/0182/0190); the mechanism lives in [`mover`].
-            // **Water walking** (decision 0866): hand the mover the liquid surface as a floor. The
-            // `!swimming` half is the reference's own gate — the water-walk arm at `0x63160d` is
-            // skipped when `MOVEFLAG_SWIMMING` is set (`0x631617`) — so granting the aura to a
-            // submerged caster does not eject them; they surface onto the water on the way out.
-            // (This branch is already the non-swimming one, so `swimming` is false here; the
-            // condition is written out because the gate is the mechanism, not an accident of
-            // control flow.)
-            let water_floor = (player.modes.water_walking && !swimming)
-                .then_some(surface_y)
-                .flatten();
+            // **Water walking** (decisions 0866 + 1611): hand the mover the liquid surface, which
+            // it treats as ordinary ground — the classify sees it, the grounded arm runs, and the
+            // clamp finalises Y ([`mover::step`], where the *why* of both halves lives). In the
+            // reference this is not a floor that gets handed anywhere: `MOVEFLAG_WATERWALKING` ORs
+            // the ADT liquid layers into the walk trace's class mask (`0x63162e`), so the surface
+            // simply *is* geometry. Passing it down is our stand-in for that, because liquid is
+            // queried rather than swept here.
+            //
+            // All three of the arm's gates live in [`mover::water_floor`], where each one's byte
+            // site and its consequence are written out — including the pitch gate that 1611 could
+            // only *name*, because the pitch was steered inside the swim branch until the hoist
+            // above.
+            let water_floor = mover::water_floor(
+                player.modes.water_walking,
+                swimming,
+                player.mover_pitch,
+                surface_y,
+            );
             mover::step(
                 &mut player,
                 &time,
@@ -1445,6 +1483,7 @@ fn control(
                 dir,
                 speed,
                 want_jump,
+                wire_jump,
                 water_floor,
             )
         };
@@ -1773,7 +1812,14 @@ fn control(
             // The counter-twist gap: how far the aim sits from the rendered body — the strafe
             // offset while it lasts, unwinding to zero as `model_yaw` closes on `face_yaw`.
             if let Some(mut twist) = twist {
-                twist.yaw_gap = wrap_pi(player.face_yaw - player.model_yaw);
+                // `WOW_TWIST_GAP=<radians>` forces the gap — the counter-twist's A/B lever. The
+                // pass is inert at `yaw_gap == 0` and a scripted probe cannot open a real gap
+                // (`WOW_PROBE_CAM` turns the model with the camera, so the measured gap is float
+                // noise, ~1e-6 rad), which means "removing the twist changed nothing" has never
+                // yet been a measurement of the twist — only of a pass that never ran. This is
+                // what lets it actually be exercised.
+                twist.yaw_gap = twist_gap_override()
+                    .unwrap_or_else(|| wrap_pi(player.face_yaw - player.model_yaw));
             }
         }
 
@@ -1944,4 +1990,15 @@ fn control(
         movement_net::park_mover(&net.0 .0, &mut player);
         camera::fly_free(dt, &keys, typing, &mut rig, &mut cam, &mut cam_t);
     }
+}
+
+/// `WOW_TWIST_GAP=<radians>`: pin the body counter-twist's yaw gap instead of deriving it from
+/// aim-minus-model. Zero-cost when unset: one env read, once.
+fn twist_gap_override() -> Option<f32> {
+    static G: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("WOW_TWIST_GAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+    })
 }

@@ -128,9 +128,9 @@ pub(super) enum UiFixture {
     /// Rows read the CVar registration defaults (hermetic capture = no config file), so the
     /// pixels move only with the window, the atlas seam, or a registered default.
     OptionsAudio,
-    /// The Options window ON THE GRAPHICS PAGE (decision 0959; farclip row retired 0961;
-    /// Environment Detail joined 0992) — uiScale at its 0.64..1.0 panel range with the percent
-    /// readout, and the dropdown row's closed capsule (the 1.12 kit art) reading "High". Rows
+    /// The Options window ON THE GRAPHICS PAGE (decision 0959; farclip row retired 0961 and back
+    /// 1513; Environment Detail joined 0992, a slider since 1649) — uiScale at its 0.64..1.0 panel
+    /// range with the percent readout, and three slider grooves under it. Rows
     /// read the CVar registration defaults (hermetic capture = no config file), so the pixels
     /// move only with the window, the atlas seam, or a registered default.
     OptionsGraphics,
@@ -144,10 +144,12 @@ pub(super) enum UiFixture {
     /// known colour so the markers sit somewhere checkable rather than at the default white's
     /// centre. The one fixture whose subject is pixels this client computes.
     ColorPicker,
-    /// The Graphics page with the Environment Detail MENU OPEN (0992) — the dropdown-list look
+    /// The Controls page with the Camera Following Style MENU OPEN — the dropdown-list look
     /// instrument: the shared DropDownList1 at the window's effective scale (the kit's uiScale
-    /// correction), three entries with High checked, the kit's dialog backdrop.
-    OptionsWorldDetail,
+    /// correction), three entries with the stored one checked, the kit's dialog backdrop. It was
+    /// Environment Detail's list (0992) until 1649 put that row back on the reference's slider;
+    /// the instrument follows the shape, not the row, so it moved to a row that still has a list.
+    OptionsDropdownList,
     /// The Options window MID-SEARCH (decision 0984) — the results-view look instrument: the
     /// "volume" query reflows the four live volume sliders under the clickable Audio head
     /// (GameFontNormalLarge), title "Search Results", Defaults hidden, the clear-X shown in
@@ -231,27 +233,42 @@ pub(super) struct GlueScenario {
     pub(super) screen: GlueScreen,
     /// The preview's race, sex and class ids — the reference comparisons are per-race, so a
     /// scenario says which one it photographs. Applied through the existing
-    /// `WOW_CHARCREATE_PICK` instrument rather than a second path into `CreateSelection`.
-    pub(super) pick: (u8, u8, u8),
+    /// `WOW_CHARCREATE_PICK` instrument rather than a second path into `CreateSelection` — and
+    /// **that instrument wins when it is already set**, so one scenario photographs any race
+    /// (`WOW_CHARCREATE_PICK=6,0,11 WOW_CAPTURE=glue-charcreate` is the tauren stage). `None` for
+    /// a screen with no preview to pick.
+    pub(super) pick: Option<(u8, u8, u8)>,
 }
 
-/// Which glue screen a [`GlueScenario`] photographs. One today; the select screen wants a roster
-/// (so it needs a server, or a seeded one) and the login screen is nearly static.
+/// Which glue screen a [`GlueScenario`] photographs. The select screen wants a roster (so it
+/// needs a server, or a seeded one) and is not here.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum GlueScreen {
     /// The character-creation screen (decision 0423). Photographs, in one frame: the authored-rig
     /// lighting of the `UI_*` backdrop scene and its per-race fog (the lane 1171 left uncovered),
     /// the preview body in its starting outfit (0527), and the GlueXML panel around them.
     CharCreate,
+    /// The login screen (decision 0539) — `UI_MainMenu` behind the account form. Nearly static,
+    /// which is why it was not here until its framing was the subject (B330, decision 1619): the
+    /// gate's backdrop is the narrowest art of the seven scenes, so it is the one whose edges a
+    /// wide window reaches first. `WOW_WIN=2560x1440` is the reporter's shape.
+    Login,
 }
 
 /// The glue sweep. Human, 1 (Human male warrior) — the race whose scene the reference's own
-/// screenshots use, and the outfit path most exercised elsewhere.
-pub(super) const GLUE_SCENARIOS: &[GlueScenario] = &[GlueScenario {
-    name: "glue-charcreate",
-    screen: GlueScreen::CharCreate,
-    pick: (1, 0, 1),
-}];
+/// screenshots use, and the outfit path most exercised elsewhere — and the login gate.
+pub(super) const GLUE_SCENARIOS: &[GlueScenario] = &[
+    GlueScenario {
+        name: "glue-charcreate",
+        screen: GlueScreen::CharCreate,
+        pick: Some((1, 0, 1)),
+    },
+    GlueScenario {
+        name: "glue-login",
+        screen: GlueScreen::Login,
+        pick: None,
+    },
+];
 
 /// THE golden baseline: **two spots FRAMED BY THE DIRECTOR, each at noon and at night — four
 /// captures, and that is the whole sweep.** Elwynn water and a Felwood hollow on Kalimdor. The
@@ -1062,15 +1079,15 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 720,
         ui: Some(UiFixture::ColorPicker),
     },
-    // The Graphics page with the Environment Detail dropdown OPEN (0992). Run with
-    // `WOW_CAPTURE_UI=1 WOW_CAPTURE=ui-options-worlddetail`.
+    // The Controls page with the Camera Following Style dropdown OPEN (0992, re-seated 1649). Run
+    // with `WOW_CAPTURE_UI=1 WOW_CAPTURE=ui-options-dropdown`.
     Scenario {
-        name: "ui-options-worlddetail",
+        name: "ui-options-dropdown",
         map: MAP_AZEROTH,
         eye: GROUND_EYE,
         look: GROUND_LOOK,
         minute: 720,
-        ui: Some(UiFixture::OptionsWorldDetail),
+        ui: Some(UiFixture::OptionsDropdownList),
     },
     // The options window's Keybindings page, Movement expanded (1008). Run with
     // `WOW_CAPTURE_UI=1 WOW_CAPTURE=ui-keybindings`.

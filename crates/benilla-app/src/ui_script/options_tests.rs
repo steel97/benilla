@@ -5,7 +5,7 @@
 //! select/hover wash mechanism, the working era search; 0985: the provenance split those
 //! cite; 0989: the directed cuts — steppers and the corner X gone, the whole bar live via
 //! the engine's track-press law, the search box at the era's verbatim seat; 0992: the
-//! dropdown row shape on the 1.12 kit — Environment Detail — and the Nameplates page's
+//! dropdown row shape on the 1.12 kit — Camera Following Style — and the Nameplates page's
 //! three UnitName* rows; 1476: the ground dim — a black fill over the 0.6 tile, seated clear
 //! of the rope's ink, because a 60% veil is not a page you can read over bright terrain).
 //!
@@ -604,6 +604,60 @@ fn a_track_press_seats_the_thumb_and_keeps_dragging() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
+/// **A slider row's readout sits on its label's line.** The row shows one setting as two
+/// `GameFontNormal` strings — the name at the left, the value at the right — and a reader takes
+/// them as a single line; ours were **3 units apart** at every UI scale (≈4 px on a maximised
+/// 1440p window, which is where B232 photographed them).
+///
+/// The cause is a nudge that leaked from the art onto the text: the readout hangs off
+/// `$parentControl`, and the control was seated at the row's `CENTER(-80, +3)` — the +3 lifting
+/// the 17-tall groove and its 32 px thumb inside the 26-tall row. Anything anchored to the
+/// control inherited a seat that exists for a texture. The nudge now lives on the two art frames
+/// it was for (`$parentGroove`, `$parentSlider`), so the bar does not move by a pixel and the
+/// number falls onto the label's line — asserted here on both halves, over every slider row the
+/// window has: a label/value line, and the groove still riding 3 units high of the row.
+#[test]
+fn a_slider_rows_readout_sits_on_its_labels_line() {
+    let mut s = harness_on(audio_harness());
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    for (page, rows) in [
+        ("Controls", &["RowMouseSpeed", "RowMaxCameraDistance"][..]),
+        (
+            "Audio",
+            &["RowMaster", "RowSound", "RowMusic", "RowAmbience"][..],
+        ),
+        ("Graphics", &["RowUiScale", "RowFarclip"][..]),
+    ] {
+        s.run(&format!("OptionsFrameCategoryListRow{page}:Click()"))
+            .unwrap();
+        s.resolve(); // seat the rects before reading them
+        let mid = |frame: &str| -> f32 {
+            let top: f32 = s.eval(&format!("return {frame}:GetTop()")).unwrap();
+            let bottom: f32 = s.eval(&format!("return {frame}:GetBottom()")).unwrap();
+            (top + bottom) * 0.5
+        };
+        for row in rows {
+            let base = format!("OptionsFrameContainerBody{page}{row}");
+            // The two strings are the assertion: same font, same row, one line. (Both are
+            // regions, so both rects arrive in the same space — the comparison needs no scale.)
+            let (label, value) = (
+                mid(&format!("{base}Label")),
+                mid(&format!("{base}ControlValue")),
+            );
+            assert!(
+                (label - value).abs() < 0.01,
+                "{base}: the readout sits {:.2} off its label's line",
+                value - label
+            );
+            // …and the art it used to ride is exactly where it was: 3 units high of the row.
+            assert!(
+                (mid(&format!("{base}ControlGroove")) - mid(&base) - 3.0).abs() < 0.01,
+                "{base}: the groove left its seat"
+            );
+        }
+    }
+}
+
 /// The Audio harness: the real registered CVar set on the table before the XML loads, exactly
 /// the app's boot order (register → seed → load → select).
 fn audio_harness() -> UiScript {
@@ -961,6 +1015,67 @@ fn the_graphics_page_reads_the_cvar_table_on_select() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
+/// The **Display Mode** row (1650) — modern Classic's own control, which 1627 had already given us
+/// the two states for. Blizzard's `Blizzard_SettingsDefinitions_Shared/Graphics.lua` (identical on
+/// live, classic and classic_era) builds a boolean proxy as a dropdown with exactly two entries,
+/// `VIDEO_OPTIONS_WINDOWED_FULLSCREEN` and `VIDEO_OPTIONS_WINDOWED`, and no Fullscreen entry at all.
+///
+/// **The polarity is the thing worth pinning.** `gxWindow` is 1.12's CVar and keeps 1.12's sense —
+/// `"1"` is WINDOWED — so the FIRST entry, the borderless one this client defaults to, is the CVar's
+/// `"0"`. A row whose label and value run opposite ways is exactly the kind that gets silently
+/// inverted by a later edit, and until this test there was no coverage of the row at all.
+#[test]
+fn the_display_mode_dropdown_maps_its_entries_to_the_gx_window_polarity() {
+    const ROW: &str = "OptionsFrameContainerBodyGraphicsRowDisplayMode";
+    let mut s = audio_harness();
+    s.set_cvar_host("gxWindow", "0");
+    let mut s = harness_on(s);
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowGraphics:Click()")
+        .unwrap();
+    assert_eq!(
+        s.eval::<String>(&format!("return {ROW}Label:GetText()"))
+            .unwrap(),
+        "Display Mode"
+    );
+    // "0" is NOT windowed, which 1627 redefined as the borderless fullscreen window.
+    assert_eq!(
+        s.eval::<String>(&format!("return {ROW}DropdownText:GetText()"))
+            .unwrap(),
+        "Windowed (Fullscreen)"
+    );
+    assert!(
+        s.take_cvar_changes().is_empty(),
+        "reading the table on select must not write it back"
+    );
+
+    // Two entries, and only two — the modern list has no Fullscreen row, because 8.0.1 removed
+    // the exclusive mode those clients had and 1627 ships none for its own platform reasons.
+    s.run(&format!("{ROW}DropdownButton:Click()")).unwrap();
+    assert!(s.eval::<bool>("return DropDownList1:IsVisible()").unwrap());
+    assert_eq!(
+        s.eval::<f64>("return DropDownList1.numButtons").unwrap(),
+        2.0
+    );
+    assert!(s
+        .eval::<bool>("return DropDownList1Button1Check:IsVisible()")
+        .unwrap());
+
+    // Picking Windowed writes the CVar's "1", closes the list, and repaints the capsule.
+    s.run("DropDownList1Button2:Click()").unwrap();
+    assert_eq!(
+        s.take_cvar_changes(),
+        vec![("gxWindow".to_string(), "1".to_string())]
+    );
+    assert_eq!(
+        s.eval::<String>(&format!("return {ROW}DropdownText:GetText()"))
+            .unwrap(),
+        "Windowed"
+    );
+    assert!(!s.eval::<bool>("return DropDownList1:IsVisible()").unwrap());
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
 /// **Vertical Sync** (1394) — the Graphics page's third row, and the first option in this window
 /// that reaches the *window* rather than a gameplay or UI knob. It is 1.12's own Video Options
 /// checkbox 5 (`gxVSync`), which lived on the perf HUD as a dev checkbox until it turned out to be
@@ -1011,13 +1126,13 @@ fn the_vertical_sync_row_reads_and_writes_the_present_mode_cvar() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
-/// The dropdown row (0992, the first): the capsule reads the CVar on select (text from the
-/// row's own entries), the capsule button opens the shared list at the OWNER's effective scale
-/// (the kit's 0992 uiScale correction — the window rides SetScale) with the current value's
-/// entry checked, and an entry click writes the CVar, repaints the capsule, and closes the
-/// list on the kit's own law.
+/// Environment Detail is the reference's own slider (1649): 0..2 step 1 over `WorldDetail`, with
+/// 0992's Low/Medium/High names kept in the readout seat — a groove whose readout says "1" tells a
+/// player nothing. Dragging writes the CVar; a value from outside the range shows the nearest stop
+/// and writes nothing back (0959's out-of-range law).
 #[test]
-fn the_world_detail_dropdown_writes_the_cvar_and_the_capsule_follows() {
+fn the_world_detail_slider_writes_the_cvar_and_the_readout_names_its_stop() {
+    const ROW: &str = "OptionsFrameContainerBodyGraphicsRowWorldDetail";
     let mut s = audio_harness();
     s.set_cvar_host("WorldDetail", "0");
     let mut s = harness_on(s);
@@ -1025,68 +1140,57 @@ fn the_world_detail_dropdown_writes_the_cvar_and_the_capsule_follows() {
     s.run("OptionsFrameCategoryListRowGraphics:Click()")
         .unwrap();
     assert_eq!(
-        s.eval::<String>(
-            "return OptionsFrameContainerBodyGraphicsRowWorldDetailDropdownText:GetText()"
-        )
-        .unwrap(),
-        "Low"
-    );
-    assert_eq!(
-        s.eval::<String>("return OptionsFrameContainerBodyGraphicsRowWorldDetailLabel:GetText()")
+        s.eval::<String>(&format!("return {ROW}Label:GetText()"))
             .unwrap(),
         "Environment Detail"
+    );
+    assert_eq!(
+        s.eval::<String>(&format!("return {ROW}ControlValue:GetText()"))
+            .unwrap(),
+        "Low"
     );
     assert!(
         s.take_cvar_changes().is_empty(),
         "reading the table on select must not write it back"
     );
 
-    // The capsule button opens the list: three entries, the stored value's row checked, and
-    // the shared list wearing the window's effective scale (0.78 era scale, checkFit capped).
-    s.run("OptionsFrameContainerBodyGraphicsRowWorldDetailDropdownButton:Click()")
-        .unwrap();
-    assert!(s.eval::<bool>("return DropDownList1:IsVisible()").unwrap());
-    assert_eq!(
-        s.eval::<f64>("return DropDownList1.numButtons").unwrap(),
-        3.0
-    );
+    // The reference's grid, verbatim: three stops, one apart (OptionsFrame.lua l.27).
     assert!(s
-        .eval::<bool>("return DropDownList1Button1Check:IsVisible()")
-        .unwrap());
-    assert!(!s
-        .eval::<bool>("return DropDownList1Button3Check:IsVisible()")
-        .unwrap());
-    assert!(s
-        .eval::<bool>(
-            "return math.abs(DropDownList1:GetScale() - OptionsFrame:GetScale()) < 0.0001"
-        )
+        .eval::<bool>(&format!(
+            "local lo, hi = {ROW}ControlSlider:GetMinMaxValues() \
+             return lo == 0 and hi == 2 and {ROW}ControlSlider:GetValueStep() == 1"
+        ))
         .unwrap());
 
-    // Clicking High: the write queues, the capsule repaints, the list closes.
-    s.run("DropDownList1Button3:Click()").unwrap();
+    // A drag to the top stop: the write queues and the readout names it.
+    s.run(&format!("{ROW}ControlSlider:SetValue(2)")).unwrap();
     assert_eq!(
         s.take_cvar_changes(),
         vec![("WorldDetail".to_string(), "2".to_string())]
     );
     assert_eq!(
-        s.eval::<String>(
-            "return OptionsFrameContainerBodyGraphicsRowWorldDetailDropdownText:GetText()"
-        )
-        .unwrap(),
+        s.eval::<String>(&format!("return {ROW}ControlValue:GetText()"))
+            .unwrap(),
         "High"
     );
-    assert!(!s.eval::<bool>("return DropDownList1:IsVisible()").unwrap());
 
-    // An off-grid value (an env A/B: the hermetic capture's clutter-off session seeds "-1")
+    // Off-grid input snaps to the stop grid (era obeyStepOnDrag), naming the stop it landed on.
+    s.run(&format!("{ROW}ControlSlider:SetValue(0.6)")).unwrap();
+    assert_eq!(
+        s.eval::<String>(&format!("return {ROW}ControlValue:GetText()"))
+            .unwrap(),
+        "Medium"
+    );
+
+    // An out-of-range value (an env A/B: the hermetic capture's clutter-off session seeds "-1")
     // displays the NEAREST stop — 0959's out-of-range law — and writes nothing back.
     s.set_cvar_host("WorldDetail", "-1");
+    s.take_cvar_changes();
     s.run("OptionsFrameCategoryListRowAudio:Click(); OptionsFrameCategoryListRowGraphics:Click()")
         .unwrap();
     assert_eq!(
-        s.eval::<String>(
-            "return OptionsFrameContainerBodyGraphicsRowWorldDetailDropdownText:GetText()"
-        )
-        .unwrap(),
+        s.eval::<String>(&format!("return {ROW}ControlValue:GetText()"))
+            .unwrap(),
         "Low"
     );
     assert!(
@@ -1251,6 +1355,89 @@ fn the_ui_scale_slider_defers_to_the_apply_button() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
+/// **Render Scale** (decision 1639) — benilla's own Graphics row, and since 1648 the page's ONLY
+/// antialiasing control: the reference's own Multisampling row was pulled on the director's call,
+/// leaving `gxMultisample` reachable as a CVar and `$WOW_MSAA` but off the page.
+///
+/// Three things this pins, each of which was a real choice:
+///
+/// - **It reads the CVar and shows a percentage.** 1.0 must render as "100%", because the whole
+///   point of the row is that the number in front of the player means something without a manual.
+/// - **It is DEFERRED.** Committing live would rebuild the world's render target on every drag
+///   tick — tens of megabytes, thirty times across one sweep of the handle. Staging to Apply makes
+///   that exactly one rebuild. (`uiScale` above it defers for a different reason; the flag is the
+///   same.)
+/// - **It is not mute.** Every other tooltip on this window resolves an `OPTION_TOOLTIP_*` out of
+///   1.12's GlobalStrings, and a benilla row with no counterpart there has so far gone silent (the
+///   nameplate pair). This one carries a description under a `BENILLA_` prefix — the reference's
+///   namespace stays the reference's — because the dial's first reviewer said outright that they
+///   could not tell what it did.
+#[test]
+fn the_render_scale_row_shows_a_percentage_and_defers_to_apply() {
+    let mut s = audio_harness();
+    s.set_cvar_host("renderScale", "1");
+    let mut s = harness_on(s);
+    s.run("ShowUIPanel(OptionsFrame)").unwrap();
+    s.run("OptionsFrameCategoryListRowGraphics:Click()")
+        .unwrap();
+
+    assert_eq!(
+        s.eval::<String>("return OptionsFrameContainerBodyGraphicsRowRenderScaleLabel:GetText()")
+            .unwrap(),
+        "Render Scale"
+    );
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyGraphicsRowRenderScaleControlValue:GetText()"
+        )
+        .unwrap(),
+        "100%",
+        "off has to read as 100%, not as 1"
+    );
+    // The player's range is 50–200 %, narrower than the CVar's own clamp (0.25–4.0, which leaves
+    // room for the supersampling instrument). A row that offered the whole clamp would put 400 %
+    // in front of someone who only wanted their frame rate back.
+    assert!(s
+        .eval::<bool>(
+            "local lo, hi = OptionsFrameContainerBodyGraphicsRowRenderScaleControlSlider:GetMinMaxValues()              return math.abs(lo - 0.5) < 0.0001 and math.abs(hi - 2.0) < 0.0001"
+        )
+        .unwrap());
+    // Not mute: the row resolves a description, unlike the other benilla-own rows.
+    assert!(s
+        .eval::<bool>("return BENILLA_TOOLTIP_RENDER_SCALE ~= nil")
+        .unwrap());
+    let _ = s.take_cvar_changes();
+
+    // The move stages and shows Apply; it does NOT rebuild the render target.
+    s.run("OptionsFrameContainerBodyGraphicsRowRenderScaleControlSlider:SetValue(0.75)")
+        .unwrap();
+    assert_eq!(
+        s.eval::<String>(
+            "return OptionsFrameContainerBodyGraphicsRowRenderScaleControlValue:GetText()"
+        )
+        .unwrap(),
+        "75%"
+    );
+    assert!(
+        s.take_cvar_changes().is_empty(),
+        "a deferred row must not write the CVar on the move"
+    );
+    assert!(s
+        .eval::<bool>("return OptionsFrameApplyButton:IsVisible()")
+        .unwrap());
+
+    // Apply commits once.
+    s.run("OptionsFrameApplyButton:Click()").unwrap();
+    assert_eq!(
+        s.take_cvar_changes(),
+        vec![("renderScale".to_string(), "0.75".to_string())]
+    );
+    assert!(!s
+        .eval::<bool>("return OptionsFrameApplyButton:IsVisible()")
+        .unwrap());
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
 /// Pending edits are PANEL-wide like era's modified table: they survive a category switch
 /// (the row redisplays the pending value on return, era's GetValue-returns-pending) and die
 /// only when the window hides — the reopened window reads the committed truth.
@@ -1344,7 +1531,7 @@ fn the_terrain_distance_slider_snaps_to_the_1_12_grid_and_writes_live() {
 }
 
 /// Defaults on the Graphics page: uiScale back to its registered default (0.9) and farclip to
-/// its (777), the rows following, ONLY the moved values queuing — and a pending uiScale edit
+/// its (350), the rows following, ONLY the moved values queuing — and a pending uiScale edit
 /// dies with it (the default write supersedes what Apply would have committed).
 #[test]
 fn defaults_resets_the_graphics_page_to_registered_defaults() {
@@ -1367,7 +1554,7 @@ fn defaults_resets_the_graphics_page_to_registered_defaults() {
         "{changes:?}"
     );
     assert!(
-        changes.contains(&("farclip".to_string(), "777".to_string())),
+        changes.contains(&("farclip".to_string(), "350".to_string())),
         "{changes:?}"
     );
     assert_eq!(
@@ -1380,7 +1567,7 @@ fn defaults_resets_the_graphics_page_to_registered_defaults() {
             "return OptionsFrameContainerBodyGraphicsRowFarclipControlValue:GetText()"
         )
         .unwrap(),
-        "777"
+        "350"
     );
     assert_eq!(
         s.eval::<String>(
@@ -1910,6 +2097,25 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
             untipped.push(row.to_string());
             continue;
         }
+        // The deliberate exceptions (1639 Render Scale, 1650 Display Mode). Neither has a 1.12
+        // counterpart whose `OPTION_TOOLTIP_*` could be resolved — Render Scale has no era row at
+        // all, and Display Mode's era row was a CHECKBOX whose string says "Check to…" — and both
+        // are rows a player needs a description for. Each carries one under a `BENILLA_` prefix so
+        // the reference's namespace stays the reference's, which is exactly what this guard is
+        // here to protect. Everything the guard was built to catch — an invented or typo'd
+        // `OPTION_TOOLTIP_` key that silently resolves to nothing — is untouched: the pairing below
+        // is exact, so a `BENILLA_` key on the wrong row still fails.
+        const BENILLA_OWNED: &[(&str, &str)] = &[
+            ("BENILLA_TOOLTIP_RENDER_SCALE", "GraphicsRowRenderScale"),
+            ("BENILLA_TOOLTIP_DISPLAY_MODE", "GraphicsRowDisplayMode"),
+        ];
+        if let Some((_, want_row)) = BENILLA_OWNED.iter().find(|(k, _)| *k == key) {
+            assert_eq!(row, *want_row, "{row}: not this row's string");
+            let text: String = s.eval(&format!("return {key}")).unwrap();
+            assert!(!text.is_empty(), "{row}: {key} resolves to nothing");
+            checked += 1;
+            continue;
+        }
         assert!(
             key.starts_with("OPTION_TOOLTIP_"),
             "{row}: {key} is not a 1.12 option-tooltip key"
@@ -1925,9 +2131,10 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
         );
         checked += 1;
     }
-    // 25 CVar rows (the Chat page's two bubble switches are 1139's and its Detailed Loot
+    // 27 CVar rows (the Chat page's two bubble switches are 1139's and its Detailed Loot
     // Information + Guild Member Alert are 1589's; Status Bar Text, Mouse Sensitivity
-    // and Max Camera Distance 1140's; Graphics' Vertical Sync is 1394's; Camera Following Style
+    // and Max Camera Distance 1140's; Graphics' Vertical Sync is 1394's, its Display Mode
+    // 1627's (a dropdown since 1650) and its Multisampling 1632's; Camera Following Style
     // 1493's; Terrain Distance 1513's) + the Combat page's 14 saved-variable rows (1134) + the Interface page's 6 (3 from
     // 1136, Buff Durations 1139, the target-of-target pair 1576), the Action Bars page's 2 (the
     // lock 1136, Always Show
@@ -1937,7 +2144,9 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     // bar as the other two. Camera Following Style is counted on the key it wears at rest (Smart's
     // OPTION_TOOLTIP_CAMERA1) and Show When on its own (Always's OPTION_TOOLTIP_TARGETOFTARGET5);
     // their other entries ride the same census as the selection moves.
-    assert_eq!(checked, 53, "every tipped row carries a live 1.12 key");
+    // 53 of the 55 are 1.12's own; the other two are Render Scale (1639) and Display Mode
+    // (1650), whose descriptions are benilla's and whose carve-out is above.
+    assert_eq!(checked, 55, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
@@ -2033,15 +2242,18 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
             s.errors()
         );
     }
-    // 25 of the 26 CVar rows (the Chat page's two bubble switches are 1139's and its Detailed
+    // 27 of the 28 CVar rows (the Chat page's two bubble switches are 1139's and its Detailed
     // Loot Information + Guild Member Alert 1589's; Status Bar Text, Mouse Sensitivity and
-    // Max Camera Distance 1140's; Vertical Sync 1394's; Camera Following Style 1493's; Terrain
-    // Distance 1513's), plus the Combat page's 14 saved-variable rows (1134), the Interface
+    // Max Camera Distance 1140's; Vertical Sync 1394's, Display Mode 1627's and Multisampling
+    // 1632's; Camera Following
+    // Style 1493's; Terrain Distance 1513's), plus the Combat page's 14 saved-variable rows (1134), the Interface
     // page's 6 (1136, + Buff Durations 1139, + the target-of-target pair 1576), Action Bars' 2
     // (the lock 1136, Always Show
     // ActionBars 1500), the Chat page's 1 (Remove Chat Hover Delay, 1589) and 6 API rows (Show
     // Cloak / Show Helm, 1472; the four multibar switches, 1500).
-    assert_eq!(raised, 53, "every row but Auto Loot has a 1.12 description");
+    // …plus the Graphics page's Render Scale (1639) and Display Mode (1650), the two rows whose
+    // descriptions are benilla's own rather than 1.12 GlobalStrings — see the guard above.
+    assert_eq!(raised, 55, "every row but Auto Loot raises a description");
 }
 
 /// The **Combat page** (decision 1134) — the first rows in this window whose store is a

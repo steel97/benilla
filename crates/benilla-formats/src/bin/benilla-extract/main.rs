@@ -16,7 +16,9 @@ use benilla_formats::open_chain;
 use clap::{Parser, Subcommand};
 
 mod chaincensus;
+mod charatlas;
 mod charprocs;
+mod glueextent;
 mod m2dump;
 mod scan;
 mod shakecensus;
@@ -54,6 +56,55 @@ enum Command {
         internal_path: String,
         /// Output `.png` file.
         output: PathBuf,
+    },
+    /// Composite ONE character's body atlas off the chain and report what painted what: the
+    /// equipment blits in blit order (with the file each region name resolved to, or `MISSING`),
+    /// the per-tile rows repainted vs the same character naked, and the geoset set the same
+    /// equipment selects. The "this garment stops early / that slot repainted this one" instrument
+    /// — a dressed body is ten fixed atlas tiles, and every defect in that class is one tile
+    /// receiving the wrong contribution.
+    Charatlas {
+        /// `ChrRaces` id (1 human · 2 orc · 3 dwarf · 4 night elf · 5 undead · 6 tauren · 7 gnome ·
+        /// 8 troll).
+        #[arg(long)]
+        race: u8,
+        /// 0 male · 1 female.
+        #[arg(long)]
+        sex: u8,
+        /// `skinColor` — the CharSections variation the base skin + head sections key on.
+        #[arg(long, default_value_t = 0)]
+        skin: u8,
+        /// `faceType`.
+        #[arg(long, default_value_t = 0)]
+        face: u8,
+        /// `facialHairStyle`.
+        #[arg(long, default_value_t = 0)]
+        facial_hair: u8,
+        /// `hairStyle`.
+        #[arg(long, default_value_t = 0)]
+        hair_style: u8,
+        /// `hairColor`.
+        #[arg(long, default_value_t = 0)]
+        hair_color: u8,
+        /// The eight worn `ItemDisplayInfo` ids, comma-separated, in bodyslot order:
+        /// shirt,chest,belt,pants,boots,wrist,gloves,tabard. `0` leaves a slot empty; a short list
+        /// leaves the rest empty.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        slots: Vec<u32>,
+        /// Write the composited atlas here as a PNG (256²).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Measure every shipped glue scene's **art extent** (decision 1619): how far the opaque art
+    /// of each `UI_*` diorama covers around its authored camera 0, and the window aspects past
+    /// which the glue framing law stops widening and zooms instead. The instrument behind B330
+    /// (the login backdrop's edges showing at 16:9) — the same measurement the client makes at
+    /// scene spawn, printed for all seven scenes with the looser readings beside it.
+    Glueextent {
+        /// Also print every batch's footprint in the frame (front/back/clipped triangle counts,
+        /// projected extents) — which card sets the measured edge.
+        #[arg(long)]
+        batches: bool,
     },
     /// Dump a DBC table to CSV using our schema for it (headers included).
     Dbc {
@@ -659,6 +710,36 @@ fn main() -> Result<()> {
             }
             eprintln!("{} files", files.len());
         }
+        Command::Charatlas {
+            race,
+            sex,
+            skin,
+            face,
+            facial_hair,
+            hair_style,
+            hair_color,
+            slots,
+            out,
+        } => {
+            let mut worn = [0u32; 8];
+            for (dst, src) in worn.iter_mut().zip(&slots) {
+                *dst = *src;
+            }
+            charatlas::charatlas(
+                &mut chain,
+                &charatlas::Look {
+                    race,
+                    sex,
+                    skin,
+                    face,
+                    facial_hair,
+                    hair_style,
+                    hair_color,
+                    slots: worn,
+                },
+                out.as_deref(),
+            )?;
+        }
         Command::Extract {
             internal_path,
             output,
@@ -709,6 +790,7 @@ fn main() -> Result<()> {
                 output.display()
             );
         }
+        Command::Glueextent { batches } => glueextent::glueextent(&mut chain, batches)?,
         Command::M2coll { internal_path } => m2dump::m2coll(&mut chain, &internal_path)?,
         Command::M2seq { internal_path } => m2dump::m2seq(&mut chain, &internal_path)?,
         Command::M2events { internal_path } => m2dump::m2events(&mut chain, &internal_path)?,

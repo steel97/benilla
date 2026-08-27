@@ -494,3 +494,222 @@ fn measure_sweep_steady_state_cost() {
         residual,
     );
 }
+
+/// **The hover-shape law** (decision 1388, ledger B06): a tooltip line that changes ROLE between
+/// WRAPPED and PLAIN must cost **zero** derivations of the layout graph.
+///
+/// `a_tooltip_content_change_costs_exactly_one_layout_solve` above asserts the same zero and could
+/// not see this, because the tooltip it drives always has the same SHAPE — the same lines, the
+/// same wrap flags, only the widths move. A real hover sweep changes shape on every step: one
+/// item's line 2 is a wrapping "Use:" description, the next one's is a plain "Main Hand", and a
+/// spell's line 2 is a plain mana cost where the next spell's is a wrapping tooltip body.
+///
+/// `append_line` re-pins the line's wrap column from that flag on every append, and the write is
+/// gated on a real change — so it fires exactly on the shape flip and nowhere else. It reached the
+/// conservative `Model::touch_layout` (it predates 1388 and was never migrated, being an internal
+/// write rather than a `SetWidth` binding), and the whole graph was therefore re-derived on every
+/// hover from one item to a differently-shaped one: every live frame's scale re-synced, every seed
+/// rect re-filtered, every anchored region re-hashed and its edges rebuilt. Live at 12,465
+/// anchored regions the preamble read `incr=0` on every content-change frame.
+///
+/// The positive control is not optional: "zero derivations" is what a permanently broken counter
+/// reports too, so the flip is driven for a while BEFORE the window opens (a birth is legitimately
+/// structural) and the counter is proved able to move.
+#[test]
+fn a_tooltip_line_flipping_wrapped_to_plain_costs_no_graph_derivation() {
+    let mut s = settled_default_ui();
+    s.run(
+        r#"
+        FlipOwner = CreateFrame("Button", "FlipOwner"); FlipOwner:SetPoint("CENTER", 0, 0)
+        FlipOwner:SetSize(10, 10)
+        flip_n = 0
+        -- The two shapes a hover alternates between. The trailing `1` on the wrap arm is
+        -- `AddLine`'s positional wrapText flag (the byte-pinned 0x531630 signature) — it is what
+        -- pins the line's wrap column, and what un-pins it again on the plain arm.
+        function flip_change()
+            flip_n = flip_n + 1
+            GameTooltip:SetOwner(FlipOwner, "ANCHOR_RIGHT")
+            GameTooltip:AddLine("Item head", 1, 1, 1)
+            if math.mod(flip_n, 2) == 0 then
+                GameTooltip:AddLine("Use: restores health over 21 sec.", 0, 1, 0, 1)
+            else
+                GameTooltip:AddLine("Main Hand", 1, 1, 1)
+            end
+            GameTooltip:Show()
+        end
+        "#,
+    )
+    .unwrap();
+
+    // The positive control, taken across the owner's birth and the line pool's growth — both move
+    // the roster, which is the one thing a per-node ledger cannot describe, so both MUST derive.
+    let born_at = s.layout_derivations();
+    for _ in 0..8 {
+        s.run("flip_change()").unwrap();
+        app_frame(&mut s);
+    }
+    assert!(
+        s.layout_derivations() > born_at,
+        "creating the owner and growing the tooltip's line pool must derive the graph — reading \
+         zero here means `layout_derivations` never moves and the assertion below is vacuous."
+    );
+
+    let derives_before = s.layout_derivations();
+    for _ in 0..10 {
+        s.run("flip_change()").unwrap();
+        app_frame(&mut s);
+    }
+    let derives = s.layout_derivations() - derives_before;
+    assert_eq!(
+        derives, 0,
+        "10 hovers between a wrapped line and a plain one derived the layout graph {derives} \
+         times. The wrap-pin write in `tooltip::append_line` moves ONE region's explicit size and \
+         must name it (`touch_layout_region`); the conservative `touch_layout` re-derives the \
+         whole roster on every hover (decision 1388)."
+    );
+}
+
+/// **The hover-sweep law** (decision 1625, ledger B06): sweeping the cursor across a bag grid or a
+/// spellbook page — a NEW tooltip OWNER on every step — must cost **zero** derivations of the
+/// layout graph.
+///
+/// This is the shape the director's report actually has, and it is the one the guard above still
+/// could not see: that one keeps a single owner and only changes the tooltip's content. A real
+/// sweep does both, and the owner half is the more expensive of the two, because
+/// `GameTooltip:SetOwner` RETARGETS the plate's anchor at the button under the cursor. 1388
+/// classified a retarget as structural — an edge disappears and another appears, which no per-node
+/// hash can describe — and answered it by throwing the cached graph away. That answer cost a full
+/// whole-roster derivation on every slot crossed. 1625 keeps the graph and re-points the one
+/// node's edges instead.
+///
+/// The correctness half of that patch is guarded where it can be *seen*, on rects, by
+/// `benilla-ui`'s `a_retargeted_anchor_follows_its_new_target` (and by `WOW_LAYOUT_VERIFY` behind
+/// every one of that crate's tests). This one guards the COST, on the shipped UI, where the roster
+/// is big enough for the derivation to matter.
+#[test]
+fn a_hover_sweep_across_owners_costs_no_graph_derivation() {
+    let mut s = settled_default_ui();
+    s.run(
+        r#"
+        for i = 1, 12 do
+            local b = CreateFrame("Button", "SweepOwner" .. i)
+            b:SetPoint("CENTER", 0, 0); b:SetSize(10, 10)
+        end
+        sweep_n = 0
+        -- A different owner AND a different line shape every step: the two halves of a real sweep
+        -- across a bag grid, where each slot is its own button and each item its own plate.
+        function sweep_change()
+            sweep_n = sweep_n + 1
+            local slot = math.mod(sweep_n, 12) + 1
+            GameTooltip:SetOwner(getglobal("SweepOwner" .. slot), "ANCHOR_RIGHT")
+            GameTooltip:AddLine("Item " .. slot, 1, 1, 1)
+            if math.mod(sweep_n, 2) == 0 then
+                GameTooltip:AddLine("Use: restores health over 21 sec.", 0, 1, 0, 1)
+            else
+                GameTooltip:AddLine("Main Hand", 1, 1, 1)
+            end
+            GameTooltip:Show()
+        end
+        "#,
+    )
+    .unwrap();
+
+    // The positive control: twelve owner births and the tooltip's line pool growing are all
+    // roster moves, so the settling pass MUST derive. Zero here would make the assertion vacuous.
+    let born_at = s.layout_derivations();
+    for _ in 0..40 {
+        s.run("sweep_change()").unwrap();
+        app_frame(&mut s);
+    }
+    assert!(
+        s.layout_derivations() > born_at,
+        "creating twelve owners and growing the line pool must derive the graph — reading zero \
+         here means `layout_derivations` never moves and the assertion below proves nothing."
+    );
+
+    // Two full laps of the twelve owners, so every step is a re-hover of a button the graph
+    // already knows: nothing structural is left to discover.
+    let derives_before = s.layout_derivations();
+    for _ in 0..24 {
+        s.run("sweep_change()").unwrap();
+        app_frame(&mut s);
+    }
+    let derives = s.layout_derivations() - derives_before;
+    assert_eq!(
+        derives, 0,
+        "24 hovers across 12 owners derived the layout graph {derives} times — one per slot \
+         crossed. `SetOwner` re-points ONE node's anchor and must patch that node's edges \
+         (`Model::touch_layout_retarget_frame`); the conservative touch re-derives the whole \
+         roster on every slot the cursor passes over (decisions 1388, 1625)."
+    );
+}
+
+/// **The action-bar hover law** (decision 1630, ledger B06): sweeping the cursor across ACTION BAR
+/// buttons must cost **zero** derivations of the layout graph.
+///
+/// The two guards above drive `SetOwner(button, "ANCHOR_RIGHT")` — the bag slot's idiom. The bars
+/// do not use it. With `UberTooltips` at its shipped default of `"1"`, every action button routes
+/// through `GameTooltip_SetDefaultAnchor` (`ActionBar.xml:510`, and the stance/pet/bonus bars the
+/// same), which is `SetOwner(owner, "ANCHOR_NONE")` followed by an explicit `SetPoint` — a
+/// completely different arm of the same verb, and the one that DROPS the tooltip's anchors.
+///
+/// That drop took the conservative touch, so it re-derived the whole graph on every button the
+/// cursor crossed — and on nothing else, which is why it survived two rounds of fixing and a
+/// live probe: the director's own recording is what named it, every derive frame owned by a
+/// `MultiBarBottomLeftButton*` or `BonusActionButton*`. The lesson worth keeping is in the guards
+/// as much as the fix: a hover guard that only drives one of two anchor idioms is testing the
+/// idiom, not the gesture.
+#[test]
+fn an_action_bar_hover_sweep_costs_no_graph_derivation() {
+    let mut s = settled_default_ui();
+    s.run(
+        r#"
+        for i = 1, 12 do
+            local b = CreateFrame("Button", "BarOwner" .. i)
+            b:SetPoint("CENTER", 0, 0); b:SetSize(36, 36)
+        end
+        bar_n = 0
+        -- `GameTooltip_SetDefaultAnchor`'s body, which is what every action button actually runs:
+        -- own the tooltip WITHOUT an anchor, then point it by hand.
+        function bar_hover()
+            bar_n = bar_n + 1
+            local owner = getglobal("BarOwner" .. (math.mod(bar_n, 12) + 1))
+            GameTooltip:SetOwner(owner, "ANCHOR_NONE")
+            GameTooltip:ClearAllPoints()
+            GameTooltip:SetPoint("BOTTOMRIGHT", "UIParent", "BOTTOMRIGHT", -70, 80)
+            GameTooltip:AddLine("Spell " .. bar_n, 1, 1, 1)
+            if math.mod(bar_n, 2) == 0 then
+                GameTooltip:AddLine("Blasts the enemy for 20 damage.", 1, 1, 1, 1)
+            else
+                GameTooltip:AddLine("Instant", 1, 1, 1)
+            end
+            GameTooltip:Show()
+        end
+        "#,
+    )
+    .unwrap();
+
+    // Positive control across the births and the line pool's growth — both structural.
+    let born_at = s.layout_derivations();
+    for _ in 0..40 {
+        s.run("bar_hover()").unwrap();
+        app_frame(&mut s);
+    }
+    assert!(
+        s.layout_derivations() > born_at,
+        "creating twelve buttons must derive the graph — zero here makes the assertion vacuous."
+    );
+
+    let derives_before = s.layout_derivations();
+    for _ in 0..24 {
+        s.run("bar_hover()").unwrap();
+        app_frame(&mut s);
+    }
+    let derives = s.layout_derivations() - derives_before;
+    assert_eq!(
+        derives, 0,
+        "24 action-bar hovers derived the layout graph {derives} times. `SetOwner`'s ANCHOR_NONE \
+         arm drops the tooltip's anchors, which is a retarget to the EMPTY target set and names \
+         its node like any other (decision 1630, extending 1625)."
+    );
+}

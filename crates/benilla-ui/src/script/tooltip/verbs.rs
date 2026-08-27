@@ -71,22 +71,41 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                             let same = input.anchors.len() == 1
                                 && crate::script::object::anchor_bits_eq(&input.anchors[0], &new);
                             if !same {
+                                // The plate re-points at the button under the cursor, which moves
+                                // an EDGE — structural under 1388, and therefore a whole-graph
+                                // derivation on every bag slot and every spellbook button a hover
+                                // sweep crossed. It names its node now (decision 1625): the old
+                                // and new target lists are both right here, so the cached graph's
+                                // edges are re-pointed instead of thrown away.
+                                let old_targets: Vec<u32> =
+                                    input.anchors.iter().map(|a| a.relative_to).collect();
                                 input.anchors = vec![new];
-                                model.touch_layout();
+                                model.touch_layout_retarget_frame(h, &old_targets, &[owner_id]);
                             }
                         }
                         None if anchor.eq_ignore_ascii_case("ANCHOR_NONE") => {
                             // The caller points it (ClearAllPoints+SetPoint) — drop ours now so a
                             // stale owner anchor never wins the frame the caller forgets to.
+                            //
+                            // Dropping every anchor is a retarget to the EMPTY target set, and it
+                            // names its node like any other (decision 1625). It matters here more
+                            // than anywhere: this arm is `GameTooltip_SetDefaultAnchor`'s, which is
+                            // the path EVERY action-bar hover takes (`ActionBar.xml:510`, the
+                            // `UberTooltips` default; the stance, pet and bonus bars the same) —
+                            // while a bag slot anchors straight to its button and never comes
+                            // through here. So a conservative touch on this line was a whole-graph
+                            // derivation on every action button the cursor crossed, and on nothing
+                            // else, which is exactly the shape the director's recorder reported (decision 1630):
+                            // every derive frame owned by a MultiBar/BonusAction button.
                             let dropped = match model.layout_inputs.get_mut(&h) {
                                 Some(input) if !input.anchors.is_empty() => {
-                                    input.anchors.clear();
-                                    true
+                                    Some(input.anchors.drain(..).map(|a| a.relative_to).collect())
                                 }
-                                _ => false,
+                                _ => None,
                             };
-                            if dropped {
-                                model.touch_layout();
+                            if let Some(old_targets) = dropped {
+                                let old_targets: Vec<u32> = old_targets;
+                                model.touch_layout_retarget_frame(h, &old_targets, &[]);
                             }
                         }
                         None => {} // ANCHOR_PRESERVE

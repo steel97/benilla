@@ -25,7 +25,7 @@
 //! panel, and this one is `#[cfg(feature = "dev")]`, so anything a player must reach cannot live
 //! here at all. The measurement knob the checkbox actually existed for is `$WOW_NOVSYNC=1`.
 
-use benilla_ui::script::{JustifyH, JustifyV, Outline};
+use benilla_ui::script::{JustifyH, JustifyV, Outline, UiScript};
 use bevy::prelude::*;
 use bevy::time::Real;
 use bevy::window::{PrimaryWindow, Window};
@@ -48,8 +48,10 @@ const Z_PILL: u64 = u64::MAX;
 /// The quad pill's font height (logical px) and box padding.
 const PILL_QUAD_PX: f32 = 12.0;
 const PILL_PAD: Vec2 = Vec2::new(9.0, 4.0);
-/// Top-center offset.
+/// Top-center offset — where the pill sits when nothing else claims that band.
 const PILL_TOP: f32 = 8.0;
+/// The gap the pill leaves under whatever game UI it is stepping below.
+const PILL_YIELD_GAP: f32 = 4.0;
 
 /// How often the drawn snapshot advances. Fast enough that the numbers read as live and a latched
 /// badge appears within a perceptual beat; slow enough that between refreshes the pill's cached
@@ -77,6 +79,10 @@ pub(crate) struct PerfHud {
     /// The clock `snap` was taken at. Spike ages are computed against this, not the live clock,
     /// so they hold still with the rest of the view — and it doubles as the refresh timer.
     snap_at: f32,
+    /// How far down the screen the top-centre band is already spoken for (window logical px from
+    /// the top edge, `0.0` when it is clear) — see [`top_centre_claimed`]. The pill seats itself
+    /// below this.
+    top_claimed: f32,
 }
 
 impl Default for PerfHud {
@@ -86,17 +92,27 @@ impl Default for PerfHud {
             snap: FrameStats::default(),
             // −∞, so the very first frame refreshes rather than drawing an empty snapshot.
             snap_at: f32::NEG_INFINITY,
+            top_claimed: 0.0,
         }
     }
 }
 
 impl PerfHud {
-    /// Advance the snapshot if the current one is older than [`HUD_REFRESH_SECS`].
-    fn maybe_refresh(&mut self, stats: &FrameStats, now: f32) {
-        if now - self.snap_at >= HUD_REFRESH_SECS {
-            self.snap = stats.clone();
-            self.snap_at = now;
+    /// Advance the snapshot if the current one is older than [`HUD_REFRESH_SECS`]; `true` when it
+    /// did (the caller's gate for the rest of the refresh — see [`refresh_hud_snapshot`]).
+    fn maybe_refresh(&mut self, stats: &FrameStats, now: f32) -> bool {
+        if now - self.snap_at < HUD_REFRESH_SECS {
+            return false;
         }
+        self.snap = stats.clone();
+        self.snap_at = now;
+        true
+    }
+
+    /// Where the pill's top edge goes: its usual seat, pushed below anything already occupying the
+    /// top-centre band.
+    fn pill_top(&self) -> f32 {
+        PILL_TOP.max(self.top_claimed + PILL_YIELD_GAP)
     }
 }
 
@@ -110,16 +126,73 @@ pub(super) fn toggle_hud(keys: Res<ButtonInput<KeyCode>>, mut hud: ResMut<PerfHu
 }
 
 /// Advance the HUD's 4 Hz snapshot — its own system (1453), kept separate so the sampling cadence
-/// never depends on whether anything drew this frame.
+/// never depends on whether anything drew this frame. It also re-asks who else is using the pill's
+/// band ([`top_centre_claimed`]), on the same cadence and for the same reason: once per view, not
+/// once per frame.
 pub(super) fn refresh_hud_snapshot(
     mut hud: ResMut<PerfHud>,
     stats: Res<FrameStats>,
     time: Res<Time<Real>>,
+    script: Option<NonSend<UiScript>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
 ) {
-    if hud.visible {
-        let now = time.elapsed_secs();
-        hud.maybe_refresh(&stats, now);
+    if !hud.visible {
+        return;
     }
+    let now = time.elapsed_secs();
+    if !hud.maybe_refresh(&stats, now) {
+        return;
+    }
+    hud.top_claimed = match (script, windows.single()) {
+        (Some(script), Ok(win)) => top_centre_claimed(&script, win.height()),
+        _ => 0.0,
+    };
+}
+
+/// How far down the top-centre band the **game UI** already reaches, in window logical px from the
+/// top edge (`0.0` = clear).
+///
+/// The pill has sat at the top centre since 1453 because that band was empty. It is not empty
+/// everywhere: the always-up world-state readout (`WorldStateAlwaysUpFrame` — the tower counters
+/// and battleground scores, decision 1590) is anchored to the top centre too, and in Eastern
+/// Plaguelands or a battleground the two drew straight through each other. **The dev instrument is
+/// the one that yields** — the readout is the game, the pill is scaffolding — and it yields by
+/// stepping below it rather than by moving house, because a 1.12 UI has no corner a standing
+/// overlay can claim outright (player/target frames own the top left, buffs and the minimap the top
+/// right, the action bar the bottom, the chat dock the bottom left).
+///
+/// **Asked of the frame, not recomputed from its numbers.** Its row pitch and anchor live in
+/// `assets/ui/WorldStateFrame.xml`; mirroring them here would be two copies to keep in step, so
+/// this reads the resolved edge the layout actually produced (`GetBottom`, y-up). One tiny chunk
+/// at 4 Hz, only while the HUD is drawing — the same shape as [`crate::hover_log`]'s tooltip
+/// probe.
+///
+/// **Two coordinate spaces meet here, and mixing them is the whole trap.** The layout answers in
+/// WoW UI units — a screen that is always `768/uiScale` units tall whatever the window is
+/// (decision 0582's seam) — while the pill lays itself out in window px. Subtracting one from the
+/// other is right only in the single case where the seam scale happens to be 1 (a 768 px-tall
+/// window at uiScale 1) and wrong by `windowH − 768` everywhere else — which on the director's
+/// window seated the pill back on top of the readout's third row while every test at 768 passed.
+/// So the chunk answers a **fraction of the screen**, which belongs to neither space, and the
+/// caller multiplies by the window height it actually draws in.
+///
+/// **Its own cost, stated (1370's rule for this overlay):** an edge read settles the layout, so on
+/// a frame where something has written anchors since the last resolve this pays one graph solve
+/// (~47 µs on a 200-frame tree — `layout_methods::settle`'s own measurement), four times a second.
+/// Every other frame it is a chunk load and a table lookup.
+pub(crate) fn top_centre_claimed(script: &UiScript, win_h: f32) -> f32 {
+    const CHUNK: &str = r#"
+        local f = WorldStateAlwaysUpFrame
+        if not (f and f:IsVisible()) then return -1 end
+        local bottom, screen = f:GetBottom(), GetScreenHeight()
+        if not bottom or not screen or screen <= 0 then return -1 end
+        return (screen - bottom) / screen
+    "#;
+    let frac: f32 = script.eval::<f64>(CHUNK).unwrap_or(-1.0) as f32;
+    if !(0.0..=1.0).contains(&frac) {
+        return 0.0;
+    }
+    frac * win_h
 }
 
 /// The pill as ~20 quads on the player-UI pass (decision 1453). The append lane is rebuilt every
@@ -140,7 +213,9 @@ pub(super) fn pill_quads(
         return; // headless: nothing draws, nothing to price
     };
     let win_w = win.width();
-    let stale = !matches!(&*cache, Some(c) if c.snap_at == hud.snap_at && c.win_w == win_w);
+    let top = hud.pill_top();
+    let stale =
+        !matches!(&*cache, Some(c) if c.snap_at == hud.snap_at && c.win_w == win_w && c.top == top);
     if stale {
         let cpu = hud.snap.cpu.mean();
         let fps = hud.snap.fps();
@@ -180,8 +255,8 @@ pub(super) fn pill_quads(
             bounds.max.x + PILL_PAD.x,
             bounds.max.y + PILL_PAD.y,
         );
-        // Measured about y=0; seat the whole strip at PILL_TOP.
-        let dy = PILL_TOP - strip.min.y;
+        // Measured about y=0; seat the whole strip at the pill's top edge.
+        let dy = top - strip.min.y;
         let shift = |r: Rect| Rect::new(r.min.x, r.min.y + dy, r.max.x, r.max.y + dy);
         let strip = shift(strip);
         let mut out = vec![UiQuad {
@@ -197,6 +272,7 @@ pub(super) fn pill_quads(
         *cache = Some(PillCache {
             snap_at: hud.snap_at,
             win_w,
+            top,
             quads: out,
         });
     }
@@ -204,16 +280,94 @@ pub(super) fn pill_quads(
     quads.overlays.extend(c.quads.iter().cloned());
 }
 
-/// [`pill_quads`]' cache: the laid-out pill, valid for one snapshot tick at one window width.
+/// [`pill_quads`]' cache: the laid-out pill, valid for one snapshot tick at one window width and
+/// one seat (the seat moves when the game UI takes the band — [`top_centre_claimed`]).
 pub(super) struct PillCache {
     snap_at: f32,
     win_w: f32,
+    top: f32,
     quads: Vec<UiQuad>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use benilla_ui::script::ScriptValue;
+
+    use crate::ui_script::world_state_tests::{harness, push, row};
+
+    /// The readout and the dev cost pill both want the top centre, and before this they drew straight
+    /// through each other (the pill is anchored 8 px down; the readout's first row starts at 15). The
+    /// pill asks the frame itself how far down the band is spoken for ([`top_centre_claimed`]) and
+    /// seats itself below that — so this pins the probe against the shipped XML: nothing claimed while
+    /// the readout is empty, and the readout's real resolved bottom once it is up.
+    ///
+    /// **Why it lives here and not beside the frame it drives.** It was written in
+    /// `ui_script/world_state_tests.rs`, next to the readout — but `perf` is compiled out of a player
+    /// build, so the `player-tests` gate (`--no-default-features --lib`, decision 1175) could not
+    /// compile that file, and gating the one test with `#[cfg(feature = "dev")]` trips `run_mode`'s
+    /// dev-plane enforcer (1179: seam knowledge has exactly three addresses, and a gameplay module is
+    /// not one of them). Both laws point the same way — a test of a dev instrument belongs in a dev
+    /// root. It borrows the readout's own `#[cfg(test)]` helpers rather than copying them, so the XML
+    /// it drives stays the shipped one.
+    #[test]
+    fn the_readout_tells_the_dev_pill_how_much_of_the_top_it_uses() {
+        // NOT 768. The layout answers in WoW UI units — a screen that is always 768 units tall
+        // whatever the window is (decision 0582) — and the pill draws in window px, so a probe that
+        // subtracts one from the other is right only when the two happen to coincide. Feeding a
+        // window height that is NOT the virtual one is the whole point of this test: it is what the
+        // director's client does, and the first version of this probe put the pill back on top of the
+        // readout's third row there while passing every test at 768.
+        const SCREEN_H: f32 = 900.0;
+        let mut s = harness();
+        s.fire_event("PLAYER_ENTERING_WORLD", vec![ScriptValue::Str("".into())]);
+        s.resolve();
+        assert_eq!(
+            top_centre_claimed(&s, SCREEN_H),
+            0.0,
+            "hidden readout claims nothing — the pill keeps its usual seat"
+        );
+
+        push(
+            &mut s,
+            vec![
+                row(
+                    "Interface\\WorldStateFrame\\AllianceTower",
+                    "Towers Controlled: 3",
+                    "Alliance Towers Controlled",
+                ),
+                row(
+                    "Interface\\WorldStateFrame\\HordeTower",
+                    "Towers Controlled: 1",
+                    "Horde Towers Controlled",
+                ),
+            ],
+        );
+        s.resolve();
+        let claimed = top_centre_claimed(&s, SCREEN_H);
+        assert!(
+            claimed > 8.0,
+            "two rows reach past the pill's own seat, so the pill must move: {claimed}"
+        );
+        // The frame's own geometry, read back the way the probe reads it: the container's top offset
+        // plus one row per pushed row. Asserted against the XML rather than restated as constants.
+        let expected: f32 = s
+            .eval::<f64>("return (20 + WORLD_STATE_ROW_HEIGHT * 2 + 15) / GetScreenHeight()")
+            .expect("the frame's own numbers") as f32
+            * SCREEN_H;
+        assert!(
+            (claimed - expected).abs() < 0.5,
+            "the claim is the readout's resolved bottom: {claimed} vs {expected}"
+        );
+
+        push(&mut s, Vec::new());
+        s.resolve();
+        assert_eq!(
+            top_centre_claimed(&s, SCREEN_H),
+            0.0,
+            "and it hands the band back when the scope empties"
+        );
+    }
 
     /// The view the HUD draws only advances on the refresh interval — between ticks it holds
     /// still, which is the entire cost argument (identical snapshots are what the quad cache can
@@ -225,7 +379,7 @@ mod tests {
         let t = live.feed_frames(&frames, 0.0, 1.0 / 60.0);
 
         let mut hud = PerfHud::default();
-        hud.maybe_refresh(&live, t);
+        assert!(hud.maybe_refresh(&live, t));
         assert_eq!(
             hud.snap.wall.len(),
             60,
@@ -234,18 +388,38 @@ mod tests {
         assert_eq!(hud.snap_at, t);
 
         let t2 = live.feed_frames(&[(40.0, 20.0)], t, 1.0 / 60.0);
-        hud.maybe_refresh(&live, t2);
+        assert!(
+            !hud.maybe_refresh(&live, t2),
+            "inside the interval, no refresh"
+        );
         assert_eq!(
             hud.snap.wall.len(),
             60,
             "one frame later — inside the interval — the view holds still"
         );
 
-        hud.maybe_refresh(&live, t + HUD_REFRESH_SECS);
+        assert!(hud.maybe_refresh(&live, t + HUD_REFRESH_SECS));
         assert_eq!(
             hud.snap.wall.len(),
             61,
             "past the interval the view catches up"
         );
+    }
+
+    /// The pill's seat: its usual place while the top-centre band is clear, and below the game UI
+    /// the moment something claims it — the always-up world-state readout is the one frame that
+    /// shares this band (decision 1590), and before this the two drew through each other.
+    #[test]
+    fn the_pill_steps_below_whatever_claims_the_top_centre() {
+        let mut hud = PerfHud::default();
+        assert_eq!(hud.pill_top(), PILL_TOP, "clear band — the usual seat");
+
+        // The readout is up and reaches 81 px down (its anchor plus three rows).
+        hud.top_claimed = 81.0;
+        assert_eq!(hud.pill_top(), 81.0 + PILL_YIELD_GAP);
+
+        // A claim shallower than the pill's own seat moves nothing.
+        hud.top_claimed = 1.0;
+        assert_eq!(hud.pill_top(), PILL_TOP);
     }
 }

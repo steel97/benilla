@@ -123,6 +123,7 @@ impl PluginGroup for WorldPlugins {
             // filed in the app). Its ordering rides the billboard place set, which is why the
             // lane registers itself rather than asking a caller to know that.
             .add(crate::ground_fx::plugin)
+            .add(crate::frame_pace::plugin)
             .add(crate::rig_palette::plugin)
             // The rig machinery beside the palette it fills: the pose evaluator, the pose
             // post-pass window, the world/palette composition, and the global-sequence channels.
@@ -241,6 +242,18 @@ impl Plugin for WorldFoundation {
             // The faithful view distance (`farclip`) — one source of truth for the wall + the
             // per-object cull (and, post-split, the stream radius). See `view.rs`.
             .init_resource::<crate::view::ViewDistance>()
+            // The world camera's multisampling level (`gxMultisample`, decision 1629) — read
+            // ONCE, at the camera's spawn, because the reference's own flag says latched.
+            .init_resource::<crate::view::MsaaSetting>()
+            .init_resource::<crate::view::MsaaFormats>()
+            // The process texture filter policy (`trilinear` / `anisotropic`) — read ONCE, at the
+            // CVar load, for the same reason: a sampler is baked into an uploaded texture and the
+            // reference's own UI says "enabled upon restart".
+            .init_resource::<benilla_assets::TexFilterSetting>()
+            // ...and the clamp that keeps it inside what this GPU will actually accept. Runs in
+            // plugin `finish()`, so it lands between the render adapter appearing and `Startup`
+            // reading the setting — see `view::MsaaSupportPlugin`.
+            .add_plugins(crate::view::MsaaSupportPlugin)
             // The viewer's body (wire (a)'s kinematics half) — defaulted by the engine so a
             // program with no avatar leaves it empty and every reader takes its no-body branch.
             .init_resource::<crate::view::Viewer>()

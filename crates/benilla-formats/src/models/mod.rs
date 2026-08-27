@@ -20,6 +20,7 @@ use crate::Chain;
 
 mod anim;
 mod anim_summary;
+mod art_extent;
 mod bounds;
 mod collision;
 mod key_anim;
@@ -31,6 +32,7 @@ mod types;
 mod wmo;
 pub use anim::*;
 pub use anim_summary::*;
+pub use art_extent::*;
 pub use bounds::*;
 pub use collision::*;
 pub(crate) use key_anim::{bake_track, SeqSlot};
@@ -108,6 +110,7 @@ fn remap_submesh(
             rgb_seq: None,    // …ditto (1408)
             wmo_batch: None,  // set by the WMO path from the MOGP batch-section counts
             env_map: false,   // set by the M2 path from texture_unit_lookup[texCoordSet] > 2
+            section: None,    // set by the M2 path from the batch's skin_section_index
         },
         globals,
     )

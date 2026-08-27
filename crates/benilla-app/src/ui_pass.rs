@@ -207,6 +207,25 @@ pub(crate) struct UiQuad {
     /// two filtered edges are complementary — which is B141's "odd black lines" (they recoloured
     /// with the backing quad, which is how they were caught). Splits the batch run.
     pub alpha_test: Option<f32>,
+    /// **The UV window this quad may sample**, already inset by half a texel — `None` = the
+    /// sampler's own `ClampToEdge` is the whole story (decision 1608).
+    ///
+    /// A `SetTexCoord` crop into an ATLAS is not a texture: `CLAMP_TO_EDGE` clamps at the
+    /// image's edge, not the cell's, so a magnified cell's outermost row of destination pixels
+    /// samples half a texel PAST its crop and linear-filters in whatever the neighbouring cell
+    /// authored there. `Interface\Minimap\POIIcons` is the case that forced this: cell 15 (the
+    /// generic zone-level landmark) is fully transparent, the cell directly above it is the
+    /// coffin whose bottom row is OPAQUE BLACK, and the world map drew a ~24%-black hairline
+    /// across the top edge of every zone POI — the director's "black horizontal lines".
+    ///
+    /// Set it and the fragment clamps into `[u_min, v_min, u_max, v_max]`, which is exactly what
+    /// a standalone clamped texture of that cell would sample. The producer decides *whether* a
+    /// crop is a cell (see the extract's `uv_clamp_window`): an axis whose UVs run past `[0,1]`
+    /// is the reference's TILING idiom and must never be clamped, which is why the window is
+    /// disabled **per axis** rather than per quad.
+    ///
+    /// Splits the batch run like `additive`/`circular` — it rides the material, not the vertex.
+    pub uv_clamp: Option<[f32; 4]>,
     /// CPU-clip stand-in for a real scissor rect (see the module doc). `None` = unclipped.
     pub clip: Option<Rect>,
     /// Rotate the quad's corners by this many radians **clockwise on screen** about the rect's
@@ -255,6 +274,7 @@ impl Default for UiQuad {
             premultiplied: false,
             gamma_texel: false,
             alpha_test: None,
+            uv_clamp: None,
             clip: None,
             rotation: 0.0,
             mask: None,
@@ -276,6 +296,17 @@ impl Default for UiQuad {
 ///   whole UI re-batched every frame (the 0365 live-city churn).
 #[derive(Resource, Default)]
 pub(crate) struct UiQuads {
+    /// The **world backdrop** ([`crate::world_backdrop`]): the frame the world camera rendered,
+    /// drawn before every other quad so the UI blends over it in the same gamma bytes it blends
+    /// over itself in. Not part of either lane and not sorted with them — it is not content
+    /// competing for a `z_key`, it is the ground. `None` whenever there is no world to paint (the
+    /// glue screens, the loading screen, a gated camera).
+    ///
+    /// It changes no batching decision beyond being first, and it flags [`Self::dirty`] only when
+    /// the QUAD changes — arrival, departure, a resize. Its image's contents change every frame and
+    /// deliberately do not flag anything: the batch holds the handle and the material samples
+    /// whatever the world camera just rendered into it.
+    pub backdrop: Option<UiQuad>,
     pub quads: Vec<UiQuad>,
     /// The append lane — see the struct doc. Compared by the rebuild, never flagged.
     pub overlays: Vec<UiQuad>,
@@ -388,6 +419,10 @@ pub(crate) struct UiQuadMaterial {
     #[texture(5)]
     #[sampler(6)]
     mask: Option<Handle<Image>>,
+    /// The half-texel-inset UV window the fragment may sample — `(u_min, v_min, u_max, v_max)`,
+    /// **per axis**, with `min > max` on an axis disabling that axis. See [`UiQuad::uv_clamp`].
+    #[uniform(11)]
+    uv_clamp: Vec4,
 }
 
 impl UiQuadMaterial {
@@ -413,6 +448,8 @@ impl UiQuadMaterial {
             gamma_texel: 0,
             mask_rect: Vec4::new(0.0, 0.0, -1.0, -1.0),
             mask: None,
+            // A tile samples its whole image; there is no cell to stay inside of.
+            uv_clamp: UV_CLAMP_OFF,
         }
     }
 }
@@ -513,6 +550,8 @@ pub(crate) struct PlayerUiPlugin;
 impl Plugin for PlayerUiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UiQuads>()
+            .init_resource::<UiMeshCost>()
+            .init_resource::<crate::ui_script::UiCostWanted>()
             .add_plugins((
                 Material2dPlugin::<UiQuadMaterial>::default(),
                 // Owned here, not in main.rs: the lane's decode is not optional (see its doc).
@@ -553,6 +592,23 @@ fn spawn_ui_camera(mut commands: Commands) {
     commands.spawn((
         PlayerUiCamera,
         Camera2d,
+        // **No MSAA — named, because silence here means 4×.** `bevy_render`'s `CameraPlugin`
+        // registers `Camera` → `Msaa` as a required component (`bevy_render/src/camera.rs:56`) and
+        // `Msaa::default()` is `Sample4`, so a camera that never mentions MSAA does not get "none",
+        // it gets four samples. Every other non-world camera in the tree says `Msaa::Off` out loud
+        // (the portrait booths, the minimap composite); this one simply never did, and paid for it.
+        //
+        // There is nothing here for multisampling to resolve. The world arrives already resolved —
+        // since decision 1603 the world camera renders offscreen and this pass draws the finished
+        // image as its first quad ([`crate::world_backdrop`]), so this camera's samples only
+        // re-average an image whose own MSAA is long since done. What it draws itself is
+        // axis-aligned rects, and the Bevy UI trees riding this camera (decision 0541) antialias
+        // their own edges analytically in-shader. What it *costs* is a full-window 4× sampled
+        // colour texture, a full-window 4× multisampled Core2d depth texture (Bevy sizes that one
+        // at `msaa.samples()` unconditionally — `core_2d::prepare_core_2d_depth_textures` — even
+        // though `AlphaMode2d::Blend` puts every quad in `Transparent2d`, which never writes it),
+        // 4× the fill on every quad, and a resolve. Decision 1628.
+        bevy::render::view::Msaa::Off,
         // The gamma composite lane's mandatory decode (decision 0254) — without it the UI presents
         // ~2.2× bright, since the quad pass leaves gamma values in the target.
         crate::ui_gamma::UiGammaLane,
@@ -566,13 +622,21 @@ fn spawn_ui_camera(mut commands: Commands) {
         Camera {
             order: UI_CAMERA_ORDER,
             output_mode: CameraOutputMode::Write {
-                // PREMULTIPLIED, not `ALPHA_BLENDING`: `ui_quad.wgsl` writes premultiplied colour
-                // (rgb·a), so a `SrcAlpha` factor here would weight it by alpha a SECOND time —
-                // translucent UI over the world came out `rgb·a²`, and a pure-additive quad (a = 0)
-                // over the world was multiplied clean away. Opaque panels (a = 1) hid it.
-                blend_state: Some(
-                    bevy::render::render_resource::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-                ),
+                // **No blend at all** — this camera now carries the world too
+                // ([`crate::world_backdrop`]), so its target is a whole opaque frame and the blit
+                // is a copy. That is the point: the blend that used to happen HERE, against the
+                // sRGB swapchain view, was the frame's one linear composite, and it was the only
+                // one that mixed UI with world. Moving the world into the UI's own byte buffer
+                // moves that blend into `ui_quad.wgsl`'s gamma target, where every other UI blend
+                // already lives.
+                //
+                // It also retires the hazard 0254 patched around here: `ui_quad.wgsl` writes
+                // PREMULTIPLIED colour, so the original `ALPHA_BLENDING`'s `SrcAlpha` factor
+                // weighted it by alpha twice (`rgb·a²`), and a pure-additive quad (a = 0) over the
+                // world was multiplied clean away. `PREMULTIPLIED_ALPHA_BLENDING` fixed the
+                // arithmetic but kept the blend — and kept it in the wrong space. With nothing to
+                // blend against, neither factor can be wrong.
+                blend_state: None,
                 clear_color: ClearColorConfig::None,
             },
             // An overlay must composite ONLY its own pixels. `ClearColorConfig::None` made this
@@ -656,6 +720,7 @@ struct Run {
     gamma_texel: bool,
     alpha_test: Option<f32>,
     mask: Option<UiQuadMask>,
+    uv_clamp: Option<[f32; 4]>,
     positions: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
     colors: Vec<[f32; 4]>,
@@ -675,6 +740,7 @@ impl Run {
             gamma_texel: q.gamma_texel,
             alpha_test: q.alpha_test,
             mask: q.mask.clone(),
+            uv_clamp: q.uv_clamp,
             positions: Vec::new(),
             uvs: Vec::new(),
             colors: Vec::new(),
@@ -837,7 +903,12 @@ type MatKey = (
     u32,
     Option<AssetId<Image>>,
     [u32; 4],
+    [u32; 4],
 );
+
+/// The [`UiQuadMaterial::uv_clamp`] that clamps NEITHER axis — `min > max` on an axis is the
+/// shader's per-axis "off", so `(1,1)` against `(0,0)` disables both.
+const UV_CLAMP_OFF: Vec4 = Vec4::new(1.0, 1.0, 0.0, 0.0);
 
 /// Retire every pooled batch entity (blank frame / no drawable content). Mesh handles and the
 /// material cache stay — assets referenced only by the pool cost nothing to keep and come back
@@ -858,6 +929,14 @@ fn retire_batches(pools: &mut BatchPools, commands: &mut Commands) {
 /// texture-identity runs, and write the runs into the pooled batches ([`BatchPools`]). See the
 /// module doc for the full approach (painter's order within/across runs) and its batching
 /// consequence.
+/// The two asset stores [`rebuild_ui_mesh`] writes, plus the image-removal stream its material
+/// cache has to hear — one bundle, because the rebuild is already at clippy's argument ceiling.
+type RebuildStores<'w, 's> = (
+    ResMut<'w, Assets<Mesh>>,
+    ResMut<'w, Assets<UiQuadMaterial>>,
+    MessageReader<'w, 's, AssetEvent<Image>>,
+);
+
 fn ui_mesh_frozen() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("WOW_FREEZE_UI_MESH").is_some())
@@ -871,36 +950,119 @@ static UI_DIFF: std::sync::LazyLock<bool> =
 static UI_PROBE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("WOW_UI_PROBE").as_deref() == Ok("1"));
 
+/// **What a `quads.dirty` frame costs on the RENDER side** — the meter this pass never had
+/// (decision 1625's residual, found the hard way).
+///
+/// `[ui-cost]` and the hover recorder split the UI *script* pass into tick/resolve/measure/extract/
+/// convert, and stop there. Everything below — sorting every quad in the interface, clipping and
+/// run-splitting them, and regenerating each run's vertex data — runs in a DIFFERENT system, on
+/// exactly the frames a tooltip content change dirties the lane, and no instrument had a clock on
+/// it. So the recorder built for the hover symptom could report "the UI phases are flat" on a frame
+/// that was doing a full mesh rebuild, which is worse than silence: it reads as an alibi.
+///
+/// Published as its own resource rather than a field of `UiFrameCost` because the two systems are
+/// unordered within `Update` — a field there would be wiped by whichever ran second.
+#[derive(Resource, Default, Clone)]
+pub(crate) struct UiMeshCost {
+    /// Did the rebuild actually run this frame, or did the early-out take it?
+    pub(crate) rebuilt: bool,
+    /// Total µs across the whole rebuild.
+    pub(crate) total: u128,
+    /// Collect + stable sort over every quad in both lanes.
+    pub(crate) sort: u128,
+    /// Clip + split into texture-identity runs.
+    pub(crate) split: u128,
+    /// Vertex-data regeneration, mesh writes, material lookups, batch entity churn.
+    pub(crate) write: u128,
+    /// How many quads were sorted, and how many runs came out — the counts behind the µs.
+    pub(crate) quads: usize,
+    pub(crate) runs: usize,
+    /// How many pooled batch meshes were REWRITTEN this rebuild, rather than left alone or moved
+    /// by a translation-only nudge (1361's skip gate). This is the number that reaches Bevy: each
+    /// rewrite re-extracts in `RenderExtractApp`, which is where a hover's real cost turned out to
+    /// live (decision 1634). `rewrites == runs` every frame means the gate is being defeated for
+    /// every batch at once, which is what a z coupled to the run count did.
+    pub(crate) rewrites: usize,
+}
+
 fn rebuild_ui_mesh(
     mut quads: ResMut<UiQuads>,
     mut commands: Commands,
-    // The two asset stores the rebuild writes, bundled (clippy's argument ceiling).
-    mut stores: (ResMut<Assets<Mesh>>, ResMut<Assets<UiQuadMaterial>>),
+    mut stores: RebuildStores,
     mut pools: Local<BatchPools>,
     white: Option<Res<UiWhiteTexture>>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    hidden: Res<crate::ui_hide::UiHidden>,
+    // The hide binding and the cost meter's pair, bundled (clippy's argument ceiling — the same
+    // reason `stores` is a tuple).
+    mut hide_and_meter: (
+        Res<crate::ui_hide::UiHidden>,
+        ResMut<UiMeshCost>,
+        Res<crate::ui_script::UiCostWanted>,
+    ),
 ) {
+    // **Forget the materials of images that no longer exist** — first, before any early return,
+    // because a missed read is a leak rather than a stale frame.
+    //
+    // A cached material holds a strong `Handle<Image>`, and its PREPARED form holds the whole GPU
+    // texture behind a bind group Bevy never re-prepares. So an entry keyed on a retired asset
+    // pins that texture for as long as the cache holds the key — and the world backdrop retires a
+    // full-window `Rgba16Float` image (46 MB at 3200×1800) on every resize and every render-scale
+    // change, which is once a frame while a window is being dragged (decision 1647).
+    //
+    // `Removed` only, not `Unused`: `Unused` fires when the last strong handle drops, and this
+    // cache IS a strong handle, so for a cached texture it can never fire. The producer removes
+    // the asset explicitly (`world_backdrop::track_render_size`) precisely so this can hear it.
+    let retired: Vec<AssetId<Image>> = stores
+        .2
+        .read()
+        .filter_map(|e| match e {
+            AssetEvent::Removed { id } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    if !retired.is_empty() {
+        pools.materials.retain(|key, _| !retired.contains(&key.0));
+    }
+    let (hidden, mesh_cost, cost_wanted) =
+        (&hide_and_meter.0, &mut hide_and_meter.1, &hide_and_meter.2);
+    // The meter is off unless something asked (the hover recorder, `WOW_UI_COST=1`) — an unmetered
+    // rebuild pays one bool test, not six clock reads.
+    let cost_on = cost_wanted.0 || crate::ui_script::extract::ui_cost_enabled();
+    **mesh_cost = UiMeshCost::default();
+    let t_rebuild = cost_on.then(std::time::Instant::now);
+    let mut t_mark = t_rebuild;
+    let mut lap = move || -> u128 {
+        if !cost_on {
+            return 0;
+        }
+        t_mark
+            .replace(std::time::Instant::now())
+            .map_or(0, |t| t.elapsed().as_micros())
+    };
     let (meshes, materials) = (&mut stores.0, &mut stores.1);
     let q = quads.as_mut();
     // TOGGLEUI hides at the *draw*, not at the producers: both lanes keep filling, so the UI comes
-    // back exactly as it was (see [`crate::ui_hide::UiHidden`]). Retire the batches on the toggle's
-    // down edge; on the way back up, force one full rebuild — while dark we swallow each frame's
-    // change flag and keep the append-lane mirror current, so neither lane can hand the rebuild a
-    // stale "nothing changed" the moment the UI returns. The edge is the resource's own change tick
-    // (`UiHidden` is written only by the binding and the world-exit reset), not a `Local` mirror.
-    if hidden.0 {
-        if hidden.is_changed() {
-            retire_batches(&mut pools, &mut commands);
-        }
-        q.dirty = false;
-        q.last_overlays.clone_from(&q.overlays);
-        return;
-    }
+    // back exactly as it was (see [`crate::ui_hide::UiHidden`]).
+    //
+    // **It hides the two LANES, never the backdrop.** The world reaches the screen as this pass's
+    // own first quad now ([`crate::world_backdrop`]), so the older "retire every batch while
+    // hidden" would black the screen — the exact inverse of a binding whose stated point is to
+    // leave "the world and nothing else". While dark we still swallow each frame's change flag and
+    // keep the append-lane mirror current, so neither lane can hand the rebuild a stale "nothing
+    // changed" the moment the UI returns. The edge is the resource's own change tick (`UiHidden` is
+    // written only by the binding and the world-exit reset), not a `Local` mirror.
     if hidden.is_changed() {
         q.dirty = true;
     }
-    if !q.dirty && q.overlays == q.last_overlays {
+    let lanes_hidden = hidden.0;
+    if lanes_hidden {
+        q.last_overlays.clone_from(&q.overlays);
+        // Nothing either lane produces can move a pixel while dark, so only the toggle edge and
+        // the backdrop's own arrival/departure (which sets `dirty`) reach the rebuild below.
+        if !q.dirty {
+            return;
+        }
+    } else if !q.dirty && q.overlays == q.last_overlays {
         return;
     }
     // `WOW_UI_DIFF=1` — WHO re-triggers the rebuild? Names the first differing overlay quad (or
@@ -947,8 +1109,11 @@ fn rebuild_ui_mesh(
         retire_batches(&mut pools, &mut commands);
         return;
     };
-    if q.quads.is_empty() && q.overlays.is_empty() {
+    let lanes_empty = lanes_hidden || (q.quads.is_empty() && q.overlays.is_empty());
+    if q.backdrop.is_none() && lanes_empty {
         retire_batches(&mut pools, &mut commands);
+        q.dirty = false;
+        q.last_overlays.clone_from(&q.overlays);
         return;
     }
 
@@ -961,8 +1126,21 @@ fn rebuild_ui_mesh(
     // Stable sort by z_key: the WoW-style total order. Stable so equal-z_key quads keep the producer's
     // original relative order (their own decl-order tiebreak, if any). Base lane first, append lane
     // after — the same relative order the one-Vec era produced.
-    let mut sorted: Vec<&UiQuad> = q.quads.iter().chain(q.overlays.iter()).collect();
+    let mut sorted: Vec<&UiQuad> = if lanes_hidden {
+        Vec::new()
+    } else {
+        q.quads.iter().chain(q.overlays.iter()).collect()
+    };
     sorted.sort_by_key(|q| q.z_key);
+    let n_sorted = sorted.len();
+    let us_sort = lap();
+    // The backdrop is PREPENDED, not sorted in. Giving it a `z_key` would mean picking a number
+    // below every other producer's and trusting all of them to stay above it — and the append
+    // lane's lowest band is already 0 (`overlay_z::WORLD_TEXT`), so there is no room under it
+    // without renumbering a total order that encodes fidelity facts. Position, not arithmetic.
+    if let Some(backdrop) = q.backdrop.as_ref() {
+        sorted.insert(0, backdrop);
+    }
 
     // Geometry probe (`WOW_UI_PROBE=1`): dump each textured quad's screen rect once — the
     // capture-harness companion for diagnosing extracted-vs-rendered geometry by data instead of
@@ -1023,6 +1201,7 @@ fn rebuild_ui_mesh(
                 && r.gamma_texel == q.gamma_texel
                 && r.alpha_test == q.alpha_test
                 && r.mask == q.mask
+                && r.uv_clamp == q.uv_clamp
         });
         if !same_run {
             runs.push(Run::new(texture, q));
@@ -1051,6 +1230,15 @@ fn rebuild_ui_mesh(
     // `Transparent2d` phase by ascending mesh z, so later runs drawing on top is exactly "higher z").
     // Spread runs across a z window comfortably inside the camera's default near/far (±1000) regardless
     // of run count, so this never depends on how many runs a given frame happens to produce.
+    //
+    // NB (decision 1634): this z DOES move when the run count moves, and `translation_from` bails on
+    // `z_bits` first — so it looks like a hover (which adds a run: the ButtonHilight is additive with
+    // its own texture and can never merge) would defeat 1361's skip gate for every batch at once.
+    // It was tried, with a constant denominator, and MEASURED: no change to the hover cost, because
+    // the gate is not in fact being defeated — `mesh_rewrites` reads 2.2 of 96.6 runs on a hover
+    // sweep. Left exactly as it was; the note is here so the next reader does not re-run the
+    // experiment.
+    let us_split = lap();
     let run_count = runs.len().max(1) as f32;
     // An unbounded material key set (a window resize moves every mask rect) resets the cache;
     // materials on live batches survive via the entities' own handle clones and simply re-enter
@@ -1059,6 +1247,7 @@ fn rebuild_ui_mesh(
         pools.materials.clear();
     }
     let mut used = 0usize;
+    let mut n_rewrites = 0usize;
     for (i, run) in runs.into_iter().enumerate() {
         if run.indices.is_empty() {
             continue;
@@ -1086,6 +1275,7 @@ fn rebuild_ui_mesh(
             );
         }
         let alpha_ref = run.alpha_test.unwrap_or(0.0);
+        let uv_clamp = run.uv_clamp.map_or(UV_CLAMP_OFF, Vec4::from_array);
         let key: MatKey = (
             run.texture.id(),
             run.additive,
@@ -1096,6 +1286,7 @@ fn rebuild_ui_mesh(
             alpha_ref.to_bits(),
             mask.as_ref().map(bevy::asset::Handle::id),
             mask_rect.to_array().map(f32::to_bits),
+            uv_clamp.to_array().map(f32::to_bits),
         );
         // The per-slot skip gate (decision 1361). A rebuild fires for the WHOLE quad stream the
         // moment anything differs — and one continuously-animating quad (the resting blink on
@@ -1135,6 +1326,7 @@ fn rebuild_ui_mesh(
             used += 1;
             continue;
         }
+        n_rewrites += 1;
         // Pan-gate miss diagnostic (`WOW_UI_DIFF=1`, ≤3 lines/s so a startup burst can't
         // exhaust it): names the check that sent this slot to the rewrite path.
         if *UI_DIFF {
@@ -1217,6 +1409,7 @@ fn rebuild_ui_mesh(
                     gamma_texel: u32::from(run.gamma_texel),
                     mask_rect,
                     mask,
+                    uv_clamp,
                 })
             })
             .clone();
@@ -1253,6 +1446,19 @@ fn rebuild_ui_mesh(
     pools.meshes.truncate(used);
     pools.stored.truncate(used);
     pools.offsets.truncate(used);
+    if cost_on {
+        let us_write = lap();
+        **mesh_cost = UiMeshCost {
+            rebuilt: true,
+            total: t_rebuild.map_or(0, |t| t.elapsed().as_micros()),
+            sort: us_sort,
+            split: us_split,
+            write: us_write,
+            quads: n_sorted,
+            runs: used,
+            rewrites: n_rewrites,
+        };
+    }
 }
 
 /// Deliberately-overlapping synthetic content proving the sort: 5 z strata × 40 quads each, offset both
@@ -1349,7 +1555,12 @@ mod tests {
         app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
             .init_asset::<Mesh>()
             .init_asset::<UiQuadMaterial>()
+            // The pass binds images and listens for their removal (the material cache sweep), so
+            // an app without the Image asset is an under-provisioned harness, not a lighter one.
+            .init_asset::<Image>()
             .init_resource::<UiQuads>()
+            .init_resource::<UiMeshCost>()
+            .init_resource::<crate::ui_script::UiCostWanted>()
             .init_resource::<crate::ui_hide::UiHidden>()
             .insert_resource(UiWhiteTexture(Handle::default()))
             .add_systems(Update, rebuild_ui_mesh);
@@ -1424,6 +1635,140 @@ mod tests {
             1,
             "the UI comes back on the same content"
         );
+    }
+
+    /// **A removed image takes its cached material with it** (decision 1647).
+    ///
+    /// The cache holds a strong `Handle<Image>` per entry and its prepared form holds the whole GPU
+    /// texture behind a bind group Bevy never re-prepares — so an entry keyed on an asset that no
+    /// longer exists pins that texture indefinitely. Nothing here notices until something retires
+    /// images in bulk, and the world backdrop does exactly that: one full-window `Rgba16Float`
+    /// image per resize, which is once a frame while a window is being dragged.
+    ///
+    /// The removal is seen a few frames late by construction (the loop below names the three
+    /// lags). That is fine for memory hygiene and would NOT be fine for correctness — which is
+    /// exactly why the correctness half of 1647 is a new `AssetId` rather than an invalidation.
+    #[test]
+    fn a_removed_image_does_not_keep_its_material_alive() {
+        let mut app = rebuild_app();
+        let art = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(Image::new_fill(
+                Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                &[255; 4],
+                TextureFormat::Rgba8Unorm,
+                RenderAssetUsages::default(),
+            ));
+        let art_id = art.id();
+        {
+            let mut q = app.world_mut().resource_mut::<UiQuads>();
+            q.quads.push(UiQuad {
+                rect: Rect::new(0.0, 0.0, 32.0, 32.0),
+                texture: Some(art.clone()),
+                ..default()
+            });
+            q.dirty = true;
+        }
+        app.update();
+        assert!(
+            names_image(&app, art_id),
+            "the textured quad must have produced a material naming that image"
+        );
+
+        // Retire it exactly the way the world backdrop retires a resized target: drop every quad
+        // that names it, then remove the asset. Only the cache is left holding it.
+        drop(art);
+        {
+            let mut q = app.world_mut().resource_mut::<UiQuads>();
+            q.quads.retain(|quad| quad.texture.is_none());
+            q.dirty = true;
+        }
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .remove(art_id);
+        // Three separate one-frame lags stand between the removal and an observably dead material:
+        // `Assets::asset_events` writes the `Removed` message in `PostUpdate` while the rebuild
+        // reads it in `Update`; the retired batch entity's own handle drops at that frame's command
+        // flush; and a dropped handle is only reclaimed by `track_assets` in the NEXT `PreUpdate`.
+        // None of that matters for the freeze — the correctness half is a new AssetId, not an
+        // invalidation — so the loop simply spends the frames rather than pretending to be exact.
+        for _ in 0..4 {
+            app.update();
+        }
+
+        assert!(
+            !names_image(&app, art_id),
+            "a material for a removed image is dead weight: it pins the image AND the GPU \
+             texture behind its prepared bind group for as long as the cache holds the key"
+        );
+    }
+
+    /// Does any live `UiQuadMaterial` still name this image?
+    fn names_image(app: &App, id: AssetId<Image>) -> bool {
+        app.world()
+            .resource::<Assets<UiQuadMaterial>>()
+            .iter()
+            .any(|(_, m)| m.texture.as_ref().is_some_and(|t| t.id() == id))
+    }
+
+    /// **TOGGLEUI hides the UI, not the world.** Since the world arrives as this pass's own
+    /// backdrop quad ([`crate::world_backdrop`]), the dark path can no longer mean "retire every
+    /// batch" — that would black the screen, which is the exact inverse of what the binding is
+    /// for. One batch survives while dark (the backdrop's), and the lanes come back on top of it.
+    ///
+    /// This is the regression the change itself created: every earlier version of the hidden path
+    /// asserted zero batches, and zero batches is now a black screen.
+    #[test]
+    fn toggleui_keeps_the_world_backdrop() {
+        let mut app = rebuild_app();
+        let backdrop = UiQuad {
+            rect: Rect::from_corners(Vec2::ZERO, Vec2::new(800.0, 600.0)),
+            texture: None,
+            ..UiQuad::default()
+        };
+        {
+            let mut q = app.world_mut().resource_mut::<UiQuads>();
+            q.backdrop = Some(backdrop);
+            q.dirty = true;
+        }
+        app.update();
+        let lit = batches(&mut app);
+        assert!(lit >= 1, "content drawn to begin with");
+
+        set_hidden(&mut app, true);
+        app.update();
+        assert_eq!(
+            batches(&mut app),
+            1,
+            "dark ⇒ the backdrop alone; anything less is a black screen"
+        );
+
+        set_hidden(&mut app, false);
+        app.update();
+        assert_eq!(
+            batches(&mut app),
+            lit,
+            "the UI comes back over the same world"
+        );
+    }
+
+    /// With no world to paint (the glue screens, the loading screen, a gated camera) the dark path
+    /// is the old one: nothing at all. The backdrop earns an exemption because it IS the world,
+    /// not because it is first in the list.
+    #[test]
+    fn toggleui_with_no_backdrop_still_retires_everything() {
+        let mut app = rebuild_app();
+        app.update();
+        assert_eq!(batches(&mut app), 1, "one batch drawn to begin with");
+        set_hidden(&mut app, true);
+        app.update();
+        assert_eq!(batches(&mut app), 0, "no world, no backdrop, nothing drawn");
     }
 
     /// **The desaturation flag reaches the MATERIAL, and splits the run** (decision 1327).

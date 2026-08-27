@@ -51,6 +51,10 @@ struct Row {
     frame_ms: f32,
     cpu_ms: f32,
     cost: UiFrameCost,
+    /// The RENDER-side half of the same frame (`ui_pass::UiMeshCost`). Added after the 1625 fix
+    /// left the symptom standing: the UI-script phases read flat on a hovered frame while the mesh
+    /// rebuild below them was doing whole-interface work, and this recorder could not see it.
+    mesh: crate::ui_pass::UiMeshCost,
     /// The tooltip context: `None` = no tooltip up. `(owner frame, line count, first line)`.
     tip: Option<(String, i64, String)>,
 }
@@ -84,8 +88,9 @@ impl Plugin for HoverLogPlugin {
                 let _ = writeln!(
                     out,
                     "frame_ms,cpu_ms,tick_us,resolve_us,measure_us,extract_us,convert_us,\
-                     diff_us,quads,solves,skipped,measured,measured_texts,tip_owner,tip_lines,\
-                     tip_first_line,spliced"
+                     diff_us,quads,solves,derives,skipped,measured,measured_texts,tip_owner,tip_lines,\
+                     tip_first_line,spliced,mesh_us,mesh_sort_us,mesh_split_us,mesh_write_us,\
+                     mesh_quads,mesh_runs,mesh_rewrites,dropped"
                 );
                 info!("hover log: recording every frame to {path}");
                 app.insert_resource(Recorder {
@@ -134,6 +139,7 @@ fn cell(s: &str) -> String {
 fn record(
     time: Res<Time<Real>>,
     cost: Res<UiFrameCost>,
+    mesh: Res<crate::ui_pass::UiMeshCost>,
     script: Option<NonSend<UiScript>>,
     mut rec: ResMut<Recorder>,
 ) {
@@ -153,9 +159,9 @@ fn record(
     let (owner, lines, first) = tip
         .clone()
         .unwrap_or_else(|| (String::new(), 0, String::new()));
-    let _ = writeln!(
+    let _ = write!(
         rec.out,
-        "{frame_ms:.3},{cpu_ms:.3},{},{},{},{},{},{},{},{},{},{},{},{},{lines},{},{}",
+        "{frame_ms:.3},{cpu_ms:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{lines},{},{}",
         c.tick,
         c.resolve,
         c.measure,
@@ -164,6 +170,7 @@ fn record(
         c.diff,
         c.quads,
         c.solves,
+        c.derives,
         u8::from(c.skipped),
         c.measured,
         cell(&c.measured_texts.join(" ⏎ ")),
@@ -171,10 +178,23 @@ fn record(
         cell(&first),
         c.spliced,
     );
+    let _ = writeln!(
+        rec.out,
+        ",{},{},{},{},{},{},{},{}",
+        mesh.total,
+        mesh.sort,
+        mesh.split,
+        mesh.write,
+        mesh.quads,
+        mesh.runs,
+        mesh.rewrites,
+        c.dropped,
+    );
     rec.rows.push(Row {
         frame_ms,
         cpu_ms,
         cost: c,
+        mesh: mesh.clone(),
         tip,
     });
 }
@@ -210,6 +230,22 @@ fn summarize(label: &str, rows: &[&Row]) -> String {
     // extract gate skipped the conversion+rasterize loop outright.
     #[allow(clippy::cast_precision_loss)]
     let solves = rows.iter().map(|r| r.cost.solves as f64).sum::<f64>() / f64::from(n);
+    // The term `solves` hides (decision 1625): a solve that had to DERIVE the layout graph first
+    // costs an order of magnitude more than one that used the ledger, and both count as one solve.
+    // The law is zero — anything else is a write site that gave up naming its node, which
+    // `WOW_LAYOUT_DERIVE_TRACE=<secs>:<n>` will backtrace on a live run.
+    let derives = rows.iter().map(|r| r.cost.derives as f64).sum::<f64>() / f64::from(n);
+    // The RENDER half of the same frame. `rebuilt%` is the one to read first: a population that
+    // rebuilds the mesh on every frame is paying whole-interface work per frame, whatever the
+    // script-pass phases say.
+    let mesh_us = |f: fn(&crate::ui_pass::UiMeshCost) -> u128| {
+        rows.iter().map(|r| f(&r.mesh) as f64).sum::<f64>() / f64::from(n)
+    };
+    let rebuilt = 100.0 * rows.iter().filter(|r| r.mesh.rebuilt).count() as f32 / n;
+    let mesh_runs = rows.iter().map(|r| r.mesh.runs as f64).sum::<f64>() / f64::from(n);
+    // The number that reaches Bevy: a rewritten batch re-extracts, and `rewrites` tracking `runs`
+    // means the skip gate is being defeated for every batch at once (decision 1632).
+    let mesh_rw = rows.iter().map(|r| r.mesh.rewrites as f64).sum::<f64>() / f64::from(n);
     let skips = 100.0 * rows.iter().filter(|r| r.cost.skipped).count() as f32 / n;
     // Counted against the DROPPED threshold, not the raw budget: synced wall time rails at the
     // display's present grant and jitters around it, so counting frames over 16.7 ms mostly counts
@@ -222,7 +258,8 @@ fn summarize(label: &str, rows: &[&Row]) -> String {
         "  {label:<34} n={:<6} wall p50={:>6.2} p99={:>6.2} max={:>7.2}  cpu p50={:>6.2} \
          p99={:>6.2}  dropped={:>5.1}%\n      ui μs: tick={:>6.0} resolve={:>6.0} \
          measure={:>5.0} extract={:>6.0} convert={:>6.0} diff={:>5.0}\n      solves/frame={:.2} \
-         reshaped/frame={:.2} extract-gate-skipped={:.0}%",
+         derives/frame={:.2} reshaped/frame={:.2} extract-gate-skipped={:.0}%\n      mesh μs: \
+         total={:>6.0} sort={:>5.0} split={:>5.0} write={:>6.0}  rebuilt={:.0}% runs={:.0} rewrites={:.1}",
         rows.len(),
         pct(&wall, 0.50),
         pct(&wall, 0.99),
@@ -237,8 +274,16 @@ fn summarize(label: &str, rows: &[&Row]) -> String {
         ui_us(|c| c.convert),
         ui_us(|c| c.diff),
         solves,
+        derives,
         measured,
         skips,
+        mesh_us(|m| m.total),
+        mesh_us(|m| m.sort),
+        mesh_us(|m| m.split),
+        mesh_us(|m| m.write),
+        rebuilt,
+        mesh_runs,
+        mesh_rw,
     )
 }
 
@@ -303,20 +348,33 @@ fn parse_row(line: &str) -> Option<Row> {
         }
     }
     fields.push(cur);
-    if fields.len() < 16 {
+    if fields.len() < 17 {
         return None;
     }
+    // The render-side columns are APPENDED (a pre-1625 recording has none) — absent reads as zero,
+    // the same posture `spliced` took when it was added.
+    let n = |i: usize| fields.get(i).and_then(|f| f.parse().ok()).unwrap_or(0);
+    let mesh = crate::ui_pass::UiMeshCost {
+        rebuilt: n(18) > 0,
+        total: n(18),
+        sort: n(19),
+        split: n(20),
+        write: n(21),
+        quads: n(22) as usize,
+        runs: n(23) as usize,
+        rewrites: n(24) as usize,
+    };
     let num = |i: usize| fields[i].parse::<f64>().ok();
-    let owner = fields[13].clone();
+    let owner = fields[14].clone();
     Some(Row {
         frame_ms: num(0)? as f32,
         cpu_ms: num(1)? as f32,
         cost: UiFrameCost {
-            measured: num(11)? as usize,
-            measured_texts: if fields[12].is_empty() {
+            measured: num(12)? as usize,
+            measured_texts: if fields[13].is_empty() {
                 Vec::new()
             } else {
-                fields[12].split(" ⏎ ").map(str::to_string).collect()
+                fields[13].split(" ⏎ ").map(str::to_string).collect()
             },
             tick: num(2)? as u128,
             resolve: num(3)? as u128,
@@ -326,14 +384,20 @@ fn parse_row(line: &str) -> Option<Row> {
             diff: num(7)? as u128,
             quads: num(8)? as usize,
             solves: num(9)? as u64,
-            skipped: num(10)? != 0.0,
+            derives: num(10)? as u64,
+            skipped: num(11)? != 0.0,
             // Appended column (absent in pre-splice recordings — those read back as 0).
-            spliced: fields.get(16).and_then(|f| f.parse().ok()).unwrap_or(0),
+            spliced: fields.get(17).and_then(|f| f.parse().ok()).unwrap_or(0),
+            // Appended after the mesh block for the same reason `spliced` was appended after
+            // the tip block: a new column goes on the END so every recording made before it
+            // still reads (decision 1638).
+            dropped: fields.get(25).and_then(|f| f.parse().ok()).unwrap_or(0),
         },
+        mesh,
         tip: if owner.is_empty() {
             None
         } else {
-            Some((owner, num(14)? as i64, fields[15].clone()))
+            Some((owner, num(15)? as i64, fields[16].clone()))
         },
     })
 }

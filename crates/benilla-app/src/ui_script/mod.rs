@@ -29,7 +29,7 @@ use benilla_world::schedule::WorldStage;
 /// because the AddOns screens read the same folder without a VM (decision 1196).
 pub(crate) mod addons;
 mod content;
-mod extract;
+pub(crate) mod extract;
 mod input;
 mod manifest;
 
@@ -78,6 +78,31 @@ pub(crate) struct PointerOverUi(pub(crate) bool);
 #[derive(Resource, Default)]
 pub(crate) struct SyntheticPointer(pub(crate) bool);
 
+/// **A capture never reads the OS pointer** — set for the whole life of a `$WOW_CAPTURE` /
+/// `$WOW_CAPTURE_UI` run, and never cleared.
+///
+/// [`input::feed_ui_input`] treats this exactly like [`SyntheticPointer`]: the mouse half of the
+/// pass is skipped entirely, touching nothing. The keyboard half is untouched.
+///
+/// **Why it is not just `SyntheticPointer`.** They are different statements. That one means "a
+/// probe is driving a gesture *right now*", and the drag probe clears it when its gesture ends
+/// (`capture::probes::act`) — so borrowing it would re-expose the real cursor for the rest of the
+/// run, which is the opposite of the guarantee wanted here.
+///
+/// **Why it exists at all.** The mouse feed reads `window.cursor_position()`, so a UI capture's
+/// pixels depended on where the person at the keyboard had left their mouse: a cursor resting over
+/// the window arms a hover and a tooltip that a cursor an inch to the left does not. The old
+/// defence was an assumption written in a comment — *"probes park the cursor outside"* — with
+/// nothing enforcing it. On 2026-08-26 a `ui-tooltip` A/B came back with an MAE of 5.275 against
+/// 0.020 for every other UI scenario; that particular anomaly turned out to be a rebuilt-between-
+/// legs mistake, and three attempts to reproduce a cursor-driven one all failed, because
+/// `CGWarpMouseCursorPosition` does not synthesise the events winit needs. So the hazard was left
+/// on the record as **suspected, unproven** — and this closes it by construction instead, which
+/// costs nothing and does not require ever winning that argument. A capture that cannot read the
+/// pointer cannot be perturbed by it.
+#[derive(Resource, Default)]
+pub(crate) struct CapturePointerPinned(pub(crate) bool);
+
 /// The egui dev overlay's half of the pointer arbitration, written each egui pass by the debug
 /// panel's `track_pointer_over_ui`. **Defined here, with the arbiter that reads it** (decision
 /// 1174 finishing 0026): the type has to exist in a build with no dev overlays compiled in, and
@@ -118,11 +143,22 @@ pub(crate) struct UiFrameCost {
     pub(crate) diff: u128,
     pub(crate) quads: usize,
     pub(crate) solves: u64,
+    /// How many times this frame's resolve DERIVED the layout graph from scratch (decision 1388's
+    /// `layout_derivations`). The law is zero, and it is here because it was not: the recorder was
+    /// built for the hover-cost symptom and reported `solves` — the cheap term — while a
+    /// derivation, ~30× more expensive and paid on the same frames, was invisible to it
+    /// (decision 1625).
+    pub(crate) derives: u64,
     pub(crate) skipped: bool,
     /// How many entries the per-entry splice re-converted this frame — `0` on a settled or
     /// full-conversion frame. Nonzero is the proof the splice path fired (the equivalence tests
     /// and the live `[ui-cost] spliced=` field both read it).
     pub(crate) spliced: usize,
+    /// How many entries the splice *dropped* — drew last frame and does not draw now. A frame
+    /// that only closes something has `spliced == 0` and still rode the splice, so this is the
+    /// other half of "did the splice path fire" (decision 1638). Not a CSV column: the recorder's
+    /// row is the phase timings, and `[ui-cost] dropped=` already carries it inline.
+    pub(crate) dropped: usize,
 }
 
 /// Does anything want [`UiFrameCost`] filled in this run? Measuring the split costs a clock read
@@ -291,6 +327,11 @@ impl Plugin for UiScriptPlugin {
             .init_resource::<UiCostWanted>()
             .init_resource::<PointerOverUi>()
             .init_resource::<SyntheticPointer>()
+            // Not `init_resource`: the value IS the answer, read once from the env at build.
+            .insert_resource(CapturePointerPinned(
+                std::env::var_os("WOW_CAPTURE").is_some()
+                    || std::env::var_os("WOW_CAPTURE_UI").is_some(),
+            ))
             .init_resource::<EguiPointerOver>()
             .init_resource::<InspectMode>()
             .init_resource::<PlayerUiHover>()
@@ -549,6 +590,19 @@ fn demo_unit_feed(script: Option<NonSendMut<UiScript>>, mut fired: Local<VmMemo<
         // it that this seed never fed, so the capture quietly stopped showing the "5" it exists to
         // prove (found while fixing decision 1301).
         script.set_bonus_bar_offset(1);
+        // One MACRO slot too (button 4): a GM-style macro that casts nothing, so the capture
+        // shows the macro-name line under the icon and the icon full-colour — B340's shape
+        // (decision 1636). The table is seeded here because a capture has no character identity
+        // for `ui_macro::load_macros` to read a file for; nothing overwrites it.
+        script.set_macros(benilla_ui::script::MacroState {
+            account: vec![benilla_ui::script::MacroView {
+                name: "spawn".into(),
+                texture: Some("Interface\\Icons\\Ability_Racial_Cannibalize".into()),
+                body: ".spawn 16032".into(),
+                local_only: false,
+            }],
+            character: Vec::new(),
+        });
         for (action, icon, kind, id, count) in [
             (
                 73,
@@ -563,6 +617,13 @@ fn demo_unit_feed(script: Option<NonSendMut<UiScript>>, mut fired: Local<VmMemo<
                 "Interface\\Icons\\Ability_Warrior_BattleShout",
                 0x00,
                 102,
+                0,
+            ),
+            (
+                76,
+                "Interface\\Icons\\Ability_Racial_Cannibalize",
+                0x40,
+                1,
                 0,
             ),
             (80, "Interface\\Icons\\INV_Misc_Food_16", 0x80, 117, 5),
@@ -598,6 +659,17 @@ fn demo_unit_feed(script: Option<NonSendMut<UiScript>>, mut fired: Local<VmMemo<
                     count,
                     // The seed's only ITEM slot is the food stack, which is consumable.
                     consumable: kind == 0x80,
+                }),
+            );
+            // The state feed has nothing to feed server-less (no `PlayerActions`), and a slot
+            // with no pushed state answers `IsUsableAction` nil — the 0.4 grey on every icon,
+            // which the `ui-actionbar` baseline wore for as long as it existed. Stand in for it
+            // as this feed stands in for the unit feed: a live bar's resting state is usable.
+            script.set_action_state(
+                action,
+                Some(benilla_ui::script::ActionState {
+                    usable: true,
+                    ..Default::default()
                 }),
             );
         }
@@ -859,8 +931,10 @@ mod quest_timer_tests;
 
 #[cfg(test)]
 mod durability_tests;
+// `pub(crate)` for its `harness`/`push`/`row` helpers: `perf::hud`'s own test drives the readout
+// through them rather than keeping a second copy of the XML-loading boilerplate.
 #[cfg(test)]
-mod world_state_tests;
+pub(crate) mod world_state_tests;
 
 #[cfg(test)]
 mod screenshot_tests;

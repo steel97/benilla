@@ -601,7 +601,15 @@ pub(super) fn append_line(
     if let Some(d) = model.region_data.get_mut(&lh) {
         if d.size != pin {
             d.size = pin;
-            model.touch_layout();
+            // NAMED, not conservative (decision 1388). This writes one region's EXPLICIT SIZE and
+            // nothing else — no anchor target, no roster membership — which is the exact shape
+            // 1388 migrated every size setter to. It was missed because it is an internal write
+            // rather than a `SetWidth` binding, and the miss is expensive in the one place it can
+            // least afford to be: the pin flips whenever a line changes ROLE between wrapped and
+            // plain, which is what every hover from one item or spell to a differently-shaped one
+            // does. A conservative touch there re-derives the whole layout graph — every live
+            // frame's scale re-synced, every anchored region re-hashed — on each hover.
+            model.touch_layout_region(lh);
             // The wrap pin is the measure key's wrap-width input.
             model.touch_measure(lh);
         }
@@ -663,16 +671,16 @@ fn cell(model: &Model, rh: crate::widget::RegionHandle) -> Cell {
 /// frames whose lines haven't been measured yet (the XML default size holds until the measure
 /// round-trip lands, one frame later — the same convergence the Lua loop had).
 pub(super) fn layout_tooltips(model: &mut Model) {
+    // The arena's tooltip registry, not the resolve's whole frame roster: this pre-pass runs at
+    // the top of EVERY resolve, and finding two or three tooltips by scanning ~4000 ids was most
+    // of what it cost (decision 1634). `frame_to_id` still gates each one — a tooltip outside the
+    // resolve's roster would mint an id here and take the ledger's conservative branch with it.
     let tips: Vec<FrameHandle> = model
-        .frame_to_id
-        .keys()
+        .arena
+        .tooltip_kinds()
+        .iter()
         .copied()
-        .filter(|&h| {
-            matches!(
-                model.arena.frame(h).map(|f| &f.kind_state),
-                Some(KindState::Tooltip(_))
-            )
-        })
+        .filter(|h| model.frame_to_id.contains_key(h))
         .collect();
     for h in tips {
         let (num, lefts, rights, min_w, pad_w) = match model.arena.frame(h).map(|f| &f.kind_state) {
@@ -759,7 +767,14 @@ pub(super) fn tick_fades(lua: &Lua) {
     let mut finished: Vec<FrameHandle> = Vec::new();
     {
         let model = lua.app_data_ref::<Model>().expect("model app_data");
-        for &h in model.frame_to_id.keys() {
+        // The arena's tooltip registry (1634) — this runs every tick, and the roster it used to
+        // walk is ~4000 entries at a corpus UI. The `frame_to_id` gate is kept: `hide_tooltip`
+        // below writes layout, and a frame outside the resolve's roster takes the ledger's
+        // conservative branch.
+        for &h in model.arena.tooltip_kinds() {
+            if !model.frame_to_id.contains_key(&h) {
+                continue;
+            }
             let Some(frame) = model.arena.frame(h) else {
                 continue;
             };

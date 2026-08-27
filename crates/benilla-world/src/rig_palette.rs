@@ -447,6 +447,58 @@ impl RigPalettes {
         }
     }
 
+    /// **The rider write** (decision 1609): fill every row of `slot` with ONE rigid frame, and
+    /// publish the world position it is measured from.
+    ///
+    /// An attached model rests at bind pose, where a palette row `world_from_joint × ibp` is the
+    /// placement matrix for every joint (`F × bind_j × bind_j⁻¹`) — so the whole model is one
+    /// frame repeated, and no inverse-bindpose list is consulted or needed. `frame` arrives in the
+    /// HOST rig's frame, at rig-sized magnitudes; `origin` is the host's world position, which the
+    /// vertex stage adds back camera-relative. The point of the whole lane is that the two are
+    /// never summed in f32 on the CPU (see [`crate::rig_rider`]).
+    ///
+    /// **Idempotent, deliberately.** Riders are re-derived every frame from the host's pose, so a
+    /// standing unit would otherwise dirty its rows — and pay an upload — for a value that has not
+    /// moved. The compare is bit equality, not an epsilon, exactly as the camera's own no-op write
+    /// gate is (decision 1362): a real sub-epsilon change must still land.
+    pub(crate) fn write_rider(&mut self, slot: u16, frame: Affine3A, origin: Vec3) {
+        let s = slot as usize;
+        let (Some(&base), Some(&len)) = (self.table.get(s), self.slot_len.get(s)) else {
+            return;
+        };
+        if len == 0 {
+            return;
+        }
+        let (m3, t) = (frame.matrix3, frame.translation);
+        let want = [
+            [m3.x_axis.x, m3.y_axis.x, m3.z_axis.x, t.x],
+            [m3.x_axis.y, m3.y_axis.y, m3.z_axis.y, t.y],
+            [m3.x_axis.z, m3.y_axis.z, m3.z_axis.z, t.z],
+        ];
+        let r0 = 3 * base as usize;
+        let origin_word = self.origins.get(s).copied();
+        let unchanged = self.rows[r0..r0 + 3] == want
+            && origin_word == Some([origin.x, origin.y, origin.z, 0.0]);
+        if unchanged {
+            return;
+        }
+        self.cost_rows += len;
+        self.set_origin(slot, origin);
+        let wm = self.bone_watermark();
+        let rows = rows_make_mut(
+            &mut self.rows,
+            wm,
+            &mut self.cost_copies,
+            &mut self.cost_copy_us,
+        );
+        for b in 0..len as usize {
+            let r = 3 * (base as usize + b);
+            rows[r..r + 3].copy_from_slice(&want);
+        }
+        let mirrored = self.mirrored.get(s).copied().unwrap_or(false);
+        self.dirty.push((base, len, mirrored));
+    }
+
     /// Flag a rig's rows to ALSO reach the booth mirror buffers ([`RigPaletteMirrors`]): the
     /// booth spawners call it for their rigs — whose materials bind a studio light buffer, not
     /// the shared one — right after allocation.
@@ -467,13 +519,28 @@ impl RigPalettes {
     /// rig-relative (decision 0974), so the slot's origin goes back on here — the picker ray is a
     /// world-space ray, and it is not a precision consumer.
     pub fn world_palette(&self, slot: u16, bones: usize) -> Option<Vec<Mat4>> {
+        let o = *self.origins.get(slot as usize)?;
+        self.rows_at(slot, bones, [o[0], o[1], o[2]])
+    }
+
+    /// The rig's palette rows **as the vertex stage blends them** — rig-relative (decision 0974),
+    /// the slot origin deliberately NOT added back. [`Self::world_palette`] is the picker's
+    /// world-space read; this is the PRECISION one, for the same reason [`Self::rider_placement`]
+    /// returns its pair unsummed: re-adding the ~9 k-yard origin would stamp the very f32 grid
+    /// the lane exists to avoid onto the measurement, and the instrument would then read its own
+    /// arithmetic as the defect.
+    pub fn rig_rows(&self, slot: u16, bones: usize) -> Option<Vec<Mat4>> {
+        self.rows_at(slot, bones, [0.0; 3])
+    }
+
+    /// Both reads above: the rows of `slot`, with `o` added onto the translation column.
+    fn rows_at(&self, slot: u16, bones: usize, o: [f32; 3]) -> Option<Vec<Mat4>> {
         let s = slot as usize;
         let len = (*self.slot_len.get(s)? as usize).min(bones);
         if len == 0 {
             return None;
         }
-        let base = self.table[s] as usize;
-        let o = self.origins[s];
+        let base = *self.table.get(s)? as usize;
         Some(
             (0..len)
                 .map(|b| {
@@ -487,6 +554,35 @@ impl RigPalettes {
                 })
                 .collect(),
         )
+    }
+
+    /// A slot's rig ORIGIN — the world position its rows are measured from, exactly as the vertex
+    /// stage reads it out of `rig_origin[slot]`. The instrument pairs it with [`Self::rig_rows`] to
+    /// reproduce the shader's own `frame_from_local * v + (frame_origin - view.world_position)`
+    /// without ever forming the absolute world coordinate the lane exists to avoid.
+    pub fn slot_origin(&self, slot: u16) -> Option<Vec3> {
+        let o = self.origins.get(slot as usize)?;
+        Some(Vec3::new(o[0], o[1], o[2]))
+    }
+
+    /// A rider slot's placement **as the vertex stage reads it** (decision 1609): its
+    /// `(rig_origin, row-0 translation)` pair, unsummed. The instrument read — `WOW_JITTER`
+    /// measures the row's own motion against the anchor's absolute world translation, and the
+    /// whole point of the lane is that only the first of those two is on an f32 grid coarse
+    /// enough to see. Summing them here would destroy exactly the thing being measured, which is
+    /// why this returns the pair and [`Self::world_palette`] (a picker read, not a precision one)
+    /// does not.
+    pub fn rider_placement(&self, slot: u16) -> Option<(Vec3, Vec3)> {
+        let s = slot as usize;
+        if *self.slot_len.get(s)? == 0 {
+            return None;
+        }
+        let r = 3 * *self.table.get(s)? as usize;
+        let o = self.origins.get(s)?;
+        Some((
+            Vec3::new(o[0], o[1], o[2]),
+            Vec3::new(self.rows[r][3], self.rows[r + 1][3], self.rows[r + 2][3]),
+        ))
     }
 
     /// How many live rigs have a COMPUTED palette (their first bone's first row is non-zero — a
@@ -545,6 +641,16 @@ impl RigSkin {
     /// its palette read with it; the collapsed lane has no joint list to measure).
     pub fn bones(&self) -> u32 {
         self.len
+    }
+
+    /// The rig's inverse bindposes — the instrument read. `WOW_JITTER`'s palette term probes the
+    /// rows at each bone's BIND position, which is the only honest way to ask "how far does a
+    /// vertex bound to this bone actually move" of the numbers the GPU blends: a row's own
+    /// translation column is the bind-space ORIGIN's image, a lever up to the model's full height
+    /// away from the bone, and differencing it reads a rotation as ~10x the displacement any real
+    /// vertex sees.
+    pub fn ibp(&self) -> &Handle<SkinnedMeshInverseBindposes> {
+        &self.ibp
     }
 
     /// Allocate a palette rig for the collapsed lane (decision 0724): no joint entities — the
@@ -938,7 +1044,11 @@ pub fn plugin(app: &mut App) {
         .add_systems(Update, census_rig_palettes)
         .add_systems(
             PostUpdate,
-            (compute_rig_palettes, publish_rig_palettes)
+            (
+                compute_rig_palettes,
+                crate::rig_rider::write_rig_riders,
+                publish_rig_palettes,
+            )
                 .chain()
                 // After the last joint-world writer: propagation, then the billboard joint pass
                 // (which rewrites joint GlobalTransforms in place — see its module doc).
@@ -1112,6 +1222,53 @@ mod tests {
             p.free(s);
         }
         assert!(p.alloc(1).is_some());
+    }
+
+    /// **The rider write's two contracts** (decision 1609): one frame reaches EVERY row of the
+    /// slot — which is what makes an attached model's bind-pose palette equal its static
+    /// placement — and re-writing the same frame is a no-op, so a standing unit's five
+    /// attachments cost five compares a frame and never an upload.
+    #[test]
+    fn a_rider_frame_fills_every_row_and_re_writing_it_is_free() {
+        let mut p = RigPalettes::default();
+        let skin = RigSkin::allocate_bones(&mut p, 4, Handle::default()).unwrap();
+        let origin = Vec3::new(-9464.31, 62.17, 56.91);
+        let frame = Affine3A::from_rotation_translation(
+            Quat::from_rotation_y(0.7),
+            Vec3::new(0.3, 1.4, -0.2),
+        );
+        p.dirty.clear();
+        p.write_rider(skin.slot, frame, origin);
+        assert_eq!(p.dirty.len(), 1, "the first write dirties the range");
+        assert_eq!(p.dirty[0].1, 4, "and dirties ALL of it, not just row 0");
+
+        // Every row carries the same frame: a bind-pose model's `world_from_joint × ibp` is the
+        // placement itself for every joint, so the whole model is one matrix repeated. Read back
+        // through the picker's own reconstruction, which is the only public row reader.
+        let pal = p.world_palette(skin.slot, 4).unwrap();
+        let want = Mat4::from(Affine3A::from_translation(origin) * frame);
+        for (b, m) in pal.iter().enumerate() {
+            assert!(m.abs_diff_eq(want, 1e-2), "row {b}: {m:?} vs {want:?}");
+        }
+        // And the unsummed pair the vertex stage actually reads.
+        let (o, t) = p.rider_placement(skin.slot).unwrap();
+        assert_eq!(o, origin);
+        assert!(t.abs_diff_eq(Vec3::from(frame.translation), 1e-6));
+
+        // Idempotent: the standing-still case must not reach the upload.
+        p.dirty.clear();
+        p.write_rider(skin.slot, frame, origin);
+        assert!(
+            p.dirty.is_empty(),
+            "an unchanged rider frame must not dirty its range"
+        );
+        // A real move still lands — bit equality, not an epsilon (the 1362 gate's rule).
+        p.write_rider(
+            skin.slot,
+            Affine3A::from_translation(Vec3::new(0.3, 1.4, -0.2 + 1.0e-6)) * frame,
+            origin,
+        );
+        assert_eq!(p.dirty.len(), 1, "a sub-millimetre move is still a move");
     }
 
     /// The picker's read side puts the slot's ORIGIN back on (decision 0974) — rows are stored

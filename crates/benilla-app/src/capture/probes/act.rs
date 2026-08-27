@@ -387,6 +387,175 @@ fn fire_probe_lua(
 /// line survives a window moving. `WOW_PROBE_DRAG_LUA="<chunk>"` runs a chunk after each gesture —
 /// the report channel (`ProbeLog` from [`ProbeLuaPlugin`] is installed by that probe; this one
 /// prints the chunk's own returned string).
+/// The HOVER SWEEP (`WOW_PROBE_HOVER="Frame1;Frame2;…"`, `WOW_PROBE_HOVER_AT` seconds, default 14,
+/// `WOW_PROBE_HOVER_STEP` seconds per frame-to-frame step, default 0.25, looping until exit) —
+/// the cursor crosses each named frame's centre through the REAL pointer path, pressing nothing.
+///
+/// **A leg that does not ALTERNATE cannot be read.** `WOW_PROBE_HOVER_DUTY=<on>:<off>` sweeps for
+/// `on` seconds, parks the pointer over nothing for `off`, and repeats. Compare-the-two-halves
+/// designs that put all the parked frames at the start and all the swept frames after read the
+/// run's own drift as the effect: three legs of the same gesture, same binary, gave within-run
+/// `cpu_ms` deltas of +2.03, +1.02 and −0.61 ms while their per-phase µs columns agreed to 3%
+/// (decision 1634). Alternating pools both regimes across the same minutes, so drift cancels
+/// instead of landing on one side.
+///
+/// **`WOW_PROBE_HOVER_STEP` is the dial that decides what is being measured, and the default is
+/// not the director's gesture.** A hand spamming hovers moves the mouse *every frame*; at the
+/// 0.25 s default only 4 frames in 60 carry a pointer move, which divides whatever a move costs by
+/// fifteen and reads as "hovering is free" (it did, three times, before this note existed). Set it
+/// to ~0.016 to sweep at frame rate. `WOW_PROBE_HOVER_JITTER=<px>` then splits the two halves the
+/// sweep otherwise fuses: with one name and a jitter, the pointer moves every frame while the
+/// hovered frame and its tooltip stay put.
+///
+/// Built because a hover-cost pin was taken with a Lua driver that called `GameTooltip:SetOwner`
+/// directly, and that driver is not the gesture: it never moves `model.mouseover`, so it skips the
+/// hit test, `OnEnter`/`OnLeave`, the button's state textures and highlight, and whatever the
+/// shipped UI hangs off those. The reported symptom was "hovering costs 2 ms" and the instrument
+/// could not hover. This is the missing half of `WOW_HOVER_LOG`: that one records what a hand on
+/// the mouse does, and this one supplies the hand.
+pub(crate) struct ProbeHoverPlugin;
+
+impl Plugin for ProbeHoverPlugin {
+    fn build(&self, app: &mut App) {
+        let names: Vec<String> = std::env::var("WOW_PROBE_HOVER")
+            .unwrap_or_default()
+            .split(';')
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        let at = std::env::var("WOW_PROBE_HOVER_AT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(14.0);
+        let step = std::env::var("WOW_PROBE_HOVER_STEP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.25);
+        let jitter = std::env::var("WOW_PROBE_HOVER_JITTER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let duty = std::env::var("WOW_PROBE_HOVER_DUTY")
+            .ok()
+            .and_then(|v| {
+                v.split_once(':')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+            })
+            .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)));
+        app.insert_resource(ProbeHover {
+            names,
+            at,
+            step,
+            jitter,
+            duty,
+            i: 0,
+            next: 0.0,
+            announced: false,
+            parked: false,
+        })
+        .add_systems(Update, fire_probe_hover);
+    }
+}
+
+/// [`ProbeHoverPlugin`]'s state: which name is next, and when.
+#[derive(Resource)]
+struct ProbeHover {
+    names: Vec<String>,
+    at: f32,
+    step: f32,
+    /// `WOW_PROBE_HOVER_JITTER=<px>` — nudge each step off the frame's centre by up to this many
+    /// pixels, cycling through a small square. Zero (the default) parks the cursor exactly on the
+    /// centre, so a ONE-NAME sweep issues the same coordinates forever and the pointer never moves.
+    jitter: f32,
+    /// `WOW_PROBE_HOVER_DUTY=<on>:<off>` — alternate `on` seconds of sweeping with `off` seconds
+    /// parked off every frame, forever. See the plugin doc for why a leg that does not alternate
+    /// cannot be read at this resolution.
+    duty: Option<(f32, f32)>,
+    i: usize,
+    next: f32,
+    announced: bool,
+    /// Which half of the duty cycle we are in (meaningless when `duty` is `None`).
+    parked: bool,
+}
+
+/// Where the pointer goes during a duty cycle's parked half: the top-left corner, over nothing.
+const HOVER_PARK_AT: (f32, f32) = (2.0, 2.0);
+
+/// Move the cursor onto the next named frame's centre. Loops forever, so a run of any length is a
+/// steady sweep — the population the recorder splits on.
+fn fire_probe_hover(
+    mut probe: ResMut<ProbeHover>,
+    mut synthetic: ResMut<crate::ui_script::SyntheticPointer>,
+    time: ProbeClock,
+    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    self_player: Query<(), With<crate::net::SelfPlayer>>,
+) {
+    if probe.names.is_empty() {
+        return;
+    }
+    let now = time.elapsed_secs();
+    if now < probe.at || self_player.is_empty() || now < probe.next {
+        return;
+    }
+    let Some(mut script) = script else { return };
+    synthetic.0 = true;
+    // The duty cycle, if armed: which half of the current period is this, and did it just flip?
+    if let Some((on, off)) = probe.duty {
+        let period = (on + off).max(1e-3);
+        let parked = (now - probe.at).rem_euclid(period) >= on;
+        let flipped = parked != probe.parked;
+        probe.parked = parked;
+        if parked {
+            probe.next = now + probe.step;
+            if flipped {
+                script.mouse_move(HOVER_PARK_AT.0, HOVER_PARK_AT.1);
+            }
+            return;
+        }
+    }
+    probe.next = now + probe.step;
+    let name = probe.names[probe.i % probe.names.len()].clone();
+    probe.i += 1;
+    match frame_centre(&script, &name) {
+        Some((x, y)) => {
+            if !probe.announced {
+                probe.announced = true;
+                info!(
+                    "probe-hover: sweeping {} frame(s) every {:.2}s, first {name} ({x:.0},{y:.0})",
+                    probe.names.len(),
+                    probe.step
+                );
+            }
+            let (dx, dy) = jitter_offset(probe.jitter, probe.i);
+            script.mouse_move(x + dx, y + dy);
+        }
+        // Named but unresolved is worth saying once per pass rather than silently sweeping air —
+        // a sweep over frames that do not exist reads as "hovering is free".
+        None => warn!("probe-hover: {name} has no resolved rect — nothing hovered this step"),
+    }
+}
+
+/// A deterministic offset inside a `j`-pixel square, cycling with the step index.
+///
+/// It exists to separate the two costs a hover sweep otherwise fuses: **the pointer moved** (the
+/// hit test re-runs) and **the hovered frame changed** (the tooltip is torn down and rebuilt). A
+/// one-name sweep with a jitter moves the pointer every step while the hovered frame — and the
+/// tooltip on it — stay put, which is the first of the two on its own.
+fn jitter_offset(j: f32, i: usize) -> (f32, f32) {
+    if j <= 0.0 {
+        return (0.0, 0.0);
+    }
+    // A 4-phase square walk: (+,+) → (-,+) → (-,-) → (+,-). Every step is a real move, and the
+    // cursor never leaves a `j`-pixel box around the centre.
+    let (sx, sy) = match i % 4 {
+        0 => (1.0, 1.0),
+        1 => (-1.0, 1.0),
+        2 => (-1.0, -1.0),
+        _ => (1.0, -1.0),
+    };
+    (sx * j, sy * j)
+}
+
 pub(crate) struct ProbeDragPlugin;
 
 impl Plugin for ProbeDragPlugin {

@@ -158,6 +158,7 @@ mod ui_unit;
 mod ui_world_map;
 mod video;
 mod vplates;
+mod world_backdrop;
 mod world_state;
 mod world_state_ui;
 
@@ -224,6 +225,7 @@ use ui_trade::UiTradePlugin;
 use ui_tradeskill::UiTradeSkillPlugin;
 use ui_trainer::UiTrainerPlugin;
 use ui_unit::UiUnitPlugin;
+use world_backdrop::WorldBackdropPlugin;
 
 // The `benilla` launcher shim (the bin package) is this library's only caller: it stamps the
 // build id at compile time and hands it into [`run`]. Re-exported so the shim needs no bevy
@@ -356,6 +358,14 @@ pub fn run(build: BuildId) -> AppExit {
 
     app.add_plugins(benilla_world::boot::tuned_default_plugins(Window {
         title: "benilla".into(),
+        // **Born in the player's display mode, not flipped into it** (decision 1627). `gxWindow`
+        // is read straight off `config.toml` here rather than waiting for `Startup`'s
+        // `load_config`, because a launch that opens windowed and goes fullscreen one frame later
+        // is a visible flash on every start — and, under a compositor that only maps a fullscreen
+        // surface 1:1 (gamescope), a first second spent in the exact input state this is meant to
+        // end. Every instrumented run stays windowed regardless (`video::windowed_env`), so the
+        // capture harness, the probe fleet and `$WOW_WIN` are untouched by any of this.
+        mode: video::boot_window_mode(),
         // UI-fixture captures shrink the window so the docked panel fills the frame — the capture
         // is the look-pass instrument and the window is its subject. The action bar is the
         // exception: it spans 1024px + 128px end caps along the screen bottom, so it gets a wide,
@@ -363,61 +373,59 @@ pub fn run(build: BuildId) -> AppExit {
         // the 1:1 gx window: at 1024×768 one gx unit = 1280 px, so the plate must land at the
         // border texture's native 128×32 — directly diffable against the decoded BLP. Sized
         // per-capture off WOW_CAPTURE.
-        resolution: if capturing && std::env::var("WOW_CAPTURE_UI").as_deref() == Ok("1") {
-            // `$WOW_WIN` overrides here too — the resolution-A/B instrument for UI scenarios (a
-            // scale-dependent text bug looks fine at the scenario's default size and truncates at
-            // fullscreen heights).
-            if let Some(win) = std::env::var("WOW_WIN").ok().and_then(|v| {
-                let (w, h) = v.split_once('x')?;
-                Some(UVec2::new(w.parse().ok()?, h.parse().ok()?))
-            }) {
-                win
-            } else {
-                match std::env::var("WOW_CAPTURE").as_deref() {
-                    Ok("ui-actionbar") => UVec2::new(1300, 260),
-                    Ok("vplates") => UVec2::new(1024, 768),
-                    // The director's small-window shape: short enough that the action bar strip
-                    // overlaps the chat edit box rows — the overlap is the subject.
-                    Ok("ui-chatedit") => UVec2::new(566, 377),
-                    // The fullscreen map's chrome is a centered 1024×768 block; a hair of margin
-                    // shows the blackout doing its job.
-                    Ok("ui-worldmap") => UVec2::new(1100, 800),
-                    // The 920×724 era options window wants air on every side so the straddling
-                    // right-edge tile and the hung close X stay in frame.
-                    Ok("ui-options") | Ok("ui-options-audio") | Ok("ui-options-graphics") => {
-                        UVec2::new(1200, 900)
-                    }
-                    _ => UVec2::new(640, 700),
-                }
-            }
-            .into()
-        } else {
-            // `$WOW_WIN=WxH` (logical px): override the world capture/window size — the
-            // resolution-A/B instrument. The FFXGlow blur geometry is byte-pinned in TEXELS, so its
-            // angular footprint shrinks as resolution grows and thin bright features (fence rails)
-            // self-amplify at 4K where the 1024-era reference diluted them; matching the era's
-            // pixel density (e.g. `WOW_WIN=512x288` on a 2× display → 1024×576 physical) isolates
-            // that term. Also the knob for any future era-resolution comparison.
-            std::env::var("WOW_WIN")
-                .ok()
-                .and_then(|v| {
-                    let (w, h) = v.split_once('x')?;
-                    Some(UVec2::new(w.parse().ok()?, h.parse().ok()?))
-                })
-                // A run that reads no pixels gets a SMALL window. It is held `AlwaysOnTop` for its
-                // whole life so it can never be occluded into the ~1 fps throttle
-                // (`capture::ProbeFocusPlugin`, decision 0906) — at the full default that meant
-                // every agent probe planted a screen-filling window over the director's work. Small
-                // + cornered (`ProbeFocusPlugin` parks it) is un-occludable AND out of the way;
-                // anything photographing pixels keeps the full size, and `WOW_WIN` overrides either
-                // way (decision 1148).
-                .unwrap_or(if benilla_world::bgwin::no_pixel_run() {
-                    UVec2::new(640, 360)
+        resolution: video::at_requested_dpi(
+            if capturing && std::env::var("WOW_CAPTURE_UI").as_deref() == Ok("1") {
+                // `$WOW_WIN` overrides here too — the resolution-A/B instrument for UI scenarios (a
+                // scale-dependent text bug looks fine at the scenario's default size and truncates at
+                // fullscreen heights).
+                if let Some(win) = video::requested_window_size() {
+                    win
                 } else {
-                    UVec2::new(1600, 900)
-                })
+                    match std::env::var("WOW_CAPTURE").as_deref() {
+                        Ok("ui-actionbar") => UVec2::new(1300, 260),
+                        Ok("vplates") => UVec2::new(1024, 768),
+                        // The director's small-window shape: short enough that the action bar strip
+                        // overlaps the chat edit box rows — the overlap is the subject.
+                        Ok("ui-chatedit") => UVec2::new(566, 377),
+                        // The fullscreen map's chrome is a centered 1024×768 block; a hair of margin
+                        // shows the blackout doing its job.
+                        Ok("ui-worldmap") => UVec2::new(1100, 800),
+                        // The 920×724 era options window wants air on every side so the straddling
+                        // right-edge tile and the hung close X stay in frame.
+                        Ok("ui-options") | Ok("ui-options-audio") | Ok("ui-options-graphics") => {
+                            UVec2::new(1200, 900)
+                        }
+                        _ => UVec2::new(640, 700),
+                    }
+                }
                 .into()
-        },
+            } else {
+                // `$WOW_WIN=WxH` (logical px): override the world capture/window size — the
+                // resolution-A/B instrument. The FFXGlow blur geometry is byte-pinned in TEXELS, so its
+                // angular footprint shrinks as resolution grows and thin bright features (fence rails)
+                // self-amplify at 4K where the 1024-era reference diluted them; matching the era's
+                // pixel density (e.g. `WOW_WIN=512x288` on a 2× display → 1024×576 physical) isolates
+                // that term. Also the knob for any future era-resolution comparison.
+                video::requested_window_size()
+                    // A run that reads no pixels gets a SMALL window. It is held `AlwaysOnTop` for its
+                    // whole life so it can never be occluded into the ~1 fps throttle
+                    // (`capture::ProbeFocusPlugin`, decision 0906) — at the full default that meant
+                    // every agent probe planted a screen-filling window over the director's work. Small
+                    // + cornered (`ProbeFocusPlugin` parks it) is un-occludable AND out of the way;
+                    // anything photographing pixels keeps the full size, and `WOW_WIN` overrides either
+                    // way (decision 1148).
+                    .unwrap_or(if benilla_world::bgwin::no_pixel_run() {
+                        UVec2::new(640, 360)
+                    } else {
+                        // The player's `gxResolution` — what "windowed" means for them, and what
+                        // leaving fullscreen restores (1627). Its default is the 1600×900 that was
+                        // hard-coded here before, and while `mode` above is fullscreen `bevy_winit`
+                        // ignores this entirely (it applies an inner size only on the `Windowed` arm).
+                        video::boot_windowed_size()
+                    })
+                    .into()
+            },
+        ),
         // The boot present mode. `$WOW_NOVSYNC=1` uncaps presentation so a headless FPS-journal
         // run measures true frame cost, not the vsync ceiling — the same uncap the capture probe
         // flips mid-run, available from boot for non-capture probes (perf triage at the glue
@@ -532,6 +540,10 @@ pub fn run(build: BuildId) -> AppExit {
     // The player-UI quad pass (decision 0068 §2): its own composited-above-the-world,
     // below-the-egui-dev-overlays camera + sorted-quad renderer. `$WOW_UI_DEMO=1` seeds a proof scene.
     .add_plugins(PlayerUiPlugin)
+    // The world's frame, rendered off-screen and handed to the UI pass as its first quad — the
+    // seam that puts the UI-over-world blend back into gamma bytes (0161/0254's last piece).
+    // Registered AFTER the UI pass: it writes `UiQuads`, which that plugin owns.
+    .add_plugins(WorldBackdropPlugin)
     // The HUD minimap (decision 0203 phase 1): fills the `<Minimap>` widget's extracted hole with
     // the streamed tile window + mask + player arrow, and feeds the zone text.
     .add_plugins(minimap::MinimapPlugin)

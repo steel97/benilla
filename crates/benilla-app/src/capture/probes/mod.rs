@@ -13,7 +13,9 @@ use bevy::prelude::*;
 mod fx_draw_census;
 pub(crate) use fx_draw_census::plugin as fx_draw_census_plugin;
 mod act;
-pub(crate) use act::{ProbeChatPlugin, ProbeDragPlugin, ProbeKeyPlugin, ProbeLuaPlugin};
+pub(crate) use act::{
+    ProbeChatPlugin, ProbeDragPlugin, ProbeHoverPlugin, ProbeKeyPlugin, ProbeLuaPlugin,
+};
 
 /// The probe **run** itself — its bounded lifetime, and the window it lives in (level,
 /// parking, size). Nothing here measures anything; it is the shell every other probe rides.
@@ -39,6 +41,12 @@ pub(crate) use ground_census::GroundCensusPlugin;
 /// decision 1403).
 mod visual_census;
 pub(crate) use visual_census::UnitVisualsPlugin;
+
+/// The motion-jitter meter — per frame, the camera / root / pose terms of a subject's rendered
+/// position as first *and second* differences, in mm and in pixels at its own distance: the
+/// reader that separates "the pose is noisy" from "the pose is smooth and the frames are not".
+mod jitter;
+pub(crate) use jitter::JitterMeterPlugin;
 
 /// The dress census — per-player "what did the wire ask for, what did we resolve, what is actually
 /// hanging off the skeleton": the three things a screenshot of a geared character conflates, and
