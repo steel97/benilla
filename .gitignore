@@ -19,3 +19,6 @@ trace-*.json
 .DS_Store
 *.swp
 /.idea/
+
+benilla-macarm
+start.sh
