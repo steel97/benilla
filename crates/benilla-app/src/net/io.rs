@@ -2,7 +2,8 @@
 //!
 //! [`spawn_net`] starts a read thread with **two park points** (decisions 0193 + 0539): it first
 //! parks **pre-logon** on the credentials channel — the login screen's pause — then, once a
-//! [`LoginRequest`] walks logon → realm → world handshake (emitting [`SessionEvent::LoginStage`]s,
+//! [`LoginRequest`] (credentials *and* the realmlist to dial) walks logon → realm → world
+//! handshake (emitting [`SessionEvent::LoginStage`]s,
 //! and [`SessionEvent::LoginFailed`] + re-park on any pre-roster failure), it **parks at character
 //! select**: it emits the roster as a [`SessionEvent::CharacterList`] and blocks until the app
 //! answers with a guid over the pick channel. The pick sends `CMSG_PLAYER_LOGIN`, and the thread
@@ -78,6 +79,12 @@ pub(crate) fn inbound_census() -> (u64, Option<u64>) {
 pub(crate) struct LoginRequest {
     pub(crate) user: String,
     pub(crate) pass: String,
+    /// The realmlist to dial, `host[:port]` (decision 1667). **Per-attempt, exactly like the
+    /// credentials beside it** — the login screen can now repoint the client between attempts, and
+    /// an address travelling with its attempt means an edit made mid-dial cannot silently retarget
+    /// the connection already in flight. It is also the only shape under which the abandon
+    /// generation stays meaningful: what a cancel abandons is *this* attempt, at *that* server.
+    pub(crate) host: String,
     pub(crate) generation: u64,
 }
 
@@ -105,11 +112,14 @@ pub(crate) struct PingClock {
 /// during an outage can't flood the log. Reset when a fresh writer arrives.
 const SEND_WARN_CAP: u32 = 8;
 
-/// Connection parameters, from env (`WOW_HOST` as `host[:port]`, `WOW_CHAR`). Credentials are NOT here anymore
-/// (decision 0539): they arrive per-attempt over the login channel — the app's policy owns the
-/// env fast path and its `one`/`pone` defaults.
+/// What is left of the per-process connection parameters: `WOW_CHAR`, and nothing else.
+///
+/// Neither the credentials nor the **address** live here any more. 0539 moved the credentials onto
+/// each [`LoginRequest`]; decision 1667 moved the host the same way and for the same reason — it
+/// is now a setting the player edits on the login screen (`crate::realmlist`), so a value latched
+/// out of the environment once at spawn could only ever be stale. `$WOW_HOST` is still honoured;
+/// it is read where every other env-overridable setting is read, by `Realmlist::default()`.
 pub(super) struct NetConfig {
-    host: String,
     /// `WOW_CHAR`, when explicitly set. Here it only names the create-if-empty character on a fresh
     /// account; as a *pick* it is app-side policy (`crate::char_select` auto-answers the roster with
     /// it — the dev fast path past the select screen).
@@ -119,7 +129,6 @@ pub(super) struct NetConfig {
 impl NetConfig {
     pub(super) fn from_env() -> Self {
         NetConfig {
-            host: std::env::var("WOW_HOST").unwrap_or_else(|_| "localhost".into()),
             character: std::env::var("WOW_CHAR").ok(),
         }
     }
@@ -255,36 +264,56 @@ fn run(
     let stage = |s: LoginStage| {
         let _ = events_tx.send(SessionEvent::LoginStage { stage: s });
     };
-    let fail = |code: Option<u8>, reason: String| {
+    let fail = |refusal: Option<benilla_protocol::LoginRefusal>, reason: String| {
         let _ = events_tx.send(SessionEvent::LoginFailed {
-            code,
+            refusal,
             reason,
             terminal: false,
+            dial: None,
+        });
+        Ok(Cycle::Repark)
+    };
+    // The dial that never opened a socket — the only failure whose cause the *screen* can act on,
+    // now that the address is something a player types (1667). Kept separate from `fail` so the
+    // classification happens once, at the one place holding the error object.
+    let fail_dial = |dial: benilla_protocol::DialFailure, reason: String| {
+        let _ = events_tx.send(SessionEvent::LoginFailed {
+            refusal: None,
+            reason,
+            terminal: false,
+            dial: Some(dial),
         });
         Ok(Cycle::Repark)
     };
     // A failure resubmitting cannot fix — the app shows it and stops (no paced retry).
     let fail_terminal = |reason: String| {
         let _ = events_tx.send(SessionEvent::LoginFailed {
-            code: None,
+            refusal: None,
             reason,
             terminal: true,
+            dial: None,
         });
         Ok(Cycle::Repark)
     };
 
     // Logon (the dial + SRP6 exchange — one blocking sequence against realmd).
     stage(LoginStage::Connecting);
-    let logon = match benilla_protocol::logon(&cfg.host, &req.user, &req.pass) {
+    let logon = match benilla_protocol::logon(&req.host, &req.user, &req.pass) {
         Ok(l) => l,
         Err(e) => {
             if canceled() {
                 return Ok(Cycle::Repark);
             }
             // A server refusal carries its auth result byte (the app maps it to the client's
-            // own AUTH_* string); a transport failure carries None.
-            let code = e.downcast_ref::<AuthReject>().map(|r| r.code);
-            return fail(code, format!("{e:#}"));
+            // own AUTH_* string); a transport failure carries None. A failure to get a socket at
+            // all carries the dial verdict, which is the one the screen can turn into advice.
+            if let Some(dial) = e.downcast_ref::<benilla_protocol::DialFailure>() {
+                return fail_dial(dial.clone(), format!("{e:#}"));
+            }
+            let refusal = e
+                .downcast_ref::<AuthReject>()
+                .map(|r| benilla_protocol::LoginRefusal::Logon(r.code));
+            return fail(refusal, format!("{e:#}"));
         }
     };
     if canceled() {
@@ -296,11 +325,30 @@ fn run(
     let world_addr = realm
         .as_ref()
         .map(|r| r.address.clone())
-        // Strip any explicit auth `:port` off `WOW_HOST` — the fallback world port is its own.
-        .unwrap_or_else(|| format!("{}:{}", host_port(&cfg.host, WORLD_PORT).0, WORLD_PORT));
+        // Strip any explicit auth `:port` off the realmlist — the fallback world port is its own.
+        .unwrap_or_else(|| format!("{}:{}", host_port(&req.host, WORLD_PORT).0, WORLD_PORT));
 
     stage(LoginStage::Handshaking);
-    let mut session = match WorldSession::connect(&world_addr, &req.user, logon.session_key) {
+    // The realm we are dialing, for the queue dialog to name — the roster that would otherwise
+    // carry it is on the far side of the queue, which is exactly when the name is wanted.
+    let realm_name = realm.as_ref().map(|r| r.name.clone());
+    // Report our place, and keep waiting only while the attempt is still wanted. A queue can
+    // last minutes, so unlike every other handshake stage it has to test the abandon generation
+    // itself — otherwise a Cancel would close the dialog while this thread quietly held its place
+    // in line and then walked into the world anyway.
+    let mut on_queue = |position: Option<u32>| {
+        let _ = events_tx.send(SessionEvent::LoginQueued {
+            position,
+            realm: realm_name.clone(),
+        });
+        !canceled()
+    };
+    let mut session = match WorldSession::connect_queued(
+        &world_addr,
+        &req.user,
+        logon.session_key,
+        &mut on_queue,
+    ) {
         Ok(s) => s,
         Err(e) => {
             if canceled() {
@@ -311,9 +359,22 @@ fn run(
             if let Some(w) = e.downcast_ref::<WardenRequired>() {
                 return fail_terminal(w.to_string());
             }
+            // The world server's own refusal, in its own enum — the screen owes the player the
+            // authored `AUTH_*` string for it, which it cannot recover from a formatted message.
+            if let Some(r) = e.downcast_ref::<benilla_protocol::WorldAuthReject>() {
+                return fail(
+                    Some(benilla_protocol::LoginRefusal::World(r.code)),
+                    format!("{e:#}"),
+                );
+            }
             return fail(None, format!("world handshake with {world_addr}: {e:#}"));
         }
     };
+    // The handshake can now block for minutes (the queue), so a cancel that landed while it did
+    // must not be overtaken by the roster it is about to fetch.
+    if canceled() {
+        return Ok(Cycle::Repark);
+    }
 
     // The roster (creating a starter character on a fresh account so PLAYER_LOGIN has a target).
     // Failures here are still pre-roster: surface as LoginFailed, re-park. (An immediately-run
@@ -766,6 +827,18 @@ fn writer_loop(
                     ClientCommand::RepairItem { vendor, item_guid } => {
                         w.repair_item(vendor, item_guid)
                     }
+                    ClientCommand::GmTicketCreate {
+                        category,
+                        map,
+                        pos,
+                        text,
+                    } => w.gm_ticket_create(category, map, pos, &text),
+                    ClientCommand::GmTicketUpdate { category, text } => {
+                        w.gm_ticket_updatetext(category, &text)
+                    }
+                    ClientCommand::GmTicketGet => w.gm_ticket_get(),
+                    ClientCommand::GmTicketDelete => w.gm_ticket_delete(),
+                    ClientCommand::GmTicketSystemStatus => w.gm_ticket_system_status(),
                     ClientCommand::BinderActivate { binder } => w.binder_activate(binder),
                     ClientCommand::TalentWipeConfirm { trainer } => w.talent_wipe_confirm(trainer),
                     ClientCommand::BankerActivate { guid } => w.banker_activate(guid),
@@ -778,6 +851,15 @@ fn writer_loop(
                     ClientCommand::TrainerBuySpell { trainer, spell_id } => {
                         w.trainer_buy_spell(trainer, spell_id)
                     }
+                    ClientCommand::ListStabledPets { npc } => w.list_stabled_pets(npc),
+                    ClientCommand::StablePet { npc } => w.stable_pet(npc),
+                    ClientCommand::UnstablePet { npc, pet_number } => {
+                        w.unstable_pet(npc, pet_number)
+                    }
+                    ClientCommand::StableSwapPet { npc, pet_number } => {
+                        w.stable_swap_pet(npc, pet_number)
+                    }
+                    ClientCommand::BuyStableSlot { npc } => w.buy_stable_slot(npc),
                     ClientCommand::LearnTalent { talent_id, rank } => {
                         w.learn_talent(talent_id, rank)
                     }
@@ -806,6 +888,9 @@ fn writer_loop(
                         spell_id,
                         item_guid,
                     } => w.cast_spell_item(spell_id, item_guid),
+                    ClientCommand::LootMasterGive { guid, slot, target } => {
+                        w.loot_master_give(guid, slot, target)
+                    }
                     ClientCommand::Loot { guid } => w.loot(guid),
                     ClientCommand::AutostoreLootItem { slot } => w.autostore_loot_item(slot),
                     ClientCommand::LootMoney => w.loot_money(),
@@ -944,6 +1029,7 @@ fn writer_loop(
                     ClientCommand::Logout => w.logout_request(),
                     ClientCommand::LogoutCancel => w.logout_cancel(),
                     ClientCommand::CompleteCinematic => w.complete_cinematic(),
+                    ClientCommand::NextCinematicCamera => w.next_cinematic_camera(),
                     ClientCommand::MoveModeAck {
                         guid,
                         counter,
@@ -1029,6 +1115,20 @@ fn writer_loop(
                         w.guild_set_officer_note(&name, &note)
                     }
                     ClientCommand::GuildInfoText { text } => w.guild_info_text(&text),
+                    // The petition family (decision 1672) — founding a guild.
+                    ClientCommand::PetitionShowList { npc } => w.petition_show_list(npc),
+                    ClientCommand::PetitionBuy { npc, name } => w.petition_buy(npc, &name),
+                    ClientCommand::PetitionShowSignatures { item } => {
+                        w.petition_show_signatures(item)
+                    }
+                    ClientCommand::PetitionSign { item, byte } => w.petition_sign(item, byte),
+                    ClientCommand::OfferPetition { item, player } => w.offer_petition(item, player),
+                    ClientCommand::TurnInPetition { item } => w.turn_in_petition(item),
+                    ClientCommand::PetitionQuery { petition_id, item } => {
+                        w.petition_query(petition_id, item)
+                    }
+                    ClientCommand::PetitionRename { item, name } => w.petition_rename(item, &name),
+                    ClientCommand::PetitionDecline { item } => w.petition_decline(item),
                     ClientCommand::TaxiNodeStatusQuery { guid } => w.taxi_node_status_query(guid),
                     ClientCommand::TaxiQueryNodes { guid } => w.taxi_query_available_nodes(guid),
                     ClientCommand::ActivateTaxi {
