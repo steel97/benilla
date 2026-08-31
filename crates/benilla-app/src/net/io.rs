@@ -758,6 +758,11 @@ fn writer_loop(
                         src_bag,
                         src_slot,
                     } => w.swap_item(dst_bag, dst_slot, src_bag, src_slot),
+                    ClientCommand::AutoStoreBagItem {
+                        src_bag,
+                        src_slot,
+                        dst_bag,
+                    } => w.auto_store_bag_item(src_bag, src_slot, dst_bag),
                     ClientCommand::SplitItem {
                         src_bag,
                         src_slot,
@@ -840,6 +845,7 @@ fn writer_loop(
                     ClientCommand::GmTicketDelete => w.gm_ticket_delete(),
                     ClientCommand::GmTicketSystemStatus => w.gm_ticket_system_status(),
                     ClientCommand::BinderActivate { binder } => w.binder_activate(binder),
+                    ClientCommand::SummonResponse { summoner } => w.summon_response(summoner),
                     ClientCommand::TalentWipeConfirm { trainer } => w.talent_wipe_confirm(trainer),
                     ClientCommand::BankerActivate { guid } => w.banker_activate(guid),
                     ClientCommand::BuyBankSlot { guid } => w.buy_bank_slot(guid),
@@ -917,7 +923,13 @@ fn writer_loop(
                     }
                     ClientCommand::QuestQuery { quest } => w.quest_query(quest),
                     ClientCommand::QuestgiverStatusQuery { npc } => w.questgiver_status_query(npc),
+                    ClientCommand::QuestgiverHello { npc } => w.questgiver_hello(npc),
                     ClientCommand::QuestlogRemove { slot } => w.questlog_remove_quest(slot),
+                    ClientCommand::PushQuestToParty { quest } => w.push_quest_to_party(quest),
+                    ClientCommand::QuestConfirmAccept { quest } => w.quest_confirm_accept(quest),
+                    ClientCommand::QuestPushResult { sharer, msg } => {
+                        w.quest_push_result(sharer, msg)
+                    }
                     ClientCommand::GetMailList { mailbox } => w.get_mail_list(mailbox),
                     ClientCommand::SendMail {
                         mailbox,
@@ -1016,6 +1028,8 @@ fn writer_loop(
                     // The player-trade arc (decision 0592) — the CMSG verbs onto the P0 writers.
                     ClientCommand::InitiateTrade { target } => w.initiate_trade(target),
                     ClientCommand::BeginTrade => w.begin_trade(),
+                    ClientCommand::BusyTrade => w.busy_trade(),
+                    ClientCommand::IgnoreTrade => w.ignore_trade(),
                     ClientCommand::AcceptTrade => w.accept_trade(),
                     ClientCommand::UnacceptTrade => w.unaccept_trade(),
                     ClientCommand::CancelTrade => w.cancel_trade(),
@@ -1039,9 +1053,21 @@ fn writer_loop(
                         pos,
                         orientation,
                     } => w.move_mode_ack(guid, counter, mode, apply, flags, (pos, orientation)),
+                    ClientCommand::KnockBackAck {
+                        guid,
+                        counter,
+                        launch,
+                        flags,
+                        pos,
+                        orientation,
+                        transport,
+                    } => {
+                        w.knock_back_ack(guid, counter, launch, flags, (pos, orientation), transport)
+                    }
                     ClientCommand::RepopRequest => w.repop_request(),
                     ClientCommand::CorpseQuery => w.corpse_query(),
                     ClientCommand::ReclaimCorpse { corpse } => w.reclaim_corpse(corpse),
+                    ClientCommand::SelfRes => w.self_res(),
                     ClientCommand::SpiritHealerActivate { npc } => w.spirit_healer_activate(npc),
                     ClientCommand::ResurrectResponse { caster, accept } => {
                         w.resurrect_response(caster, accept)
@@ -1075,6 +1101,7 @@ fn writer_loop(
                     ClientCommand::ReadyCheckStart => w.ready_check_start(),
                     ClientCommand::ReadyCheckAnswer { ready } => w.ready_check_answer(ready),
                     ClientCommand::RequestRaidInfo => w.request_raid_info(),
+                    ClientCommand::ResetInstances => w.reset_instances(),
                     ClientCommand::DuelAccepted { arbiter } => w.duel_accepted(arbiter),
                     ClientCommand::DuelCancelled { arbiter } => w.duel_cancelled(arbiter),
                     ClientCommand::TogglePvp => w.toggle_pvp(),
