@@ -175,7 +175,6 @@ impl Cooldowns {
     /// used to do made the GO insert of any cooldown-carrying spell (Frost Nova) overwrite its
     /// own running GCD node — the whole bar's pie flashed and died ~100 ms after the press,
     /// while cooldown-less spells (Arcane Explosion) kept theirs (decision 0947).
-    #[allow(clippy::too_many_arguments)] // the SPELLHISTORY node's own field list
     fn add(
         &mut self,
         spell_id: u32,
@@ -403,6 +402,23 @@ impl Cooldowns {
         }
     }
 
+    /// **The list belongs to the world session, not to the process** (decision 2116) — the
+    /// session-end clear every other net-backed store already had
+    /// ([`crate::net::apply::session::disconnected`]).
+    ///
+    /// `SMSG_INITIAL_SPELLS` carries the WHOLE set of cooldowns still running, at every world
+    /// entry, and [`Self::seed_initial`] appends (the reference's `AddCooldown 0x6e12c0` never
+    /// matches by id — see [`Self::add`]). So a store that survives the socket answers the *old*
+    /// session's records for the rest of their lives: a second login on the same character reads
+    /// its own stale copy rather than the wire's fresh remainder (measured live — a 600 s record
+    /// re-derived from the first login still winning over the second login's 594 s one), and a
+    /// login on a DIFFERENT character inherits cooldowns that are not theirs, for spells they may
+    /// not know. Nothing is lost by clearing: the next world entry — including 0065's seamless
+    /// reconnect, which is a full re-login — re-seeds from the wire.
+    pub(crate) fn clear_session(&mut self) {
+        self.wipe();
+    }
+
     /// One `SMSG_SPELL_COOLDOWN` pair (`0x6e9460`'s per-entry law): a nonzero wire duration is
     /// the spell recovery verbatim (category untracked); zero means "the spell's own Spell.dbc
     /// recovery + category recovery". `SPELL_ATTR_COOLDOWN_ON_EVENT` parks it and suppresses the
@@ -551,11 +567,24 @@ impl Cooldowns {
     /// set; `+0x28`/`+0x2c` are never referenced and no time source is called). Its reference
     /// consumers are all bit25/cooldown-on-event gates: the usable walk's grey-while-parked leg
     /// (`0x6e3fb1`) — ours — and the cast-fail on-hold revert.
-    pub(crate) fn has_on_hold_record(&self, spell_id: u32, spell: Option<&SpellDisplay>) -> bool {
-        let category = spell.map_or(0, |s| s.category);
+    ///
+    /// **It is item-keyed, and that is not cosmetic** (wow-re `action-button-state-api.md` §2c.4,
+    /// 2026-09-13). The node walk's spell-id leg is `node+0x08 == spellId && node+0x0c == itemId`
+    /// (`6e173f`/`6e1744`), and `0x6e2fc0` — the action bar's ITEM gate, and the **sole** consumer
+    /// of the item-keyed form image-wide — passes the item ENTRY as that second argument
+    /// (`6e3037 push esi`). Every other caller passes `0` (`0x6e2fa0`'s `push 0` at `6e2fa9`).
+    /// So an item's own parked record is only findable under its entry; querying a spell slot's
+    /// `(spell, 0)` form can never see it.
+    ///
+    /// `category` is the caller's for the same reason: `0x6e1690` starts from the spell's own
+    /// `[SpellRec+0x8]` and, when `itemId != 0`, **overwrites** it from the item's fifth spell
+    /// array `spellcategory[5]` (`rec+0x16c+4i`, `6e16f6`–`6e171b`, last match wins). Our wire
+    /// hands that resolved value over as `ItemUseSpell::category`, so the item's call site passes
+    /// the item's category and a spell's passes the spell's.
+    pub(crate) fn has_on_hold_record(&self, spell_id: u32, item_entry: u32, category: u32) -> bool {
         self.records.iter().any(|r| {
             r.on_hold
-                && ((r.spell_id == spell_id && r.item_id == 0)
+                && ((r.spell_id == spell_id && r.item_id == item_entry)
                     || (category != 0
                         && r.category == category
                         && !r.category_recovery.duration.is_zero()))
@@ -711,7 +740,7 @@ mod tests {
         // 0379's INTERIM: there is no separate GCD site); the corrected `0x6e1690` on-hold
         // predicate stays false (no parked record).
         assert!(cds.not_ready(133, 0, Some(&fireball()), mid));
-        assert!(!cds.has_on_hold_record(133, Some(&fireball())));
+        assert!(!cds.has_on_hold_record(133, 0, fireball().category));
     }
 
     /// The director's Frost Nova report (decision 0947): a cooldown-carrying spell's GO
@@ -798,7 +827,7 @@ mod tests {
         );
         assert!(cds.not_ready(5384, 0, Some(&fd), t0 + Duration::from_secs(60)));
         assert!(
-            cds.has_on_hold_record(5384, Some(&fd)),
+            cds.has_on_hold_record(5384, 0, fd.category),
             "the corrected 0x6e1690: an on-hold record — the usable walk's grey-while-parked"
         );
 
@@ -826,6 +855,82 @@ mod tests {
         cds.apply_wire_cooldown(100, 0, Some(&charge()), t0);
         let ch = cds.info(100, 0, Some(&charge()), t0 + Duration::from_secs(5));
         assert_eq!((ch.remaining_ms, ch.duration_ms), (10_000, 15_000));
+    }
+
+    /// **The session end empties the list, so the next login's wire is the whole truth**
+    /// (decision 2116). `seed_initial` appends by design (the reference's `AddCooldown` never
+    /// matches by id), so without the clear the previous session's record stays and — being
+    /// stamped with the FULL remainder it had at the earlier login — outlives and outbids the
+    /// fresh one. Measured live before the fix: a second world entry read `d=600` where the wire
+    /// had just said 594.
+    #[test]
+    fn a_session_end_empties_the_list_so_the_next_logins_wire_is_the_whole_truth() {
+        use benilla_protocol::messages::SpellCooldown;
+        let wire = |ms| SpellCooldown {
+            spell_id: 12975, // Last Stand — 10 minutes, no category
+            item_id: 0,
+            category: 0,
+            spell_cd_ms: ms,
+            category_cd_ms: 0,
+        };
+        let t0 = Instant::now();
+        let mut cds = Cooldowns::default();
+
+        // Login one: 600 s still to run.
+        cds.seed_initial(&wire(600_000), t0);
+        assert_eq!(cds.info(12975, 0, None, t0).duration_ms, 600_000);
+
+        // …the player logs out six seconds later and comes straight back in; the server's list
+        // now says 594 s.
+        let t1 = t0 + Duration::from_secs(6);
+        cds.clear_session();
+        assert!(cds.records.is_empty(), "the list dies with the session");
+        cds.seed_initial(&wire(594_000), t1);
+
+        let read = cds.info(12975, 0, None, t1);
+        assert_eq!(
+            (cds.records.len(), read.duration_ms, read.remaining_ms),
+            (1, 594_000, 594_000),
+            "one record, the second login's — a surviving first-login record would answer 600 s \
+             and go on answering it for the whole cooldown"
+        );
+    }
+
+    /// **`0x6e1690`'s item-keyed form** (wow-re `action-button-state-api.md` §2c.4). The node
+    /// walk's spell-id leg is `node+0x08 == spellId && node+0x0c == itemId`, and the action bar's
+    /// ITEM gate `0x6e2fc0` is the sole caller image-wide that passes a **non-zero** `itemId` —
+    /// the item ENTRY, at `6e3037 push esi`. Our store keys an item's record `(use_spell, entry)`
+    /// to match, so the spell-slot form `(spell, 0)` must NOT find it: a query keyed `0` walking
+    /// into an item's parked record would be the leg firing for the wrong button, and a query
+    /// keyed on the entry failing to find it is the bug this pins — the item's gate would have
+    /// rested on the category leg alone.
+    #[test]
+    fn an_on_hold_record_is_findable_only_under_the_key_that_armed_it() {
+        let t0 = Instant::now();
+        let mut cds = Cooldowns::default();
+        // An on-use item whose spell carries bit 25 (cooldown-on-event), category 0 so the
+        // category leg cannot mask the spell-id leg's answer either way.
+        let use_spell = ItemUseSpell {
+            spell_id: 5384,
+            cooldown_ms: 30_000,
+            category: 0,
+            category_cooldown_ms: 0,
+        };
+        let on_event = spell(0, 30_000, 0, (0, 0), 0x0200_0000);
+        cds.start_item(1487, &use_spell, Some(&on_event), t0);
+
+        assert!(
+            cds.has_on_hold_record(5384, 1487, 0),
+            "the ITEM gate's own query — `0x6e2fc0` passes the entry as itemId"
+        );
+        assert!(
+            !cds.has_on_hold_record(5384, 0, 0),
+            "the spell-slot form must not reach an item's record: itemId is part of the match"
+        );
+        assert!(
+            !cds.has_on_hold_record(5384, 999, 0),
+            "and not another item's entry either"
+        );
     }
 
     #[test]

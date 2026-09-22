@@ -5,10 +5,10 @@
 //! (`Normal/Pushed/Disabled/Highlight`), the `ButtonText` fontstring + `text` attribute, the
 //! `OnClick` script slot (`+0x4cc`); CheckButton runs Button's loader first and adds
 //! `CheckedTexture`/`DisabledCheckedTexture` + the `checked` bool (`+0x4dc`). Which texture *shows*
-//! is interaction state ([`ButtonState::region_visible`], applied at extract) — faithful to the
-//! documented widget model (texture array + current pointer `+0x4c4`), not byte-pinned. Two stated
-//! v1 gaps: the highlight draws with normal blending (the client ADD-blends it; the quad pass has
-//! no blend modes yet), and `PushedTextOffset` is not modeled. Per-state label fonts *are*: the
+//! is **latched on the transition**, not resolved at paint: [`ButtonState::set_state`] is the
+//! client's `SetState 0x779790` and [`settle`] is where the derived inputs reach it. Two stated v1
+//! gaps: the highlight draws with normal blending (the client ADD-blends it; the quad pass has no
+//! blend modes yet), and `PushedTextOffset` is not modeled. Per-state label fonts *are*: the
 //! `*FontObject` trio picks which object each state inherits and `extract` re-resolves it every
 //! frame, while `SetFont` writes the button's own face/size/flags over all of them
 //! ([`crate::widget::ButtonFont`]).
@@ -21,10 +21,12 @@ use mlua::{Lua, MultiValue, ObjectLike, Table, Value};
 
 use super::object::{as_f32, frame_handle_of};
 use super::region::region_wrapper;
-use super::{event, Model, RegionData};
+use super::{event, JustifyH, Model, RegionData};
+use crate::justify::Justify;
 use crate::order::DrawLayer;
 use crate::widget::{
-    ButtonFont, ButtonState, FrameHandle, FrameKind, KindState, RegionHandle, RegionKind,
+    ButtonFont, ButtonState, ButtonVisualState, FrameHandle, FrameKind, KindState, RegionHandle,
+    RegionKind,
 };
 
 pub(super) const REG_BUTTON_METHODS: &str = "__benilla_button_methods";
@@ -55,15 +57,19 @@ impl Slot {
         }
     }
 
-    fn set(self, bs: &mut ButtonState, rh: crate::widget::RegionHandle) {
+    /// The three STATE slots go through [`ButtonState::set_state_slot`] — the client's
+    /// `0x778fd0` family, which stores the slot *and* pushes it to the shown pointer when it is
+    /// the current state's. Every other slot is a plain field: the highlight, the checked pair
+    /// and the label are not in the state array and have show rules of their own.
+    fn set(self, bs: &mut ButtonState, rh: Option<crate::widget::RegionHandle>) {
         match self {
-            Slot::Normal => bs.normal = Some(rh),
-            Slot::Pushed => bs.pushed = Some(rh),
-            Slot::Disabled => bs.disabled = Some(rh),
-            Slot::Highlight => bs.highlight = Some(rh),
-            Slot::Checked => bs.checked_tex = Some(rh),
-            Slot::DisabledChecked => bs.disabled_checked = Some(rh),
-            Slot::Text => bs.text = Some(rh),
+            Slot::Normal => bs.set_state_slot(ButtonVisualState::Normal, rh),
+            Slot::Pushed => bs.set_state_slot(ButtonVisualState::Pushed, rh),
+            Slot::Disabled => bs.set_state_slot(ButtonVisualState::Disabled, rh),
+            Slot::Highlight => bs.highlight = rh,
+            Slot::Checked => bs.checked_tex = rh,
+            Slot::DisabledChecked => bs.disabled_checked = rh,
+            Slot::Text => bs.text = rh,
         }
     }
 
@@ -81,8 +87,57 @@ impl Slot {
     }
 }
 
-/// Point the ButtonText at the button's NORMAL font object, so the label's *query* surface answers
-/// what its paint already shows.
+/// The NORMAL embedded font's justify word — `[button+0x390]` (`+0x33c`, the normal `CSimpleFont`,
+/// plus its `+0x54` justify cell): the element-level `<NormalFont justifyH=>` when the template
+/// wrote one (a local write on that instance, severed from what it inherits), else what the
+/// instance inherits from its font object, else the ctor default (CENTER). The word the label
+/// adopter anchors by — decision 1996.
+fn normal_font_justify(model: &Model, bs: &ButtonState) -> Justify {
+    let mut word = Justify::default();
+    let inherited = || {
+        bs.normal_font
+            .as_deref()
+            .and_then(|n| model.font_object(n))
+            .and_then(|fo| fo.justify_h)
+    };
+    if let Some(j) = bs.normal_justify_h.or_else(inherited) {
+        word.set_h(j);
+    }
+    word
+}
+
+/// `CSimpleButton::SetFontString 0x778d20`'s tail — the ONE path a button label enters by,
+/// whether `SetText` made it (`0x778dc0` allocates, then calls this) or Lua handed one over
+/// (`SetFontString`): anchor it to the button **only if it has no anchor of its own** and **by the
+/// NORMAL font's justify word** (`[button+0x390]`: LEFT→LEFT, RIGHT→RIGHT, else CENTER — never
+/// the string's own `+0x120`, which on a fresh string is the ctor's CENTER), then apply the
+/// button's per-state font to it on the spot (`0x779810`). wow-re
+/// `system/ui/scratch/resize-bounds-and-button-fontstring.md` §5.2, every clause VERIFIED.
+///
+/// The word's source is the whole bug this fixes (decision 1996): a `UIMenuButtonTemplate` row
+/// has no `<ButtonText>` — its label is born from the reference's `UIMenu_AddButton` →
+/// `button:SetText(text)` — and its `<NormalFont inherits="GameFontNormal" justifyH="LEFT"/>` is
+/// the only thing that puts the label at the row's left edge. Reading the fresh string's own
+/// word instead seated every row CENTER, and with the shortcut string anchored RIGHT in a fixed
+/// 104-wide row, "Macro" ran into "/macro".
+fn adopt_label(model: &mut Model, owner: FrameHandle, rh: RegionHandle) {
+    let point = {
+        let Some(frame) = model.arena.frame(owner) else {
+            return;
+        };
+        let KindState::Button(bs) = &frame.kind_state else {
+            return;
+        };
+        super::region::justify_anchor_point(normal_font_justify(model, bs).0)
+    };
+    super::region::anchor_unanchored_at(model, rh, point);
+    apply_normal_font(model, owner);
+}
+
+/// Point the ButtonText at the button's NORMAL font — object and local justify — so the label's
+/// *query* surface answers what its paint already shows. The live link the reference's per-state
+/// applier `0x779810` → `0x770c60` installs: the instance's field block flows onto the label
+/// behind the label's own severance mask.
 ///
 /// Before this, the two disagreed. `extract` resolves the per-state font object every frame and
 /// overlays it onto a CLONE of the region's data (`extract.rs` l.114-122), so the label painted
@@ -105,26 +160,84 @@ impl Slot {
 /// either way, and no corpus site reads a label's font mid-state.
 ///
 /// `font::repaint` honours the severance mask, so a `<FontHeight>` or `SetTextColor` the label set
-/// for itself survives the link (the rule wow-re pinned in `font-object-lua-surface.md`).
-fn link_label_to_font_object(lua: &Lua, text: Option<RegionHandle>, name: Option<&str>) {
-    let Some(rh) = text else { return };
-    let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-    let Some(name) = name else {
-        model.region_data.entry(rh).or_default().font_object = None;
-        return;
+/// for itself survives the link (the rule wow-re pinned in `font-object-lua-surface.md`), and the
+/// local justify goes behind the same mask.
+fn apply_normal_font(model: &mut Model, owner: FrameHandle) {
+    let (rh, name, local_justify) = {
+        let Some(frame) = model.arena.frame(owner) else {
+            return;
+        };
+        let KindState::Button(bs) = &frame.kind_state else {
+            return;
+        };
+        let Some(rh) = bs.text else {
+            return;
+        };
+        (rh, bs.normal_font.clone(), bs.normal_justify_h)
     };
     // An unregistered name is not an error here: `SetTextFontObject` already accepted it, and the
     // loader's own log-and-continue rule (0068) owns the reporting.
-    let Some(fo) = model.font_object(name).cloned() else {
-        return;
-    };
+    let fo = name.as_deref().and_then(|n| model.font_object(n).cloned());
     let d = model.region_data.entry(rh).or_default();
-    d.font_object = Some(name.to_string());
-    super::font::repaint(d, &fo);
+    match (&name, fo) {
+        (None, _) => d.font_object = None,
+        (Some(_), None) => {}
+        (Some(name), Some(fo)) => {
+            d.font_object = Some(name.clone());
+            super::font::repaint(d, &fo);
+        }
+    }
+    if let Some(j) = local_justify {
+        if !d.font_explicit.justify_h {
+            d.justify.set_h(j);
+        }
+    }
     model.touch_measure(rh);
 }
 
+/// Which of the button's three embedded font instances a `<…Font>` element writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LabelFont {
+    Normal,
+    Highlight,
+    Disabled,
+}
+
+/// `<NormalFont justifyH=>` / `<HighlightFont justifyH=>` / `<DisabledFont justifyH=>` — the
+/// loader-facing write of a per-state embedded font's own justify (`CSimpleButton::LoadXML
+/// 0x7788c0` → the `<Font>` loader `0x783c30` on `+0x33c`/`+0x3b8`/`+0x434`: a `<Font>`-typed
+/// element, so the attribute lands on the instance itself, severed from whatever it inherits).
+/// No 1.12 Lua verb writes this — the API trio sets the OBJECT each instance inherits, never its
+/// local fields — which is why it is crate-internal rather than a method. A label already
+/// adopted keeps its anchor (the reference decided that at adoption) while its own justify word
+/// follows the normal instance, as the live link propagates the write.
+pub(crate) fn set_label_font_justify_h_lua(
+    lua: &Lua,
+    wrapper: &Table,
+    which: LabelFont,
+    j: JustifyH,
+) -> mlua::Result<()> {
+    let owner = frame_handle_of(lua, wrapper)?;
+    with_button(lua, wrapper, |bs| match which {
+        LabelFont::Normal => bs.normal_justify_h = Some(j),
+        LabelFont::Highlight => bs.highlight_justify_h = Some(j),
+        LabelFont::Disabled => bs.disabled_justify_h = Some(j),
+    })?;
+    if which == LabelFont::Normal {
+        let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+        apply_normal_font(&mut model, owner);
+    }
+    Ok(())
+}
+
 /// Run `f` over a frame's Button state under one short write borrow.
+///
+/// **It no longer settles a state machine afterwards, because there is no longer one to settle**
+/// (decision 2134). The button's state is a latch the engine's own edges write; a Lua write moves
+/// it only when the write IS an edge (`Enable`/`Disable`, `SetButtonState`), and those call the
+/// edge themselves. `RegisterForClicks` and the texture setters no longer disturb the state at
+/// all — which is the reference's behaviour: re-registering a held button's clicks does not
+/// un-press it.
 fn with_button<T>(
     lua: &Lua,
     this: &Table,
@@ -139,6 +252,133 @@ fn with_button<T>(
     match &mut frame.kind_state {
         KindState::Button(bs) => Ok(f(bs)),
         _ => Err(mlua::Error::runtime("not a Button")),
+    }
+}
+
+/// `Enable()` / `Disable()` — and the second thing they do, which is not the state texture.
+///
+/// `Disable 0x77ffd0` ends `0x78009a call [vtbl+0x90](0)`, reaching the shared helper
+/// `0x779160`; the constructor reaches the same helper with `1` (`0x778766`), which is what puts
+/// a fresh button in NORMAL. That helper does **two** things:
+///
+/// - `[vtbl+0x9c](state, 0)` = `SetButtonState 0x779790` — [`ButtonState::set_enabled`]'s half,
+///   whose two early-outs (nothing happens if the button is already in the state being asked for)
+///   are the helper's own; and
+/// - `0x7791bb push 4; call 0x76a730` — the per-layer enable for layer **4 = HIGHLIGHT**, written
+///   into the very `[frame+0x198]` array that `Enable/DisableDrawLayer` writes and that
+///   `0x76b3a0` reads back at draw time.
+///
+/// So a disabled button's highlight is switched off **at the layer**, which takes every region
+/// the frame owns there with it — not only the HighlightTexture. That is why the highlight is no
+/// longer gated on `enabled` inside [`ButtonState::region_visible`]: one mechanism, in the place
+/// the client keeps it, instead of a second rule that agreed with it on the common case and
+/// disagreed on `<Layer level="HIGHLIGHT">` art the button did not put there itself.
+///
+/// **The restore is NOT symmetric, and this comment used to claim it was** — *"one array and one
+/// writer, so an addon's `DisableDrawLayer("HIGHLIGHT")` is undone by the next `Enable()`"*. Both
+/// halves are false (wow-re `scratch/button-disabled-state-texture-law.md` §7, sharpened
+/// 2026-09-09 off `0x779160` read contiguously for exactly this question). The indexed form
+/// `[reg + 4*reg + 0x198]` has **three** sites image-wide — `0x76a717` (=1), `0x76a737` (=0) and
+/// `DrawLayer 0x76b3a6`'s read — so there are **two** writers; and the enable arm calls
+/// *neither* helper. It reaches the ON one only one hop away and only when the button is the
+/// frame under the cursor:
+///
+/// ```text
+/// 779183  mov ecx,[esi+0xa0]   ; the CSimpleTop singleton
+/// 779189  cmp esi,[ecx+0x7c]   ; am I the hover target?
+/// 77918c  jne 0x7791ce         ;   no -> return, layer untouched
+/// 779192  call [edx+0x4c]      ; = 0x779490 -> 0x76b6a0 -> 0x76b6c9 push 4; call 0x76a710
+/// ```
+///
+/// — i.e. `Enable()` on a hovered button restores the layer **by re-running the frame's Lua
+/// `<OnEnter>`**, and on a non-hovered one restores nothing (the next hover-enter does it). Both
+/// restore paths are gated on the LockHighlight flag `[frame+0xf8]`, and the disable arm's
+/// `0x7791bb call 0x76a730(4)` is the one site in the image that is *not* — so
+/// `LockHighlight()` → `Disable()` → `Enable()` leaves the layer off in the reference, and only
+/// `UnlockHighlight()`+`LockHighlight()` or an explicit `EnableDrawLayer` brings it back.
+///
+/// **Ours is the symmetric bit-flip**, which draws the same in the ordinary case — a highlight is
+/// only visible while hovered, and every hover-enter sets it — and diverges in two script-visible
+/// ways: we do not fire the `<OnEnter>` the reference synthesises when you `Enable()` a hovered
+/// button, and we restore a locked-then-disabled highlight the reference leaves dark. Named here
+/// rather than fixed, because the faithful shape needs the layer restore moved onto the hover
+/// path where the reference keeps it.
+fn set_enabled(lua: &Lua, this: &Table, on: bool) -> mlua::Result<()> {
+    let h = frame_handle_of(lua, this)?;
+    let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+    let frame = model
+        .arena
+        .frame_mut(h)
+        .ok_or_else(|| mlua::Error::runtime("stale frame handle"))?;
+    // The state half is [`ButtonState::set_enabled`], whose two early-outs are the client's:
+    // `Enable()` on a button that is not DISABLED does nothing at all, and neither does
+    // `Disable()` on one that already is.
+    match &mut frame.kind_state {
+        KindState::Button(bs) => bs.set_enabled(on),
+        _ => return Err(mlua::Error::runtime("not a Button")),
+    };
+    let bit = 1u8 << DrawLayer::Highlight.index();
+    if on {
+        frame.disabled_layers &= !bit;
+    } else {
+        frame.disabled_layers |= bit;
+    }
+    Ok(())
+}
+
+/// Run one of the engine's own state edges over frame `h`, if it is a live Button.
+///
+/// The reference's edge set is exactly seven `SetButtonState` call sites and **six of them are
+/// engine-side** (wow-re `scratch/button-state-edge-set.md`, VERIFIED): Enable, Disable, the hide
+/// notify, mouse-down, mouse-up and the drag-threshold crossing. There is **no enter or leave
+/// edge** — which is why the pointer path no longer calls anything here when the cursor crosses a
+/// button's boundary (decision 2134).
+///
+/// Harmless on a non-Button handle, and on a stale one.
+pub(super) fn edge(model: &mut Model, h: FrameHandle, f: impl FnOnce(&mut ButtonState)) {
+    if let Some(frame) = model.arena.frame_mut(h) {
+        if let KindState::Button(bs) = &mut frame.kind_state {
+            f(bs);
+        }
+    }
+}
+
+/// Does a hover edge on frame `h` reach the **base** enter/leave notify — the HIGHLIGHT layer and
+/// the Lua `<OnEnter>`/`<OnLeave>` script slots — or is it swallowed on the way there?
+///
+/// `CSimpleButton::OnEnter 0x779490` and `OnLeave 0x7794e0` both open on the state word, and the
+/// branch skips the *whole* body except the sound:
+///
+/// ```text
+/// 779493  mov eax,[esi+0x328]
+/// 779499  test eax,eax
+/// 77949b  je 0x7794b0          ; DISABLED -> skip the base notify AND the label restyle
+/// 77949d  call 0x76b6a0        ; CSimpleFrame::OnEnter — highlight layer on, <OnEnter> at +0x140
+/// ```
+///
+/// — so **a DISABLED Button runs neither script**, and `0x7794b0`'s hover sound is the only thing
+/// past the branch (wow-re `scratch/button-state-edge-set.md` §3.1, VERIFIED; the base pair's
+/// script slots `+0x140`/`+0x148` are `ledger.tsv:7944/7945`). Every path that delivers a hover
+/// edge dispatches through the object's own vtable, so there is no way around the guard: the hover
+/// walk (`0x766218`–`0x76623c`, `[vt+0x50]` then `[vt+0x4c]`), `SetMouseFocus 0x764dc0`
+/// (`0x764ddd push 0`), and the hide/removal tail (`0x764cce mov edx,[edi]; push 1;
+/// call [edx+0x50]`). `CheckButton` inherits both slots; the Hyperlink and NamePlate buttons
+/// override them and tail straight back into this pair (`0x7cb8a5`), so the guard covers the
+/// family.
+///
+/// The hover **target** still moves — the walk reassigns `[root+0x7c]` *before* it fires either
+/// notify — so `GetMouseFocus()` answers a disabled button; it is the scripts alone that stay
+/// quiet. This is what makes AtlasLoot's unset QuickLook buttons safe on the reference: their
+/// `<OnEnter>` guards with `if this:IsEnabled() then`, which is a NUMBER `1`/`0` and therefore
+/// always truthy (`scratch/button-enabled-state.md`), so the body would index a nil
+/// `QuickLooks[n]` — the reference never runs it at all.
+///
+/// `None` (the cursor over no frame) and every non-Button kind notify normally.
+pub(super) fn hover_notify_runs(model: &Model, h: Option<FrameHandle>) -> bool {
+    let Some(h) = h else { return true };
+    match model.arena.frame(h).map(|f| &f.kind_state) {
+        Some(KindState::Button(bs)) => bs.enabled(),
+        _ => true,
     }
 }
 
@@ -192,23 +432,31 @@ fn ensure_slot(lua: &Lua, this: &Table, slot: Slot) -> mlua::Result<u32> {
             model.region_data.insert(
                 rh,
                 RegionData {
-                    additive: slot == Slot::Highlight,
+                    blend: if slot == Slot::Highlight {
+                        crate::script::BlendMode::Add
+                    } else {
+                        crate::script::BlendMode::default()
+                    },
                     ..Default::default()
                 },
             );
             model.touch_layout(); // a region entered the layout gate's read set (decision 0740)
-                                  // A freshly built slot region gets the creation-path implicit anchor (decision 1310):
-                                  // the reference's C++ string setters SetAllPoints a fresh state texture outright
-                                  // (`0x778f9d`/`0x7790db` — fresh means zero anchors, so the conditional form is
-                                  // equivalent), and ButtonText creation runs the FontString post-step (`0x778b96` →
-                                  // `0x771480`), which seats a fresh label CENTER. The XML loader re-derives after
-                                  // applying authored `<Anchors>` (see `loader/widgets.rs`); an EXISTING slot region is
-                                  // never touched here — the get half of get-or-create changes no geometry.
-            super::region::implicit_creation_anchor(&mut model, rh);
             if let Some(frame) = model.arena.frame_mut(h) {
                 if let KindState::Button(bs) = &mut frame.kind_state {
-                    slot.set(bs, rh);
+                    slot.set(bs, Some(rh));
                 }
+            }
+            // A freshly built slot region gets its creation-path implicit anchor (decision 1310)
+            // — an EXISTING slot region is never touched here; the get half of get-or-create
+            // changes no geometry. Which anchor depends on the slot: the reference's C++ string
+            // setters SetAllPoints a fresh state texture outright (`0x778f9d`/`0x7790db` — fresh
+            // means zero anchors, so the conditional form is equivalent), while a fresh LABEL is
+            // handed to the adopter (`SetText 0x778dc0` → `0x778d20`), which anchors it by the
+            // button's normal font and links it (decision 1996). The XML loader re-derives after
+            // applying authored `<Anchors>` (see `loader/widgets.rs`).
+            match slot {
+                Slot::Text => adopt_label(&mut model, h, rh),
+                _ => super::region::implicit_creation_anchor(&mut model, rh),
             }
             rh
         }
@@ -216,8 +464,91 @@ fn ensure_slot(lua: &Lua, this: &Table, slot: Slot) -> mlua::Result<u32> {
     Ok(model.region_id(rh))
 }
 
-/// The shared body of `Set<State>Texture(path)` / `(r, g, b [, a])`.
+/// Point `slot` at `rh` (or at nothing) and hand back whatever it held before, when that is a
+/// different region. The reference's slot store `0x778fd0` ends in the outgoing object's
+/// vtable-slot-0 dtor, so the caller frees it.
+fn swap_slot(
+    model: &mut Model,
+    h: FrameHandle,
+    slot: Slot,
+    rh: Option<RegionHandle>,
+) -> mlua::Result<Option<RegionHandle>> {
+    let frame = model
+        .arena
+        .frame_mut(h)
+        .ok_or_else(|| mlua::Error::runtime("stale frame handle"))?;
+    let KindState::Button(bs) = &mut frame.kind_state else {
+        return Err(mlua::Error::runtime("not a Button"));
+    };
+    let outgoing = slot.get(bs).filter(|old| Some(*old) != rh);
+    slot.set(bs, rh);
+    model.touch_layout();
+    Ok(outgoing)
+}
+
+/// Free the region a slot just gave up — never the one that just moved in.
+fn free_outgoing(lua: &Lua, outgoing: Option<RegionHandle>, incoming: RegionHandle) {
+    if let Some(old) = outgoing.filter(|old| *old != incoming) {
+        super::region::free_region(
+            &mut lua.app_data_mut::<Model>().expect("model app_data"),
+            old,
+        );
+    }
+}
+
+/// The shared body of `Set<State>Texture(texture | "path" | nil)` / `(r, g, b [, a])`.
+///
+/// The reference forks on `lua_type(L, 2)` into four legs (`0x781970`, carved instruction by
+/// instruction in wow-re `button-state-texture-path-setter.md` §1). **Two of them never touch the
+/// slot's own region at all**, so they are resolved *before* [`ensure_slot`] — which would
+/// otherwise lazily build a region for a call whose entire purpose is to replace or drop one.
 fn set_slot_texture(lua: &Lua, this: &Table, slot: Slot, args: &MultiValue) -> mlua::Result<()> {
+    match args.front() {
+        // **A widget object installs THAT region into the slot** (`0x781b0b`: `push the Texture
+        // object; push idx; call 0x778fd0`) — it does not load a path into the slot's own region.
+        // Three corpus addons build a highlight exactly this way and every one of them was a
+        // silent no-op here: Bongos' bar-drag button (`bar.lua:64-71`), _Nameplates' mouseover
+        // glow (`_Nameplates.lua:217-222`) and Quiver's option rows (`Quiver.bundle.lua:8949-53`)
+        // each `CreateTexture` on the button, colour it, `SetAllPoints`, and hand it over.
+        Some(Value::Table(t)) => {
+            let rh = super::region::region_handle_of(lua, t)?;
+            let h = frame_handle_of(lua, this)?;
+            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+            // The reference type-checks the handed object and raises rather than installing a
+            // FontString into a texture slot (`0x781ab1`, `0x87a1e0`).
+            if model.arena.region(rh).map(|r| r.kind) != Some(RegionKind::Texture) {
+                return Err(mlua::Error::runtime("Wrong object type, expected texture"));
+            }
+            let outgoing = swap_slot(&mut model, h, slot, Some(rh))?;
+            drop(model);
+            free_outgoing(lua, outgoing, rh);
+            return Ok(());
+        }
+        // **nil CLEARS the slot** (`0x781b5a`: `push 0; push idx; call 0x778fd0`, whose tail runs
+        // the outgoing object's dtor). Clearing the pointer alone would be worse than doing
+        // nothing: `ButtonState::region_visible` shows any region that is not one of the button's
+        // own slots unconditionally, so an unhooked state texture would start drawing in *every*
+        // state instead of none. `TheoryCraft/TheoryCraftUI.lua:215-217` strips a talent-rank
+        // button's normal/pushed/highlight art with three of these.
+        //
+        // A call with NO argument is left alone: `LUA_TNONE` is not `LUA_TNIL`, and the
+        // reference's own nil test is `0x781b4f call 0x6f3400 == 0`.
+        Some(Value::Nil) => {
+            let h = frame_handle_of(lua, this)?;
+            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+            let outgoing = swap_slot(&mut model, h, slot, None)?;
+            drop(model);
+            if let Some(old) = outgoing {
+                super::region::free_region(
+                    &mut lua.app_data_mut::<Model>().expect("model app_data"),
+                    old,
+                );
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let id = ensure_slot(lua, this, slot)?;
     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
     let rh = *model.id_to_region.get(&id).expect("slot region id");
@@ -290,15 +621,27 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // SetText/GetText target the ButtonText fontstring (RF-28: the `text` attr routes there).
     m.set(
         "SetText",
-        lua.create_function(|lua, (this, text): (Table, Option<String>)| {
+        lua.create_function(|lua, (this, text): (Table, Option<Value>)| {
+            let text = super::binding_abi::text_arg(lua, text)?;
+            // `CSimpleButton::SetText 0x778dc0` opens `if (!text) return;` (`0x778dcc`, wow-re
+            // `button-label-build-and-anchor-order.md`) — a nil never reaches the label at all, so
+            // it neither clears the text nor lazily creates the FontString. That guard is the
+            // BUTTON's own: a `FontString:SetText(nil)` is not a no-op, it truncates the cell
+            // (`0x771d80`, decision 2110). Below the guard the button is a pass-through to
+            // `[button+0x338]->0x771d80`.
+            let Some(text) = text else { return Ok(()) };
             let id = ensure_slot(lua, &this, Slot::Text)?;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             let rh = *model.id_to_region.get(&id).expect("text region id");
-            model.region_data.entry(rh).or_default().text = text;
+            model.region_data.entry(rh).or_default().text = Some(text);
             model.touch_measure(rh);
             Ok(())
         })?,
     )?;
+    // GetText — like the FontString's own (`region::text`, decision 2110), an **empty label reads
+    // back nil**: `Button:GetText 0x780e10` carries the same first-byte substitution at `0x780ec5`,
+    // over three nil conditions rather than two (no label region, a NULL cell, an empty cell).
+    // Its EditBox neighbour deliberately does not — the law is per binding.
     m.set(
         "GetText",
         lua.create_function(|lua, this: Table| {
@@ -307,6 +650,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 rh.and_then(|rh| model.region_data.get(&rh))
                     .and_then(|d| d.text.clone())
+                    .filter(|t| !t.is_empty())
             };
             match text {
                 Some(t) => Ok(Value::String(lua.create_string(&t)?)),
@@ -357,17 +701,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     //    (`0x77fd10(parent, 2, 1)` — layer id 2 in the client's own `.rdata 0x811a80` name table).
     //    Always, whatever it was parented to or drawn in before.
     //  · **it is anchored only if it has NO anchors of its own** (a scan of all nine
-    //    `anchorPoints` slots): LEFT/RIGHT/CENTER by the justify bits, to the matching point on
-    //    the button. That is exactly [`super::region::implicit_creation_anchor`]'s FontString arm,
-    //    which already transcribes the same `& 7` → LEFT(1)/RIGHT(4)/else-CENTER chain, so it is
-    //    reused rather than re-written. One stated difference: the reference reads the *button's*
-    //    Normal `CSimpleFont` justify word and ours reads the string's own — they agree in the
-    //    ordinary case, because our extract resolves the button's per-state font onto the label
-    //    every frame anyway.
-    //
-    // The fifth clause — apply the button's per-state font immediately — needs no code: our
-    // extract re-points the label at the current state's font object every frame
-    // ([`ButtonState::normal_font`]), so binding the label IS applying it.
+    //    `anchorPoints` slots): LEFT/RIGHT/CENTER by the justify bits of the **button's normal
+    //    font** (`[button+0x390]`), to the matching point on the button — [`adopt_label`], the
+    //    same `& 7` → LEFT(1)/RIGHT(4)/else-CENTER chain the FontString post-step runs, over the
+    //    other word. (It used to reuse the post-step and read the string's own word; the two
+    //    only agree when the normal font has no justify — decision 1996.)
+    //  · **the button's per-state font is applied immediately** (`0x779810`) — the same
+    //    [`adopt_label`] links the label to the normal font, so its query surface answers.
     m.set(
         "SetFontString",
         lua.create_function(|lua, args: MultiValue| {
@@ -438,7 +778,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             if let Some(r) = model.arena.region_mut(rh) {
                 r.draw_layer = DrawLayer::Artwork;
             }
-            super::region::implicit_creation_anchor(&mut model, rh);
+            adopt_label(&mut model, owner, rh);
             // A new label, a new owner and a possible new anchor — the layout's read set moved,
             // and the string's extents are what the button's own `GetTextWidth` reports.
             model.touch_layout();
@@ -504,11 +844,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "SetTextFontObject",
         lua.create_function(|lua, (this, font): (Table, Value)| {
             let name = super::font::resolve("SetTextFontObject", &font)?;
-            let text = with_button(lua, &this, |bs| {
-                bs.normal_font.clone_from(&name);
-                bs.text
-            })?;
-            link_label_to_font_object(lua, text, name.as_deref());
+            let owner = frame_handle_of(lua, &this)?;
+            with_button(lua, &this, |bs| bs.normal_font = name)?;
+            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+            apply_normal_font(&mut model, owner);
             Ok(())
         })?,
     )?;
@@ -625,17 +964,63 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     m.set(
         "SetTextColor",
         lua.create_function(
-            |lua, (this, r, g, b, a): (Table, f32, f32, f32, Option<f32>)| {
+            |lua, (this, r, g, b, a): (Table, Value, Value, Value, Option<f32>)| {
+                // Shape C on the channels (`Button:SetTextColor 0x780ee0`, `2=C 3=C 4=C 5=B`).
+                let (r, g, b) = (
+                    super::object::as_f32(&r),
+                    super::object::as_f32(&g),
+                    super::object::as_f32(&b),
+                );
                 with_button(lua, &this, |bs| {
                     bs.normal_color = Some([r, g, b, a.unwrap_or(1.0)])
                 })
             },
         )?,
     )?;
+    // GetTextColor() → r, g, b, a — **FOUR values** (`0x781100`, table `0x879d00`, argc 1, arity 4,
+    // kinds `(number,number,number,number)`), the same shape as the FontString/Font-object twins
+    // (`0x79d840` table `0x87c1d8`, `0x79f680`) this codebase already answers. Three is the
+    // plausible wrong answer, and the shapes table calls the name `name-not-unique` precisely
+    // because it is registered on seven tables; this is the Button one.
+    //
+    // **Read like `GetFont` right above, not like `SetTextColor` right above that.** The reference
+    // reads the colour back off the button's NORMAL embedded `CSimpleFont`, and an unset local
+    // colour there still resolves through what the normal state INHERITS
+    // (`<NormalFont>`/`SetTextFontObject`) — which is how a `GameMenuButtonTemplate` button answers
+    // `GameFontNormal`'s colour before anything calls `SetTextColor`. Falling back to white would
+    // be wrong in exactly the case the corpus cares about: reading a stock button's colour to
+    // restore it after a temporary recolour. White is the last resort, matching every other colour
+    // getter here (`GetVertexColor`, `FontString:GetTextColor`) — the untinted default a region
+    // with no colour anywhere draws at.
+    //
+    // Completeness rather than a live break: the census found no corpus site with a Button
+    // receiver (every measured `GetTextColor` call is on a FontString or a font object). It is here
+    // because the reference registers it and the widget shape gate can then cover it.
+    m.set(
+        "GetTextColor",
+        lua.create_function(|lua, this: Table| {
+            let (own, inherits) =
+                with_button(lua, &this, |bs| (bs.normal_color, bs.normal_font.clone()))?;
+            let c = own.unwrap_or_else(|| {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                inherits
+                    .and_then(|n| model.font_object(&n))
+                    .and_then(|f| f.color)
+                    .unwrap_or([1.0, 1.0, 1.0, 1.0])
+            });
+            Ok((c[0], c[1], c[2], c[3]))
+        })?,
+    )?;
     m.set(
         "SetHighlightTextColor",
         lua.create_function(
-            |lua, (this, r, g, b, a): (Table, f32, f32, f32, Option<f32>)| {
+            |lua, (this, r, g, b, a): (Table, Value, Value, Value, Option<f32>)| {
+                // Shape C on the channels (`Button:SetTextColor 0x780ee0`, `2=C 3=C 4=C 5=B`).
+                let (r, g, b) = (
+                    super::object::as_f32(&r),
+                    super::object::as_f32(&g),
+                    super::object::as_f32(&b),
+                );
                 with_button(lua, &this, |bs| {
                     bs.highlight_color = Some([r, g, b, a.unwrap_or(1.0)])
                 })
@@ -645,7 +1030,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     m.set(
         "SetDisabledTextColor",
         lua.create_function(
-            |lua, (this, r, g, b, a): (Table, f32, f32, f32, Option<f32>)| {
+            |lua, (this, r, g, b, a): (Table, Value, Value, Value, Option<f32>)| {
+                // Shape C on the channels (`Button:SetTextColor 0x780ee0`, `2=C 3=C 4=C 5=B`).
+                let (r, g, b) = (
+                    super::object::as_f32(&r),
+                    super::object::as_f32(&g),
+                    super::object::as_f32(&b),
+                );
                 with_button(lua, &this, |bs| {
                     bs.disabled_color = Some([r, g, b, a.unwrap_or(1.0)])
                 })
@@ -670,11 +1061,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     m.set(
         "Enable",
-        lua.create_function(|lua, this: Table| with_button(lua, &this, |bs| bs.enabled = true))?,
+        lua.create_function(|lua, this: Table| set_enabled(lua, &this, true))?,
     )?;
     m.set(
         "Disable",
-        lua.create_function(|lua, this: Table| with_button(lua, &this, |bs| bs.enabled = false))?,
+        lua.create_function(|lua, this: Table| set_enabled(lua, &this, false))?,
     )?;
     // IsEnabled() → the NUMBER 1 or the NUMBER 0 — never a boolean, and never nil.
     //
@@ -692,13 +1083,16 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // `guildButtonDisabled` read BOTH spellings and said so); those workarounds go with this
     // change, which is 1719's bar — a prior call revisited because a new measurement arrived.
     //
-    // Slider carries its own `IsEnabled` (slider.rs) and is deliberately NOT changed here: the
-    // note above is the BUTTON method table, and whether the slider widget shares the contract is
-    // unverified. Assuming they match is exactly the guess this comment exists to have avoided.
+    // Slider used to carry its own `IsEnabled` (slider.rs), left alone here because "whether the
+    // slider widget shares the contract is unverified". It does not share it — it does not HAVE
+    // one: 1.12 registers `Enable`/`Disable`/`IsEnabled` on this table alone, and the Slider's
+    // LoadXML `0x789580` has no `enabled` attribute either, so ours was a superset. The trio came
+    // off the Slider rather than being brought into line with this contract; see the note at its
+    // old site in `slider.rs`.
     m.set(
         "IsEnabled",
         lua.create_function(|lua, this: Table| {
-            with_button(lua, &this, |bs| i64::from(bs.enabled))
+            with_button(lua, &this, |bs| i64::from(bs.enabled()))
         })?,
     )?;
 
@@ -719,49 +1113,53 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // SetButtonState("PUSHED"/"NORMAL") / GetButtonState — the scripted press state
-    // (`0x780270`/`0x780180`; ref `ActionButtonDown/Up`, ActionButton.lua:15-28: DOWN pushes
-    // only from NORMAL, UP fires only from PUSHED — the state doubles as the keybind debounce).
-    // Case-insensitive like the API's other string enums; an unknown state is a runtime error.
-    // DISABLED is Enable/Disable's to set, not this method's (the 1.12 FrameXML never passes it).
+    // **`SetButtonState(state[, lock]) 0x780270` — TWO arguments**, and the second is not
+    // cosmetic (wow-re `scratch/binding-shape-arity-law.md` §3, VERIFIED). It reads three stack
+    // indices and returns none; the state maps case-insensitively over exactly
+    // `{"DISABLED", "NORMAL", "PUSHED"}` (`0x780390`, `SStrCmpI`) and an unrecognised string
+    // raises `Usage: %s:SetButtonState("state", lock)`; the flag is `GetBoolOrDefault` with
+    // **default 0** (`0x78032c push 0`), whose number arm truncates through `_ftol`, so the
+    // literal `1` that `MainMenuBarMicroButtons.lua` passes arms it.
+    //
+    // **The lock is the whole of decision 2134.** While it is set the button ignores the mouse
+    // press/release transitions; while it is clear, the next release un-pushes a scripted push —
+    // which is what Tablet-2.0's rows depend on, since the library pushes them and never calls
+    // `SetButtonState("NORMAL")` anywhere.
+    //
+    // DISABLED really is accepted here — the mapper takes it — even though the 1.12 FrameXML
+    // never passes it.
     m.set(
         "SetButtonState",
-        lua.create_function(|lua, (this, state): (Table, String)| {
-            let pushed = if state.eq_ignore_ascii_case("PUSHED") {
-                true
+        lua.create_function(|lua, (this, state, lock): (Table, String, MultiValue)| {
+            let new = if state.eq_ignore_ascii_case("PUSHED") {
+                ButtonVisualState::Pushed
             } else if state.eq_ignore_ascii_case("NORMAL") {
-                false
+                ButtonVisualState::Normal
+            } else if state.eq_ignore_ascii_case("DISABLED") {
+                ButtonVisualState::Disabled
             } else {
                 return Err(mlua::Error::runtime(format!(
-                    "SetButtonState: unknown state '{state}'"
+                    "Usage: SetButtonState(\"state\", lock) — unknown state '{state}'"
                 )));
             };
-            with_button(lua, &this, |bs| bs.pushed_state = pushed)
+            let first = lock.into_iter().next();
+            let locked = super::binding_abi::bool_or_default(first.as_ref(), false);
+            with_button(lua, &this, |bs| bs.set_button_state(new, locked))
         })?,
     )?;
     m.set(
         "GetButtonState",
         lua.create_function(|lua, this: Table| {
-            let h = frame_handle_of(lua, &this)?;
-            // The LIVE mouse-held press counts too (hovered + a registered button down on this
-            // frame — the same predicate the extract pass renders the PushedTexture by), closing
-            // the documented INTERIM where a mouse-held button answered "NORMAL": the chat scroll
-            // buttons' hold-repeat (ref MessageFrameScrollButton_OnUpdate) polls exactly this
-            // mid-press (decision 0288 P3). It reads the same in the reference for the same
-            // reason — `0x7792ad` writes ONE state variable and `0x780180` reads it back, so a
-            // right-held button answers "PUSHED" as surely as a left-held one.
-            let held = {
-                let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model.mouseover == Some(h) && press_held(&model, h)
-            };
-            with_button(lua, &this, move |bs| {
-                if !bs.enabled {
-                    "DISABLED"
-                } else if bs.pushed_state || held {
-                    "PUSHED"
-                } else {
-                    "NORMAL"
-                }
+            // ONE variable, read back (`0x780180` reads `[obj+0x328]`). This used to OR in the
+            // live mouse-held press, because the state was derived and the press lived outside
+            // the widget; now the press *wrote* the state at its edge, so a mouse-held button
+            // answers "PUSHED" for the same reason the reference does — and cannot disagree with
+            // the art the way a re-derived answer could (decision 2134). The chat scroll buttons'
+            // hold-repeat (ref `MessageFrameScrollButton_OnUpdate`) still reads what it needs.
+            with_button(lua, &this, |bs| match bs.button_state() {
+                ButtonVisualState::Disabled => "DISABLED",
+                ButtonVisualState::Pushed => "PUSHED",
+                ButtonVisualState::Normal => "NORMAL",
             })
         })?,
     )?;
@@ -826,7 +1224,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "GetChecked",
         lua.create_function(|lua, this: Table| {
             let checked = with_button(lua, &this, |bs| bs.checked)?;
-            Ok(crate::script::binding_abi::predicate(checked))
+            Ok(crate::script::binding_abi::flag(checked))
         })?,
     )?;
     lua.set_named_registry_value(REG_CHECKBUTTON_METHODS, c)?;
@@ -883,18 +1281,6 @@ pub(super) fn wants_press_visual(model: &Model, h: FrameHandle, button: &str) ->
     }
 }
 
-/// Is a press currently holding this button down — the `held` half of the PushedTexture rule.
-///
-/// Any captured mouse button counts, gated by [`wants_press_visual`]. Callers pair it with
-/// `hovered`, which is `0x779256`'s hit test at press time plus `0x7793f0`'s restore-to-NORMAL
-/// when the pointer leaves mid-press.
-pub(super) fn press_held(model: &Model, h: FrameHandle) -> bool {
-    model
-        .mouse_down_on
-        .iter()
-        .any(|(button, &pressed)| pressed == h && wants_press_visual(model, h, button))
-}
-
 /// The click behavior shared by the input path and `Click()`: gated on `enabled`; a CheckButton
 /// **toggles before OnClick fires** (the documented widget contract — a handler reading
 /// `self:GetChecked()` sees the new state); then `OnClick(self, button, down)` — `down` is `true`
@@ -943,7 +1329,7 @@ pub(super) fn click_button(lua: &Lua, id: u32, button: &str, down: bool, scripte
         match &mut frame.kind_state {
             // A Button/CheckButton click is gated on its enabled flag…
             KindState::Button(bs) => {
-                if bs.enabled {
+                if bs.enabled() {
                     if is_check {
                         bs.checked = !bs.checked;
                     }
@@ -969,6 +1355,15 @@ pub(super) fn click_button(lua: &Lua, id: u32, button: &str, down: bool, scripte
             .expect("model app_data")
             .errors
             .push(e.to_string());
+    }
+    // **A nameplate's click is the engine's too** (decision 2148): the reference's plate overrides
+    // the button click slot (`0x7cb910`) *and* chains the base, so its unit is selected whether the
+    // click came from the pointer or from Lua's own `Click()` — this funnel is both. Recorded after
+    // the handler, like the loot take below and for the same reason: an addon hook that errors
+    // cannot silently eat the selection. A press (`down`) records nothing — the plate registers for
+    // `LeftButtonUp | RightButtonUp` only (`RegisterForClicks(0x500)` at `0x7cb637`).
+    if !down {
+        super::nameplate::note_click(lua, id, button);
     }
     // …and then the take, unconditionally on the handler's outcome. `0x4c1867` is not guarded by
     // anything the Lua side did: the base call at `0x4c1833` returns void and its result is never

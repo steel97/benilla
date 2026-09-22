@@ -15,7 +15,7 @@ const WOLF_FACTION: u32 = 32;
 /// The `name-water` fixture's unit: the same wolf, re-seated 25 yd along the water scenario's own
 /// look bearing (`WATER_EYE` → `WATER_LOOK`) at the river surface, so its overhead name projects
 /// onto the water *beyond* it.
-const NAME_WATER_POS: [f32; 3] = [-9512.97, -331.29, 61.4];
+pub(super) const NAME_WATER_POS: [f32; 3] = [-9512.97, -331.29, 61.4];
 
 /// The lighting matrix's chest (decision 0744): `GameObjectDisplayInfo` 259,
 /// `World\SkillActivated\Containers\TreasureChest01.mdx`. GameObject guids carry the `0xF110` high
@@ -33,7 +33,6 @@ const SUBJECT_YAW: f32 = 2.36;
 /// feeds then push it into the VM during the settle window exactly as live wire data would. Item
 /// icons resolve through the offline `ItemDisplayCatalog` (display ids chosen from entries that
 /// catalog is known to carry); names land directly in the caches (no server to ask).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn seed_ui_fixture(
     mut ctx: ResMut<CaptureCtx>,
     mut commands: Commands,
@@ -51,9 +50,11 @@ pub(super) fn seed_ui_fixture(
     mut selection: ResMut<crate::target::Selection>,
     mut player: ResMut<crate::player::Player>,
     // Bundled: Bevy systems cap at 16 top-level params — a nested tuple is one param.
-    (mut actions, mut bank): (
+    (mut actions, mut bank, mut exit, mut loading): (
         ResMut<crate::ui_action::PlayerActions>,
         ResMut<crate::ui_bank::BankOpen>,
+        MessageWriter<AppExit>,
+        ResMut<crate::loading_screen::LoadingScreen>,
     ),
 ) {
     // A glue-screen capture has no world scenario, and no glue screen opens a UI fixture.
@@ -67,6 +68,22 @@ pub(super) fn seed_ui_fixture(
         return;
     }
     ctx.ui_seeded = true;
+
+    // **A UI capture with no script VM is not a capture — refuse it.** Every seed below opens its
+    // window by calling into the in-game UI, so with no VM they all fail the same way: a nil
+    // global, one `warn!` in a log full of pipeline chatter, a valid-looking PNG of a UI-less
+    // world, and exit 0. That is the false-negative shape `method.md` §6 exists to prevent, and it
+    // burned a session. `scenario_wants_ui` removed the cause (a `ui:` scenario no longer needs
+    // `WOW_CAPTURE_UI=1`); this is the tripwire for whatever else could leave the VM absent, and
+    // it exits non-zero the way the window-size refusal does (`video::warn_if_window_mismatch`).
+    if script.is_none() {
+        error!(
+            "capture: REFUSING this capture — scenario {:?} declares a UI fixture but no script              VM exists, so its window cannot be opened and the shot would be a UI-less world              wearing the scenario's name.",
+            scenario.name
+        );
+        exit.write(AppExit::error());
+        return;
+    }
 
     // A creature guid whose entry bits (24–47) carry 90001 — the NameCache resolves vendor/NPC
     // names by that entry, so inserting the name by entry makes the title path run for real.
@@ -135,6 +152,15 @@ pub(super) fn seed_ui_fixture(
     };
 
     match fixture {
+        // Nothing to open — the UI being loaded (and `demo_unit_feed`'s synthetic player/target)
+        // IS the fixture. The `script.is_none()` refusal above still guards it: these scenarios
+        // photograph the player UI, so a run without a VM is as wrong for them as for any other.
+        UiFixture::Bare => {}
+        // The one fixture that opens no window: it raises the world-entry loading screen over the
+        // settled scene and pins it there, tip and all. `hold_for_capture` sets the `Pick` edge;
+        // `crate::game_tip::drive_game_tip` paints it on the next frame, and the stability watch
+        // settles on the held image.
+        UiFixture::LoadingTip => loading.hold_for_capture(scenario.map),
         UiFixture::Merchant => {
             names.insert_creature(
                 NPC_ENTRY,
@@ -231,8 +257,8 @@ pub(super) fn seed_ui_fixture(
             gossip.quests = vec![(783, 0, 5, "Eagan Peltskinner".into())];
             // One short option AND four that WRAP — the live shape both gossip bugs came in as
             // (the director's screenshots), and a menu deliberately TALLER than the parchment so
-            // the capture covers the whole chain: the per-row auto-height
-            // (`BenillaGossipRow_Resize`), the scroll frame that contains the overflow, and the
+            // the capture covers the whole chain: the stock `GossipResize`'s per-row auto-height,
+            // the scroll frame that contains the overflow, and the
             // scrollbar that appears with it. A fixture of one-line labels showed none of this —
             // every row fit the template's 16 px and nothing ever overflowed.
             let judgement = [
@@ -490,13 +516,16 @@ pub(super) fn seed_ui_fixture(
             };
             // Entry 1 (selected by first-valid auto-selection): in progress, one creature
             // objective at 3/10 (the slot counter below) + one item objective (bags are empty in
-            // capture → 0/5), choice + fixed rewards, money.
+            // capture → 0/5), choice + fixed rewards, money. `quest_type: 1` is QuestInfo.dbc's
+            // "Elite" — the real 783 is a plain quest, but this fixture is the only thing that
+            // puts a row TAG in front of the capture, and the tag and the "(Complete)" state word
+            // are different branches of the same row string (entry 2 covers the other).
             quest_log.insert_template(QuestTemplate {
                 quest_id: 783,
                 method: 2,
                 level: 2,
                 zone_or_sort: 12,
-                quest_type: 0,
+                quest_type: 1,
                 rep_objective_faction: 0,
                 rep_objective_value: 0,
                 next_quest_in_chain: 0,
@@ -640,6 +669,29 @@ pub(super) fn seed_ui_fixture(
             };
             seed_bag_window(&mut script, icons.as_deref());
             seed_equipped_bags(&mut script, icons.as_deref());
+        }
+        UiFixture::Cooldown => {
+            let Some(mut script) = script else {
+                return;
+            };
+            seed_cooldown_filmstrip(&mut script, icons.as_deref());
+        }
+        UiFixture::CooldownShine => {
+            let Some(mut script) = script else {
+                return;
+            };
+            seed_cooldown_filmstrip(&mut script, icons.as_deref());
+            // The pet bar's autocast shine, raised by hand: no pet is fed here, so the bar's own
+            // show path never runs. The shine is the subject, not the bar's chrome.
+            if let Err(e) = script.run(
+                "PetActionBarFrame:Show()\n\
+                 for i = 1, 4 do\n\
+                     local b = getglobal(\"PetActionButton\"..i)\n\
+                     if b then b:Show(); getglobal(b:GetName()..\"AutoCast\"):Show() end\n\
+                 end",
+            ) {
+                warn!("capture: ui-cooldown-shine failed to raise the autocast shine: {e}");
+            }
         }
         UiFixture::WorldMap => {
             let Some(mut script) = script else {
@@ -980,39 +1032,39 @@ pub(super) fn seed_ui_fixture(
             // capture pins: the era chrome (nine-slice seams, right-edge straddle), the tab
             // plates, the search-box seat, the category list art with Controls selected (the
             // OnShow default), and the window's fit scale.
-            if let Err(e) = script.run("ShowUIPanel(OptionsFrame)") {
+            if let Err(e) = script.run("ShowUIPanel(BenillaOptionsFrame)") {
                 warn!("capture: ui-options seed failed to open the window: {e}");
             }
         }
         UiFixture::OptionsAudio => {
-            let Some(mut script) = script else {
+            let Some(script) = script else {
                 return;
             };
             // The Audio page (0957): register the real CVar set first — the hermetic capture has
             // no CvarPlugin file load to race, and the rows must read real values, not the
             // nil-tolerant zeros — then open and select through the live paths.
             script.register_cvars(crate::cvars::registered_pairs());
-            if let Err(e) =
-                script.run("ShowUIPanel(OptionsFrame); OptionsFrameCategoryListRowAudio:Click()")
-            {
+            if let Err(e) = script.run(
+                "ShowUIPanel(BenillaOptionsFrame); BenillaOptionsFrameCategoryListRowAudio:Click()",
+            ) {
                 warn!("capture: ui-options-audio seed failed: {e}");
             }
         }
         UiFixture::OptionsGraphics => {
-            let Some(mut script) = script else {
+            let Some(script) = script else {
                 return;
             };
             // The Graphics page (0959), same posture as the Audio fixture: real CVar set, live
             // open-and-select paths.
             script.register_cvars(crate::cvars::registered_pairs());
             if let Err(e) =
-                script.run("ShowUIPanel(OptionsFrame); OptionsFrameCategoryListRowGraphics:Click()")
+                script.run("ShowUIPanel(BenillaOptionsFrame); BenillaOptionsFrameCategoryListRowGraphics:Click()")
             {
                 warn!("capture: ui-options-graphics seed failed: {e}");
             }
         }
         UiFixture::OptionsChat => {
-            let Some(mut script) = script else {
+            let Some(script) = script else {
                 return;
             };
             // The Chat page (1589), the page fixtures' posture: the real CVar set, then the live
@@ -1020,9 +1072,9 @@ pub(super) fn seed_ui_fixture(
             // `ChatFrame.xml` declares at file scope, so a hermetic capture sees the shipped "0"
             // and the row paints unchecked — which is the shipped default, not a missing load.
             script.register_cvars(crate::cvars::registered_pairs());
-            if let Err(e) =
-                script.run("ShowUIPanel(OptionsFrame); OptionsFrameCategoryListRowChat:Click()")
-            {
+            if let Err(e) = script.run(
+                "ShowUIPanel(BenillaOptionsFrame); BenillaOptionsFrameCategoryListRowChat:Click()",
+            ) {
                 warn!("capture: ui-options-chat seed failed: {e}");
             }
         }
@@ -1044,17 +1096,19 @@ pub(super) fn seed_ui_fixture(
             }
         }
         UiFixture::OptionsDropdownList => {
-            let Some(mut script) = script else {
+            let Some(script) = script else {
                 return;
             };
             // The dropdown list open (0992, re-seated onto Camera Following Style by 1649), same
             // posture as the page fixtures: real CVar set, the live open-select-toggle path. The
-            // list's width settles from its OnUpdate a frame later (the kit's WIDTH SETTLE law) —
-            // inside the capture's settle frames.
+            // list's width lands inside the click that opens it — the stock kit's
+            // `UIDropDownMenu_Refresh` sizes every button from `normalText:GetWidth() + 60`
+            // (`UIDropDownMenu.lua` l.395-422) and the engine's measurer answers that getter in
+            // the call that asked, so there is no settle to wait out.
             script.register_cvars(crate::cvars::registered_pairs());
             if let Err(e) = script.run(
-                "ShowUIPanel(OptionsFrame); OptionsFrameCategoryListRowControls:Click(); \
-                 OptionsFrameContainerBodyControlsRowCameraFollowStyleDropdownButton:Click()",
+                "ShowUIPanel(BenillaOptionsFrame); BenillaOptionsFrameCategoryListRowControls:Click(); \
+                 BenillaOptionsFrameContainerBodyControlsRowCameraFollowStyleDropdownButton:Click()",
             ) {
                 warn!("capture: ui-options-dropdown seed failed: {e}");
             }
@@ -1071,15 +1125,15 @@ pub(super) fn seed_ui_fixture(
             script.register_cvars(crate::cvars::registered_pairs());
             script.register_bindings(&crate::bindings::registry_commands());
             if let Err(e) = script.run(
-                "ShowUIPanel(OptionsFrame); \
-                 OptionsFrameCategoryListRowKeybindings:Click(); \
+                "ShowUIPanel(BenillaOptionsFrame); \
+                 BenillaOptionsFrameCategoryListRowKeybindings:Click(); \
                  KeyBindings_ExpandSection(1, true); KeyBindingsPage_Update()",
             ) {
                 warn!("capture: ui-keybindings seed failed: {e}");
             }
         }
         UiFixture::OptionsSearch => {
-            let Some(mut script) = script else {
+            let Some(script) = script else {
                 return;
             };
             // Mid-search (0984), same posture as the page fixtures: real CVar set, then the
@@ -1090,7 +1144,7 @@ pub(super) fn seed_ui_fixture(
             // advance law's visual regression guard.
             script.register_cvars(crate::cvars::registered_pairs());
             if let Err(e) = script.run(
-                "ShowUIPanel(OptionsFrame); OptionsFrameSearchBox:SetText(\"volume\"); OptionsFrameSearchBox:SetFocus()",
+                "ShowUIPanel(BenillaOptionsFrame); BenillaOptionsFrameSearchBox:SetText(\"volume\"); BenillaOptionsFrameSearchBox:SetFocus()",
             )
             {
                 warn!("capture: ui-options-search seed failed: {e}");
@@ -1230,9 +1284,9 @@ pub(super) fn seed_ui_fixture(
                 "ChatFrameEditBox:SetText(\"hello northshire\")\n\
                  ChatFrameEditBox:HighlightText(6, 16)\n\
                  ChatFrame1:SetScript('OnUpdate', function()\n\
-                     BenillaFCF_TabResize(ChatFrame1Tab)\n\
+                     PanelTemplates_TabResize(10, ChatFrame1Tab)\n\
                      ChatFrame1Tab:SetAlpha(1.0)\n\
-                     for _, t in ipairs(BenillaFCF_Textures(1)) do t:SetAlpha(0.25) end\n\
+                     FCF_SetWindowAlpha(ChatFrame1, 0.25, 1)\n\
                  end)",
             ) {
                 warn!("capture: ui-chatedit seed failed: {e}");
@@ -1269,7 +1323,7 @@ pub(super) fn seed_ui_fixture(
             //                                                             a tab quad is measured against
             let mode = std::env::var("WOW_TABHOVER").unwrap_or_else(|_| "1".into());
             let select = if mode == "3" { 1 } else { 2 };
-            if let Err(e) = script.run(&format!("BenillaFCF_TabClick({select})")) {
+            if let Err(e) = script.run(&format!("FCF_SelectDockFrame(ChatFrame{select})")) {
                 warn!("capture: ui-chat-tabhover select failed: {e}");
             }
             script.resolve();
@@ -1301,6 +1355,15 @@ pub(super) fn seed_ui_fixture(
         }
         UiFixture::NameWater => {
             use benilla_protocol::messages::ObjectFields;
+            // The subject is an NPC's overhead name, and `UnitNameNPC` registers "0" (1804's
+            // byte-read default), so without this the shot contains no name at all — which is
+            // exactly what it had contained since 1804 landed. Set through Lua, the way a player
+            // turns it on, so the sync drains it into `NameConfig` like any other CVar write.
+            if let Some(script) = script.as_deref_mut() {
+                if let Err(e) = script.run("SetCVar(\"UnitNameNPC\", \"1\")") {
+                    warn!("capture: name fixture could not enable UnitNameNPC: {e}");
+                }
+            }
             // The synthetic self player at the eye (the reaction lookup reads its store, and the
             // name colour is that verdict).
             const SELF_GUID: u64 = 0x51;
@@ -1410,6 +1473,79 @@ pub(super) fn seed_ui_fixture(
 /// fixtures. The bag is a standalone addon (no `ShowUIPanel` path): drive the container snapshot
 /// and purse directly, then open and paint. The feed (`crate::ui_items`) leaves bag 0 alone when
 /// there is no `SelfPlayer` (net is disabled in capture), so this manual snapshot is not clobbered.
+/// The pinned `GetTime()` value the cooldown filmstrip parks the VM's session clock at, seconds.
+/// Large, because the reference's own `CooldownFrame_SetTimer` refuses a `start <= 0` and the
+/// starts here are `now − fraction · span`.
+const COOLDOWN_NOW_S: f64 = 100_000.0;
+
+/// Each filmstrip slot's cooldown duration, seconds. Long enough that the settle window's few
+/// seconds of VM clock move a phase by `~5e-4` of a step, so the shot is reproducible.
+const COOLDOWN_SPAN_S: f64 = 10_000.0;
+
+/// **The cooldown sweep as a filmstrip** (B379): sixteen backpack slots, each parked at its own
+/// fraction of one very long cooldown, so the window shows sixteen points of the 1000 ms sweep at
+/// once — the instrument for "what does the indicator actually draw", which no test can reach
+/// (the engine tests prove the scrub, not the picture).
+///
+/// Game slot 1 renders TOP-LEFT and slot 16 bottom-right (`ContainerFrame_GenerateFrame` numbers
+/// backwards — see [`seed_bag_window`]), so ascending slot is reading order and ascending
+/// fraction reads as a filmstrip.
+fn seed_cooldown_filmstrip(
+    script: &mut benilla_ui::script::UiScript,
+    icons: Option<&crate::entities::ItemDisplays>,
+) {
+    // Park the session clock FIRST: `set_container` stores each triple against it, and
+    // `GetContainerItemCooldown`'s cold-at-expiry guard reads it.
+    if let Err(e) = script.run(&format!("__benilla_now = {COOLDOWN_NOW_S}")) {
+        warn!("capture: ui-cooldown failed to pin the session clock: {e}");
+    }
+    const DISP_STONE: u32 = 6418;
+    let texture = icons
+        .and_then(|i| i.catalog.get(DISP_STONE))
+        .and_then(|d| d.icon.clone());
+    let span_ms = COOLDOWN_SPAN_S * 1000.0;
+    let now_ms = COOLDOWN_NOW_S * 1000.0;
+    let mut slots = std::collections::HashMap::new();
+    for slot in 1u32..=16 {
+        // Sixteen phases across the sweep, biased off both ends: 0 is the uniform disc and 1 is
+        // the flash, and neither is what this instrument is looking at.
+        let fraction = (f64::from(slot) - 0.5) / 16.0;
+        slots.insert(
+            slot,
+            benilla_ui::script::ContainerSlot {
+                petition: None,
+                durability: None,
+                duration_ms: None,
+                bar_placeable: true,
+                texture: texture.clone(),
+                count: 1,
+                quality: Some(1),
+                item_id: 6948,
+                link: Some("|cffffffff|Hitem:6948|h[Hearthstone]|h|r".into()),
+                locked: false,
+                equip_slots: Vec::new(),
+                cooldown: Some(((now_ms - fraction * span_ms) as i64, span_ms as u32, true)),
+                readable: false,
+                creator: None,
+                flags: 0,
+                already_bound: false,
+                enchants: Vec::new(),
+            },
+        );
+    }
+    script.set_container(
+        0,
+        Some(benilla_ui::script::ContainerState {
+            name: Some("Backpack".into()),
+            num_slots: 16,
+            slots,
+        }),
+    );
+    if let Err(e) = script.run("OpenBag(0)") {
+        warn!("capture: ui-cooldown failed to open the backpack: {e}");
+    }
+}
+
 fn seed_bag_window(
     script: &mut benilla_ui::script::UiScript,
     icons: Option<&crate::entities::ItemDisplays>,
@@ -1429,6 +1565,7 @@ fn seed_bag_window(
         benilla_ui::script::ContainerSlot {
             petition: None,
             durability: None,
+            duration_ms: None,
             bar_placeable: true,
             texture: icon(disp),
             count,
@@ -1525,6 +1662,7 @@ fn seed_equipped_bags(
         |disp: u32, count: u32, name: &str, quality: u32| benilla_ui::script::ContainerSlot {
             petition: None,
             durability: None,
+            duration_ms: None,
             bar_placeable: true,
             texture: icon(disp),
             count,

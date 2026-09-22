@@ -19,11 +19,11 @@ use crate::glue::art::{
     class_tc, race_tc, tc_rect, GlueArt, ALLIANCE_FILL, BACKDROP_ALLIANCE, BACKDROP_HORDE, BTN_BG,
     BTN_HOVER, FALLBACK_ALPHA, HORDE_FILL,
 };
-use crate::glue::widgets::{FallbackFace, GlueDisabled, Hilight, HoverLabel};
+use crate::glue::widgets::{FallbackFace, GlueDisabled, Hilight, HoverLabel, LockHighlight};
 
 /// Refill everything that follows the selection — icon rects, dial labels, info texts, faction
 /// tints, class-slot mapping — on selection change or a fresh spawn.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 pub(super) fn refresh_dynamic(
     sel: Res<CreateSelection>,
     catalog: Option<Res<CharCreate>>,
@@ -219,12 +219,18 @@ pub(super) fn refresh_dynamic(
     }
 }
 
-/// Per-frame interaction visuals the CREATE screen owns: highlight overlays (hover — and held
-/// while selected, the ref's `LockHighlight`), hover labels, and the Create button's disabled
-/// latch while a create is in flight. The screen-agnostic passes — up/down art swaps, the glue
-/// buttons' art + caption color, outline mirroring — are [`crate::glue`]'s, registered beside
-/// this in the plugin chain.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+/// Per-frame interaction visuals the CREATE screen owns: which icon is *chosen* (the ref's
+/// `LockHighlight`, which [`crate::glue::glue_hilights`] then renders), hover labels, the no-art
+/// fallback shade, and the Create button's disabled latch while a create is in flight. The
+/// screen-agnostic passes — up/down art swaps, the glue buttons' art + caption color, outline
+/// mirroring — are [`crate::glue`]'s, registered beside this in the plugin chain.
+///
+/// **The chosen-icon write is its own query, deliberately.** It used to be a sixth term on the
+/// hover query below, which meant a button without a [`LockHighlight`] dropped out of the hover
+/// visuals too — and since no spawn site on this screen had one, that query matched *nothing*:
+/// no selected sheen and no icon name anywhere on the create screen. Two jobs, two queries, so a
+/// missing component can only ever cost its own job.
+#[allow(clippy::type_complexity)]
 pub(super) fn refresh_hover(
     sel: Res<CreateSelection>,
     catalog: Option<Res<CharCreate>>,
@@ -241,7 +247,7 @@ pub(super) fn refresh_hover(
         ),
         (With<Button>, Without<crate::glue::widgets::GlueBtn>),
     >,
-    mut hilights: Query<&mut Visibility, (With<Hilight>, Without<HoverLabel>)>,
+    mut locks: Query<(&CreateAction, &mut LockHighlight)>,
     mut labels: Query<&mut Visibility, (With<HoverLabel>, Without<Hilight>)>,
     mut disables: Query<(&CreateAction, &mut GlueDisabled)>,
 ) {
@@ -254,6 +260,16 @@ pub(super) fn refresh_hover(
         _ => false,
     };
 
+    // `SetCharacterRace`/`SetCharacterClass`/`SetCharacterGender`: `LockHighlight()` on the one
+    // that is chosen, `UnlockHighlight()` on the rest. Nothing about visibility — the sheen is
+    // `crate::glue::glue_hilights`' alone.
+    for (action, mut locked) in &mut locks {
+        let is_sel = selected(action);
+        if locked.0 != is_sel {
+            locked.0 = is_sel;
+        }
+    }
+
     for (action, interaction, children, mut bg, fallback) in &mut buttons {
         let is_sel = selected(action);
         let hovered = *interaction != Interaction::None;
@@ -264,13 +280,6 @@ pub(super) fn refresh_hover(
             bg.0 = if lit { BTN_HOVER } else { BTN_BG };
         }
         for child in children {
-            if let Ok(mut vis) = hilights.get_mut(*child) {
-                *vis = if lit {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                };
-            }
             if let Ok(mut vis) = labels.get_mut(*child) {
                 // Without icon art the label IS the button face — always visible.
                 let show = lit || art.races.is_none();
@@ -358,15 +367,19 @@ pub(super) fn scroll_drive(
 pub(super) fn scroll_visuals(
     art: Res<GlueArt>,
     scrolls: Query<(&ComputedNode, &ScrollPosition), With<InfoScroll>>,
-    mut arrows: Query<(&ScrollArrow, &Interaction, &mut ImageNode, &Children)>,
+    mut arrows: Query<(
+        &ScrollArrow,
+        &Interaction,
+        &mut ImageNode,
+        &mut GlueDisabled,
+    )>,
     mut thumbs: Query<(&ScrollThumb, &mut Node)>,
     mut hides: Query<(&ScrollHides, &mut Visibility), Without<Hilight>>,
-    mut hilights: Query<&mut Visibility, With<Hilight>>,
 ) {
     let Some(sc) = &art.scroll else {
         return;
     };
-    for (arrow, interaction, mut img, children) in &mut arrows {
+    for (arrow, interaction, mut img, mut off) in &mut arrows {
         let Ok((node, pos)) = scrolls.get(arrow.scroll) else {
             continue;
         };
@@ -386,14 +399,10 @@ pub(super) fn scroll_visuals(
         if img.image != *face {
             img.image = face.clone();
         }
-        for child in children {
-            if let Ok(mut vis) = hilights.get_mut(*child) {
-                *vis = if !disabled && *interaction != Interaction::None {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                };
-            }
+        // A scroll arrow at the end of its travel is genuinely disabled — said once, in the
+        // component the shared sheen pass already reads, rather than re-derived beside it.
+        if off.0 != disabled {
+            off.0 = disabled;
         }
     }
     for (thumb, mut node) in &mut thumbs {

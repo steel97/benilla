@@ -39,8 +39,8 @@ use crate::net::{NetCommands, ObjectStore, SelfPlayer};
 use super::errors::{first_missing_totem, first_short_reagent, mount_result_key};
 use super::weapon_icon::{auto_attack_icon, substitutes_weapon_icon};
 use super::{
-    cast_fail, show_messages, ui_error_text, CastErrors, MessageSink, MountErrors, PlayerActions,
-    Shown, Spells, UiError, UiErrorKeys, UiErrorTexts,
+    cast_fail, show_messages, ui_error_text, CastErrors, MessageSink, MountErrors, PetTameFailures,
+    PlayerActions, Shown, Spells, UiError, UiErrorKeys, UiErrorTexts,
 };
 
 /// What an ITEM action shows when its icon cannot be resolved — the reference's own hardcoded
@@ -75,23 +75,49 @@ pub(super) struct FeedMemory {
     macro_generation: u64,
 }
 
-#[allow(clippy::too_many_arguments)] // a Bevy system's full input set
+/// The DBC name tables the cast-fail **argument arms** read (`FailArgs`), as one parameter — three
+/// `Option<Res<…>>` that are one concept and were pushing this system past Bevy's parameter arity
+/// (decision 1948). Each is `Option` for the same reason `FailArgs`' fields are: a client with no
+/// game data has none, and the arm then declines and the template strips.
+///
+/// The fourth table, `SpellShapeshiftForm.dbc` (`0x56`), is not here: it already rides
+/// [`Spells`], which this system takes anyway, so [`Self::args`] takes that and joins them.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(super) struct FailNameTables<'w> {
+    /// `SpellFocusObject.dbc` — the crafting book's catalog, for `0x5e`.
+    focus: Option<Res<'w, crate::ui_tradeskill::SpellFocus>>,
+    /// `AreaTable.dbc` — the map arc's, for `0x5d`.
+    areas: Option<Res<'w, crate::area::AreaTableRes>>,
+    /// `SpellMechanic.dbc` — for `0x8d`, the one arm whose word is produced locally.
+    mechanics: Option<Res<'w, super::SpellMechanics>>,
+}
+
+impl FailNameTables<'_> {
+    fn args<'a>(&'a self, spells: Option<&'a Spells>) -> cast_fail::FailArgs<'a> {
+        cast_fail::FailArgs {
+            arg: None,
+            focus: self.focus.as_deref().map(|f| &f.catalog),
+            areas: self.areas.as_deref().map(|a| &a.0),
+            mechanics: self.mechanics.as_deref().map(|m| &m.catalog),
+            forms: spells.map(|s| &s.forms),
+        }
+    }
+}
+
 pub(super) fn feed_actions(
     script: Option<NonSendMut<UiScript>>,
     mut actions: ResMut<PlayerActions>,
     mut cast_errors: ResMut<CastErrors>,
     mut mount_errors: ResMut<MountErrors>,
+    mut pet_tame_failures: ResMut<PetTameFailures>,
     mut ui_error_keys: ResMut<UiErrorKeys>,
     mut ui_error_texts: ResMut<UiErrorTexts>,
     spells: Option<Res<Spells>>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     icons: Option<Res<ItemDisplays>>,
     sub_classes: Option<Res<crate::ui_items::ItemSubClasses>>,
-    // The two DBC name tables the cast-fail argument arms read (`FailArgs`): the crafting book's
-    // SpellFocusObject catalog and the map arc's AreaTable one, both already loaded.
-    spell_focus: Option<Res<crate::ui_tradeskill::SpellFocus>>,
-    areas: Option<Res<crate::area::AreaTableRes>>,
+    name_tables: FailNameTables,
     commands: Res<NetCommands>,
     mut memory: Local<crate::ui_script::VmMemo<FeedMemory>>,
     // Where a displayed message lands: the chat window (the combat log's own record of a failed
@@ -118,91 +144,184 @@ pub(super) fn feed_actions(
     let self_store = self_q.iter().next();
     let mut await_template: Vec<crate::ui_action::CastFail> = Vec::new();
     // The same failures, worded for the combat log. Collected beside the red line rather than
-    // instead of it: `0x6e1a00` calls `0x62c360` AND `DisplayError`, and they say different
-    // things — "Not enough mana." on the screen, "You fail to cast Frostbolt: Not enough mana."
+    // instead of it: `0x6e1a00` calls `0x62c360` AND `DisplayError`, which frame the one string
+    // two ways — "Not enough mana." on the screen, "You fail to cast Frostbolt: Not enough mana."
     // in the log.
     let mut fail_lines: Vec<crate::ui_chat::combat::PendingCombat> = Vec::new();
-    let fail_args = cast_fail::FailArgs {
-        arg: None,
-        focus: spell_focus.as_deref().map(|f| &f.catalog),
-        areas: areas.as_deref().map(|a| &a.0),
-    };
+    let fail_args = name_tables.args(spells.as_deref());
     let texts: Vec<cast_fail::CastFailLine> = cast_errors
         .0
         .drain(..)
         .filter_map(|fail| {
             let crate::ui_action::CastFail {
-                spell_id, reason, ..
+                spell_id,
+                reason,
+                caster,
+                ..
             } = fail;
+            let pet = caster == crate::ui_action::Caster::Pet;
             let d = spells.as_ref().and_then(|s| s.catalog.get(spell_id));
             let get = |key: &str| script.lua().globals().get::<String>(key).ok();
-            // 0x19/0x1a/0x1b EQUIPPED_ITEM_CLASS* — the other argument-formatted family whose
-            // `%s` benilla models (`0x6e1db7`, the arm that resolves an item class/subclass name
-            // through `0x6e2380`): "Must have a **Wand** equipped", the SINGULAR DisplayName,
-            // where the spell tooltip's own requirement line takes the verbose plural. Purely a
-            // DBC read, so no query/redisplay round trip. A multi-bit mask resolves too — through
-            // ItemSubClassMask.dbc's group name, else the FIRST matching subclass (law
-            // §3-EQUIPITEM; the tooltip's twin joins instead).
-            if let (0x19..=0x1b, Some(d), Some(subs)) = (reason, d, sub_classes.as_deref()) {
-                if let Some(name) = (d.equipped_item_class >= 0)
-                    .then(|| {
-                        subs.0.requirement_display_name(
-                            d.equipped_item_class as u32,
-                            d.equipped_item_subclass_mask,
-                        )
-                    })
-                    .flatten()
+            // The displayed line first, the log line off it — the reference's own order, and the
+            // reason the two can no longer drift apart (see the combat-log twin below).
+            let line = (|| -> Option<cast_fail::CastFailLine> {
+                // 0x19/0x1a/0x1b EQUIPPED_ITEM_CLASS* — the other argument-formatted family whose
+                // `%s` benilla models (`0x6e1db7`, the arm that resolves an item class/subclass name
+                // through `0x6e2380`): "Must have a **Wand** equipped", the SINGULAR DisplayName,
+                // where the spell tooltip's own requirement line takes the verbose plural. Purely a
+                // DBC read, so no query/redisplay round trip. A multi-bit mask resolves too — through
+                // ItemSubClassMask.dbc's group name, else the FIRST matching subclass (law
+                // §3-EQUIPITEM; the tooltip's twin joins instead).
+                if let (0x19..=0x1b, Some(d), Some(subs)) = (reason, d, sub_classes.as_deref()) {
+                    if let Some(name) = (d.equipped_item_class >= 0)
+                        .then(|| {
+                            subs.0.requirement_display_name(
+                                d.equipped_item_class as u32,
+                                d.equipped_item_subclass_mask,
+                            )
+                        })
+                        .flatten()
+                    {
+                        let key = cast_fail::CAST_FAIL_KEYS[reason as usize];
+                        return get(key)
+                            .filter(|s| !s.is_empty())
+                            .map(|t| cast_fail::CastFailLine::passthrough(t.replace("%s", &name)));
+                    }
+                }
+                // `0x31` NEED_EXOTIC_AMMO (`0x6e1e54`) — the same `0x6e2380` helper as the arm
+                // above, one class over: `requirement_display_name(6 /* Projectile */, 1 << arg)`
+                // reads the singular DisplayName at `row + 0x28 + locale*4`, so "Requires exotic
+                // ammo: %s" names the ammo type. The shift is masked to five bits because the
+                // reference's is — `0x6e1e5c: shl edx,cl` takes x86's own `cl & 31` — and a
+                // subclass naming no row declines to the strip fallback exactly as
+                // `0x6e1e6a: je 0x6e21d8` does.
+                //
+                // **The player's arm only.** The pet handler's index table (`0x6e93d0`) is gated
+                // `cmp reason,0x8d; ja default` and carries no `0x31` entry, so a pet's exotic-ammo
+                // refusal takes its generic arm `0x6e936a` and shows the bare template — unlike
+                // `0x19`–`0x1b` just above, which the pet's own table *does* fill (`0x6e904d`).
+                // Same shape as `0x78`/`0x5c` below, and the same trap decision 2033 named.
+                //
+                // **It declines on a vmangos server, every time**, and that is the server's shape
+                // rather than a gap here: `Spell::SendCastResult` fills `failureArg1` for
+                // NOT_READY, REQUIRES_SPELL_FOCUS, REQUIRES_AREA and the EQUIPPED_ITEM_CLASS
+                // family and for nothing else, so `0x31` arrives with no word and the line reads
+                // "Requires exotic ammo:". Modeled anyway because the arm is the mechanism and the
+                // word is the server's to supply (decision 2292).
+                if let (false, 0x31, Some(arg), Some(subs)) =
+                    (pet, reason, fail.arg, sub_classes.as_deref())
                 {
-                    let key = cast_fail::CAST_FAIL_KEYS[reason as usize];
+                    const ITEM_CLASS_PROJECTILE: u32 = 6;
+                    if let Some(name) = subs
+                        .0
+                        .requirement_display_name(ITEM_CLASS_PROJECTILE, 1u32 << (arg & 31))
+                    {
+                        let key = cast_fail::CAST_FAIL_KEYS[reason as usize];
+                        return get(key)
+                            .filter(|s| !s.is_empty())
+                            .map(|t| cast_fail::CastFailLine::passthrough(t.replace("%s", &name)));
+                    }
+                }
+                // `0x78` TOTEMS / `0x5c` REAGENTS — **the player's arms only**. The pet handler's
+                // index table (`0x6e93d0`) sends both to its generic arm, so a pet's refusal takes the
+                // shared passthrough below and never runs the bag walk or the item query (decision
+                // 2033).
+                if !pet && (reason == 0x78 || reason == 0x5c) {
+                    let d = d?;
+                    let failing = if reason == 0x78 {
+                        self_store
+                            .and_then(|s| first_missing_totem(d, s, &items))
+                            // No store to test against (a race): name the first tool at all.
+                            .or_else(|| d.totems.iter().copied().find(|&t| t != 0))
+                    } else {
+                        self_store
+                            .and_then(|s| first_short_reagent(d, s, &items))
+                            .or_else(|| d.reagents.iter().map(|&(id, _)| id).find(|&id| id != 0))
+                    }?;
+                    let cached = items
+                        .template(failing, 0, &commands)
+                        .map(|i| i.name.clone());
+                    let name = match cached {
+                        Some(name) => name,
+                        // Answered-unknown → the ref's callback fallback literal (`0x838044`);
+                        // still pending → keep the entry queued for the redisplay.
+                        None if items.template_answered_unknown(failing) => "UNKNOWN".to_string(),
+                        None => {
+                            // The cache-miss re-queue — and it comes back MARKED, because the
+                            // reference's retry is a different raise (see `CastFail::redisplay`).
+                            await_template.push(fail.requeued());
+                            return None;
+                        }
+                    };
+                    let key = if reason == 0x78 {
+                        "SPELL_FAILED_TOTEMS"
+                    } else {
+                        "SPELL_FAILED_REAGENTS"
+                    };
                     return get(key)
                         .filter(|s| !s.is_empty())
                         .map(|t| cast_fail::CastFailLine::passthrough(t.replace("%s", &name)));
                 }
-            }
-            if reason == 0x78 || reason == 0x5c {
-                let d = d?;
-                let failing = if reason == 0x78 {
-                    self_store
-                        .and_then(|s| first_missing_totem(d, s, &items))
-                        // No store to test against (a race): name the first tool at all.
-                        .or_else(|| d.totems.iter().copied().find(|&t| t != 0))
-                } else {
-                    self_store
-                        .and_then(|s| first_short_reagent(d, s, &items))
-                        .or_else(|| d.reagents.iter().map(|&(id, _)| id).find(|&id| id != 0))
-                }?;
-                let cached = items
-                    .template(failing, 0, &commands)
-                    .map(|i| i.name.clone());
-                let name = match cached {
-                    Some(name) => name,
-                    // Answered-unknown → the ref's callback fallback literal (`0x838044`);
-                    // still pending → keep the entry queued for the redisplay.
-                    None if items.template_answered_unknown(failing) => "UNKNOWN".to_string(),
-                    None => {
-                        await_template.push(fail);
-                        return None;
-                    }
-                };
-                let key = if reason == 0x78 {
-                    "SPELL_FAILED_TOTEMS"
-                } else {
-                    "SPELL_FAILED_REAGENTS"
-                };
-                return get(key)
-                    .filter(|s| !s.is_empty())
-                    .map(|t| cast_fail::CastFailLine::passthrough(t.replace("%s", &name)));
-            }
-            // The combat-log twin. **Only the `…SELF` half is reachable here**: `SMSG_CAST_FAILED`
-            // is addressed to the caster alone, so benilla never learns that somebody *else's*
-            // cast failed — the `…OTHER` keys exist and stay unproduced, exactly as the reference
-            // leaves its own two unreachable `…SELFSTART` keys.
+                cast_fail::cast_fail_text(
+                    caster,
+                    reason,
+                    d,
+                    cast_fail::FailArgs {
+                        arg: fail.arg,
+                        ..fail_args
+                    },
+                    &get,
+                )
+            })();
+            // The retest instrument for this whole bug class (decision 1313). A red-line defect is
+            // reported as *seen* — B255 arrived as a screenshot of the word "Requires" — and until
+            // this line the only way to read what the client resolved was to look at the screen.
+            // Logging the reason, its wire argument and the resolved line makes an argument arm
+            // that silently declined (a missing word, an unnamed id) legible from a probe run.
+            // The line's `Debug` carries BOTH buffers, so a probe also reads the toast string
+            // beside the log string — the one reading that makes 2285's class of drift visible
+            // without opening the chat window.
+            debug!(
+                "ui_action: cast fail — {caster:?} spell {spell_id} reason {reason:#04x} \
+                 arg {:?} → {:?}",
+                fail.arg, line
+            );
+            // **The combat-log twin — the reference's OTHER buffer, not the displayed text**
+            // (decision 2285, correcting 2280). It runs after the resolution because the
+            // reference's does: `0x6e1a00` calls `DisplayError 0x496720` at `0x6e21dd` and the
+            // log formatter `0x62c360` at `0x6e21fc`. But what it hands the formatter is `edi`
+            // (`0x6e21e2`), the **argText** buffer — which is the first-layer
+            // `SPELL_FAILED_<name>` string for every reason no argument arm claims, *including*
+            // the eighteen the second layer re-words on screen. A cooldown refusal toasts "Spell
+            // is not ready yet." and logs "Not yet recovered"; `0x09` toasts "You have no target."
+            // and logs "No target". [`CastFailLine::logged`] is that one-byte test.
             //
-            // The reason `%s` is the FIRST-layer string — `GetText("SPELL_FAILED_<name>")`, which
-            // is what `0x6e1a00` holds when it calls the formatter — not the errorId-substituted
-            // message the red line shows. An empty one drops the line rather than printing a
-            // sentence with a hole, the same rule every other family here follows.
-            if let Some(display) = d {
+            // The trap this corrects is that deriving the log's `%s` a *second* time, from the
+            // key table, gets six of the seven divergent rows right by accident and the filled
+            // arms wrong — which is how a raw "Must be in %s" sat in the log while the red line
+            // read "Must be in Cat Form". One resolution, two buffers, is the shape that holds.
+            //
+            // A refusal that resolved to nothing logs nothing, which is the same control flow:
+            // `0x17` DONT_REPORT, the keys 5875 leaves out of `GlobalStrings.lua`, and `0x56`'s
+            // no-forms exit all jump past `0x62c360` as well as past `DisplayError`.
+            //
+            // **A redisplay is not a raise.** The item-cache retry (`0x6e29b0`) calls
+            // `DisplayError` directly and never reaches the log formatter, so an entry that had
+            // to wait for its item name shows the toast alone — `CastFail::redisplay`.
+            //
+            // **Only the `…SELF` half is reachable here**: `SMSG_CAST_FAILED` is addressed to the
+            // caster alone, so benilla never learns that somebody *else's* cast failed — the
+            // `…OTHER` keys exist and stay unproduced, exactly as the reference leaves its own
+            // two unreachable `…SELFSTART` keys.
+            //
+            // **The pet's refusal is not logged.** `0x6e1a00` calls the log formatter `0x62c360`
+            // beside its `DisplayError`; `Spell_C::HandlePetCastFailed 0x6e8eb0` calls neither it
+            // nor the error sound — its entire call set is the two packet readers, `0x496720` and
+            // the string plumbing. Before decision 2033 a pet's refused Growl printed "You fail to
+            // cast Growl: ..." in the combat log, attributed to the player.
+            if let (Some(shown), Some(display), false, false) =
+                (line.as_ref(), d, pet, fail.redisplay)
+            {
                 // `0x62aff0`: `Attributes` bit 4 marks an ABILITY, which "performs" rather than
                 // "casts".
                 const ATTR_IS_ABILITY: u32 = 0x10;
@@ -211,11 +330,7 @@ pub(super) fn feed_actions(
                 } else {
                     crate::ui_chat::combat::SPELLFAILCAST
                 };
-                let why = cast_fail::CAST_FAIL_KEYS
-                    .get(usize::from(reason))
-                    .and_then(|k| get(k))
-                    .filter(|t| !t.is_empty());
-                if let (Some(why), false) = (why, display.name.is_empty()) {
+                if !display.name.is_empty() {
                     fail_lines.push(crate::ui_chat::combat::PendingCombat {
                         kind: crate::ui_chat::ChatEventKind::SpellFailedLocalPlayer,
                         family,
@@ -224,7 +339,7 @@ pub(super) fn feed_actions(
                         object: 0,
                         fills: crate::ui_chat::combat::Fills {
                             spell: display.name.clone(),
-                            named: why,
+                            named: shown.logged().to_string(),
                             ..Default::default()
                         },
                         named: crate::ui_chat::combat::Named::Ready,
@@ -232,25 +347,7 @@ pub(super) fn feed_actions(
                     });
                 }
             }
-            let text = cast_fail::cast_fail_text(
-                reason,
-                d,
-                cast_fail::FailArgs {
-                    arg: fail.arg,
-                    ..fail_args
-                },
-                &get,
-            );
-            // The retest instrument for this whole bug class (decision 1313). A red-line defect is
-            // reported as *seen* — B255 arrived as a screenshot of the word "Requires" — and until
-            // this line the only way to read what the client resolved was to look at the screen.
-            // Logging the reason, its wire argument and the resolved text makes an argument arm
-            // that silently declined (a missing word, an unnamed id) legible from a probe run.
-            debug!(
-                "ui_action: cast fail — spell {spell_id} reason {reason:#04x} arg {:?} → {:?}",
-                fail.arg, text
-            );
-            text
+            line
         })
         .collect();
     cast_errors.0.extend(await_template);
@@ -282,6 +379,22 @@ pub(super) fn feed_actions(
             .into_iter()
             .map(|(key, text)| Shown::keyed(key, text)),
     );
+
+    // Taming refusals ([`PetTameFailures`]) — the one message whose argText is itself a
+    // GlobalStrings lookup. The reference resolves the reason's `PETTAME_*` key first
+    // (`0x6e6a20`'s `0x703bf0` call) and passes the resulting STRING as `DisplayError(0xee)`'s
+    // argument, so `ERR_TAME_FAILED` ("%s.") renders "Creature is too high level for you to
+    // tame." — two lookups, in this order, and neither can be folded into the other.
+    let tame_texts: Vec<Shown> = pet_tame_failures
+        .0
+        .drain(..)
+        .filter_map(|reason| {
+            let reason_key = benilla_protocol::messages::pet_tame_failure_key(reason);
+            let reason_text = script.lua().globals().get::<String>(reason_key).ok()?;
+            super::keyed_line_s(&script, "ERR_TAME_FAILED", &[&reason_text])
+        })
+        .collect();
+    show_messages(&mut script, &mut sink, "ui_action", tame_texts);
 
     // Client-local by-key refusals (the `DisplayError` route — [`UiErrorKeys`]); the key IS the
     // GlobalStrings lookup, no code table between, and the key is also what names the surface:
@@ -377,7 +490,7 @@ pub(super) fn feed_actions(
                             d,
                             sp,
                             store,
-                            &mut items,
+                            &items,
                             icons.as_deref(),
                             &commands,
                         )
@@ -505,7 +618,7 @@ pub(super) fn feed_actions(
                                 d,
                                 sp,
                                 Some(store),
-                                &mut items,
+                                &items,
                                 icons.as_deref(),
                                 &commands,
                             );
@@ -550,13 +663,12 @@ pub(super) fn feed_actions(
 /// The spellbook's `GetSpellTexture` (`0x4b3f50`) deliberately runs ONLY arms 1 and 3 — it never
 /// serves `ActiveIconID` (proof by exhaustion in the note). `ui_spellbook` keeps that asymmetry;
 /// do not "fix" it to match the bar.
-#[allow(clippy::too_many_arguments)] // the resolver's full input set, twice-called above
 fn spell_action_icon(
     spell_id: u32,
     d: &benilla_formats::SpellDisplay,
     spells: &super::Spells,
     store: Option<&crate::net::ObjectStore>,
-    items: &mut Items,
+    items: &Items,
     icons: Option<&ItemDisplays>,
     commands: &NetCommands,
 ) -> Option<String> {

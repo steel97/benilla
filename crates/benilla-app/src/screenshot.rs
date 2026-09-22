@@ -20,7 +20,7 @@
 //! before the capture is for.
 //!
 //! **And on our pipeline that `Hide()` lands one frame too late** — measured, not reasoned:
-//! a live double press wrote the text straight into the second PNG. `ui_script`'s `drive_script`
+//! a live double press wrote the text straight into the second PNG. `ui_script`'s paint pass
 //! ticks the VM and builds this frame's UI quad list at the TOP of the `UiInput` set; the binding
 //! dispatch that runs `TakeScreenshot()` sits at the BOTTOM of that same set. So by the time the
 //! binding hides the frame, the quads carrying its text are already built, and the frame that then
@@ -28,7 +28,7 @@
 //! otherwise; the real client simply does not build its draw list in that order.
 //!
 //! So [`ask_for_captures`] **holds each ask for one frame** ([`ScreenshotState::pending`]). The
-//! capture is requested on the frame AFTER the press, whose `drive_script` has rebuilt the quads
+//! capture is requested on the frame AFTER the press, whose `paint_script` has rebuilt the quads
 //! with the frame hidden. One frame is the whole fix and also the minimum: any less and the stale
 //! quads are what gets photographed, any more and the shutter drifts from the keypress for no
 //! reason. `ui_script::screenshot_tests` pins the UI contract; this file's own test pins the
@@ -65,7 +65,7 @@ use bevy::tasks::IoTaskPool;
 
 use benilla_ui::script::UiScript;
 
-use crate::ui_script::UiInput;
+use crate::ui_script::{UiFeed, UiInput};
 
 /// The reference's own file stem (`WoWScrnShot_`), kept: a player who knows what WoW screenshots
 /// are called finds the same names here, and so does every screenshot-organizing tool the
@@ -152,7 +152,7 @@ impl ScreenshotState {
 ///
 /// The order within a frame is: spawn last frame's asks first, then drain this frame's. Both halves
 /// matter. Spawning first means the entity is in the world before the render extract at the end of
-/// THIS frame, whose UI quads `drive_script` rebuilt with the status line already hidden. Draining
+/// THIS frame, whose UI quads `paint_script` rebuilt with the status line already hidden. Draining
 /// second means an ask made by the binding dispatch earlier in this same frame waits its turn
 /// rather than being photographed against the quads that were built before the hide — which is the
 /// bug this deferral exists for (module docs).
@@ -255,7 +255,7 @@ impl Plugin for ScreenshotPlugin {
         app.init_resource::<ScreenshotState>().add_systems(
             Update,
             (
-                report_captures.before(UiInput),
+                report_captures.in_set(UiFeed),
                 ask_for_captures
                     .after(UiInput)
                     .after(crate::bindings::BindingSet),

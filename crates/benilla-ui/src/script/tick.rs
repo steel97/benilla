@@ -1,11 +1,13 @@
 //! The host runtime loop — an `impl UiScript` block beside its concern (the `layout.rs` pattern):
 //! the event fan-out to registered frames ([`UiScript::fire_event`]), the per-frame advance
-//! ([`UiScript::tick`]: OnUpdate + the engine-side fades/cooldowns), and the FrameXML session clock
+//! ([`UiScript::tick`]: OnUpdate + the engine-side fades and the model panes' clocks), and the FrameXML session clock
 //! ([`UiScript::now`]). The low-level handler-firing these drive lives in [`super::event`].
+
+use mlua::Lua;
 
 use crate::widget::FrameHandle;
 
-use super::{editbox, event, tooltip, ScriptValue, UiScript};
+use super::{editbox, event, tooltip, Model, ScriptValue, UiScript};
 
 impl UiScript {
     /// Queue an event to fire at the **start of the next tick**, into the same
@@ -51,15 +53,28 @@ impl UiScript {
     /// its zeroed links — memory-accident territory we render as a deterministic stop, a knowing
     /// divergence from an accident, not from a mechanism).
     pub fn fire_event(&mut self, event: &str, args: Vec<ScriptValue>) {
+        fire_event_into(&self.lua, event, args);
+    }
+}
+
+/// [`UiScript::fire_event`] against the VM directly, for a caller that holds `&Lua` rather than
+/// `&UiScript` — which is every Lua binding, and therefore `UpdateSpells` (decision 1924).
+///
+/// Identical behaviour; `fire_event` is the same call with the script's own VM. The `&mut self` on
+/// the method was never load-bearing — the body reaches everything through `lua.app_data_mut()` —
+/// and this is the shape [`crate::loader::load_into`] already uses for the same reason (1188 §2).
+pub(crate) fn fire_event_into(lua: &Lua, event: &str, args: Vec<ScriptValue>) {
+    let model_mut = || lua.app_data_mut::<Model>().expect("model app_data set");
+    {
         let mut at = {
-            let model = self.model_mut();
+            let model = model_mut();
             model
                 .event_to_frames
                 .get(event)
                 .and_then(|l| l.first().copied())
         };
         while let Some(h) = at {
-            let mut model = self.model_mut();
+            let mut model = model_mut();
             // The saved handle must still be registered — its removal (by the previous handler)
             // ends the walk, per the doc above.
             let Some(pos) = model
@@ -75,13 +90,16 @@ impl UiScript {
                 .and_then(|l| l.get(pos + 1).copied());
             let id = model.frame_id(h);
             drop(model);
-            if let Err(e) = event::fire_event_handler(&self.lua, id, event, &args) {
-                self.push_error(e);
+            if let Err(e) = event::fire_event_handler(lua, id, event, &args) {
+                model_mut().record_script_error(e.to_string());
             }
             at = next;
         }
     }
+    event::fire_all_event_listeners(lua, event, &args);
+}
 
+impl super::UiScript {
     /// Advance time: run `OnUpdate(self, elapsed)` on every *effectively-visible* frame that has one
     /// (RF-0025: OnUpdate → `this` + `arg1 = elapsed`). Errors collected, never panicking.
     /// Also advances the `GetTime()` clock — the FrameXML session clock (seconds, monotonic,
@@ -89,11 +107,29 @@ impl UiScript {
     /// binding reads it without a host round-trip. Reference FrameXML (CastingBarFrame & co.)
     /// anchors durations on GetTime; the clock advancing in the same call that fires OnUpdate
     /// keeps the two views of time consistent within a frame.
-    /// The current `GetTime()` value (`__benilla_now`, seconds) — the FrameXML session clock. The app
+    /// The current `GetTime()` value (`__benilla_now`, seconds) — the FrameXML clock. The app
     /// reads it to stamp an absolute expiry into the clock a Lua countdown reads (the aura feed's
     /// `expirationTime`, decision 0257); it is the same value `GetTime()` returns inside the VM.
     pub fn now(&self) -> f64 {
         self.lua.globals().get("__benilla_now").unwrap_or(0.0)
+    }
+
+    /// Start this VM's `GetTime()` clock at `secs` rather than at zero — how a host hands a
+    /// **freshly built** VM the clock its process is already on (decision 2116).
+    ///
+    /// The reference's `GetTime` (`0x515ea0`) is `KERNEL32!GetTickCount` scaled by 0.001 (through
+    /// the thunk `0x42c010` → `0x42b790`; wow-re `system/core/ledger.tsv` boundary row and
+    /// `system/ui/ledger.tsv:3265`) — an **OS** clock that knows nothing about the Lua VM and never
+    /// restarts, which is exactly what lets stock `Cooldown.lua` gate on `start > 0`. Ours lives
+    /// inside the VM, so without this a rebuilt VM — every logout/login, every `ReloadUI` — would
+    /// restart it at zero and every host value already converted onto it would land in the past.
+    ///
+    /// Set once, at construction: from then on only [`Self::tick`] moves the clock, so the
+    /// `(Instant, GetTime)` pair a host keeps beside it stays atomic by construction.
+    pub fn set_now(&mut self, secs: f64) {
+        if let Err(e) = self.lua.globals().set("__benilla_now", secs) {
+            self.push_error(e);
+        }
     }
 
     pub fn tick(&mut self, elapsed: f32) {
@@ -112,6 +148,11 @@ impl UiScript {
         // OnUpdate sweep, matching the reference's order: the box's own OnUpdate override drains
         // before the FrameXML handlers that read the box get their turn.
         editbox::drain_text_changed(&self.lua);
+        // …and the caret flush's own fire, the second half of `0x77a790`'s update walk
+        // (`0x77d3e0` → `0x77da80`): `OnCursorChanged` when the caret has moved. It is what
+        // `ScrollingEdit_OnCursorChanged` records and `ScrollingEdit_OnUpdate` then scrolls by,
+        // so this is the mail body and the GM ticket box following the caret as you type.
+        editbox::drain_cursor_changed(&self.lua);
         // Events queued by Lua bindings last tick (`Model::pending_events` — e.g. `SetMapZoom` →
         // `WORLD_MAP_UPDATE`; the cursor arc's `CURSOR_UPDATE`/`ITEM_LOCK_CHANGED`/
         // `DELETE_ITEM_CONFIRM`, decision 0216) fire first, so handlers see them before this
@@ -167,10 +208,10 @@ impl UiScript {
                 self.push_error(e);
             }
         }
+        self.tick_model_panes(elapsed);
         // Advance every ScrollingMessageFrame's per-line fade (the client's OnUpdate `0x788460`).
         // Independent of the frame's own OnUpdate script — the fade is C++ behavior, not Lua. The
         // AtBottom freeze gate lives inside `ScrollingMessageState::tick`.
-        let now = self.now();
         let mut model = self.model_mut();
         // The sibling class's OnUpdate (`0x786200`): the same two-phase fade with no scroll gate,
         // plus the capacity law that is this class's stand-in for `maxLines` — the cap is what fits
@@ -198,7 +239,6 @@ impl UiScript {
                 mf.trim_to_viewport(viewport_rows);
             }
         }
-        let mut finished_cooldowns: Vec<FrameHandle> = Vec::new();
         for &h in &ticked {
             let Some(frame) = model.arena.frame_mut(h) else {
                 continue;
@@ -206,17 +246,6 @@ impl UiScript {
             if let crate::widget::KindState::ScrollingMessage(smf) = &mut frame.kind_state {
                 smf.tick(elapsed);
             }
-            // A Cooldown whose flash has finished hides itself — the reference machine's
-            // `OnAnimFinished` → `Hide()` edge (`Cooldown.lua`), modeled engine-side like the
-            // message fade above (C++-equivalent behavior, not Lua).
-            if let crate::widget::KindState::Cooldown(cd) = &frame.kind_state {
-                if frame.shown && cd.duration > 0.0 && now >= cd.finished_at() {
-                    finished_cooldowns.push(h);
-                }
-            }
-        }
-        for h in finished_cooldowns {
-            model.arena.set_shown(h, false);
         }
         drop(model);
         // Advance fading tooltips (FadeOut's ramp + end-of-ramp hide) — engine behavior like the
@@ -241,5 +270,127 @@ impl UiScript {
         // `WOW_UI_HANDLERS=<secs>` — who spent the frame (decision 1395). Last, so a report covers
         // everything this tick fired; a no-op unless the instrument is armed.
         self.report_handler_profile(elapsed);
+    }
+}
+
+impl UiScript {
+    /// The model panes' per-frame pass (decision 2007; wow-re `modelframe-render-law.md` §4).
+    ///
+    /// Three things the reference does each frame for a **visible** model pane, in this order:
+    /// the widget's own `OnUpdate` (`0x76d7f0`, walked by the UI pump with the Lua OnUpdates the
+    /// caller just fired) advances its private scene clock by `trunc(elapsed · 1000)` ms — a
+    /// truncation, no `+0.5` (`76d854 __ftol`); the paint (`vt+0x98`, `0x76d1a0`) fires
+    /// `OnUpdateModel` before it builds the scene; and the scene's animate runs the completion
+    /// callback (`0x76cdc0`) when the armed sequence has run its length — `OnAnimFinished`, on
+    /// natural completion only (mode 0), once per arm, for a looping sequence's first pass as
+    /// much as for a clamped one's end (the flag test sits after the enqueue — wow-re
+    /// `modelframe-texanim-and-sequence-law.md`, Q4). A hidden pane gets none of the three: its
+    /// clock stands still and it completes nothing, which is what makes the minimap ping "resume
+    /// where the last one stopped".
+    ///
+    /// The completion is read AFTER `OnUpdateModel` because the handler may re-arm (the cooldown
+    /// flips to its flash there), and a fresh arm has nothing to complete.
+    fn tick_model_panes(&mut self, elapsed: f32) {
+        let dt_ms = (elapsed * 1000.0).trunc().max(0.0) as u64;
+        let update_ids: Vec<u32> = {
+            let mut model = self.model_mut();
+            let ticked: Vec<FrameHandle> = model.arena.ticked_kinds().to_vec();
+            for h in ticked {
+                let Some(f) = model.arena.frame_mut(h) else {
+                    continue;
+                };
+                if !f.effective_visible {
+                    continue;
+                }
+                if let crate::widget::KindState::Model(m) = &mut f.kind_state {
+                    m.clock_ms += dt_ms;
+                }
+            }
+            // The handler population, maintained by `SetScript` like `on_update_frames`; a
+            // destroyed frame's handle compacts out on its first miss.
+            if model
+                .on_update_model_frames
+                .iter()
+                .any(|&h| model.arena.frame(h).is_none())
+            {
+                let arena = &model.arena;
+                let live: Vec<FrameHandle> = model
+                    .on_update_model_frames
+                    .iter()
+                    .copied()
+                    .filter(|&h| arena.frame(h).is_some())
+                    .collect();
+                model.on_update_model_frames = live;
+            }
+            // Visible MODEL panes WITH A MODEL INSTALLED: the handler is `CSimpleModel::LoadXML`'s
+            // (`+0x3cc`) and the paint that fires it (`76d1bc`) is reached only past the
+            // `[widget+0x318] ≠ 0` gate at `76d24c` — a file set, resident or still streaming;
+            // a pane with no file paints nothing and fires nothing (wow-re
+            // `modelframe-texanim-and-sequence-law.md`, Q4). A script of that name on any
+            // other kind is inert, as it is in the reference.
+            let frames: Vec<FrameHandle> = model
+                .on_update_model_frames
+                .iter()
+                .copied()
+                .filter(|&h| {
+                    model.arena.frame(h).is_some_and(|f| {
+                        f.effective_visible
+                            && matches!(&f.kind_state, crate::widget::KindState::Model(m) if m.path.is_some())
+                    })
+                })
+                .collect();
+            let mut ids: Vec<u32> = frames.into_iter().map(|h| model.frame_id(h)).collect();
+            ids.sort_unstable(); // creation order — the OnUpdate sweep's own law
+            ids
+        };
+        for id in update_ids {
+            if let Err(e) = event::fire_widget_handler(&self.lua, id, "OnUpdateModel", Vec::new()) {
+                self.push_error(e);
+            }
+        }
+        let finished_ids: Vec<u32> = {
+            let mut model = self.model_mut();
+            let ticked: Vec<FrameHandle> = model.arena.ticked_kinds().to_vec();
+            let mut due: Vec<FrameHandle> = Vec::new();
+            for h in ticked {
+                let Some(f) = model.arena.frame(h) else {
+                    continue;
+                };
+                if !f.effective_visible {
+                    continue;
+                }
+                let crate::widget::KindState::Model(m) = &f.kind_state else {
+                    continue;
+                };
+                let Some(path) = m.path.as_deref() else {
+                    continue;
+                };
+                let Some(facts) = model.model_facts.get(&crate::widget::model_key(path)) else {
+                    continue;
+                };
+                if m.completion_due(facts) {
+                    due.push(h);
+                }
+            }
+            let mut ids = Vec::with_capacity(due.len());
+            for h in due {
+                if let Some(crate::widget::KindState::Model(m)) =
+                    model.arena.frame_mut(h).map(|f| &mut f.kind_state)
+                {
+                    if let Some(a) = &mut m.armed {
+                        a.finished = true;
+                    }
+                }
+                ids.push(model.frame_id(h));
+            }
+            ids.sort_unstable();
+            ids
+        };
+        for id in finished_ids {
+            if let Err(e) = event::fire_widget_handler(&self.lua, id, "OnAnimFinished", Vec::new())
+            {
+                self.push_error(e);
+            }
+        }
     }
 }

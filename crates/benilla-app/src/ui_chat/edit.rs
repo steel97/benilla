@@ -1,28 +1,18 @@
-//! The `ChatEdit_*` state machine, transcribed (decision 0288 P5; ref ChatFrame.lua l.1782-2242):
-//! the sticky type law (SAY/PARTY/RAID/GUILD/BATTLEGROUND commit on send — `ChatTypeInfo`'s
-//! sticky column), the **live parse** (typing `/g hi` or `/w Bob hi` converts the box in place,
-//! remainder preserved — `ChatEdit_ParseText(send=0)` on every text change), the header
-//! (`CHAT_<T>_SEND` text + the type's color on header AND typed text, insets past the header —
-//! `ChatEdit_UpdateHeader`), the 10-deep `lastTell` ring with Tab cycling in whisper mode, the
-//! invalid-type downgrade on open (PARTY with no party → SAY — `ChatEdit_OnShow`), and the R /
-//! `/` bindings (OPENCHAT-family, Bindings.xml).
+//! The chat SEND types and the joined-channel roster — what the app keeps beside the reference's
+//! own `ChatEdit_*` machine (ChatFrame.lua l.1782-2242), which owns the edit box since the chat
+//! window became the reference's (decision 1948): the sticky type, the live parse, the header,
+//! the tell ring, the Tab cycle and the R/`/` bindings are all its Lua now.
 //!
-//! Division of labor: this module owns the STATE + the live-parse/header systems; [`super::input`]
-//! owns the submitted-line routing (send-by-current-type + the action-command grammar). The box
-//! widget itself (focus, history, insets mechanics) is the engine's.
-
-use std::collections::VecDeque;
+//! [`SendType`] names the wire kind an addon's `SendChatMessage` token maps to
+//! ([`super::input::drain_addon_chat_sends`]); [`ChannelState`] is the client-side mirror of the
+//! joined channels (the `/N` numbering the reference keeps C-side).
 
 use bevy::prelude::*;
 
-use crate::names::NameCache;
-use crate::net::{ChatKind, NetCommands, SelfGuid};
-use crate::ui_script::{run_or_warn, UiKeyboardCapture};
+use crate::net::ChatKind;
 
-use super::event::{default_color, ChatEventKind};
-
-/// The box's send type — `ChatTypeInfo`'s sendable keys ([`SendType::sticky`] marks the sticky
-/// column's 1-entries). `Whisper`/`Channel` carry their target in [`ChatEditState`].
+/// The sendable chat types — `ChatTypeInfo`'s sendable keys, as the wire kind an addon's
+/// `SendChatMessage` token maps to. `Whisper`/`Channel` carry their target in the call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // RaidLeader/BgLeader have no slash of their own (server-promoted sends);
                     // Channel is the P6 wiring's target — the enum is the full sendable law.
@@ -39,30 +29,35 @@ pub(crate) enum SendType {
     Officer,
     Battleground,
     BattlegroundLeader,
+    Afk,
+    Dnd,
     Channel,
 }
 
 impl SendType {
-    /// `ChatTypeInfo[type].sticky == 1` (ref ChatFrame.lua l.10-114): SAY, PARTY, RAID, GUILD,
-    /// BATTLEGROUND only.
-    pub(crate) fn sticky(self) -> bool {
-        matches!(
-            self,
-            SendType::Say
-                | SendType::Party
-                | SendType::Raid
-                | SendType::Guild
-                | SendType::Battleground
-        )
-    }
-
     /// The chat-type TOKEN an addon passes to `SendChatMessage` (decision 1199) — the reference's
     /// own `ChatTypeInfo` keys, uppercase.
     ///
-    /// `None` for a token we do not send. That is the honest answer for `"AFK"`/`"DND"` (which
-    /// set a flag rather than sending a line) and for anything an addon simply made up; the
-    /// caller reports it rather than guessing SAY, because a raid warning silently going to /say
-    /// is worse than one that does not go.
+    /// `None` for a token we do not send — anything an addon simply made up. The caller reports
+    /// it rather than guessing SAY, because a raid warning silently going to /say is worse than
+    /// one that does not go.
+    ///
+    /// **`"AFK"` and `"DND"` ARE sends, and this said the opposite** — "which set a flag rather
+    /// than sending a line". They are `CMSG_MESSAGECHAT` types `0x14`/`0x15` like every other row
+    /// here, carrying the away message as their body; it is the SERVER that toggles the
+    /// `PLAYER_FLAGS` bit off the packet and streams it back (vmangos `ChatHandler.cpp`'s
+    /// `CHAT_MSG_AFK` arm → `Player::ToggleAFK`). The wire half was already built and reachable —
+    /// `ChatKind::Afk`/`Dnd`, `writer::chat::send_afk`/`send_dnd`, `CHAT_TYPE_AFK` — and this
+    /// function was the only thing standing between the stock file and it.
+    ///
+    /// **What that cost, and why it is 1751's own lesson:** benilla's slash grammar has always
+    /// had a working `/afk` (`S::ChatAfk` → `ParsedChat::AfkDnd`). Migrating the chat window
+    /// (1948) put the stock `ChatFrame.lua` on the chain, and its parser claims a slash line
+    /// before benilla's grammar ever sees it — so `/afk` became
+    /// `SlashCmdList["CHAT_AFK"](msg)` → `SendChatMessage(msg, "AFK")` → here → `None`, and the
+    /// player got `Unknown chat type "AFK".` Migrating a window means building whatever engine
+    /// verb the stock file turns out to call; the verb existed, and a wrong sentence in this doc
+    /// comment is what kept it unreachable. Decision 2079.
     pub(crate) fn from_token(token: &str) -> Option<SendType> {
         Some(match token {
             "SAY" => SendType::Say,
@@ -77,6 +72,8 @@ impl SendType {
             "OFFICER" => SendType::Officer,
             "BATTLEGROUND" => SendType::Battleground,
             "BATTLEGROUND_LEADER" => SendType::BattlegroundLeader,
+            "AFK" => SendType::Afk,
+            "DND" => SendType::Dnd,
             "CHANNEL" => SendType::Channel,
             _ => return None,
         })
@@ -97,60 +94,9 @@ impl SendType {
             SendType::Officer => ChatKind::Officer,
             SendType::Battleground => ChatKind::Battleground,
             SendType::BattlegroundLeader => ChatKind::BattlegroundLeader,
+            SendType::Afk => ChatKind::Afk,
+            SendType::Dnd => ChatKind::Dnd,
             SendType::Channel => ChatKind::Channel,
-        }
-    }
-
-    /// The header's display color = the matching receive kind's table color
-    /// (`ChatEdit_UpdateHeader` reads `ChatTypeInfo[type]`).
-    ///
-    /// CHANNEL takes the same override the render path does — `info = ChatTypeInfo["CHANNEL"..
-    /// channel]` (l.1902), the number from `GetChannelName`. It lands on the identical FFC0C0
-    /// while the extras carry CHANNEL's seed color (1275), so the CHANNEL arm below is right
-    /// today; a per-number recolor is what would make the box's number load-bearing here.
-    fn color(self) -> [u8; 3] {
-        use ChatEventKind as K;
-        default_color(match self {
-            SendType::Say => K::Say,
-            SendType::Yell => K::Yell,
-            SendType::Emote => K::Emote,
-            SendType::Whisper => K::Whisper,
-            SendType::Party => K::Party,
-            SendType::Raid => K::Raid,
-            SendType::RaidLeader => K::RaidLeader,
-            SendType::RaidWarning => K::RaidWarning,
-            SendType::Guild => K::Guild,
-            SendType::Officer => K::Officer,
-            SendType::Battleground => K::Battleground,
-            SendType::BattlegroundLeader => K::BattlegroundLeader,
-            SendType::Channel => K::Channel,
-        })
-    }
-
-    /// The primary slash alias (`SLASH_<TYPE>1`) — the canonical form history recall stores
-    /// (the ref's `ChatEdit_AddHistory` header). `None` for the two leader types 1.12 gives no
-    /// ChatEdit slash.
-    pub(super) fn canonical_slash(self) -> Option<&'static str> {
-        self.aliases().first().copied()
-    }
-
-    /// The slash aliases that switch the box to this type (`SLASH_<TYPE>n`, GlobalStrings
-    /// 3490-3801 — the full quoted sets).
-    fn aliases(self) -> &'static [&'static str] {
-        match self {
-            SendType::Say => &["s", "say"],
-            SendType::Yell => &["y", "yell", "sh", "shout"],
-            SendType::Emote => &["e", "em", "emote", "me"],
-            SendType::Whisper => &["w", "whisper", "t", "tell", "send"],
-            SendType::Party => &["p", "party"],
-            SendType::Raid => &["raid", "ra", "rsay"],
-            SendType::RaidLeader => &[], // no ChatEdit slash in 1.12 (leader auto via /raid)
-            SendType::RaidWarning => &["rw"],
-            SendType::Guild => &["g", "gc", "gu", "guild"],
-            SendType::Officer => &["o", "osay"],
-            SendType::Battleground => &["bg", "battleground"],
-            SendType::BattlegroundLeader => &[],
-            SendType::Channel => &["c", "csay"],
         }
     }
 }
@@ -177,11 +123,18 @@ pub(crate) const MAX_CHANNELS: usize = 10;
 /// A `Vec<String>` cannot express that: `retain` closed the hole and renumbered everything above
 /// it, so walking out of a zone renamed *other* channels — the director saw General and
 /// LocalDefense trade numbers on one zone change, and a `/2` typed after that went somewhere else.
+///
+/// **And each slot carries a state, because the reference's does** (`+0x9c`, decision 2130). We
+/// model the one value of it that changes what the player sees: **3, locally suspended**. States
+/// 0 (server-confirmed), 1 (join not yet acknowledged) and 2 (renamed, re-join pending) collapse
+/// here, and that is sound rather than lazy — the reference reads 0 to decide whether a LEAVE goes
+/// out, and our walk decides that from the slot's own state on the request side (1284). State 3
+/// does not collapse: it is the difference between keeping a channel and losing it.
 #[derive(Resource, Default)]
 pub(crate) struct ChannelState {
     /// Slot `i` is channel number `i + 1`; `None` is a freed slot, kept so the numbers above it
     /// do not move. Never longer than [`MAX_CHANNELS`].
-    pub joined: Vec<Option<String>>,
+    pub joined: Vec<Option<ChannelSlot>>,
     /// `ChatChannels.dbc`, loaded once at Startup ([`super::channels::load_chat_channels`]).
     ///
     /// It lives here because both of its consumers are this type's own business: composing the
@@ -190,22 +143,286 @@ pub(crate) struct ChannelState {
     /// needs no extra bookkeeping at join time. Empty without an install, which degrades to
     /// "no zone channels, arg7 always 0" rather than to an error.
     pub channels: benilla_formats::ChatChannelsCatalog,
+    /// **The `ZONECHANNELS` mask** — the reference's `DWORD ds:0xb6e5e0`, bit `1 << (ChannelID-1)`
+    /// (decision 2120; wow-re `system/ui/scratch/zone-chat-channel-autojoin.md` §3 carries the
+    /// complete 8-site census of that global).
+    ///
+    /// **It is durable state, not a view of [`Self::joined`].** The reference seeds it once — from
+    /// the chat cache's header line (`0x498d83`, an overwrite) or, with no usable file, from every
+    /// `ChatChannels.dbc` row carrying `INITIAL` (`0x4997fc`) — then ORs a bit on each
+    /// server-confirmed join (`0x49bbaf`, the `YOU_JOINED` arm) and clears one only on an explicit
+    /// leave-by-name (`0x49f10a`/`0x49f11a` inside `0x49ee70`). The zone walk's own LEAVE, sent
+    /// every time you cross a border or walk out of a capital, does **not** touch it — which is
+    /// why `Trade`'s bit survives a logout in Elwynn Forest.
+    ///
+    /// Deriving it from the live roster at write time instead is what decision 2120 corrects, and
+    /// it was not cosmetic: the per-window line is written as `the window's own bits AND this
+    /// mask`, so one save taken while the roster was momentarily empty — the session-end flush
+    /// racing `end_session_channels` on the same unordered `OnExit(InWorld)` edge — wrote
+    /// `ZONECHANNELS 0` into every block, and the next login rebuilt window 1 with **no channels
+    /// at all**. The stock `ChatFrame_OnEvent` drops every `CHANNEL*` line whose channel the
+    /// window does not carry (ref `ChatFrame.lua` l.1374-1391, `if found == 0 … return`), so that
+    /// character silently lost its `Joined Channel:` notices *and* all General/Trade speech, for
+    /// good. Ten of the twenty files in this repo's own config folder had reached that state,
+    /// including the director's own character.
+    ///
+    /// Not cleared by the session end: it belongs to the character's file, and the login that
+    /// reads that file is what seats it.
+    ///
+    /// **`None` until that login has read the file** — the reference's "chat system ready" flag
+    /// `ds:0xb6e5c8`, set at the tail of the cache loader (`0x499a18`) and the first thing
+    /// `ZoneChannelRefresh` tests (`0x49a219`, a full bail). The walk is the mask's consumer
+    /// (decision 2144: **the mask is the join predicate**, `0x49a494`), so a walk before the seat
+    /// would read an empty word and join nothing — and nothing re-triggers it when the word
+    /// lands. An `Option` says "not seated" in the type rather than in a second flag that could
+    /// drift from it; the saver refuses to compose a file from `None` for the same reason
+    /// (writing `ZONECHANNELS 0` is the damage 2120 repaired).
+    pub zone_mask: Option<u32>,
+}
+
+/// One joined-channel record — the reference's `[0xb4fe04] + n*0xa0` slot, in the fields this
+/// client uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChannelSlot {
+    /// `+0x04` — the channel's current name. The zone walk RENAMES this in place
+    /// ([`ChannelState::rename_slot`]).
+    pub name: String,
+    /// `+0x9c` — the slot's state, in the three values that change what the player sees.
+    pub state: SlotState,
+}
+
+/// The reference's per-slot state (`slot+0x9c`), modelled in the values whose **notice token**
+/// differs — because the token is what the stock `ChatFrame_OnEvent` branches on, and one of those
+/// branches deletes the window's channel registration.
+///
+/// The complete writer census is wow-re `zone-chat-channel-autojoin.md` §6.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SlotState {
+    /// `0` (server-confirmed) and `1` (join not yet acknowledged), which we cannot tell apart and
+    /// do not need to: the reference reads `0` to decide whether a LEAVE goes out, and our walk
+    /// reads this state for the same decision — a slot it registered and never confirmed sends
+    /// one LEAVE the server answers "Not on channel", which is the one cost of the collapse.
+    #[default]
+    Joined,
+    /// `2` — **renamed, re-join pending**: the zone walk moved this row's name because the player
+    /// crossed a border (`0x49bcd3`, inside the rename `0x49bc50`). The confirming `YOU_JOINED`
+    /// then carries the `YOU_CHANGED` token instead, which is `CHAT_YOU_CHANGED_NOTICE` —
+    /// *"Changed Channel: [%s]"*, a line the reference has and we never printed.
+    Renamed,
+    /// `3` — **locally suspended**: the row lost its eligibility, which in the 1.12 data means
+    /// exactly one thing, walking out of a capital with `Trade` joined (§5/§6). `0x49bcf0` sets it
+    /// and sends nothing; the LEAVE has already gone out earlier in the same iteration.
+    ///
+    /// The record and its number survive, and the arriving `YOU_LEFT` carries the `SUSPENDED`
+    /// token instead (`0x49c0e0`) — same rendered text, different arg1, which is exactly what stops
+    /// `ChatFrame_OnEvent` from deleting the registration. Walking back into a city then re-joins
+    /// through the state-3 bypass (§7 pass 1 step 2), where the name has not changed and the
+    /// comparison would otherwise say there was nothing to do.
+    Suspended,
+}
+
+impl ChannelSlot {
+    /// A server-confirmed slot — the only way one is ever born here, because this client registers
+    /// a slot on `YOU_JOINED` rather than at send time (the reference's `0x49b980` does the latter,
+    /// at state 1; the difference is invisible to everything we model).
+    pub(crate) fn joined(name: &str) -> Self {
+        ChannelSlot {
+            name: name.to_string(),
+            state: SlotState::Joined,
+        }
+    }
+}
+
+/// The bit `id` occupies in a `ZONECHANNELS` word — `1 << (ChannelID - 1)`; nothing outside
+/// `1..=32` has one.
+pub(crate) fn zone_bit(id: u32) -> u32 {
+    if id == 0 || id > 32 {
+        0
+    } else {
+        1 << (id - 1)
+    }
 }
 
 impl ChannelState {
+    /// A server-confirmed join sets the channel's `ZONECHANNELS` bit — the reference's `0x49bbaf`,
+    /// which ORs `1 << (slot.ChannelID - 1)` in the `YOU_JOINED` arm. A custom channel has no DBC
+    /// id and so no bit, which is why this is a no-op for one.
+    pub(crate) fn note_zone_channel_joined(&mut self, name: &str) {
+        let bit = zone_bit(self.channels.zone_channel_id(name));
+        match &mut self.zone_mask {
+            Some(mask) => *mask |= bit,
+            // Nothing sends a join before the cache loader has run — the walk waits for the seat
+            // and the file's own custom re-joins come after it — so this is a broken ordering,
+            // not a state to absorb.
+            None if bit != 0 => warn!(
+                "chat: {name:?} confirmed joined before the chat cache seated the zone mask — bit                  {bit:#x} dropped"
+            ),
+            None => {}
+        }
+    }
+
+    /// An **explicit** leave clears the bit — `0x49f10a`/`0x49f11a` inside leave-by-name
+    /// `0x49ee70`, and only there. The zone walk's LEAVE goes out on a different path and leaves
+    /// the mask alone: crossing a border is not "I left this channel".
+    ///
+    /// Keyed the way the reference keys it (wow-re `leavechannelbyname-contract.md` §8): the slot
+    /// found by the **wire name**, and its own DBC id — so a name no slot carries clears nothing,
+    /// whatever row it would resolve to.
+    pub(crate) fn note_zone_channel_left(&mut self, name: &str) {
+        if self.number_of(name).is_none() {
+            return;
+        }
+        if let Some(mask) = &mut self.zone_mask {
+            *mask &= !zone_bit(self.channels.zone_channel_id(name));
+        }
+    }
+
+    /// Does the mask carry `id`'s bit — is this `ChatChannels.dbc` row one the walk joins? The
+    /// reference's live predicate `0x49a494` (decision 2144). `None` (not seated) answers false.
+    pub(crate) fn zone_row_wanted(&self, id: u32) -> bool {
+        self.zone_mask.is_some_and(|mask| mask & zone_bit(id) != 0)
+    }
+
+    /// **The numeric leg of leave-by-name** — `0x49ee70` step 1 (wow-re
+    /// `leavechannelbyname-contract.md` §3, VERIFIED): a `SStrToInt` of the argument that is not
+    /// zero names joined slot `n`, and only a **server-confirmed** one (`slot+0x9c == 0`,
+    /// `0x49be50`); a hole, an out-of-range number or a suspended slot make the whole call a
+    /// no-op — no packet, no mask change. `None` is that no-op. Anything else is already the wire
+    /// name: the VM's `LeaveChannelByName` composed a shortcut or passed a custom name through.
+    ///
+    /// Here rather than in the VM because the slot **states** live here; the VM's mirror carries
+    /// names alone.
+    pub(crate) fn leave_target(&self, arg: &str) -> Option<String> {
+        let digits: String = arg
+            .strip_prefix('-')
+            .unwrap_or(arg)
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if digits.is_empty() || digits.chars().all(|c| c == '0') {
+            return Some(arg.to_string());
+        }
+        if arg.starts_with('-') {
+            return None; // a negative never names a slot
+        }
+        digits
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .and_then(|n| self.joined.get(n - 1))
+            .and_then(|slot| slot.as_ref())
+            .filter(|slot| slot.state == SlotState::Joined)
+            .map(|slot| slot.name.clone())
+    }
+
+    /// **Rename a slot in place — the zone walk crossing a border** (decision 2130).
+    ///
+    /// The reference's `0x49bc50(oldName, newName)`, called from `ZoneChannelRefresh`'s pass 1
+    /// step 6 (wow-re `zone-chat-channel-autojoin.md` §7, VERIFIED): it copies the new name into
+    /// the slot and moves its state to "re-join pending" — **at send time**, before the server has
+    /// answered the `CMSG_LEAVE_CHANNEL` that went out a moment earlier.
+    ///
+    /// That ordering is the whole point, and it is not bookkeeping. When the server's `YOU_LEFT`
+    /// for the *old* name arrives, no slot carries that name any more — `0x49be90` is a pure name
+    /// scan with no state filter — so the marshaller (`0x49b0b0`) takes its NULL-slot leg
+    /// (`0x49b12f`) and defaults `arg7`, `arg8`, `arg9` and `arg10` to `0 / 0 / "" / 0` **together**,
+    /// and the stock `ChatFrame_OnEvent` finds no match and returns (`found == 0`). Which means it
+    /// never reaches its own `YOU_LEFT` arm, and that arm is the one that **deletes the window's
+    /// channel registration** (`ChatFrame.lua` l.1382-1384):
+    ///
+    /// ```lua
+    /// this.channelList[index] = nil;
+    /// this.zoneChannelList[index] = nil;
+    /// ```
+    ///
+    /// Nothing in stock FrameXML ever re-adds one on a join, and **nothing in the engine does
+    /// either**: a closed census of event 395 (`0x18b`) leaves five fire sites in the image, none of
+    /// them reachable from a zone change, for guilded and unguilded players alike (wow-re §11.1,
+    /// VERIFIED). The rename is not one repopulation mechanism among several — it is the only thing
+    /// standing between a border crossing and a dead channel.
+    ///
+    /// So without it, one crossing costs the window General and LocalDefense **for the rest of the
+    /// session** — the replacement join notice dropped unprinted, and every line spoken in the new
+    /// zone with it. `ui_chat::tests::a_zone_change_must_not_deregister_the_channel_it_renames` is
+    /// that claim.
+    ///
+    /// Freeing and re-claiming instead would also renumber: the slot is the channel's `/N`.
+    ///
+    /// Returns the slot number when there was one to rename.
+    pub(crate) fn rename_slot(&mut self, old: &str, new: &str) -> Option<u32> {
+        let n = self.number_of(old)?;
+        let slot = self.joined[n as usize - 1].as_mut()?;
+        slot.name = new.to_string();
+        // `0x49bcd3`: `(old == 3) ? 1 : 2`. A suspended slot comes back as a plain pending join —
+        // our `Joined` is that state 1 — so its confirming notice reads `YOU_JOINED`, not
+        // `YOU_CHANGED`; any other state is a rename awaiting its re-join, and the notice resolves
+        // it.
+        slot.state = if slot.state == SlotState::Suspended {
+            SlotState::Joined
+        } else {
+            SlotState::Renamed
+        };
+        Some(n)
+    }
+
+    /// **Suspend the slot holding `name` — the row stopped applying** (`0x49bcf0`, state 3).
+    ///
+    /// Walking out of a capital with `Trade` joined is the only case the 1.12 data produces. The
+    /// LEAVE has already gone out; this is what keeps the record, so the notice that comes back is
+    /// `SUSPENDED` rather than `YOU_LEFT` and the window keeps its registration
+    /// ([`ChannelSlot::suspended`]). Freeing it instead is the same bug the rename fixes, on the
+    /// one row a rename cannot reach.
+    pub(crate) fn suspend_slot(&mut self, name: &str) -> Option<u32> {
+        let n = self.number_of(name)?;
+        self.joined[n as usize - 1].as_mut()?.state = SlotState::Suspended;
+        Some(n)
+    }
+
+    /// **The confirming `YOU_JOINED` resolves the slot's state** — the reference's `0x49bb20`
+    /// writes `+0x9c = 0` unconditionally on that arm. Without this a renamed slot would stay in
+    /// [`SlotState::Renamed`] for good and every later join notice would read "Changed Channel".
+    ///
+    /// Separate from [`Self::claim_slot`] because the notice arrives for slots we already number —
+    /// a rename is exactly that case, and it is the one that must not take a second slot.
+    pub(crate) fn confirm_slot(&mut self, name: &str) {
+        if let Some(n) = self.number_of(name) {
+            if let Some(slot) = self.joined[n as usize - 1].as_mut() {
+                slot.state = SlotState::Joined;
+            }
+        }
+    }
+
+    /// The state of the slot holding `name` — the notice arms' own split. A name we hold no slot
+    /// for answers `None`, which is the leg where the reference defaults every derived arg.
+    pub(crate) fn slot_state(&self, name: &str) -> Option<SlotState> {
+        self.number_of(name)
+            .and_then(|n| self.joined[n as usize - 1].as_ref())
+            .map(|s| s.state)
+    }
+
+    /// The roster as the VM's mirror wants it — `GetChannelName`/`GetChannelList` read names, and
+    /// the holes have to survive the trip or `/N` addresses the wrong channel.
+    pub(crate) fn names(&self) -> Vec<Option<String>> {
+        self.joined
+            .iter()
+            .map(|s| s.as_ref().map(|s| s.name.clone()))
+            .collect()
+    }
+
+    /// Every joined channel's name, holes skipped.
+    pub(crate) fn iter_names(&self) -> impl Iterator<Item = &str> {
+        self.joined.iter().flatten().map(|s| s.name.as_str())
+    }
+
     /// The 1-based number of `name` (case-insensitive), if joined.
     pub(crate) fn number_of(&self, name: &str) -> Option<u32> {
         self.joined
             .iter()
-            .position(|c| c.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(name)))
+            .position(|c| {
+                c.as_ref()
+                    .is_some_and(|c| c.name.eq_ignore_ascii_case(name))
+            })
             .map(|i| i as u32 + 1)
-    }
-
-    /// The channel occupying slot `number` (1-based), if any.
-    pub(crate) fn name_of(&self, number: u32) -> Option<&str> {
-        self.joined
-            .get(usize::try_from(number.checked_sub(1)?).ok()?)?
-            .as_deref()
     }
 
     /// Give `name` a slot: **the first free one**, else a new one while under [`MAX_CHANNELS`] —
@@ -217,16 +434,23 @@ impl ChannelState {
     /// error-string table this build indexes by id, and the structural half is what matters.
     pub(crate) fn claim_slot(&mut self, name: &str) -> Option<u32> {
         if let Some(n) = self.number_of(name) {
+            // A confirmed join on a slot we already hold clears its suspension — the reference's
+            // `0x49bb20` writes state 0 unconditionally. This is the other half of the state-3
+            // bypass: walking back into a capital re-joins `Trade - City` under the name the slot
+            // already carries.
+            if let Some(slot) = self.joined[n as usize - 1].as_mut() {
+                slot.state = SlotState::Joined;
+            }
             return Some(n);
         }
         if let Some(i) = self.joined.iter().position(Option::is_none) {
-            self.joined[i] = Some(name.to_string());
+            self.joined[i] = Some(ChannelSlot::joined(name));
             return Some(i as u32 + 1);
         }
         if self.joined.len() >= MAX_CHANNELS {
             return None;
         }
-        self.joined.push(Some(name.to_string()));
+        self.joined.push(Some(ChannelSlot::joined(name)));
         Some(self.joined.len() as u32)
     }
 
@@ -270,436 +494,5 @@ impl ChannelState {
         event.zone_channel_id = self.channels.zone_channel_id(&event.channel_base);
         event.channel_number = n;
         event.channel = format!("{n}. {}", event.channel_base);
-    }
-}
-
-/// The chat edit box's cross-open state (the fields `ChatEdit_OnLoad` seeds on the box).
-#[derive(Resource)]
-pub(crate) struct ChatEditState {
-    pub chat_type: SendType,
-    /// `stickyType` — what Escape/close reverts to and what the box opens as.
-    pub sticky: SendType,
-    /// The current whisper target (`editBox.tellTarget`).
-    pub tell_target: String,
-    /// The current channel's WIRE name (the ref's `editBox.channelTarget` is the number; the
-    /// name is what the send body carries either way).
-    pub channel_target: String,
-    /// The current channel's 1-based number (the joined-order slot), for the header.
-    pub channel_number: u32,
-    /// The `lastTell` ring (`NUM_REMEMBERED_TELLS = 10`), most recent first.
-    pub last_tell: VecDeque<String>,
-    /// `toldTarget` — who WE last whispered (the ctrl-R / ReplyTell2 memory).
-    pub last_told: Option<String>,
-    /// The header/insets need a repaint (type or target changed).
-    pub header_dirty: bool,
-    /// The last text the live parse saw (skip re-parsing an unchanged box).
-    last_text: String,
-}
-
-impl Default for ChatEditState {
-    fn default() -> Self {
-        ChatEditState {
-            chat_type: SendType::Say,
-            sticky: SendType::Say,
-            tell_target: String::new(),
-            channel_target: String::new(),
-            channel_number: 0,
-            last_tell: VecDeque::new(),
-            last_told: None,
-            header_dirty: true,
-            last_text: String::new(),
-        }
-    }
-}
-
-impl ChatEditState {
-    /// `ChatEdit_SetLastTellTarget`: move-to-front dedup (case-insensitive), cap 10.
-    pub(crate) fn remember_tell(&mut self, target: &str) {
-        self.last_tell.retain(|t| !t.eq_ignore_ascii_case(target));
-        self.last_tell.push_front(target.to_string());
-        self.last_tell.truncate(10);
-    }
-
-    /// `ChatEdit_GetNextTellTarget`: the ring entry after `current` (wrapping to the most
-    /// recent), for Tab cycling in whisper mode.
-    pub(crate) fn next_tell(&self, current: &str) -> Option<String> {
-        if self.last_tell.is_empty() {
-            return None;
-        }
-        if current.is_empty() {
-            return self.last_tell.front().cloned();
-        }
-        let pos = self
-            .last_tell
-            .iter()
-            .position(|t| t.eq_ignore_ascii_case(current));
-        match pos {
-            Some(i) if i + 1 < self.last_tell.len() => self.last_tell.get(i + 1).cloned(),
-            _ => self.last_tell.front().cloned(),
-        }
-    }
-
-    /// The header's text for the current type (`ChatEdit_UpdateHeader`'s strings, quoted).
-    /// Channel shows the stripped name (the `[%d. %s]:` number form is the P6 wiring).
-    fn header_text(&self, own_name: &str) -> String {
-        match self.chat_type {
-            SendType::Say => "Say: ".into(),
-            SendType::Yell => "Yell: ".into(),
-            SendType::Emote => format!("{own_name} "),
-            SendType::Whisper => format!("Tell {}: ", self.tell_target),
-            SendType::Party => "Party: ".into(),
-            SendType::Raid => "Raid: ".into(),
-            SendType::RaidLeader => "Raid: ".into(),
-            SendType::RaidWarning => "Raid Warning: ".into(),
-            SendType::Guild => "Guild: ".into(),
-            SendType::Officer => "Officer: ".into(),
-            SendType::Battleground => "Battleground: ".into(),
-            SendType::BattlegroundLeader => "Battleground: ".into(),
-            SendType::Channel => {
-                // CHAT_CHANNEL_SEND = "[%d. %s]: " (the zone tail stripped like the display law).
-                let name = self.channel_target.split(" - ").next().unwrap_or("");
-                format!("[{}. {name}]: ", self.channel_number)
-            }
-        }
-    }
-}
-
-/// The live parse (`ChatEdit_ParseText(send=0)`, run per frame while the box is focused): a
-/// leading `/<alias> ` converts the box's TYPE in place, keeping the remainder as the draft —
-/// typing `/g hi` flips to Guild with "hi" in the box. `/w`/`/t` wait for the target word to
-/// complete (`ChatEdit_ExtractTellTarget` grabs the first word once a space follows it); `/r`
-/// loads the last teller (`ChatEdit_GetLastTellTarget`). Action commands (`/join`, `/wave`, …)
-/// are NOT consumed here — they execute on Enter ([`super::input`]).
-pub(super) fn chat_edit_live(
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
-    mut state: ResMut<ChatEditState>,
-    channels: Res<ChannelState>,
-    ui_capture: Res<UiKeyboardCapture>,
-    mut names: ResMut<NameCache>,
-    self_guid: Res<SelfGuid>,
-    commands: Res<NetCommands>,
-) {
-    let Some(script) = script else {
-        return;
-    };
-    if !ui_capture.typing {
-        return; // box not focused — nothing to live-parse
-    }
-    let text: String = script
-        .eval("return (ChatFrameEditBox and ChatFrameEditBox:GetText()) or ''")
-        .unwrap_or_default();
-    if text != state.last_text {
-        state.last_text = text.clone();
-        if let Some((new_type, remainder)) = parse_type_switch(&state, &channels, &text) {
-            match new_type {
-                TypeSwitch::Plain(t) => {
-                    state.chat_type = t;
-                }
-                TypeSwitch::Whisper(target) => {
-                    state.chat_type = SendType::Whisper;
-                    state.tell_target = target;
-                }
-                TypeSwitch::Channel { name, number } => {
-                    state.chat_type = SendType::Channel;
-                    state.channel_target = name;
-                    state.channel_number = number;
-                }
-            }
-            state.header_dirty = true;
-            state.last_text = remainder.clone();
-            let lua_text = remainder.replace('\\', "\\\\").replace('"', "\\\"");
-            run_or_warn(
-                &script,
-                &format!("ChatFrameEditBox:SetText(\"{lua_text}\")"),
-            );
-        }
-    }
-    if state.header_dirty {
-        // The Emote header is the player's own name (CHAT_EMOTE_SEND = "%s "), resolved through
-        // the same ask-once cache as everyone else's.
-        let own = self_guid
-            .0
-            .and_then(|g| names.resolve(g, &commands).map(str::to_string))
-            .unwrap_or_else(|| "You".to_string());
-        let header = state.header_text(&own);
-        let [r, g, b] = state.chat_type.color();
-        let (rf, gf, bf) = (
-            f32::from(r) / 255.0,
-            f32::from(g) / 255.0,
-            f32::from(b) / 255.0,
-        );
-        let lua_header = header.replace('\\', "\\\\").replace('"', "\\\"");
-        // Header text+color, typed-text color, and the insets past the measured header
-        // (`SetTextInsets(15 + header:GetWidth(), 13, 0, 0)` — ref ChatEdit_UpdateHeader l.1912).
-        // The width is the measure round-trip's, one frame late for a fresh string — so we re-run
-        // while dirty until a nonzero width lands. GetWidth serves ONLY a measure of the CURRENT
-        // text (region.rs key-checks it): after a type switch (Say → "Tell Alice:") the old
-        // header's width reads 0, not stale — the settle below waits for the RIGHT measure
-        // instead of latching the previous header's insets (the /w cursor-in-the-header bug).
-        run_or_warn(
-            &script,
-            &format!(
-                "ChatFrameEditBoxHeader:SetText(\"{lua_header}\")\n\
-                 ChatFrameEditBoxHeader:SetTextColor({rf:.4}, {gf:.4}, {bf:.4})\n\
-                 ChatFrameEditBox:SetTextColor({rf:.4}, {gf:.4}, {bf:.4})\n\
-                 local w = ChatFrameEditBoxHeader:GetWidth()\n\
-                 if w and w > 1 then\n\
-                     ChatFrameEditBox:SetTextInsets(15 + w, 13, 0, 0)\n\
-                     BenillaChatHeaderSettled = true\n\
-                 end"
-            ),
-        );
-        // Stay dirty until the measured width landed (the round-trip is a frame late on a fresh
-        // header string).
-        if script
-            .eval::<bool>("local s = BenillaChatHeaderSettled; BenillaChatHeaderSettled = false; return s or false")
-            .unwrap_or(false)
-        {
-            state.header_dirty = false;
-        }
-    }
-}
-
-/// A live type switch the parse found.
-pub(super) enum TypeSwitch {
-    Plain(SendType),
-    Whisper(String),
-    Channel { name: String, number: u32 },
-}
-
-/// The `/N` / `/c <name-or-number>` channel switch against the joined list. `cmd_lower` is the
-/// first word (no slash); returns the switch + remaining draft.
-pub(super) fn channel_switch(
-    channels: &ChannelState,
-    cmd_lower: &str,
-    args: &str,
-) -> Option<(TypeSwitch, String)> {
-    if let Ok(n) = cmd_lower.parse::<u32>() {
-        let name = channels.name_of(n)?;
-        return Some((
-            TypeSwitch::Channel {
-                name: name.to_string(),
-                number: n,
-            },
-            args.to_string(),
-        ));
-    }
-    if ["c", "csay"].contains(&cmd_lower) {
-        let (chan, remainder) = args.split_once(' ').unwrap_or((args, ""));
-        if chan.is_empty() {
-            return None;
-        }
-        let number = if let Ok(n) = chan.parse::<u32>() {
-            n
-        } else {
-            channels.number_of(chan)?
-        };
-        let name = channels.name_of(number)?.to_string();
-        return Some((TypeSwitch::Channel { name, number }, remainder.to_string()));
-    }
-    None
-}
-
-/// Match `text` against the type-switch grammar. Returns the switch + the box's remaining draft.
-pub(super) fn parse_type_switch(
-    state: &ChatEditState,
-    channels: &ChannelState,
-    text: &str,
-) -> Option<(TypeSwitch, String)> {
-    let rest = text.strip_prefix('/')?;
-    let (cmd, args) = rest.split_once(' ').unwrap_or((rest, ""));
-    if cmd.is_empty() {
-        return None;
-    }
-    let lower = cmd.to_ascii_lowercase();
-    // `/<digits>` — the numbered-channel switch (`ChatEdit_ParseText` l.2110-2121: a live
-    // GetChannelName hit converts immediately, remainder kept) and `/c <name-or-number>`
-    // (`ChatEdit_ExtractChannel`). Both wait for the delimiting space like every live switch.
-    if rest.contains(' ') {
-        if let Some(switch) = channel_switch(channels, &lower, args) {
-            return Some(switch);
-        }
-    }
-    // `/r` — reply: load the last teller (only when one exists; else leave the text alone).
-    if (lower == "r" || lower == "reply") && rest.contains(' ') {
-        let target = state.last_tell.front()?.clone();
-        return Some((TypeSwitch::Whisper(target), args.to_string()));
-    }
-    // Whisper family: wait for the completed target word ("/w Bob " — the space after the name
-    // is the ref's extract trigger).
-    if SendType::Whisper.aliases().contains(&lower.as_str()) {
-        let (target, remainder) = args.split_once(' ')?;
-        if target.is_empty() || target.starts_with('|') {
-            return None; // the ref rejects a link-leading "name"
-        }
-        return Some((
-            TypeSwitch::Whisper(target.to_string()),
-            remainder.to_string(),
-        ));
-    }
-    // The plain type families — the switch fires as soon as the command word is delimited
-    // (a trailing space), so "/g" alone doesn't convert while you're still typing "/gc".
-    if !rest.contains(' ') {
-        return None;
-    }
-    for t in [
-        SendType::Say,
-        SendType::Yell,
-        SendType::Emote,
-        SendType::Party,
-        SendType::Raid,
-        SendType::RaidWarning,
-        SendType::Guild,
-        SendType::Officer,
-        SendType::Battleground,
-    ] {
-        if t.aliases().contains(&lower.as_str()) {
-            return Some((TypeSwitch::Plain(t), args.to_string()));
-        }
-    }
-    None
-}
-
-/// The open commands through the binding table (0997; 1.12 defaults OPENCHAT = Enter,
-/// OPENCHATSLASH = `/`, REPLY = R, REPLY2 = Shift-R): OPENCHAT opens with the sticky type,
-/// downgrading an invalid PARTY/RAID to SAY against the live group state (the ref's
-/// `ChatEdit_UpdateHeader` invalid-type law; the sticky itself keeps its value, so rejoining a
-/// group restores it — GUILD/BG downgrades wait on their arcs' state); OPENCHATSLASH opens
-/// pre-slashed; REPLY opens as a reply to the last teller, and **REPLY2 to the last person YOU
-/// told** — the reference's own split, `ChatEdit_GetLastTellTarget` against
-/// `ChatEdit_GetLastToldTarget` (ChatFrame.lua l.1627/1645), and the reason they are two
-/// commands rather than one. The dispatch already gated on nothing owning the keyboard
-/// (a focused box's Enter is the box's), and Shift-Enter no longer opens chat — `SHIFT-ENTER`
-/// is a different chord than `ENTER`, the exact-modifier law the reference applies.
-pub(super) fn open_chat_keys(
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
-    binds: Res<crate::bindings::BindingsState>,
-    mut state: ResMut<ChatEditState>,
-    group: Res<crate::ui_party::GroupState>,
-) {
-    let Some(mut script) = script else {
-        return;
-    };
-    use crate::bindings::cmd;
-    let open_plain = binds.fired(cmd::OPEN_CHAT);
-    let open_slash = binds.fired(cmd::OPEN_CHAT_SLASH);
-    let open_reply = binds.fired(cmd::REPLY) && !state.last_tell.is_empty();
-    // REPLY2 rides `last_told`, which the send path has been keeping all along
-    // ([`super::input::send`]) with nothing reading it. Same guard shape as REPLY's: with nobody
-    // told yet the reference falls into its own empty-string else-branch and opens nothing.
-    let open_reply2 = binds.fired(cmd::REPLY2) && state.last_told.is_some();
-    if !(open_plain || open_slash || open_reply || open_reply2) {
-        return;
-    }
-    if open_reply || open_reply2 {
-        state.chat_type = SendType::Whisper;
-        // REPLY wins a same-frame tie, which is the order the reference's two bindings can only
-        // be pressed in anyway (they are different chords); stated rather than left to the `if`.
-        state.tell_target = if open_reply {
-            state.last_tell.front().cloned().unwrap_or_default()
-        } else {
-            state.last_told.clone().unwrap_or_default()
-        };
-    } else {
-        state.chat_type = sticky_on_open(state.sticky, &group);
-    }
-    state.header_dirty = true;
-    state.last_text.clear();
-    script.focus_editbox("ChatFrameEditBox");
-    if open_slash {
-        run_or_warn(&script, "ChatFrameEditBox:SetText(\"/\")");
-        state.last_text = "/".into();
-    }
-}
-
-/// The type a freshly opened box starts in: the sticky, **downgraded to SAY when the group it
-/// names is gone** (ref `ChatFrame_OpenChat` l.1554-1565 — a sticky PARTY with an empty party opens
-/// as SAY, and so does a sticky RAID outside a raid). The sticky itself is untouched, so rejoining
-/// restores it. One function because two callers need the identical law: the ENTER binding
-/// ([`open_chat_keys`]) and an addon's `ChatFrame_OpenChat` ([`open_chat_requests`]).
-pub(super) fn sticky_on_open(sticky: SendType, group: &crate::ui_party::GroupState) -> SendType {
-    match sticky {
-        SendType::Party if !group.in_group => SendType::Say,
-        SendType::Raid | SendType::RaidWarning if !(group.in_group && group.group_type == 1) => {
-            SendType::Say
-        }
-        sticky => sticky,
-    }
-}
-
-/// `ChatFrame_OpenChat(text[, chatFrame])` — an addon asking for the chat box, prefilled
-/// (`benilla_ui::script::chat_window` registers the verb and queues the text).
-///
-/// The reference shows the box, stashes the text on it, and lets `ChatEdit_OnUpdate` type it in
-/// (`this.setText == 1` → `this:SetText(this.text)`, ChatFrame.lua l.1795) — the fill is a frame
-/// late there too. Ours focuses the box (which shows it) and writes the text now; `last_text` is
-/// deliberately left EMPTY rather than mirroring what we just wrote, so the next frame's
-/// [`chat_edit_live`] sees a change and runs the live parse over it. That is the whole point for
-/// two of the three corpus callers: they prefill `"/w <name> "`, and it is the live parse — not
-/// this function — that turns those characters into whisper mode with the target extracted,
-/// exactly as it would for a human typing them.
-pub(super) fn open_chat_requests(
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
-    mut state: ResMut<ChatEditState>,
-    group: Res<crate::ui_party::GroupState>,
-) {
-    let Some(mut script) = script else {
-        return;
-    };
-    // Last request wins — two opens in one frame are one box, and the later caller is the one
-    // whose text the user is about to see.
-    let Some(text) = script.take_open_chat_requests().pop() else {
-        return;
-    };
-    state.chat_type = sticky_on_open(state.sticky, &group);
-    state.header_dirty = true;
-    state.last_text.clear();
-    script.focus_editbox("ChatFrameEditBox");
-    let lua_text = text.replace('\\', "\\\\").replace('"', "\\\"");
-    run_or_warn(
-        &script,
-        &format!("ChatFrameEditBox:SetText(\"{lua_text}\")"),
-    );
-}
-
-/// The unit popup's WHISPER action (`ChatFrame_SendTell` → the engine's tell queue, decision
-/// 0434 §5): open the edit box in whisper mode to the named player — the ref fills its box with
-/// "/w name "; our box's whisper form is chat_type + tell_target, the reply key's exact shape.
-pub(super) fn open_tell_requests(
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
-    mut state: ResMut<ChatEditState>,
-) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let Some(name) = script.take_tell_requests().pop() else {
-        return;
-    };
-    state.chat_type = SendType::Whisper;
-    state.tell_target = name;
-    state.header_dirty = true;
-    state.last_text.clear();
-    script.focus_editbox("ChatFrameEditBox");
-}
-
-/// Tab in the box (the engine's `OnTabPressed` → `BenillaChatTabPressed` queue): whisper mode
-/// cycles the `lastTell` ring (`ChatEdit_OnTabPressed` l.1983-1991). The slash tab-COMPLETION
-/// walk (cycling `SLASH_*` prefix matches) is deferred with the P8 polish — flagged, not silent.
-pub(super) fn chat_tab_cycle(
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
-    mut state: ResMut<ChatEditState>,
-) {
-    let Some(mut script) = script else {
-        return;
-    };
-    if !script.take_chat_tab() {
-        return;
-    }
-    if state.chat_type == SendType::Whisper {
-        let current = state.tell_target.clone();
-        if let Some(next) = state.next_tell(&current) {
-            state.tell_target = next;
-            state.header_dirty = true;
-        }
     }
 }

@@ -4,11 +4,13 @@
 //! axis — frames grow per-kind method tables ([`super::statusbar`], [`super::button`]), regions
 //! grow paint/coords methods here.
 
-use mlua::{Lua, Table, Value};
+use mlua::{Lua, MultiValue, Table, Value};
 
+use super::object::anchor_args::{parse_set_point, resolve_rel_target, UNNAMED};
 use super::object::{
-    anchor_bits_eq, anchor_retarget_is_structural, as_f32, decode_id, id_to_lud, point_from_str,
+    anchor_bits_eq, anchor_retarget_is_structural, decode_id, id_to_lud, NamedTarget,
 };
+use super::region_map::{set_shared, Side};
 use super::{
     Model, REG_FONTSTRING_META, REG_FONTSTRING_METHODS, REG_REGION_META, REG_REGION_METHODS,
     REG_TEXTURE_META, REG_TEXTURE_METHODS, REG_TITLE_META, REG_TITLE_METHODS, REG_WRAPPERS, SCREEN,
@@ -132,7 +134,15 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let rh = region_handle_of(lua, &region)?;
             let mut model = lua.app_data_mut::<Model>().expect("model");
             let data = model.region_data.entry(rh).or_default();
-            data.portrait_unit = Some(unit);
+            // CANONICAL (lowercase) on the way in, like `set_unit`'s map key: the binding
+            // resolves its token through the one resolver every `Unit*` binding shares
+            // (`0x519ef0` → `0x515970`), whose every compare is `_strnicmp` — so the stock
+            // `MerchantFrame.lua:68`, `GuildRegistrarFrame.lua:4` and `TradeFrame.lua:41` all
+            // write `"NPC"` and mean `"npc"`. The app samples the booth by this string
+            // (`portrait::PortraitImages`, keyed by the lowercase slot names), and a raw `"NPC"`
+            // reached it and matched nothing: an empty portrait ring on all three windows
+            // (decision 2022).
+            data.portrait_unit = Some(unit.to_ascii_lowercase());
             data.texture = None;
             data.fill = None;
             data.circular = true;
@@ -202,12 +212,17 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // **`__index` is the method TABLE, not a dispatcher function** (decision 2310) — here and at
+    // the three leaf metatables below. A Rust `__index` makes every `t.SetTexture` a Lua→Rust→Lua
+    // round trip plus a named-registry string lookup; measured at ~195 ns against ~9 ns for the
+    // table form, paid by every widget method access in the client. Nothing mutates these tables
+    // after install (`super::region_map::install` writes into them in place, and runs inside
+    // `super::object::install`), so holding the table itself cannot go stale.
     let region_meta = lua.create_table()?;
-    let region_index = lua.create_function(|lua, (_this, key): (Table, Value)| {
-        let methods: Table = lua.named_registry_value(REG_REGION_METHODS)?;
-        methods.get::<Value>(key)
-    })?;
-    region_meta.set("__index", region_index)?;
+    region_meta.set(
+        "__index",
+        lua.named_registry_value::<Table>(REG_REGION_METHODS)?,
+    )?;
     lua.set_named_registry_value(REG_REGION_META, region_meta)?;
     Ok(())
 }
@@ -227,17 +242,14 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
     //
     // Resolution is [`region_name_of`], shared with `IsObjectType`'s `Usage:` text so the two can
     // never disagree about what this region is called.
-    m.set(
-        "GetName",
-        lua.create_function(|lua, this: Table| {
-            let id = decode_id(&this)?;
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            match region_name_of(&model, id) {
-                Some(n) => Ok(Value::String(lua.create_string(&n)?)),
-                None => Ok(Value::Nil),
-            }
-        })?,
-    )?;
+    set_shared(lua, &m, Side::Region, "GetName", |lua, this: Table| {
+        let id = decode_id(&this)?;
+        let model = lua.app_data_ref::<Model>().expect("model app_data");
+        match region_name_of(&model, id) {
+            Some(n) => Ok(Value::String(lua.create_string(&n)?)),
+            None => Ok(Value::Nil),
+        }
+    })?;
 
     // ── GetObjectType / IsObjectType: the last two of the Region map (1244 §4 closed) ───────────
     //
@@ -249,13 +261,16 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
     // `GetObjectType` is a per-class `.data` `const char*` read through `vtable[+0x1c]` — Texture
     // `0x773480` → `"Texture"`, FontString `0x7735d0` → `"FontString"` — pushed with
     // `lua_pushstring`, exactly one value, extra arguments ignored with no arity check.
-    m.set(
+    set_shared(
+        lua,
+        &m,
+        Side::Region,
         "GetObjectType",
-        lua.create_function(|lua, this: Table| {
+        |lua, this: Table| {
             let rh = region_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
             Ok(region_type_name(&model, rh))
-        })?,
+        },
     )?;
 
     // `IsObjectType(name)` — binding `0x7a1290`. Four traps, all verified, all here:
@@ -279,9 +294,12 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
     //    in place, so `tex:IsObjectType(5)` compares against `"5"` and quietly answers nil — we
     //    format it and compare for real rather than short-circuiting, though no type name is
     //    numeric so the answer is nil either way.
-    m.set(
+    set_shared(
+        lua,
+        &m,
+        Side::Region,
         "IsObjectType",
-        lua.create_function(|lua, (this, want): (Table, Value)| {
+        |lua, (this, want): (Table, Value)| {
             let rh = region_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
             let want = match &want {
@@ -299,7 +317,7 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
             let leaf = region_type_name(&model, rh);
             let hit = want.eq_ignore_ascii_case(leaf) || want.eq_ignore_ascii_case("Region");
             Ok(if hit { Value::Number(1.0) } else { Value::Nil })
-        })?,
+        },
     )?;
 
     // SetParent(frame) — **a Texture/FontString really does have this**, and we were the ones
@@ -326,9 +344,12 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
     //
     // The mechanism half — full re-link, layer and sub-level preserved, `nil` = orphaned but not
     // destroyed — is [`crate::widget::WidgetArena::set_region_owner`]'s doc.
-    m.set(
+    set_shared(
+        lua,
+        &m,
+        Side::Region,
         "SetParent",
-        lua.create_function(|lua, args: mlua::MultiValue| {
+        |lua, args: mlua::MultiValue| {
             let mut it = args.into_iter();
             let Some(Value::Table(this)) = it.next() else {
                 return Err(mlua::Error::runtime("SetParent: expected a region"));
@@ -341,6 +362,15 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
             };
             let wrong_type =
                 || mlua::Error::runtime("SetParent(): Wrong parent object type, expected frame");
+            // `_G[name]` before the guard, and **without** `$parent` expansion — the reparent
+            // bindings call `0x76c760` directly (`super::object::NamedTarget`).
+            let named = match &parent {
+                Value::String(s) => Some(match s.to_str() {
+                    Ok(n) => super::object::prefetch_named_target(lua, n.as_ref(), None),
+                    Err(_) => NamedTarget::unreadable(),
+                }),
+                _ => None,
+            };
             let mut model = lua.app_data_mut::<Model>().expect("model");
             let new_owner = match &parent {
                 Value::Nil => None,
@@ -352,14 +382,17 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
                         .and_then(|id| model.id_to_frame.get(&id).copied())
                         .ok_or_else(wrong_type)?,
                 ),
-                // A name resolves through the frame registry, as every other frame-target argument
-                // does (`SetPoint`'s relativeTo, `SetParent` on the frame side).
-                Value::String(s) => {
-                    let name = s.to_str()?;
-                    Some(model.arena.lookup(name.as_ref()).ok_or_else(|| {
+                // A name resolves through `_G[name]` + the narrow **Frame** tag check
+                // (`[0xcf0c10]`), as every other frame-target argument does — the reference's
+                // `0x76c760`; see `object::NamedTarget`.
+                Value::String(_) => {
+                    let nt = named.as_ref().expect("a String argument is prefetched");
+                    let hit = super::object::resolve_named_target(&model, nt)
+                        .and_then(|id| model.id_to_frame.get(&id).copied());
+                    Some(hit.ok_or_else(|| {
                         mlua::Error::runtime(format!(
                             "SetParent(): Couldn't find region named '{}'",
-                            name.as_ref()
+                            nt.name
                         ))
                     })?)
                 }
@@ -372,7 +405,7 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
                 model.touch_layout();
             }
             Ok(())
-        })?,
+        },
     )?;
 
     // Region-level visibility — the real VisibleRegion Show/Hide on Textures/FontStrings (the
@@ -463,11 +496,13 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
     // ours was ONE table for both, so a Texture answered `SetText` and a FontString answered
     // `SetTexture`: a superset in both directions.
     //
-    // **Partitioned, not pruned.** Every name we install keeps a home; what changes is which leaf
-    // can see it. Removing the five names that are in NEITHER client map (`SetPortraitToTexture`,
-    // `SetRotation`, `SetSize`, `SetFormattedText`, `GetStringHeight`) is a separate question per
-    // name — and getting a split wrong REMOVES verbs addons use, which is worse than the superset
-    // it fixes.
+    // **Partitioned first, then pruned name by name.** The 1244/1245 split only decided which
+    // leaf could SEE each name, because getting a split wrong REMOVES verbs addons use, which is
+    // worse than the superset it fixes. The five that were in NEITHER client map were left in
+    // place as a separate question per name, and all five have since been answered:
+    // `GetStringHeight` (1251), `SetRotation` and `SetPortraitToTexture` (the latter a 1.12
+    // GLOBAL, and it lives there now), and `SetFormattedText` and `SetSize` (2142). Both leaves
+    // are the client's own lists now.
     //
     // Copied out of the full table rather than installed twice, so one implementation stands behind
     // both visibilities — and note the carve's warning that the shared names use the IDENTICAL
@@ -492,20 +527,12 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
         (REG_FONTSTRING_META, REG_FONTSTRING_METHODS),
     ] {
         let meta = lua.create_table()?;
-        let index = lua.create_function(move |lua, (_this, key): (Table, Value)| {
-            let methods: Table = lua.named_registry_value(methods_key)?;
-            methods.get::<Value>(key)
-        })?;
-        meta.set("__index", index)?;
+        meta.set("__index", lua.named_registry_value::<Table>(methods_key)?)?;
         lua.set_named_registry_value(meta_key, meta)?;
     }
 
     let title_meta = lua.create_table()?;
-    let title_index = lua.create_function(|lua, (_this, key): (Table, Value)| {
-        let methods: Table = lua.named_registry_value(REG_TITLE_METHODS)?;
-        methods.get::<Value>(key)
-    })?;
-    title_meta.set("__index", title_index)?;
+    title_meta.set("__index", title.clone())?;
     lua.set_named_registry_value(REG_TITLE_METHODS, title)?;
     lua.set_named_registry_value(REG_TITLE_META, title_meta)?;
 
@@ -640,17 +667,47 @@ pub(crate) fn implicit_creation_anchor(model: &mut Model, rh: RegionHandle) {
             ];
         }
         RegionKind::FontString => {
-            // The exact byte compare chain: `& 7` then equality against LEFT (1) and RIGHT (4) —
-            // every other value, the CENTER bit and the cleared axis included, falls to CENTER.
-            let point = match data.justify.0 & crate::justify::H_MASK {
-                0x01 => Point::Left,
-                0x04 => Point::Right,
-                _ => Point::Center,
-            };
+            let point = justify_anchor_point(data.justify.0);
             data.anchors = vec![Anchor::new(point, owner_id, point, 0.0, 0.0)];
         }
         RegionKind::Title => return,
     }
+    model.touch_layout();
+}
+
+/// The middle-row point a justify word selects — the compare chain the FontString creation
+/// post-step (`0x771480`) and the Button label adopter (`CSimpleButton::SetFontString 0x778d20`)
+/// share: `& 7`, then equality against LEFT (1) and RIGHT (4); every other value — the CENTER bit
+/// and a cleared axis alike — falls to CENTER. What differs between the two callers is only WHOSE
+/// word is read: the post-step reads the string's own (`+0x120`), the adopter reads the button's
+/// normal font's (`+0x390`) — see [`super::button`]'s `adopt_label` (decision 1996).
+pub(crate) fn justify_anchor_point(word: u32) -> crate::layout::Point {
+    use crate::layout::Point;
+    match word & crate::justify::H_MASK {
+        0x01 => Point::Left,
+        0x04 => Point::Right,
+        _ => Point::Center,
+    }
+}
+
+/// One middle-row anchor `point → the owner's same point, (0,0)`, installed only when the region
+/// has no anchor of its own — the nine-slot scan every implicit-anchor site runs first, so any
+/// anchor from any source suppresses it. [`implicit_creation_anchor`]'s FontString arm is this
+/// with the region's own justify word; the Button adopter is this with the button's.
+pub(crate) fn anchor_unanchored_at(
+    model: &mut Model,
+    rh: RegionHandle,
+    point: crate::layout::Point,
+) {
+    let Some(owner) = model.arena.region(rh).map(|r| r.owner) else {
+        return;
+    };
+    let owner_id = model.frame_id(owner);
+    let data = model.region_data.entry(rh).or_default();
+    if !data.anchors.is_empty() {
+        return;
+    }
+    data.anchors = vec![Anchor::new(point, owner_id, point, 0.0, 0.0)];
     model.touch_layout();
 }
 
@@ -663,47 +720,27 @@ pub(crate) fn implicit_creation_anchor_lua(lua: &Lua, wrapper: &Table) -> mlua::
     Ok(())
 }
 
-/// Resolve a `SetPoint`/`SetAllPoints` `relativeTo` argument (a frame/region wrapper table, a frame
-/// name, or nil) to a layout id, defaulting to `owner` when absent/unresolved.
-pub(super) fn resolve_target(model: &mut Model, target: &Value, owner: u32) -> u32 {
-    match target {
-        Value::Table(t) => decode_id(t)
-            .ok()
-            .filter(|id| model.id_to_frame.contains_key(id) || model.id_to_region.contains_key(id))
-            .unwrap_or(owner),
-        Value::String(s) => s
-            .to_str()
-            .ok()
-            .and_then(|n| {
-                // Frames first (the client's global namespace is one; frames publish before their
-                // regions build), then the region-name registry — the real XML anchors regions to
-                // sibling regions by name (merchant label plate → `$parentSlot`).
-                model
-                    .arena
-                    .lookup(n.as_ref())
-                    .map(|h| model.frame_id(h))
-                    .or_else(|| model.region_names.get(n.as_ref()).copied())
-            })
-            .unwrap_or_else(|| {
-                // The owner fallback matches the frame path, but a *named* target that doesn't
-                // resolve is almost always a bug — a typo, or an XML forward reference (anchors
-                // resolve at SetPoint time, so a target must be declared before its dependents;
-                // ItemTextFrame's scrollbar track landed on the parchment this way). Warn
-                // instead of silently misdirecting the anchor.
-                let who = model
-                    .id_to_frame
-                    .get(&owner)
-                    .and_then(|&h| model.arena.frame(h))
-                    .and_then(|f| f.name.clone())
-                    .unwrap_or_else(|| "<anonymous>".into());
-                model.warnings.push(format!(
-                    "SetPoint(region of {who}): relativeTo '{}' does not resolve — anchored to the owner",
-                    s.to_str().ok().as_deref().unwrap_or("<non-utf8>")
-                ));
-                owner
-            }),
-        _ => owner,
-    }
+/// The two things the shared ladder needs off a **region** receiver, read under one short `Model`
+/// borrow that is dropped before the `_G` read (`super::object::anchor_args`'s contract, and the
+/// frame twin's `frame_ladder_context`): the name the reference puts in its error strings, and the
+/// name a leading `$parent` expands to.
+///
+/// A region's `$parent` is its **owner** frame (the region's own `+0x9c`), so the walk starts
+/// there rather than one link higher. Its own name comes back out of `Model::region_names` — the
+/// registry is name→id, and this is the only place that wants the inverse, so it is a scan on the
+/// **error path** rather than a second map kept in step.
+pub(super) fn region_ladder_context(lua: &Lua, rh: RegionHandle) -> (String, String) {
+    let mut model = lua.app_data_mut::<Model>().expect("model");
+    let id = model.region_id(rh);
+    let who = model
+        .region_names
+        .iter()
+        .find(|(_, &v)| v == id)
+        .map(|(n, _)| n.clone())
+        .unwrap_or_else(|| UNNAMED.to_string());
+    let owner = model.arena.region(rh).map(|r| r.owner);
+    let base = super::object::parent_token_base(&model, owner);
+    (who, base)
 }
 
 /// Bit-exact equality for a region's explicit size — the layout gate's own lens
@@ -719,41 +756,22 @@ pub(super) fn size_bits_eq(a: Option<(f32, f32)>, b: Option<(f32, f32)>) -> bool
     }
 }
 
-/// `Region:SetPoint(point [, relativeTo [, relativePoint]] [, x, y])` — the region twin of
-/// [`super::object`]'s frame `SetPoint`, writing [`super::RegionData::anchors`]. The overload is
-/// disambiguated by argument *type* exactly as the frame version.
-pub(super) fn region_set_point(
-    lua: &Lua,
-    this: &Table,
-    point: &str,
-    rest: [Value; 4],
-) -> mlua::Result<()> {
-    let point = point_from_str(point)
-        .ok_or_else(|| mlua::Error::runtime(format!("SetPoint: unknown point '{point}'")))?;
+/// `Region:SetPoint(point [, relativeTo [, relativePoint]] [, x, y])` — the *same* binding as the
+/// frame's (`0x7a2540` is registered once, on `CScriptRegion`), so the argument ladder and every
+/// one of its raises come from [`super::object::anchor_args`]; this side supplies only what the
+/// reference reads off a region — the owner as the layout parent, and
+/// [`super::RegionData::anchors`] as the store.
+pub(super) fn region_set_point(lua: &Lua, this: &Table, args: &MultiValue) -> mlua::Result<()> {
     let rh = region_handle_of(lua, this)?;
+    let (who, base) = region_ladder_context(lua, rh);
+    // The `_G` read inside the ladder runs with no model guard alive — see `region_ladder_context`.
+    let p = parse_set_point(lua, args, &who, &base)?;
+
     let mut model = lua.app_data_mut::<Model>().expect("model");
+    let me = model.region_id(rh);
     let owner = region_owner_id(&mut model, rh);
-
-    let mut cursor = 0usize;
-    let rel_to_id: u32 = match rest.first() {
-        Some(Value::Table(_) | Value::String(_) | Value::Nil) => {
-            cursor = 1;
-            resolve_target(&mut model, &rest[0], owner)
-        }
-        // A leading number is the `SetPoint(point, x, y)` overload — cursor stays at 0.
-        _ => owner,
-    };
-
-    let mut rel_point = point;
-    if let Some(Value::String(s)) = rest.get(cursor) {
-        if let Some(p) = s.to_str().ok().and_then(|n| point_from_str(n.as_ref())) {
-            rel_point = p;
-            cursor += 1;
-        }
-    }
-
-    let x = rest.get(cursor).map(as_f32).unwrap_or(0.0);
-    let y = rest.get(cursor + 1).map(as_f32).unwrap_or(0.0);
+    let rel_to_id = resolve_rel_target(&model, &p.target, &who, "SetPoint", me, owner)?;
+    let (point, rel_point, x, y) = (p.point, p.rel_point, p.x, p.y);
 
     let data = model.region_data.entry(rh).or_default();
     let new = Anchor::new(point, rel_to_id, rel_point, x, y);
@@ -807,7 +825,8 @@ pub(super) fn region_set_point(
 /// Two details of the FontString row are worth spelling out, because both were wrong here before
 /// and neither is guessable from the name:
 ///
-/// * **The authored value WINS.** The old code preferred the measure and fell back to `SetSize`;
+/// * **The authored value WINS.** The old code preferred the measure and fell back to the
+///   authored size;
 ///   the reference's `jp` at `0x77294a` skips the measure entirely when the authored value is
 ///   non-zero. Per axis, not per region — `<Size x="290" y="0"/>` takes 290 from the author and
 ///   the height from the text.
@@ -849,11 +868,14 @@ pub(super) fn virtual_span(model: &Model, rh: RegionHandle) -> (f32, f32) {
             // **The floor applies to a KNOWN extent, and a pending measure is not one.** On the
             // reference every extent is known — the getter measures inline — so `0.0` never comes
             // back and the question never arises. Ours can be *waiting*, which is not a size but
-            // the absence of an answer, and several of our own convergence drivers read exactly
-            // that: `BenillaGossipRow_Resize`, the tab fit and the quest panel all guard
-            // `if h <= 0 then return end` and re-run from `OnUpdate` until the round-trip lands.
-            // Flooring a pending measure to one unit hands them a number, so they stop waiting and
-            // seat every row at 3px (`shipped_gossip_frame_drives_end_to_end` catches it).
+            // the absence of an answer. **Where that state still lives is a VM with no measurer
+            // installed** (`script::measure`'s is optional): the app seats one at the load edge
+            // (2028), so no in-app caller observes a pending measure any more, and the three
+            // convergence drivers this used to name went with their windows —
+            // `BenillaGossipRow_Resize` (gossip, 1751), our tab fit (1993/2028) and our quest
+            // panel (1944). Flooring a pending measure to one unit hands a measurer-less caller a
+            // number where it should read "not yet"; the surviving `OnUpdate` fits
+            // (`OptionsScroll_Fit`, `BenillaScroll_ResizeChild`) guard on RECTS, not on this.
             //
             // A genuinely EMPTY string is a different thing: its extent is known and it is zero, so
             // it floors — which is the case the reference's floor exists for. The layout sweep

@@ -24,8 +24,8 @@
 //! panel, and one `apply_foo` system — no plumbing changes. (Weather is the worked example.)
 //!
 //! Rendering uses bevy_egui's manual-context mode: auto-creation is disabled in [`DebugPanelPlugin`]
-//! and a dedicated full-window overlay camera composites egui over the 3D scene (alpha-blended, no
-//! clear). See bevy_egui's `side_panel` example.
+//! and a dedicated full-window overlay camera composites egui over the finished frame (a transparent
+//! canvas, premultiplied over the swapchain). See bevy_egui's `side_panel` example.
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::CameraOutputMode;
@@ -37,6 +37,7 @@ use bevy_egui::{
     PrimaryEguiContext,
 };
 
+use benilla_assets::LockRecover;
 use benilla_world::lighting::{ClockSource, GameClock, WowLighting};
 use benilla_world::model_render::{ModelKind, ModelPart};
 use benilla_world::modkeys::{dev_chord, DEV_CHORD};
@@ -248,12 +249,29 @@ impl Plugin for DebugPanelPlugin {
 /// here — fonts only initialize inside a real begin-pass). `run` is the initialization path.
 fn feed_gated_egui_output(
     mut contexts: Query<(&mut EguiContext, &mut EguiFullOutput, &EguiContextSettings)>,
+    // The empty pass's output after its first run, with the one-time texture delta (the font
+    // atlas) already delivered: every later gated frame feeds this clone instead of running a
+    // real begin/end pass — memory GC, a fresh `FullOutput`, a tessellation of nothing —
+    // 1.4 % of a parked frame's main thread for a panel that is closed (decision 1979).
+    mut cached: Local<Option<egui::FullOutput>>,
 ) {
     for (mut ctx, mut full_output, settings) in &mut contexts {
         if settings.run_manually && full_output.0.is_none() {
-            // `get_mut`, not `get`: the immutable getter sits behind bevy_egui's
-            // `immutable_ctx` feature, off in our build.
-            full_output.0 = Some(ctx.get_mut().run(egui::RawInput::default(), |_| {}));
+            full_output.0 = Some(match &*cached {
+                Some(out) => out.clone(),
+                None => {
+                    // `get_mut`, not `get`: the immutable getter sits behind bevy_egui's
+                    // `immutable_ctx` feature, off in our build. The first run is fed whole
+                    // (its texture delta carries the fonts); the cache keeps everything but
+                    // that delta, which must reach the GPU exactly once.
+                    let out = ctx.get_mut().run(egui::RawInput::default(), |_| {});
+                    let mut keep = out.clone();
+                    keep.textures_delta = Default::default();
+                    keep.shapes.clear();
+                    *cached = Some(keep);
+                    out
+                }
+            });
         }
     }
 }
@@ -291,11 +309,27 @@ fn spawn_egui_camera(mut commands: Commands) {
         RenderLayers::none(),
         Camera {
             order: 2,
+            // **An overlay composites only its own pixels** — the law the player-UI camera's
+            // clear already states. egui paints onto a transparent canvas, and the output blit
+            // lays that canvas over the finished frame in the swapchain. bevy_egui's own pass
+            // blends PREMULTIPLIED (`egui::Color32` is premultiplied, and its pipeline says so),
+            // so the canvas holds premultiplied colour with coverage in alpha, and the blit has
+            // to compose it as such — `SrcAlpha` would weight it by alpha twice.
+            //
+            // It used to load the shared main texture instead (`ClearColorConfig::None`), which
+            // happened to hold the player-UI camera's decoded frame: two cameras on one window
+            // share bevy's main textures, and that camera's decode flipped them. The blit then
+            // re-emitted the whole frame over itself. Since decision 2206 the player-UI camera
+            // writes the swapchain directly and leaves its main texture un-decoded, so an
+            // overlay that loaded it would present the UI ~2.2× bright whenever the panel was
+            // open. Clearing is what an overlay should have done all along; and, like the
+            // player-UI camera, it never touches the world image, so writeback is off.
             output_mode: CameraOutputMode::Write {
-                blend_state: Some(BlendState::ALPHA_BLENDING),
+                blend_state: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 clear_color: ClearColorConfig::None,
             },
-            clear_color: ClearColorConfig::None,
+            clear_color: ClearColorConfig::Custom(Color::NONE),
+            msaa_writeback: bevy::camera::MsaaWriteback::Off,
             ..default()
         },
     ));
@@ -347,7 +381,6 @@ fn toggle_panel(keys: Res<ButtonInput<KeyCode>>, mut debug: ResMut<DebugState>) 
 /// Draw the panel as a translucent **overlay** on the right — the world renders full-screen
 /// underneath (no viewport inset). `ui_script::PointerOverUi` keeps the cursor's panel
 /// interactions from leaking into gameplay mouse-look.
-#[allow(clippy::too_many_arguments)]
 fn debug_panel_ui(
     mut contexts: EguiContexts,
     stamp: Res<benilla_world::build_id::BuildId>,
@@ -638,7 +671,7 @@ fn debug_panel_ui(
                             // The LAST sample, not the ring average the meter shows: the panel
                             // is the instrument, and "what did the most recent pong measure" is
                             // the question a stuck or spiking meter needs answered.
-                            let last_rtt = ping.0.lock().expect("ping clock").last_rtt_ms;
+                            let last_rtt = ping.0.lock_recover().last_rtt_ms;
                             ui.label(if net_status.connected {
                                 match last_rtt {
                                     Some(ms) => format!("connected · {ms} ms ping"),

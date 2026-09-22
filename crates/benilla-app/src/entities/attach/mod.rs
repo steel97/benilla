@@ -32,11 +32,57 @@ use super::{
 mod char_skin;
 use char_skin::{build_char_skin_materials, equip_geosets, resolve_char_look, resolve_worn_equip};
 mod dress;
-use dress::{spawn_part, PartDress};
+mod merge;
+use dress::{spawn_group, PartDress};
+pub(super) use merge::MergedFormsCache;
 mod preview;
 pub(crate) use preview::equip_slot;
 pub(super) use preview::{build_dressup_preview, build_glue_pet, build_glue_preview};
 mod redress;
+
+/// The instruments' view of one body's draw population — what `WOW_DRESS_CENSUS` prints per
+/// part (`DRESS_PARTS`): index, merge group, blend, and the material id, so "why nine draws
+/// for one body" is a line of output and not a reading of the M2. Lives here because the
+/// group and index components are this module's private bookkeeping (0026's dev seam).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct BodyPartsDesc<'w, 's> {
+    parts: Query<
+        'w,
+        's,
+        (
+            &'static dress::DressedPart,
+            Option<&'static merge::DressedGroup>,
+            &'static benilla_world::model_render::ModelPart,
+            &'static MeshMaterial3d<benilla_assets::materials::WowModelMaterial>,
+        ),
+    >,
+}
+
+impl BodyPartsDesc<'_, '_> {
+    /// One line per drawn part under `unit`, sorted by part index.
+    pub(crate) fn describe(&self, unit: Entity, children: &Query<&Children>) -> Vec<String> {
+        let mut rows: Vec<(u32, String)> = children
+            .iter_descendants(unit)
+            .filter_map(|e| self.parts.get(e).ok())
+            .map(|(part, group, model, mat)| {
+                let group = group
+                    .map(|g| format!("{:?}", &g.0[..]))
+                    .unwrap_or_else(|| "-".into());
+                (
+                    part.index,
+                    format!(
+                        "DRESS_PART #{:<3} group={group:<14} blend={:?} mat={:?}",
+                        part.index,
+                        model.blend,
+                        mat.0.id()
+                    ),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|(i, _)| *i);
+        rows.into_iter().map(|(_, l)| l).collect()
+    }
+}
 pub(super) use redress::redress_player_looks;
 
 /// Set up the skinned instance shared by creatures/players (decision 0019) and animated
@@ -248,7 +294,7 @@ struct RigBuild {
 /// / player body) as submesh children, or a colored cube fallback. The entity's pose is owned by the
 /// net bridge — or, for our own avatar, the player controller — we only add the geometry (and bake
 /// per-display scale onto the root). Our own avatar is the same streamed entity and renders here too.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub(super) fn attach_entity_visuals(
     mut commands: Commands,
     pending: Query<
@@ -299,6 +345,17 @@ pub(super) fn attach_entity_visuals(
         ResMut<SkinComposites>,
         Res<AssetServer>,
         benilla_world::model_render::M2BatchMaterials,
+        // The merged-group forms (`merge`): built on a body's first silhouette, shared after.
+        ResMut<Assets<Mesh>>,
+        ResMut<merge::MergedFormsCache>,
+        // …and the animated-material lane a spawned part may need a material of its OWN on
+        // (decision 2295) — a GameObject whose file-sequence slots bake different UV or tint
+        // loops. Taken by the dressing path itself, because the clone has to exist before the
+        // part's interior and fade records are built from it; nested here for this tuple's own
+        // stated reason, the 16-param limit.
+        ResMut<benilla_world::doodad_anim::UvAnimMaterials>,
+        ResMut<benilla_world::doodad_anim::TintAnimMaterials>,
+        ResMut<benilla_world::mat_anim_table::MatAnimTable>,
     ),
     // The owned skin-palette table (decision 0720): every skinned instance claims a rig slot.
     mut palettes: ResMut<benilla_world::rig_palette::RigPalettes>,
@@ -307,8 +364,19 @@ pub(super) fn attach_entity_visuals(
     mut collider_epoch: ResMut<benilla_world::collision::ColliderEpoch>,
     time: Res<Time>,
 ) {
-    let (sections, world_assets, mut images, mut skin_composites, asset_server, mut mats) =
-        skin_build;
+    let (
+        sections,
+        world_assets,
+        mut images,
+        mut skin_composites,
+        asset_server,
+        mut mats,
+        mut meshes,
+        mut merged,
+        mut uv_reg,
+        mut tint_reg,
+        mut anim_table,
+    ) = skin_build;
     // Arm each entity's appear-fade at the moment its visual attaches (≈ its first-visible moment).
     let now = time.elapsed_secs();
     for (entity, net, equipment, reattached, mount_child, mount_body, anchored) in &pending {
@@ -660,11 +728,17 @@ pub(super) fn attach_entity_visuals(
             // display's CreatureDisplayInfoExtra (decision 0041). Both then drive the same geoset filter
             // + skin/hair materials below; a beast NPC / GameObject has no look and is unaffected.
             let look = resolve_char_look(net, dm, entity, &stores);
-            // The worn geoset selectors (decision 0074, the B1–B8 branches): a player's from the
+            // The worn geoset selectors (decisions 0074/1864, the B1–B8 branches): a player's from the
             // resolved equipment display rows; an NPC / naked default otherwise.
             // (The helm's hide-mask row pair, RF-0083: hair/facial/ears tuck under it. For a
             // character-model NPC the helm id is its CreatureDisplayInfoExtra head column.)
-            let equip_geosets = equip_geosets(displays.as_deref(), &equip, worn.cloak, worn.helm);
+            let equip_geosets = equip_geosets(
+                displays.as_deref(),
+                &equip,
+                worn.cloak,
+                worn.helm,
+                worn.tabard_preview,
+            );
             let visible_geosets: Option<Vec<u16>> = look.as_ref().and_then(|l| {
                 let cg = characters.as_deref()?;
                 Some(cg.0.visible_geosets(
@@ -686,6 +760,7 @@ pub(super) fn attach_entity_visuals(
                     equip,
                     worn.cloak,
                     worn.emblem,
+                    worn.tabard_preview,
                     displays.as_deref(),
                     sections.as_deref(),
                     world_assets.as_deref(),
@@ -792,18 +867,32 @@ pub(super) fn attach_entity_visuals(
                     JoinedFade::Pending { since: now }
                 },
             };
-            for (i, part) in parts.iter().enumerate() {
-                // Skip a geoset this character doesn't show (an unselected hair/facial/body
-                // variant, or a body region its worn gear replaces). The equipment half of that
-                // selection is re-run in place on a gear change (`attach::redress`); this is the
-                // same predicate, evaluated once at build.
-                if visible_geosets
+            // A geoset this character doesn't show (an unselected hair/facial/body variant, or a
+            // body region its worn gear replaces) is skipped. The equipment half of that
+            // selection is re-run in place on a gear change (`attach::redress`); this is the
+            // same predicate, evaluated once at build. The shown batches spawn as material
+            // GROUPS (`merge`): one entity per set of batches nothing downstream can tell apart.
+            let shows = |part: &super::EntityPart| {
+                visible_geosets
                     .as_ref()
-                    .is_some_and(|vis| !vis.contains(&part.geoset_id))
-                {
-                    continue;
-                }
-                unit_will_fade |= spawn_part(&mut commands, part, i, &dress);
+                    .is_none_or(|vis| vis.contains(&part.geoset_id))
+            };
+            let groups = merge::guard_groups(merge::group_parts(parts, shows), parts, &char_mats);
+            for group in &groups {
+                let forms = merged.forms(parts, group, &mut meshes);
+                let part = merge::group_part(parts, group, forms);
+                unit_will_fade |= spawn_group(
+                    &mut commands,
+                    &part,
+                    group,
+                    &dress,
+                    &mut dress::OwnMats {
+                        store: mats.materials(),
+                        uv: &mut uv_reg,
+                        tint: &mut tint_reg,
+                        table: &mut anim_table,
+                    },
+                );
             }
             // Mirror the appear-fade clock onto the unit root (see `unit_will_fade` above): a held item
             // / helm / shoulder attaching later reads this to join the same ramp
@@ -845,6 +934,10 @@ pub(super) fn attach_entity_visuals(
             // camera controller to target ~neck height instead of a fixed offset (harmless on NPCs).
             commands.entity(entity).insert(CameraPivot {
                 height_local: dm.map(|d| d.pivot_height_local).unwrap_or(0.0),
+                // …and how far that pivot drops while this body swims — the reference's third
+                // preset `cam+0x124`, stored as the delta it is built from (`0x50ccf6`). `0.0` for
+                // anything with no Swim sequence, so the two presets coincide.
+                swim_drop_local: dm.map(|d| d.swim_pivot_drop_local).unwrap_or(0.0),
             });
             // The overhead-anchor fallback input (combat text over a model with no PlayerName
             // attachment — `0x608640`'s defensive branch).

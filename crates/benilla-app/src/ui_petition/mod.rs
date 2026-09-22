@@ -52,7 +52,7 @@
 //!   `SMSG_PETITION_SIGN_RESULTS` to both parties and **no fresh signatures packet**
 //!   (`:299`, `:312-316`), while the reference's `PetitionFrame` registers only `PETITION_SHOW` and
 //!   `PETITION_CLOSED`. Nothing would ever repaint the name rows. So an `OK` result naming the open
-//!   charter re-sends `CMSG_PETITION_SHOW_SIGNATURES` ([`apply::sign_results`]) — INFERRED, and
+//!   charter re-sends `CMSG_PETITION_SHOW_SIGNATURES` ([`net::sign_results`]) — INFERRED, and
 //!   flagged as such below.
 //! - **Two success paths are silent on the wire and speak locally.** Offering a charter answers the
 //!   *target*, not us, and finding no charter to turn in is refused before any packet is built —
@@ -87,8 +87,6 @@
 //! 6. **Using a charter item opens it** — see [`crate::ui_items::ItemUseRoute::ShowPetition`],
 //!    where the evidence and its limits are written down.
 
-use std::collections::{HashMap, HashSet};
-
 use benilla_protocol::messages::{
     petition_result, PetitionQueryResponse, PetitionRename, PetitionShowList,
     PetitionShowSignatures, PetitionSignResults,
@@ -97,7 +95,8 @@ use bevy::prelude::*;
 
 use crate::names::NameCache;
 use crate::net::{ClientCommand, NetCommands};
-use crate::ui_script::UiInput;
+use crate::query_cache::QueryCache;
+use crate::ui_script::{UiFeed, UiInput};
 use crate::ui_session::NpcSession;
 
 mod feed;
@@ -194,12 +193,10 @@ impl NpcSession for GuildRegistrarState {
 #[derive(Resource, Default)]
 pub(crate) struct PetitionState {
     open: Option<OpenCharter>,
-    /// The lazy record cache, keyed by petition id — the guild-identity cache's twin. Session
-    /// state: a petition id means nothing across a reconnect.
-    records: HashMap<u32, Record>,
-    /// Petition ids with a `CMSG_PETITION_QUERY` in flight, so the ask happens once per id per
-    /// connection ([`crate::names::NameCache`]'s rule).
-    querying: HashSet<u32>,
+    /// The lazy record cache, keyed by petition id — the guild-identity cache's twin, ask-once
+    /// through [`QueryCache`] (decision 2288). Session state: a petition id means nothing across
+    /// a reconnect.
+    records: QueryCache<u32, Record>,
     /// `[0xbdce1c]` — set while a sign we sent is outstanding, cleared when its result lands.
     ///
     /// It exists for one reader, and that reader is easy to miss: the decline leg of a close is
@@ -262,6 +259,12 @@ struct Record {
     is_charter: bool,
 }
 
+impl crate::query_cache::AskOnce for PetitionState {
+    fn clear_pending(&mut self) {
+        self.records.clear_pending();
+    }
+}
+
 impl PetitionState {
     /// `SMSG_PETITION_SHOW_SIGNATURES` — open the window on this charter, and fire the record
     /// query if we have never seen this petition.
@@ -282,13 +285,12 @@ impl PetitionState {
     /// The lazy record fill: ask once per petition id, and answer nothing for the call that missed.
     /// The arrival simply lands in the cache; the feed's next rebuild picks it up (see
     /// [`feed`]'s note on why there is no flag).
-    fn request_record(&mut self, petition_id: u32, item: u64, commands: &NetCommands) {
-        if self.records.contains_key(&petition_id) || !self.querying.insert(petition_id) {
-            return;
-        }
-        let _ = commands
-            .0
-            .send(ClientCommand::PetitionQuery { petition_id, item });
+    fn request_record(&self, petition_id: u32, item: u64, commands: &NetCommands) {
+        self.records.get_or_ask(petition_id, || {
+            let _ = commands
+                .0
+                .send(ClientCommand::PetitionQuery { petition_id, item });
+        });
     }
 
     /// One step per landed or patched record — see [`Self::records_epoch`]'s own field doc.
@@ -299,16 +301,15 @@ impl PetitionState {
     /// `SMSG_PETITION_QUERY_RESPONSE` — fill the cache.
     fn apply_record(&mut self, response: PetitionQueryResponse) {
         self.records_epoch = self.records_epoch.wrapping_add(1);
-        self.querying.remove(&response.petition_id);
         self.records.insert(
             response.petition_id,
-            Record {
+            Some(Record {
                 owner: response.owner,
                 name: response.name,
                 body_text: response.body_text,
                 required: response.min_signatures as i32,
                 is_charter: response.flags & 1 != 0,
-            },
+            }),
         );
     }
 
@@ -326,14 +327,14 @@ impl PetitionState {
         &mut self,
         petition_id: u32,
         item: u64,
-        names: &mut NameCache,
+        names: &NameCache,
         commands: &NetCommands,
     ) -> Option<benilla_ui::script::PetitionSlotView> {
         if petition_id == 0 {
             return None;
         }
         self.request_record(petition_id, item, commands);
-        let rec = self.records.get(&petition_id)?;
+        let rec = self.records.get(petition_id)?;
         let (is_charter, title, owner_guid) = (rec.is_charter, rec.name.clone(), rec.owner);
         Some(benilla_ui::script::PetitionSlotView {
             is_charter,
@@ -360,7 +361,7 @@ impl PetitionState {
         &mut self,
         item: u64,
         signer: u64,
-        names: &mut NameCache,
+        names: &NameCache,
         commands: &NetCommands,
     ) -> Option<String> {
         let open = self.open.as_mut().filter(|o| o.item == item)?;
@@ -388,7 +389,7 @@ impl PetitionState {
         let Some(open) = self.open.as_ref() else {
             return;
         };
-        if self.signing || !self.records.contains_key(&open.petition_id) || open.owner == me {
+        if self.signing || !self.records.answered(open.petition_id) || open.owner == me {
             return;
         }
         let _ = commands
@@ -413,6 +414,8 @@ pub(crate) struct UiPetitionPlugin;
 
 impl Plugin for UiPetitionPlugin {
     fn build(&self, app: &mut App) {
+        net::register(app);
+        crate::query_cache::register::<PetitionState>(app);
         app.init_resource::<GuildRegistrarState>()
             .init_resource::<PetitionState>()
             .add_systems(
@@ -422,7 +425,7 @@ impl Plugin for UiPetitionPlugin {
                     // frame — every other NPC window's ordering.
                     crate::ui_session::close_npc_session_out_of_range::<GuildRegistrarState>
                         .before(feed::feed_petition),
-                    feed::feed_petition.before(UiInput),
+                    feed::feed_petition.in_set(UiFeed),
                     feed::drain_petition.after(UiInput),
                 ),
             );
@@ -433,9 +436,111 @@ impl Plugin for UiPetitionPlugin {
 ///
 /// **Nothing here fires an event or writes a chat line directly.** Composed lines go onto
 /// [`PetitionState::lines`] and the feed drains them, because the red `UI_ERROR_MESSAGE` channel
-/// needs the `script` handle and apply has none (`crate::ui_bank`'s `BankErrors` shape).
-pub(crate) mod apply {
+/// needs the `script` handle and a packet handler has none (`crate::ui_bank`'s `BankErrors`
+/// shape). In the net handler table since 2312.
+pub(crate) mod net {
     use super::*;
+    use benilla_protocol::{SessionEvent, SessionEventKind};
+
+    use crate::net::NetHandlerApp;
+
+    use crate::net::{GuidIndex, ObjectStore, SelfGuid};
+    use crate::ui_social::SocialState;
+
+    /// Register the family's handlers — called from [`UiPetitionPlugin`].
+    pub(super) fn register(app: &mut App) {
+        use SessionEventKind as K;
+        app.net_handler(K::PetitionShowList, on_show_list)
+            .net_handler(K::PetitionShowSignatures, on_show_signatures)
+            .net_handler(K::PetitionQueryResponse, on_query_response)
+            .net_handler(K::PetitionSignResults, on_sign_results)
+            .net_handler(K::TurnInPetitionResults, on_turn_in_results)
+            .net_handler(K::PetitionDeclined, on_declined)
+            .net_handler(K::PetitionRenamed, on_renamed);
+    }
+
+    /// The registrar's two `UNIT_NPC_FLAGS` gates are on LIVE NPC state rather than on the
+    /// packet, so the flags are read here, off the store. An unstreamed guid reads `None` and
+    /// fails the gate, as the client's own resolve does.
+    fn on_show_list(
+        In(ev): In<SessionEvent>,
+        mut registrar: ResMut<GuildRegistrarState>,
+        index: Res<GuidIndex>,
+        stores: Query<&ObjectStore>,
+    ) {
+        if let SessionEvent::PetitionShowList(list) = ev {
+            let flags = index
+                .0
+                .get(&list.npc)
+                .and_then(|e| stores.get(*e).ok())
+                .map(|s| s.0.unit_npc_flags());
+            show_list(&mut registrar, list, flags);
+        }
+    }
+
+    /// An ignored owner suppresses the ENTIRE update — no record fetch, no list, no event, no
+    /// error line (`0x5eeefe`). Consulted before anything else happens.
+    fn on_show_signatures(
+        In(ev): In<SessionEvent>,
+        mut petition: ResMut<PetitionState>,
+        social: Res<SocialState>,
+        commands: Res<NetCommands>,
+    ) {
+        if let SessionEvent::PetitionShowSignatures(sigs) = ev {
+            let ignored = social.is_ignored(sigs.owner);
+            show_signatures(&mut petition, sigs, ignored, &commands);
+        }
+    }
+
+    fn on_query_response(In(ev): In<SessionEvent>, mut petition: ResMut<PetitionState>) {
+        if let SessionEvent::PetitionQueryResponse(response) = ev {
+            query_response(&mut petition, response);
+        }
+    }
+
+    fn on_sign_results(
+        In(ev): In<SessionEvent>,
+        mut petition: ResMut<PetitionState>,
+        names: Res<NameCache>,
+        self_guid: Res<SelfGuid>,
+        commands: Res<NetCommands>,
+    ) {
+        if let SessionEvent::PetitionSignResults(results) = ev {
+            sign_results(
+                &mut petition,
+                &names,
+                self_guid.0.unwrap_or(0),
+                results,
+                &commands,
+            );
+        }
+    }
+
+    fn on_turn_in_results(
+        In(ev): In<SessionEvent>,
+        mut petition: ResMut<PetitionState>,
+        mut registrar: ResMut<GuildRegistrarState>,
+    ) {
+        if let SessionEvent::TurnInPetitionResults { result } = ev {
+            turn_in_results(&mut petition, &mut registrar, result);
+        }
+    }
+
+    fn on_declined(
+        In(ev): In<SessionEvent>,
+        mut petition: ResMut<PetitionState>,
+        names: Res<NameCache>,
+    ) {
+        if let SessionEvent::PetitionDeclined { player } = ev {
+            declined(&mut petition, &names, player);
+        }
+    }
+
+    fn on_renamed(In(ev): In<SessionEvent>, mut petition: ResMut<PetitionState>) {
+        if let SessionEvent::PetitionRenamed(rename) = ev {
+            renamed(&mut petition, rename);
+        }
+    }
 
     /// `SMSG_PETITION_SHOWLIST` — the registrar's charter list, subject to its three gates.
     ///
@@ -489,7 +594,7 @@ pub(crate) mod apply {
     ///   success additionally **closes the window** (`0x5ef037` fires `PETITION_CLOSED`).
     pub(crate) fn sign_results(
         petition: &mut PetitionState,
-        names: &mut NameCache,
+        names: &NameCache,
         self_guid: u64,
         results: PetitionSignResults,
         commands: &NetCommands,
@@ -557,7 +662,12 @@ pub(crate) mod apply {
         else {
             return;
         };
-        petition.records.entry(id).or_default().name = rename.name;
+        if !petition.records.answered(id) {
+            petition.records.insert(id, Some(Record::default()));
+        }
+        if let Some(record) = petition.records.get_mut(id) {
+            record.name = rename.name;
+        }
         // A patched title is a changed record: the tooltip's line 3 reads it too.
         petition.records_epoch = petition.records_epoch.wrapping_add(1);
     }
@@ -595,7 +705,7 @@ mod tests {
     /// return, spelled once here rather than at three assertion sites.
     fn open_title(p: &PetitionState) -> Option<&str> {
         let open = p.open.as_ref()?;
-        p.records.get(&open.petition_id).map(|r| r.name.as_str())
+        p.records.get(open.petition_id).map(|r| r.name.as_str())
     }
 
     fn signatures(item: u64, owner: u64, id: u32, signers: &[u64]) -> PetitionShowSignatures {
@@ -718,7 +828,7 @@ mod tests {
             min_signatures: 9,
             ..Default::default()
         });
-        apply::renamed(
+        net::renamed(
             &mut petition,
             PetitionRename {
                 item: 0x99,
@@ -728,7 +838,7 @@ mod tests {
         assert_eq!(open_title(&petition), Some("Second"));
 
         // An echo for a charter we do not have open is not ours to apply.
-        apply::renamed(
+        net::renamed(
             &mut petition,
             PetitionRename {
                 item: 0xdead,

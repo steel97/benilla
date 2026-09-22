@@ -41,7 +41,6 @@ pub(super) struct ModelInstance {
 /// Grow + position each model-particle emitter's instance pool from its freshly-simulated
 /// pool. Runs after [`super::sim::simulate_particles`] in the same set, so instances land on
 /// this frame's positions (the anchored-exactness rule).
-#[allow(clippy::too_many_arguments)] // a Bevy system: each param is one resource, the app's convention
 pub(super) fn update_model_particles(
     mut commands: Commands,
     models: Res<Assets<M2Model>>,
@@ -120,6 +119,9 @@ pub(super) fn update_model_particles(
                         &light.0,
                         None, // a shard's material is shared by the whole emitter
                     );
+                    // Realized at once: the over-life ramp writes this material through
+                    // `get_mut` every frame, from the first (`model_render::lazy`).
+                    crate::model_render::lazy::realize(&mut materials, material.id());
                     // The owner-last draw-order rung, stamped on after the fact: a 3-D model
                     // particle is one of its owner's emitters exactly like the quad cloud beside
                     // it, and the reference draws them in one bracket after that model's batches

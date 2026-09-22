@@ -25,7 +25,6 @@ impl WorldWriter {
     /// nearby players. `flags` must only set bits whose `MovementInfo` tail we serialize — the base
     /// directional/turn/walk bits, `JUMPING` (with its `jump` tail), `SWIMMING` (with its `pitch`
     /// tail), and `ON_TRANSPORT` (with its `transport` local-frame tail — decision 0438 phase 2).
-    #[allow(clippy::too_many_arguments)]
     pub fn send_movement(
         &mut self,
         opcode: u16,
@@ -92,6 +91,18 @@ impl WorldWriter {
         self.send(opcode::CMSG_MOVE_NOT_ACTIVE_MOVER, &body)
     }
 
+    /// Report that our movement clock skipped `lag_ms` (`CMSG_MOVE_TIME_SKIPPED`, layout in
+    /// [`messages::move_time_skipped`]) for the named mover. The server folds the number into its
+    /// own copy of our movement clock — and, when we have just boarded a transport, answers by
+    /// re-sending that transport's create update (the 1.12 boarding fix; see
+    /// [`opcode::CMSG_MOVE_TIME_SKIPPED`]).
+    pub fn move_time_skipped(&mut self, guid: u64, lag_ms: u32) -> Result<()> {
+        self.send(
+            opcode::CMSG_MOVE_TIME_SKIPPED,
+            &messages::move_time_skipped(guid, lag_ms),
+        )
+    }
+
     /// Acknowledge that a server-authored spline (Charge/knockback/taxi — an `SMSG_MONSTER_MOVE`
     /// addressed to our own guid) finished: `CMSG_MOVE_SPLINE_DONE` with a `MovementInfo` at the
     /// ride's endpoint and the `spline_id` we were driven by. The server sets `SplineDonePending` for
@@ -121,7 +132,6 @@ impl WorldWriter {
     /// echo the mover `guid` + `counter` + the exact `speed` the server sent, carrying our live
     /// `MovementInfo` (same field set as [`Self::send_movement`] — the server relocates us to it).
     /// Mandatory: unacked, the server force-resolves the change after ~4 s and flags its anticheat.
-    #[allow(clippy::too_many_arguments)]
     pub fn force_speed_change_ack(
         &mut self,
         kind: messages::SpeedKind,

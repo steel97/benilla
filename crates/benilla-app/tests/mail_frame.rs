@@ -1,65 +1,46 @@
-//! Drives the REAL `assets/ui/MailFrame.xml` through the engine (decision 0544 P1/P2) — the mail
-//! twin of `tradeskill_frame.rs`: it loads the same file chain the app does (cut to the mail
-//! window's dependency prefix), pushes a synthetic inbox, opens the window with the app's own
+//! Drives the stock `Interface\FrameXML\MailFrame.xml` through the engine (decision 0544 P1/P2) —
+//! the mail twin of `tradeskill_frame.rs`: it loads the same file chain the app does (cut to the
+//! mail window's dependency prefix), pushes a synthetic inbox, opens the window with the app's own
 //! `MAIL_SHOW`/`MAIL_INBOX_UPDATE` events, and asserts the transcribed Lua actually paints — the
 //! named regions exist, the rows populate from a fed `MailState`, the paging math is right, and the
 //! unread/read row state tracks the wire `wasRead` flag.
 
-use benilla_ui::script::{MailInboxRow, MailInvoice, MailState, UiScript};
+mod common;
 
-const UI_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui");
+use benilla_ui::script::{MailInboxRow, MailInvoice, MailState, UiScript};
 
 /// The mail window's load prefix — the app's own order (`ui_script/mod.rs`), members only.
 /// MerchantFrame.xml rides along because MailFrame.xml reuses its global `BenillaMoney_*` coin
 /// helpers (postage display), so a load error in either fails here.
-const FILES: [&str; 7] = [
-    "Fonts.xml",
-    "MoneyFrame.xml",
-    "UiPanels.xml",
+const FILES: &[&str] = &[
+    "Interface\\FrameXML\\Fonts.xml",
+    r"Interface\FrameXML\MoneyFrame.lua",
+    r"Interface\FrameXML\MoneyFrame.xml",
+    // The send tab's money entry comes off the chain since 1882 — `MoneyInputFrameTemplate` and
+    // the `MoneyInputFrame_*` verbs. Seated straight after MoneyFrame.xml, benilla.toc's order.
+    r"Interface\FrameXML\MoneyInputFrame.lua",
+    r"Interface\FrameXML\MoneyInputFrame.xml",
+    "Interface\\FrameXML\\GlobalStrings.lua",
+    r"Interface\FrameXML\UIParent.xml",
+    "ScrollTemplates.xml", // our scroll kit + the placeholder icon
     r"Interface\FrameXML\UIPanelTemplates.lua",
     r"Interface\FrameXML\UIPanelTemplates.xml",
-    "GameTooltip.xml",
-    "MailFrame.xml",
+    "Interface\\FrameXML\\BasicControls.xml",
+    "Interface\\FrameXML\\LocaleProperties.lua",
+    "Interface\\FrameXML\\StaticPopup.xml", // the dialog engine (1960)
+    "Interface\\FrameXML\\GameTooltip.xml",
+    r"Interface\FrameXML\ItemButtonTemplate.xml", // the send tab's attachment slot inherits it
+    // The stock tabs inherit `FriendsFrameTabTemplate`, and `inherits=` resolves at load — so the
+    // social window and the kit it needs come first, as the reference's toc has them (1970).
+    "Interface\\FrameXML\\UIDropDownMenu.xml",
+    "Interface\\FrameXML\\CharacterFrameTemplates.xml",
+    "Interface\\FrameXML\\FriendsFrame.xml",
+    "Interface\\FrameXML\\MailFrame.xml",
 ];
 
 fn load_ui(script: &UiScript) {
-    let dir = std::path::Path::new(UI_DIR);
-    // A manifest entry carrying a path separator is the PLAYER's own file and comes off the patch
-    // chain; a bare name is ours, under `assets/ui`. `tests/common` already draws this line — this
-    // binary grew it when 1860 moved `PanelTemplates_*` onto the chain.
-    let chain = benilla_formats::wow_data().and_then(|d| benilla_formats::open_chain(&d).ok());
-    let read = |req: &str| -> Option<Vec<u8>> {
-        let norm = req.replace('\\', "/");
-        if norm.contains('/') {
-            if let Some(b) = chain.as_ref().and_then(|c| c.read(&norm).ok()) {
-                return Some(b);
-            }
-        }
-        let base = norm.rsplit('/').next().unwrap_or(&norm);
-        std::fs::read(dir.join(&norm))
-            .or_else(|_| std::fs::read(dir.join(base)))
-            .ok()
-    };
-    let provider = |req: &str| -> Option<Vec<u8>> { read(req) };
     for file in FILES {
-        let bytes = read(file).unwrap_or_else(|| panic!("reading {file}"));
-        // A `.lua` entry is a CHUNK, not a document.
-        if file.to_ascii_lowercase().ends_with(".lua") {
-            script
-                .run_chunk_named(&bytes, &format!("@{file}"))
-                .unwrap_or_else(|e| panic!("{file}: {e}"));
-            continue;
-        }
-        let text = benilla_ui::source::decode(&bytes);
-        let doc = benilla_ui::framexml::parse(&text).unwrap_or_else(|e| {
-            panic!("parsing {file}: {e}");
-        });
-        let report = benilla_ui::loader::load(script, &doc, &provider);
-        assert!(
-            report.errors.is_empty(),
-            "{file} loaded with errors: {:#?}",
-            report.errors
-        );
+        common::load_ui(script, file);
     }
 }
 
@@ -90,6 +71,30 @@ fn row(sender: &str, subject: &str, was_read: bool, item_id: u32, cod: u32) -> M
         item_quality: (item_id != 0).then_some(1),
         can_delete: false,
         item_random_property_id: 0,
+    }
+}
+
+/// One Linen Cloth in the backpack — the send tab's attachment fixture. `ClickSendMailItemButton`
+/// reads the cursor, and `GetSendMailItem` answers off the bag slot it came from, so the row needs
+/// a real name and texture for the stock tab to title the letter with.
+fn one_linen_backpack() -> benilla_ui::script::ContainerState {
+    let mut slots = std::collections::HashMap::new();
+    slots.insert(
+        1,
+        benilla_ui::script::ContainerSlot {
+            item_id: 2589,
+            count: 20,
+            quality: Some(1),
+            texture: Some("Interface\\Icons\\INV_Fabric_Linen_01".into()),
+            link: Some("|cffffffff|Hitem:2589|h[Linen Cloth]|h|r".into()),
+            bar_placeable: true,
+            ..Default::default()
+        },
+    );
+    benilla_ui::script::ContainerState {
+        name: Some("Backpack".into()),
+        num_slots: 16,
+        slots,
     }
 }
 
@@ -275,7 +280,7 @@ fn a_letter_and_the_centre_occupant_evict_each_other() {
 
     // The director's setup: mailbox left, character sheet pushed to centre beside it.
     s.run(
-        r#"local c = CreateFrame("Frame", "CharacterFrame") c:SetSize(50, 50) c:Hide()
+        r#"local c = CreateFrame("Frame", "CharacterFrame") c:SetWidth(50); c:SetHeight(50) c:Hide()
            ShowUIPanel(CharacterFrame)"#,
     )
     .unwrap();
@@ -401,7 +406,8 @@ fn closing_a_taken_husk_deletes_it() {
     );
 }
 
-/// The expiry text pluralizes like the reference (GetText("DAYS_ABBR"): "Day"/"Days").
+/// The expiry text pluralizes like the reference (`GetText("DAYS_ABBR", nil, n)`: "Day"/"Days") —
+/// and carries the reference's own trailing space before the colour close (MailFrame.lua l.144).
 #[test]
 fn expiry_text_pluralizes_days() {
     let _data = benilla_formats::wow_data_or_skip!();
@@ -417,12 +423,12 @@ fn expiry_text_pluralizes_days() {
     assert_eq!(
         s.eval::<String>("return MailItem1ExpireTime:GetText()")
             .unwrap(),
-        "|cff20ff2029 Days|r"
+        "|cff20ff2029 Days |r"
     );
     assert_eq!(
         s.eval::<String>("return MailItem2ExpireTime:GetText()")
             .unwrap(),
-        "|cff20ff201 Day|r"
+        "|cff20ff201 Day |r"
     );
     assert!(s.take_errors().is_empty());
 }
@@ -502,14 +508,15 @@ fn money_button_hover_shows_the_amount_tooltip() {
     s.fire_event("MAIL_INBOX_UPDATE", vec![]);
     s.run("MailItem1Button:Click()").unwrap();
 
-    s.run("BenillaOpenMailMoneyButton_OnEnter(OpenMailMoneyButton)")
+    // The hover is the button's own inline handler (stock MailFrame.xml), reading `this`.
+    s.run("this = OpenMailMoneyButton OpenMailMoneyButton:GetScript(\"OnEnter\")()")
         .unwrap();
     assert!(
         s.eval::<bool>("return GameTooltip:IsShown()").unwrap(),
         "the money tooltip shows on hover"
     );
     assert!(
-        s.eval::<bool>("return GameTooltipMoneyCoin1:IsShown()")
+        s.eval::<bool>("return GameTooltipMoneyFrame:IsShown()")
             .unwrap(),
         "the coin row rendered (SetTooltipMoney path)"
     );
@@ -664,7 +671,12 @@ fn an_auction_invoice_renders_as_a_receipt() {
         "the buy mode rides the item line here, not the purchaser line"
     );
     assert_eq!(text(&s, "OpenMailInvoicePurchaser"), "FROM: Onewarrior");
-    assert_eq!(text(&s, "OpenMailInvoiceBuyMode"), "");
+    assert_eq!(
+        text(&s, "OpenMailInvoiceBuyMode"),
+        "nil",
+        "the buy-mode line is blank on a bid win, and a blank FontString reads back nil — \
+         `FontString:GetText 0x79d690` substitutes (decision 2110); this helper `tostring`s it"
+    );
     assert_eq!(money(&s, "OpenMailTransactionAmountMoneyFrame"), "9000");
     for gone in [
         "OpenMailInvoiceSalePrice",
@@ -755,5 +767,116 @@ fn the_open_letters_ring_icon_is_masked_but_the_inboxs_is_not() {
         !mail_icon.contains(&true),
         "the inbox window's own ring is purpose-drawn art and stays raw, as in the reference; \
          got {mail_icon:?}"
+    );
+}
+
+/// **"I can't even type anything in the mailbox window"** — the director's report, at its cause.
+///
+/// The send tab has five edit boxes, and exactly one of them — `SendMailNameEditBox` — carries an
+/// XML `<OnChar>` (`SendMailFrame_SendeeAutocomplete`). That handler auto-enables the box for the
+/// keyboard walk, and the box is the first-registered keyboard frame in the window, so on every
+/// keystroke the walk reached it first and the **base** `CSimpleFrame::OnChar` gate consumed:
+/// script present → fire → stop. Nothing downstream of it ever saw a character. The reference
+/// cannot do that — `CSimpleEditBox` replaces slot `+0x5c` with `0x77a900`, which asks about focus
+/// and declines (`0x77a956`) when another box owns it, and never chains to the base gate at all
+/// ([`benilla_ui`]'s `script::keyboard::is_editbox`, decision 2145).
+///
+/// The one box that DID work is the assertion's control: the autocomplete box types, once per
+/// character, and the four that were dead now type too.
+#[test]
+fn every_send_tab_box_takes_a_keystroke_not_just_the_one_with_an_onchar() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_ui(&s);
+    s.fire_event("MAIL_SHOW", vec![]);
+    s.run("MailFrameTab_OnClick(2)").unwrap();
+    s.resolve();
+    assert!(s.eval::<bool>("return SendMailFrame:IsVisible()").unwrap());
+
+    // The box whose handler was eating everyone else's keys: it still types, and its OnChar still
+    // fires exactly once per character (the insert path's fire — never the walk's).
+    s.run("SendMailNameEditBox:SetText('') SendMailNameEditBox:SetFocus()")
+        .unwrap();
+    s.run("SendMailChars = 0 \
+           SendMailNameEditBox:SetScript('OnChar', function() SendMailChars = SendMailChars + 1 end)")
+        .unwrap();
+    for c in ["T", "h", "r"] {
+        assert!(s.char_input(c), "the focused box consumes");
+    }
+    assert_eq!(
+        s.eval::<String>("return SendMailNameEditBox:GetText()")
+            .unwrap(),
+        "Thr"
+    );
+    assert_eq!(
+        s.eval::<i64>("return SendMailChars").unwrap(),
+        3,
+        "OnChar fires once per character, from the insert — not a second time from the walk"
+    );
+
+    // …and the four that took nothing at all. The money boxes are `numeric`, so they get digits.
+    for (box_name, typed, expect) in [
+        ("SendMailSubjectEditBox", ["H", "e", "y"], "Hey"),
+        ("SendMailBodyEditBox", ["o", "d", "d"], "odd"),
+        ("SendMailMoneyGold", ["1", "2", "3"], "123"),
+        ("SendMailMoneySilver", ["4", "5", "5"], "45"), // letters="2"
+    ] {
+        s.run(&format!("{box_name}:SetText('') {box_name}:SetFocus()"))
+            .unwrap();
+        for c in typed {
+            assert!(s.char_input(c), "{box_name} consumes the keystroke");
+        }
+        assert_eq!(
+            s.eval::<String>(&format!("return {box_name}:GetText()"))
+                .unwrap(),
+            expect,
+            "{box_name} takes what was typed into it"
+        );
+    }
+    assert!(s.take_errors().is_empty(), "and nothing raised on the way");
+}
+
+/// **"Sending an item still leaves the subject and the item image in the input"** — the director's
+/// second report, at its cause: the compose-tab reset used to fire `MAIL_SEND_SUCCESS` *before* it
+/// dropped the attachment, so the stock `SendMailFrame_Reset`'s own tail
+/// (`SendMailFrame_Update` → `GetSendMailItem`) painted the just-sent item straight back into the
+/// form it had blanked one line earlier. `UiScript::reset_compose_tab` is now `0x4acdc0(1)` whole —
+/// zero the globals, THEN tail-fire the three events — so there is no window in which the two
+/// disagree (decision 2145).
+#[test]
+fn the_compose_reset_clears_the_subject_and_the_attachment_together() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_ui(&s);
+    s.set_container(0, Some(one_linen_backpack()));
+    s.fire_event("MAIL_SHOW", vec![]);
+    s.run("MailFrameTab_OnClick(2)").unwrap();
+
+    // Attach the item the way the player does: pick it up, click the send slot. The stock tab
+    // names the letter after it, which is the text that used to survive the send.
+    s.run("PickupContainerItem(0, 1) ClickSendMailItemButton()")
+        .unwrap();
+    s.fire_event("MAIL_SEND_INFO_UPDATE", vec![]);
+    assert_eq!(
+        s.eval::<String>("return SendMailSubjectEditBox:GetText()")
+            .unwrap(),
+        "Linen Cloth (20)",
+        "the stock tab titles the letter after its attachment"
+    );
+
+    // The send lands. This is the whole edge: one call, and the form is clean when the FrameXML
+    // handler reads it.
+    s.reset_compose_tab();
+    assert_eq!(
+        s.eval::<String>("return SendMailSubjectEditBox:GetText()")
+            .unwrap(),
+        "",
+        "the subject does not come back from the attachment that just left"
+    );
+    assert!(
+        s.eval::<bool>("return GetSendMailItem() == nil").unwrap(),
+        "and the attachment is gone with it"
     );
 }

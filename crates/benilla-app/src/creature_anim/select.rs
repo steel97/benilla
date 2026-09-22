@@ -108,6 +108,19 @@ pub(super) const UNIT_FLAG_LOOT_SUPPRESS: u32 = 0x1000_0000;
 /// and by `SMSG_MOUNTSPECIAL_ANIM` (observed riders; our own echo is dropped in the net drain).
 pub(crate) const MOUNT_SPECIAL: u16 = 94;
 
+/// The three ids whose arm takes the **base-animation lock** — `0x5fdba0`'s tail keyed on the id
+/// actually armed, byte table `0x5fdd90` (wow-re `base-anim-lock-knockdown.md` §2). While one of
+/// these holds bone 0, `PlayAnimation` refuses every base request outright, which is what lets a
+/// stunned victim's `Knockdown` play out over the root's own `Stand` recompute.
+///
+/// They are the clips with a definite start and end pose — the ones a re-pick mid-flight would
+/// leave the body wrong: knocked flat, or halfway off the ground.
+pub(crate) const KNOCKDOWN: u16 = 121;
+/// See [`KNOCKDOWN`] — the taxi/lift pair, which take the same lock under the reference's other bit.
+pub(crate) const LIFT_OFF: u16 = 192;
+/// See [`KNOCKDOWN`].
+pub(crate) const LAND: u16 = 200;
+
 /// Movement direction/mode flag bits, matching the client's CMovement `MOVEMENTFLAGS` (cached at
 /// `unit+0x9e8`; VERIFIED wow-5875-re RF-0057 + the jump §5 cross-check). The selector tests these
 /// exactly as the binary does, so a streamed unit can eventually drop the server's raw `u32` straight in.
@@ -190,6 +203,19 @@ pub(crate) mod move_flags {
     /// with no benilla analog. Every bit we *do* model besides `ON_TRANSPORT` — the direction and
     /// turn bits, walk mode, root, [`FALLING`]/[`FALLING_FAR`], swim, water-walk — is inside.
     pub const SERVER_AUTHORED: u32 = 0x75a0_7dff;
+
+    /// Merge a server-authored packet's `MOVEMENTFLAGS` into a mover's own — the reference's masked
+    /// merge (`0x618c30 @0x618de7-df3`: `new = old ^ ((old ^ wire) & 0x75a07dff)`), **not** an
+    /// assignment. One law, both movers: our own (`player::wire_in`'s self-addressed pose) and every
+    /// watched one (`net::motion::remote::apply_move`), because the reference runs this merge inside
+    /// the one scheduler both go through and the mask is arm-invariant across all thirty relay
+    /// opcodes (wow-re `collision/scratch/movement-relay-family-map.md`, decision 2064).
+    ///
+    /// The omission that bites is pinned by test on the self lane: [`ON_TRANSPORT`] sits **outside**
+    /// the mask, so a server-authored pose can relocate a rider but never board or deboard them.
+    pub const fn merge_server_authored(local: u32, wire: u32) -> u32 {
+        (local & !SERVER_AUTHORED) | (wire & SERVER_AUTHORED)
+    }
 
     /// Any horizontal-movement direction bit (forward/back/strafe) — the client's `[9e8] & 0xf` gate.
     pub const ANY_MOVE: u32 = FORWARD | BACKWARD | STRAFE_LEFT | STRAFE_RIGHT;
@@ -726,6 +752,25 @@ pub(super) fn defense_anim(victim_state: u32, main: Option<(u8, u8)>) -> Option<
     }
 }
 
+/// The **play-time unarmed-special substitution** — the third weapon substitution in the client,
+/// and the only one that lives inside `PlayAnimation` itself rather than in a selector
+/// (`0x5fe2f0` @ `0x5fe3cc`–`0x5fe3e9`, byte-verified: wow-re `disarm-weapon-gate-law.md` §7).
+/// A requested **Special1H(57) / Special2H(58)** — the weapon-remapped spin a spell kit asks for,
+/// Eviscerate's among them — becomes **SpecialUnarmed(118)** when `GetWeapon(0, 0)` *and*
+/// `GetWeapon(1, 0)` are both NULL, i.e. both hands are empty to the combat reading.
+/// `SpecialUnarmed`'s own `AnimationData.dbc` fallback column is 57, closing the ring.
+///
+/// The test is emptiness, not weapon-ness: a hand holding a non-weapon is non-NULL and keeps the
+/// armed clip. Because it sits at the play seam it covers every requester — a genuinely
+/// weaponless rogue and a disarmed one reach it by the same route (decision 1863).
+pub(super) fn unarmed_special(id: u16, main: Option<(u8, u8)>, off: Option<(u8, u8)>) -> u16 {
+    if matches!(id, 57 | 58) && main.is_none() && off.is_none() {
+        118
+    } else {
+        id
+    }
+}
+
 /// The per-packet melee swing one-shot ids (decision 0073's tables) — what the whiff slow-down
 /// (decision 0279) is allowed to touch when it finds them on the masked overlay.
 pub(super) fn is_swing_id(id: u16) -> bool {
@@ -958,32 +1003,6 @@ pub(super) fn wound_weight(remaining_frac: f32, others: f32) -> f32 {
 pub(crate) fn blend_lambda(remaining_frac: f32) -> f32 {
     let t = remaining_frac.clamp(0.0, 1.0);
     (3.0 - 2.0 * t) * t * t
-}
-
-/// The client's `_rand` — the MSVCRT LCG (`state × 214013 + 2531011`, output `(state >> 16) &
-/// 0x7fff`; byte-verified wow-re `rf36-rand-stub.md` at `0x7400e5`) — the roll feeding op4's
-/// per-play **variation pick** (`ModelAnimations::pick_variation`) and its **replay-count roll**
-/// ([`replay_count`] — the second `_rand` site). Owned exactly rather than delegating to a host
-/// RNG, per the determinism guidance in the same note; one stream shared by every play, like the
-/// client's single CRT stream.
-pub(crate) fn msvc_rand(state: &mut u32) -> u16 {
-    *state = state.wrapping_mul(214013).wrapping_add(2531011);
-    ((*state >> 16) & 0x7fff) as u16
-}
-
-/// The per-arm **replay-count roll** (wow-re `loop-replay-fidget.md`, op4's second `_rand` site
-/// `0x712692..0x7126cd`): `R = max(1, min + ⌊roll·(max−min)/32768⌋)` from the sequence's
-/// `(minReplay, maxReplay)`. The client multiplies `R` into the play window (`0x7126d8`) — a
-/// clamp-flag one-shot runs its timeline `R` times before freezing; loop-flag sequences ignore it.
-/// Benilla expresses the same window as a repeat count on the one-shot play. `(0, 0)` → 1.
-pub(super) fn replay_count(replay: (u32, u32), roll: u16) -> u32 {
-    let (min, max) = replay;
-    let extra = if max > min {
-        (u64::from(roll) * u64::from(max - min) / 32768) as u32
-    } else {
-        0
-    };
-    (min + extra).max(1)
 }
 
 /// The engaged standing idle (decision 0073 — the `0x5fd360` arm's weapon-class Ready pick,

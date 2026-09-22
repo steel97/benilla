@@ -20,6 +20,21 @@ fn empty_catalog() -> SpellCatalog {
 /// default; the tests that want a landed template seed one.
 use crate::items::TestDeps as Deps;
 
+/// The three group-header labels [`super::law::service_group`] reads, spelled **unlike** the
+/// shipped ones on purpose (decision 2045): `TRADESKILL_SERVICE_STEP`/`_LEARN` and
+/// `KNOWN_TALENTS_HEADER` are single-value keys, so an assertion on their enUS wording would pass
+/// for any lookup at all. Naming the key in the value makes each assertion say *which* lookup the
+/// arm made. The real table is checked by
+/// [`the_group_header_keys_resolve_in_the_real_global_strings`].
+fn probe_strings(key: &str) -> Option<String> {
+    match key {
+        "TRADESKILL_SERVICE_STEP" => Some("<STEP>".into()),
+        "TRADESKILL_SERVICE_LEARN" => Some("<LEARN>".into()),
+        "KNOWN_TALENTS_HEADER" => Some("<KNOWN>".into()),
+        _ => None,
+    }
+}
+
 /// [`resolve_service`] with the icon trio defaulted — the shape the gate/state tests want.
 fn resolve_service(
     wire: &TrainerSpell,
@@ -28,7 +43,7 @@ fn resolve_service(
     skill_lines: Option<&SkillLineCatalog>,
     known: &BTreeSet<u32>,
 ) -> TrainerService {
-    let mut deps = Deps::new();
+    let deps = Deps::new();
     super::resolve_service(
         wire,
         trainer_type,
@@ -36,8 +51,9 @@ fn resolve_service(
         skill_lines,
         known,
         None,
-        &mut deps.items,
+        &deps.items,
         &deps.commands,
+        &probe_strings,
     )
 }
 
@@ -57,15 +73,16 @@ fn wire(spell: u32, state: u8, cost: u32, req_level: u8, req_skill: u32) -> Trai
 
 /// [`snapshot`] with the icon trio defaulted.
 fn snap(open: &TrainerOpen, spells: &SpellCatalog) -> Option<TrainerState> {
-    let mut deps = Deps::new();
+    let deps = Deps::new();
     snapshot(
         open,
         spells,
         None,
         &BTreeSet::new(),
         None,
-        &mut deps.items,
+        &deps.items,
         &deps.commands,
+        &probe_strings,
     )
 }
 
@@ -117,7 +134,7 @@ fn icon_of(
         trainer_type,
         spells,
         icons.as_ref(),
-        &mut deps.items,
+        &deps.items,
         &deps.commands,
     )
 }
@@ -205,7 +222,7 @@ fn trainer_icon_scans_every_effect_slot_for_either_learn_effect() {
 #[test]
 fn trainer_icon_is_nil_until_the_product_template_lands_and_asks_once() {
     let spells = icon_catalog();
-    let mut deps = Deps::new();
+    let deps = Deps::new();
     let icons = ItemDisplays::icons_for_tests(ItemDisplayCatalog::from_displays(HashMap::new()));
 
     let first = service_icon(
@@ -213,7 +230,7 @@ fn trainer_icon_is_nil_until_the_product_template_lands_and_asks_once() {
         TRAINER_TYPE_TRADESKILL,
         &spells,
         Some(&icons),
-        &mut deps.items,
+        &deps.items,
         &deps.commands,
     );
     assert_eq!(first, None, "no template yet → nil, not the wrapper's icon");
@@ -229,7 +246,7 @@ fn trainer_icon_is_nil_until_the_product_template_lands_and_asks_once() {
         TRAINER_TYPE_TRADESKILL,
         &spells,
         Some(&icons),
-        &mut deps.items,
+        &deps.items,
         &deps.commands,
     );
     assert!(
@@ -259,14 +276,14 @@ fn trainer_icon_on_real_data_reaches_for_the_crafted_item() {
 
     // A tradeskill trainer: gate 3 fires for item 2847 and the icon waits on the template —
     // crucially it is NOT the crown.
-    let mut deps = Deps::new();
+    let deps = Deps::new();
     let icons = ItemDisplays::icons_for_tests(ItemDisplayCatalog::from_displays(HashMap::new()));
     let icon = service_icon(
         2756,
         TRAINER_TYPE_TRADESKILL,
         &spells,
         Some(&icons),
-        &mut deps.items,
+        &deps.items,
         &deps.commands,
     );
     assert_eq!(
@@ -280,8 +297,8 @@ fn trainer_icon_on_real_data_reaches_for_the_crafted_item() {
     );
 
     // A class trainer with the same wire spell: the wrapper's own icon, not the recipe's.
-    let mut deps = Deps::new();
-    let class_icon = service_icon(2756, 0, &spells, None, &mut deps.items, &deps.commands);
+    let deps = Deps::new();
+    let class_icon = service_icon(2756, 0, &spells, None, &deps.items, &deps.commands);
     assert_eq!(class_icon, wrapper_icon);
     assert_ne!(
         class_icon, recipe_icon,
@@ -351,9 +368,10 @@ fn display_name_is_the_wire_spell_not_the_taught_one() {
     );
 
     // And the group law that puts it first: 2020 carries Effect 44 SKILL_STEP where a recipe
-    // wrapper does not. Both read off the real `Spell.dbc` rather than a fixture.
+    // wrapper does not. Both read off the real `Spell.dbc` rather than a fixture; the header
+    // itself is a GlobalStrings key, so the probe table names which one was looked up.
     assert_eq!(svc.group_key, 1);
-    assert_eq!(svc.group_name, "Development Skills");
+    assert_eq!(svc.group_name, "<STEP>");
     let recipe = resolve_service(
         &wire(2743, trainer_spell_state::RED, 50, 0, 164),
         TRAINER_TYPE_TRADESKILL,
@@ -362,7 +380,7 @@ fn display_name_is_the_wire_spell_not_the_taught_one() {
         &BTreeSet::new(),
     );
     assert_eq!(recipe.group_key, 2);
-    assert_eq!(recipe.group_name, "Recipes");
+    assert_eq!(recipe.group_name, "<LEARN>");
     assert_eq!(recipe.name.as_deref(), Some("Copper Chain Pants"));
 }
 
@@ -419,10 +437,10 @@ fn resolve_reads_cost_state_and_gates_with_no_catalog() {
     assert!(svc.is_trade_skill, "trainer_type 2 → tradeskill");
     assert!(svc.prof_first_rank == w.is_primary_prof_first_rank);
     // No spell catalog at a TRADESKILL trainer → the SKILL_STEP predicate reads false and the row
-    // falls to the "Recipes" group. Nothing is ever dropped at type 2 (the partition is total), so
+    // falls to the `TRADESKILL_SERVICE_LEARN` group. Nothing is ever dropped at type 2 (the partition is total), so
     // the "unresolved → 0" arm belongs to the skill-line types, not this one.
     assert_eq!(svc.group_key, 2);
-    assert_eq!(svc.group_name, "Recipes");
+    assert_eq!(svc.group_name, "<LEARN>");
     // No skill gate when req_skill is 0.
     let plain = resolve_service(
         &wire(78, trainer_spell_state::GREEN, 50, 5, 0),
@@ -578,9 +596,9 @@ fn tooltip_hops_to_the_taught_spell_where_the_icon_pins_the_wire() {
     );
     // The icon law, same row, same catalog: the WIRE spell's own art. Pinned together so the
     // disagreement is visible in one place and can't be "fixed" into agreement.
-    let mut deps = Deps::new();
+    let deps = Deps::new();
     assert_eq!(
-        super::service_icon(100, 0, &spells, None, &mut deps.items, &deps.commands),
+        super::service_icon(100, 0, &spells, None, &deps.items, &deps.commands),
         Some("WRAPPER".into()),
     );
 }
@@ -728,4 +746,26 @@ fn only_a_packet_that_opens_a_window_resets_the_filter() {
         open.fresh_list,
         "a different trainer is a new window whatever is in flight"
     );
+}
+
+/// The three group-header keys against the player's REAL `GlobalStrings.lua` — the guard the
+/// synthetic [`probe_strings`] table needs beside it, since a typo'd key yields an empty header
+/// rather than a wrong one. Skips without client data.
+#[test]
+fn the_group_header_keys_resolve_in_the_real_global_strings() {
+    let data = benilla_formats::wow_data_or_skip!();
+    let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+    let src = chain
+        .read_file("Interface\\FrameXML\\GlobalStrings.lua")
+        .expect("GlobalStrings.lua in the chain");
+    let vm = benilla_ui::script::UiScript::new().expect("VM");
+    vm.run(&String::from_utf8_lossy(&src)).expect("runs clean");
+    for key in [
+        "TRADESKILL_SERVICE_STEP",
+        "TRADESKILL_SERVICE_LEARN",
+        "KNOWN_TALENTS_HEADER",
+    ] {
+        let text = vm.lua().globals().get::<String>(key).unwrap_or_default();
+        assert!(!text.is_empty(), "{key} missing");
+    }
 }

@@ -177,6 +177,155 @@ mod loader_tests {
         );
     }
 
+    /// **A `parent=` that resolves to nothing leaves the frame PARENTLESS** — it does not fall back
+    /// to the enclosing frame (decision 2213). `0x6ee280` seeds `[ebp-0x8]` with the incoming
+    /// default parent and then writes the lookup's result back **unconditionally** at
+    /// `0x6ee3ef`, so a miss stores 0 over the seed and `0x6ee408` constructs with `ecx = 0`
+    /// (wow-re `xml-parent-attach-order.md`, VERIFIED). And an **empty** `parent=""` short-circuits
+    /// at `0x6ee3c7` before any of that: the default parent is kept, silently.
+    ///
+    /// Only the nested case can tell these apart — at top level there is no enclosing frame to
+    /// fall back to, which is why
+    /// [`Self::a_top_level_parent_attribute_attaches_and_anchors`] passed either way.
+    #[test]
+    fn a_parent_attribute_that_misses_leaves_the_frame_parentless() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <Frame name="Enclosing">
+                    <Size><AbsDimension x="200" y="100"/></Size>
+                    <Anchors><Anchor point="CENTER"/></Anchors>
+                    <Frames>
+                        <Frame name="$parentMissed" parent="NotLoadedYet">
+                            <Size><AbsDimension x="10" y="10"/></Size>
+                            <Anchors><Anchor point="CENTER"/></Anchors>
+                        </Frame>
+                        <Frame name="$parentEmpty" parent="">
+                            <Size><AbsDimension x="10" y="10"/></Size>
+                            <Anchors><Anchor point="CENTER"/></Anchors>
+                        </Frame>
+                    </Frames>
+                </Frame>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        s.resolve();
+
+        // The miss: parentless, NOT re-attached to Enclosing.
+        assert!(s.eval::<bool>("return TopMissed ~= nil").unwrap());
+        assert!(
+            s.eval::<bool>("return TopMissed:GetParent() == nil")
+                .unwrap(),
+            "a parent= that names nothing nulls the parent; it does not fall back"
+        );
+        // …and with no parent, the `$parent` chain walk finds nothing, so the "Top" seed survives
+        // (rf27 §5) — hence `TopMissed`, not `EnclosingMissed`.
+        assert!(s.eval::<bool>("return EnclosingMissed == nil").unwrap());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w == "Couldn't find frame parent: NotLoadedYet"),
+            "logged in the reference's own words (0x8710f0): {:?}",
+            report.warnings
+        );
+
+        // The empty attribute: the enclosing frame is kept, and nothing is logged.
+        assert_eq!(
+            s.eval::<String>("return EnclosingEmpty:GetParent():GetName()")
+                .unwrap(),
+            "Enclosing",
+            "parent=\"\" keeps the enclosing parent"
+        );
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("Empty")),
+            "and says nothing about it: {:?}",
+            report.warnings
+        );
+    }
+
+    /// **A top-level `name="$parent…"` resolves against the `parent=` attribute** (B387) — the
+    /// reference attaches the parent *first* (`0x6ee280` resolves it at `0x6ee3e8` and passes it to
+    /// the constructor at `0x6ee408`) and only then runs the node-apply step that reads `name=` and
+    /// calls `SetName` (`0x6ee4d6`), whose expander walks the frame's **actual** parent chain
+    /// (rf27 `0x76c5b0`). We resolved the name first, against the lexical ancestor, so ClassIcons'
+    /// `<Frame name="$parentClassIcon" parent="PlayerFrame"/>` was published as `TopClassIcon` and
+    /// every `PlayerFrameClassIcon` lookup in the addon indexed a nil.
+    ///
+    /// Four claims: the name takes the attribute parent's name; that frame's own children compose
+    /// off the corrected name; a top-level `$parent` with no attribute still falls to the `"Top"`
+    /// seed; and the `parent=` attribute itself is NOT expanded (`0x6ee3e8` calls the by-name
+    /// resolver direct, bypassing `0x76c5b0` — rf27 §2).
+    #[test]
+    fn a_dollar_parent_name_resolves_against_the_parent_attribute() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <Frame name="PlayerFrame">
+                    <Size><AbsDimension x="200" y="100"/></Size>
+                    <Anchors><Anchor point="CENTER"/></Anchors>
+                </Frame>
+                <Frame name="$parentClassIcon" parent="PlayerFrame">
+                    <Size><AbsDimension x="20" y="20"/></Size>
+                    <Anchors><Anchor point="TOPRIGHT"/></Anchors>
+                    <Frames>
+                        <Frame name="$parentDot">
+                            <Size><AbsDimension x="4" y="4"/></Size>
+                            <Anchors><Anchor point="CENTER"/></Anchors>
+                        </Frame>
+                    </Frames>
+                </Frame>
+                <Frame name="$parentLoose">
+                    <Size><AbsDimension x="10" y="10"/></Size>
+                    <Anchors><Anchor point="CENTER"/></Anchors>
+                </Frame>
+                <Frame name="Literal" parent="$parentPlayerFrame">
+                    <Size><AbsDimension x="10" y="10"/></Size>
+                    <Anchors><Anchor point="CENTER"/></Anchors>
+                </Frame>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        s.resolve();
+
+        assert!(
+            s.eval::<bool>("return PlayerFrameClassIcon ~= nil")
+                .unwrap(),
+            "the top-level $parent name took the parent= frame's name, not the lexical \"Top\""
+        );
+        assert!(s.eval::<bool>("return TopClassIcon == nil").unwrap());
+        assert_eq!(
+            s.eval::<String>("return PlayerFrameClassIcon:GetParent():GetName()")
+                .unwrap(),
+            "PlayerFrame",
+            "and it is really attached there"
+        );
+        assert!(
+            s.eval::<bool>("return PlayerFrameClassIconDot ~= nil")
+                .unwrap(),
+            "a nested child composes off the CORRECTED name"
+        );
+
+        // No attribute, no lexical parent: the expander's `"Top"` seed survives (rf27 §5).
+        assert!(s.eval::<bool>("return TopLoose ~= nil").unwrap());
+
+        // `parent="$parentPlayerFrame"` is taken LITERALLY — `0x6ee3e8` hands the raw string to
+        // `0x76c760`, so no frame of that name exists and the element falls back (and warns).
+        assert!(s.eval::<bool>("return Literal:GetParent() == nil").unwrap());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("$parentPlayerFrame")),
+            "the unexpanded attribute is named verbatim in the warning: {:?}",
+            report.warnings
+        );
+    }
+
     /// End-to-end: a virtual template, an instance inheriting it (with `<Size>`, screen `<Anchors>`,
     /// a `<Layers>` coloured `<Texture>`, a nested child `<Frame>` in `<Frames>`, and `<OnLoad>`
     /// handlers on both) — proving name publication, bottom-up OnLoad, `$parent`, and that
@@ -425,20 +574,129 @@ mod loader_tests {
             .unwrap());
     }
 
-    /// A missing include is an **error**, and the rest of the load still proceeds.
+    /// **An unrecognised `frameStrata=` warns and skips; the frame keeps the stratum it had, and
+    /// the rest of the document loads** (decision 2160).
     ///
-    /// It was a warning until decision 1186. The load-and-continue half is unchanged and faithful
-    /// (0068: the client logs and carries on) — what changed is the *reporting*, because a warning
-    /// is not in the value callers assert on. Bagnon missed all eleven of its references and came
-    /// back with zero errors, which read as a clean load of an addon that had built nothing.
+    /// The two doors differ in the reference and this is the quiet one. `CSimpleFrame::LoadXML
+    /// 0x769820` resolves through `0x6f17d0`, whose miss returns 0 without writing the out-param;
+    /// the miss leg pushes `"Frame %s: Unknown frame strata: %s"` at severity 1 into the document
+    /// sink (`0x7699a4`, a call that returns) and reconverges with the hit path at `0x7699ad`,
+    /// never reaching `SetFrameStrata 0x76a470`. `EQL3`'s `EQL3_Log.xml` carries the literal case:
+    /// `<Frame frameStrata="ARTWORK">`, a draw-LAYER name where a strata belongs.
     #[test]
-    fn missing_include_errors_and_continues() {
+    fn an_unknown_xml_frame_strata_warns_and_leaves_the_stratum_alone() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                 <Frame name="Bad" frameStrata="ARTWORK"/>
+                 <Frame name="After"/>
+               </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(
+            report.errors.is_empty(),
+            "nothing raised on the XML door: {:?}",
+            report.errors
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("Unknown frame strata") && w.contains("ARTWORK")),
+            "…and it is reported: {report:?}"
+        );
+        assert_eq!(
+            s.eval::<String>("return Bad:GetFrameStrata()").unwrap(),
+            "MEDIUM",
+            "the frame keeps what it had — the ctor's MEDIUM ([+0xc0] = 3) in the base case"
+        );
+        assert!(
+            s.eval::<bool>("return After ~= nil").unwrap(),
+            "and the document carries on"
+        );
+    }
+
+    /// **The Lua door is the LOUD one and stays that way.** `SetFrameStrata 0x774360`'s miss
+    /// reaches `0x774456 call 0x6f4940` (`luaL_error`), whose chain `luaG_errormsg 0x6fc780` /
+    /// `luaD_throw 0x6f5d80` contains no `ret` at all — the epilogue after it is dead code. Pinned
+    /// beside its XML twin so the asymmetry is a test rather than a comment.
+    #[test]
+    fn the_lua_setframestrata_still_raises_on_the_same_value() {
+        let s = UiScript::new().unwrap();
+        s.run(r#"f = CreateFrame("Frame", "Loud")"#).unwrap();
+        let err = s
+            .run(r#"f:SetFrameStrata("ARTWORK")"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ARTWORK"), "{err}");
+    }
+
+    /// **`FrameXML_Debug` is a get-or-set whose SET arm turns on the loader's trace lines**
+    /// (decision 2160) — and `0` takes the SET arm, because the number zero is Lua-truthy and only
+    /// `nil`/`false` are not (`0x48845d`, after `lua_toboolean 0x6f34d0`). That is the half a
+    /// re-implementation gets backwards, so it is the half asserted first.
+    #[test]
+    fn framexml_debug_is_a_get_or_set_and_gates_the_loader_traces() {
+        let s = UiScript::new().unwrap();
+        let doc = || parse(r#"<Ui><Frame name="Traced"/></Ui>"#);
+
+        assert_eq!(
+            s.eval::<i32>("return FrameXML_Debug()").unwrap(),
+            0,
+            "boots 0"
+        );
+        assert!(
+            load(&s, &doc(), &no_files).traces.is_empty(),
+            "and off means no trace at all"
+        );
+
+        assert_eq!(s.eval::<i32>("return FrameXML_Debug(1)").unwrap(), 1);
+        let on = load(&s, &doc(), &no_files);
+        assert!(
+            on.traces
+                .iter()
+                .any(|t| t.contains("Creating Frame named Traced")),
+            "{on:?}"
+        );
+
+        // The two arms that are easy to get wrong.
+        assert_eq!(
+            s.eval::<i32>("return FrameXML_Debug(nil)").unwrap(),
+            1,
+            "nil is a pure GET — the flag is untouched"
+        );
+        assert_eq!(
+            s.eval::<i32>("return FrameXML_Debug(0)").unwrap(),
+            0,
+            "…but 0 is TRUTHY in Lua, so it really does disable it"
+        );
+        assert!(load(&s, &doc(), &no_files).traces.is_empty());
+        // …and the stored value is truncated toward zero, `0x40a2b0`'s conversion.
+        assert_eq!(s.eval::<i32>("return FrameXML_Debug(1.9)").unwrap(), 1);
+    }
+
+    /// A missing include is **reported, not raised**, and the rest of the load still proceeds.
+    ///
+    /// It was a warning until 1186 and an error from 1186 to 2155; it is now its own list. Both of
+    /// the findings behind those moves are asserted here, because each undid the other:
+    /// **1186's** — a document that resolved *nothing* must not report success (Bagnon missed all
+    /// eleven of its references and came back with zero errors) — so the row is in the report; and
+    /// **2155's** — the reference logs `Couldn't open %s` and carries on with nothing raised
+    /// (wow-re `ui/scratch/xml-toc-path-resolution.md` §4, VERIFIED) — so the row is *not* in
+    /// `errors`, which is the list whose entries reach the player's red error dialog.
+    #[test]
+    fn missing_include_is_a_missing_file_not_an_error_and_continues() {
         let s = UiScript::new().unwrap();
         let doc = parse(r#"<Ui><Include file="Nope.xml"/><Frame name="Still"/></Ui>"#);
         let report = load(&s, &doc, &no_files);
         assert!(
-            report.errors.iter().any(|e| e.contains("Nope.xml")),
-            "an unresolved include drops a whole document: {:?}",
+            report.missing_files.iter().any(|e| e.contains("Nope.xml")),
+            "an unresolved include drops a whole document and says so: {report:?}"
+        );
+        assert!(
+            report.errors.is_empty(),
+            "…but nothing raised, so it is not a script error: {:?}",
             report.errors
         );
         assert!(
@@ -447,17 +705,38 @@ mod loader_tests {
         );
     }
 
-    /// So is a missing `<Script file=>` — it drops every handler the file would have defined.
+    /// So is a missing `<Script file=>` — it drops every handler the file would have defined, and
+    /// the reference's own leg for it (`"Error loading %s"`, `include-lua-dispatch.md` §7) returns
+    /// normally rather than throwing.
     #[test]
-    fn missing_script_file_errors_and_continues() {
+    fn missing_script_file_is_a_missing_file_not_an_error_and_continues() {
         let s = UiScript::new().unwrap();
         let doc = parse(r#"<Ui><Script file="Nope.lua"/><Frame name="Still"/></Ui>"#);
         let report = load(&s, &doc, &no_files);
         assert!(
-            report.errors.iter().any(|e| e.contains("Nope.lua")),
-            "{:?}",
-            report.errors
+            report.missing_files.iter().any(|e| e.contains("Nope.lua")),
+            "{report:?}"
         );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(s.eval::<bool>("return Still ~= nil").unwrap());
+    }
+
+    /// **A `<Script file=>` whose chunk RAISES is still an error** — the half `missing_files` must
+    /// not swallow. The two arms sit one line apart in `load_in`, and folding a miss into the
+    /// quiet list is only correct because the raise keeps its own.
+    #[test]
+    fn a_script_file_that_raises_is_still_an_error() {
+        let s = UiScript::new().unwrap();
+        let doc = parse(r#"<Ui><Script file="Boom.lua"/><Frame name="Still"/></Ui>"#);
+        let files = |req: &str| -> Option<Vec<u8>> {
+            (req == "Boom.lua").then(|| b"error('boom')".to_vec())
+        };
+        let report = load(&s, &doc, &files);
+        assert!(
+            report.errors.iter().any(|e| e.contains("Boom.lua")),
+            "a chunk that raised is an error, not a missing file: {report:?}"
+        );
+        assert!(report.missing_files.is_empty(), "{report:?}");
         assert!(s.eval::<bool>("return Still ~= nil").unwrap());
     }
 
@@ -508,6 +787,60 @@ mod loader_tests {
         );
     }
 
+    /// A named state texture and a named `<ButtonText>` are anchor targets by NAME, not only
+    /// globals: the stock trainer row hangs its label off `$parentHighlight`'s RIGHT, and a name
+    /// published only into `_G` sent the label to the button's own edge (1957).
+    #[test]
+    fn a_named_state_texture_is_an_anchor_target_for_its_sibling_label() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <Button name="Row">
+                    <Size><AbsDimension x="293" y="16"/></Size>
+                    <Anchors>
+                        <Anchor point="TOPLEFT"><Offset><AbsDimension x="22" y="-50"/></Offset></Anchor>
+                    </Anchors>
+                    <HighlightTexture name="$parentHighlight" file="Interface\Buttons\UI-PlusButton-Hilight">
+                        <Size><AbsDimension x="16" y="16"/></Size>
+                        <Anchors>
+                            <Anchor point="LEFT"><Offset><AbsDimension x="3" y="0"/></Offset></Anchor>
+                        </Anchors>
+                    </HighlightTexture>
+                    <ButtonText name="$parentText">
+                        <Size><AbsDimension x="0" y="13"/></Size>
+                        <Anchors>
+                            <Anchor point="LEFT" relativeTo="$parentHighlight" relativePoint="RIGHT">
+                                <Offset><AbsDimension x="2" y="1"/></Offset>
+                            </Anchor>
+                        </Anchors>
+                    </ButtonText>
+                    <NormalFont inherits="GameFontNormal" justifyH="LEFT"/>
+                </Button>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        s.resolve();
+        let (hl_right, text_left): (f64, f64) = s
+            .eval("return RowHighlight:GetRight(), RowText:GetLeft()")
+            .unwrap();
+        assert_eq!(hl_right, 22.0 + 3.0 + 16.0);
+        assert_eq!(
+            text_left,
+            hl_right + 2.0,
+            "the label hangs off the highlight, not the button"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| !w.contains("does not resolve")),
+            "no unresolved relativeTo: {:?}",
+            report.warnings
+        );
+    }
+
     /// A handler with a syntax error yields an `errors[]` entry, the load continues, and the other
     /// frame is still built with a working handler.
     #[test]
@@ -536,15 +869,18 @@ mod loader_tests {
     }
 
     /// Unsupported handler names are warn-once gaps, not hard errors, and don't stop the frame
-    /// from building. The example is `OnCursorChanged` — caret geometry is host-side here, so its
-    /// four float args would all be zero, which is the silent-drop this warn exists to avoid.
-    /// (It used to be `OnKeyDown`: that one is *fired* since decision 1319 and now belongs to
-    /// `script::tests::keyboard`.)
+    /// from building. The example is `OnAttributeChanged` — 2.0's secure-frame system, which no
+    /// 1.12 resolver has a slot for, so it is the one name on that list that is out permanently.
+    ///
+    /// It has been three names now, and each move is the rule working: `OnKeyDown` left when 1319
+    /// built the delivery walk, `OnCursorChanged` when 2141 built the caret flush's fire. A name
+    /// is accepted only once something fires it, so this test's subject is whatever is still
+    /// waiting.
     #[test]
     fn unsupported_script_name_is_a_warning() {
         let s = UiScript::new().unwrap();
         let doc = parse(
-            r#"<Ui><Frame name="Keyed"><Scripts><OnCursorChanged>x = 1</OnCursorChanged></Scripts></Frame></Ui>"#,
+            r#"<Ui><Frame name="Keyed"><Scripts><OnAttributeChanged>x = 1</OnAttributeChanged></Scripts></Frame></Ui>"#,
         );
         let report = load(&s, &doc, &no_files);
         assert_eq!(report.frames, 1);
@@ -552,18 +888,96 @@ mod loader_tests {
         assert!(report
             .warnings
             .iter()
-            .any(|w| w.contains("OnCursorChanged")));
+            .any(|w| w.contains("OnAttributeChanged")));
     }
 
-    /// An unknown frame type is an error that drops that subtree but not the rest of the load.
+    /// **An unknown frame type at the XML door is LOGGED, and its node is skipped — nothing
+    /// raises** (decision 2191).
+    ///
+    /// `Instantiate 0x6ee280` prints `"Unknown frame type: %s"` (`0x871124`) at `0x6ee356` and makes
+    /// no object for that node; only the Lua `CreateFrame` binding raises (`0x872fa8` via
+    /// `luaL_error`). The node's own `<Frames>` go with it — there is no object to parent them —
+    /// and the walk carries on to the next sibling.
     #[test]
-    fn unknown_frame_type_errors_but_continues() {
+    fn an_unknown_xml_frame_type_is_logged_and_its_node_skipped() {
         let s = UiScript::new().unwrap();
-        let doc = parse(r#"<Ui><Bogus name="X"/><Frame name="Real"/></Ui>"#);
+        let doc = parse(
+            r#"<Ui>
+                 <Bogus name="X"><Frames><Frame name="Inside"/></Frames></Bogus>
+                 <Frame name="Real"/>
+               </Ui>"#,
+        );
         let report = load(&s, &doc, &no_files);
+        assert!(
+            report.errors.is_empty(),
+            "nothing raised on the XML door: {:?}",
+            report.errors
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w == "Unknown frame type: Bogus"),
+            "the reference's own wording, in the log channel: {:?}",
+            report.warnings
+        );
         assert_eq!(report.frames, 1, "only the real frame built");
-        assert!(report.errors.iter().any(|e| e.contains("CreateFrame")));
+        assert!(s.eval::<bool>("return X == nil and Inside == nil").unwrap());
         assert!(s.eval::<bool>("return Real ~= nil").unwrap());
+        // …and the Lua door still raises, on the same lookup.
+        let err = s.run(r#"CreateFrame("Bogus")"#).unwrap_err().to_string();
+        assert!(err.contains("unknown frame type 'Bogus'"), "{err}");
+    }
+
+    /// **A `.toc`-listed `Bindings.xml` loads as XML and costs nothing but log lines** (decision
+    /// 2191) — MonkeyDev's shape, the director's live report. The `.toc` line runner hands every
+    /// non-`.lua` entry to the same file loader (`0x6edd51` → `0x6ede10`), whose walk ignores the
+    /// root's own tag (`<Bindings>`, tolerated) and sees three `<Binding>` elements: three unknown
+    /// frame types, logged. The file's real reading as bindings is `0x51f400`'s, which runs anyway.
+    #[test]
+    fn a_bindings_document_loaded_as_framexml_raises_nothing() {
+        let s = UiScript::new().unwrap();
+        let doc = parse(
+            r#"<Bindings>
+                 <Binding name="MONKEYDEV_STEPUP" header="MONKEYDEV">MonkeyStep_Inc()</Binding>
+                 <Binding name="MONKEYDEV_STEPDOWN">MonkeyStep_Dec()</Binding>
+               </Bindings>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report
+                .warnings
+                .iter()
+                .filter(|w| *w == "Unknown frame type: Binding")
+                .count(),
+            2,
+            "one log line per <Binding>: {:?}",
+            report.warnings
+        );
+        assert!(
+            s.eval::<bool>("return MONKEYDEV_STEPUP == nil").unwrap(),
+            "and no frame published under a binding's name"
+        );
+    }
+
+    /// The WorldFrame's one-shot record, at the XML door: a second `<WorldFrame>` is an unknown
+    /// type, so it logs and builds nothing (decisions 1984, 2191) where `CreateFrame` raises.
+    #[test]
+    fn a_second_xml_world_frame_is_logged_not_raised() {
+        let s = UiScript::new().unwrap();
+        s.run(r#"CreateFrame("WorldFrame", "WorldFrame")"#).unwrap();
+        let report = load(
+            &s,
+            &parse(r#"<Ui><WorldFrame name="Another"/></Ui>"#),
+            &no_files,
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w == "Unknown frame type: WorldFrame"));
+        assert!(s.eval::<bool>("return Another == nil").unwrap());
     }
 
     /// Env-gated smoke test over a real extracted FrameXML file (never committed; extract with
@@ -789,6 +1203,105 @@ mod loader_tests {
         );
     }
 
+    /// **An XML handler body's chunk name is `"<GetName()>:<Handler>"`, and its lines are the
+    /// body's own.** `0x7025fd` calls the script object's `GetName` through its vtable, falls back
+    /// to `<unnamed>` (`0x84c7f0`) at `0x702611`, formats `"%s:%s"` (`0x872a28`) at `0x70261b`,
+    /// and hands that to `0x704c70` at `0x70263c` — which `luaL_loadbuffer`s the raw body, so body
+    /// line *n* is chunk line *n*.
+    ///
+    /// Three producers, because they used to disagree. A named element was already right; an
+    /// unnamed one wrote `<Button>` where the image writes `<unnamed>`; and a `CreateFrame` off a
+    /// template wrote the *whole call* —
+    /// `CreateFrame("Button", "Made", inherits="ProbeTmpl"):OnClick` — into every error message
+    /// and every `debugstack` frame that handler produced.
+    #[test]
+    fn an_xml_handler_chunk_is_named_by_its_frame_and_handler() {
+        let s = UiScript::new().unwrap();
+        let doc = parse(
+            "<Ui>\n\
+             <Button name=\"NamedBtn\">\n\
+             <Scripts>\n\
+             <OnClick>\n\
+             error(\"boom\")\n\
+             </OnClick>\n\
+             </Scripts>\n\
+             </Button>\n\
+             <Button>\n\
+             <Scripts>\
+             <OnLoad>BenillaAnon = this</OnLoad>\
+             <OnClick>error(\"anon\")</OnClick>\
+             </Scripts>\n\
+             </Button>\n\
+             <Button name=\"ProbeTmpl\" virtual=\"true\">\n\
+             <Scripts><OnClick>error(\"tmpl\")</OnClick></Scripts>\n\
+             </Button>\n\
+             </Ui>",
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        s.run(r#"Made = CreateFrame("Button", "Made", nil, "ProbeTmpl")"#)
+            .unwrap();
+
+        let raised = |lua: &str| -> String {
+            s.eval::<String>(&format!("local ok, e = pcall({lua}) return tostring(e)"))
+                .unwrap()
+        };
+
+        // A named element. The body sits on the element's SECOND line, and the reference numbers a
+        // handler chunk from the body's own first line — so `:2:`, never `:3:`. Our wrapper used
+        // to end with a newline, which pushed every body line down by one.
+        let named = raised(r#"NamedBtn:GetScript("OnClick")"#);
+        assert!(
+            named.starts_with(r#"[string "NamedBtn:OnClick"]:2: boom"#),
+            "{named}"
+        );
+        // A `CreateFrame` instance is named by the INSTANCE — what `GetName()` answers — not by
+        // the call that made it and not by the template it wore.
+        let made = raised(r#"Made:GetScript("OnClick")"#);
+        assert!(
+            made.starts_with(r#"[string "Made:OnClick"]:1: tmpl"#),
+            "{made}"
+        );
+        // The nameless element takes the image's own fallback literal.
+        let anon = raised(r#"BenillaAnon:GetScript("OnClick")"#);
+        assert!(
+            anon.starts_with(r#"[string "<unnamed>:OnClick"]:1: anon"#),
+            "{anon}"
+        );
+    }
+
+    /// **An inline `<Script>` body is `"<xml path>:<Scripts>"`, with no `@`** — `0x6ee0ed push ebx`
+    /// (the document's own path) / `0x6ee0ee push 0x871074` (`"%s:<Scripts>"`) → `0x6ee0ff` sprintf
+    /// → `0x6ee10f call 0x704cd0`. `luaO_chunkid` therefore takes its *third* branch and the frame
+    /// reads `[string "…"]`, not a bare path — which is how a reader (and every addon that splits a
+    /// `debugstack` frame on `\AddOns\`) tells an inline block from the `.lua` file beside it.
+    ///
+    /// `<Script file="…">` keeps the file form, `"@%s"` (`0x8716e0`), and both are asserted here so
+    /// the two arms cannot drift into each other.
+    #[test]
+    fn an_inline_script_chunk_is_named_for_the_document_not_as_a_file() {
+        let s = UiScript::new().unwrap();
+        let doc = parse(
+            "<Ui>\n<Script file=\"Sibling.lua\"/>\n<Script>\nBenillaInline = ({}).missing.deeper\n</Script>\n</Ui>",
+        );
+        let report = load_in(&s, &doc, "Interface/AddOns/Probe/Probe.xml", &|p: &str| {
+            (p == "Interface/AddOns/Probe/Sibling.lua")
+                .then(|| b"BenillaFile = ({}).missing.deeper".to_vec())
+        });
+        assert_eq!(report.errors.len(), 2, "{:?}", report.errors);
+        assert!(
+            report.errors[0].contains("Interface\\AddOns\\Probe\\Sibling.lua:1:"),
+            "a <Script file=> chunk is still a plain `@`-path frame: {}",
+            report.errors[0]
+        );
+        assert!(
+            report.errors[1]
+                .contains("[string \"Interface\\AddOns\\Probe\\Probe.xml:<Scripts>\"]:4:"),
+            "an inline body is a `[string \"…\"]` frame naming the document: {}",
+            report.errors[1]
+        );
+    }
+
     #[test]
     fn button_xml_extras_apply() {
         let mut s = UiScript::new().unwrap();
@@ -944,7 +1457,7 @@ mod loader_tests {
         s.resolve();
         s.mouse_button(50.0, 10.0, "LeftButton", true);
         s.mouse_button(50.0, 10.0, "LeftButton", false);
-        assert!(s.eval::<bool>("return XmlEdit:HasFocus()").unwrap());
+        assert_eq!(s.focused_editbox_name().as_deref(), Some("XmlEdit"));
         s.run("typed = false").unwrap();
         assert!(s.char_input("7"));
         s.tick(0.0);
@@ -982,8 +1495,7 @@ mod loader_tests {
             ))
             .unwrap();
             assert_eq!(
-                s.eval::<bool>(&format!("return {name}:HasFocus()"))
-                    .unwrap(),
+                s.focused_editbox_name().as_deref() == Some(name),
                 want,
                 "{name}: autoFocus should be {want} (absent = the ctor default, ON)",
             );
@@ -1255,6 +1767,76 @@ mod loader_tests {
         );
     }
 
+    /// `<TitleRegion setAllPoints="true"/>` builds the frame's drag handle over its whole rect —
+    /// the stock `TutorialFrame.xml`'s (1976): a press inside it moves the frame with the cursor,
+    /// exactly as `frame:CreateTitleRegion():SetAllPoints()` from Lua does
+    /// (`script::tests::movable::a_title_region_drag_swallows_the_press_and_ends_on_release`);
+    /// the same frame without the element does not move.
+    #[test]
+    fn title_region_element_builds_the_drag_handle_over_the_frame() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <Frame name="Tut" enableMouse="true">
+                    <Size><AbsDimension x="200" y="80"/></Size>
+                    <Anchors><Anchor point="BOTTOMLEFT"><Offset><AbsDimension x="100" y="100"/></Offset></Anchor></Anchors>
+                    <TitleRegion setAllPoints="true"/>
+                </Frame>
+                <Frame name="Plain" enableMouse="true">
+                    <Size><AbsDimension x="200" y="80"/></Size>
+                    <Anchors><Anchor point="BOTTOMLEFT"><Offset><AbsDimension x="400" y="100"/></Offset></Anchor></Anchors>
+                </Frame>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        let left = |s: &mut UiScript, f: &str| {
+            s.resolve();
+            s.eval::<f64>(&format!("return {f}:GetLeft()")).unwrap()
+        };
+        assert_eq!(left(&mut s, "Tut"), 100.0);
+        s.mouse_button(150.0, 150.0, "LeftButton", true);
+        s.mouse_move(250.0, 150.0);
+        assert_eq!(
+            left(&mut s, "Tut"),
+            200.0,
+            "the element's title region drags the frame"
+        );
+        s.mouse_button(250.0, 150.0, "LeftButton", false);
+
+        assert_eq!(left(&mut s, "Plain"), 400.0);
+        s.mouse_button(450.0, 150.0, "LeftButton", true);
+        s.mouse_move(550.0, 150.0);
+        assert_eq!(left(&mut s, "Plain"), 400.0, "no element, no handle");
+        s.mouse_button(550.0, 150.0, "LeftButton", false);
+    }
+
+    #[test]
+    fn a_loader_built_title_region_emits_no_quad() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <Frame name="Tut" enableMouse="true">
+                    <Size><AbsDimension x="200" y="80"/></Size>
+                    <Anchors><Anchor point="BOTTOMLEFT"><Offset><AbsDimension x="100" y="100"/></Offset></Anchor></Anchors>
+                    <TitleRegion setAllPoints="true"/>
+                </Frame>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        s.resolve();
+        let quads = s.extract();
+        assert!(
+            quads
+                .iter()
+                .all(|q| matches!(q.target, crate::order::ZTarget::Frame(_))),
+            "a title region is a hit rectangle, never a quad: {quads:#?}"
+        );
+    }
+
     /// `<HitRectInsets>` reaches SetHitRectInsets, and the inset band stops capturing the mouse
     /// while the frame's own geometry is untouched — the ref micro-button shape (a 29x58 frame whose
     /// art fills only the lower ~40, `top="18"`).
@@ -1430,6 +2012,143 @@ mod loader_tests {
             label,
             Some([0.9, 0.8, 0.1, 1.0]),
             "<NormalText inherits=> must reach the button's Normal-state font"
+        );
+    }
+
+    /// **The two spellings of a Button's label are two different legs, and only `<NormalText>` is
+    /// disowned of its own font attributes — so its `justifyH` never reaches the label and the
+    /// implicit anchor stays CENTER, while a `<ButtonText>`'s does and still seats LEFT.**
+    ///
+    /// `CSimpleButton::LoadXML 0x7788c0`'s child chain routes them apart (wow-re
+    /// `scratch/button-label-build-and-anchor-order.md`, §5 + arbitration, VERIFIED):
+    /// `<ButtonText>` (tag `0x8799f0`, compared `0x7789c1`) goes to `0x7789d0 call 0x6f2780`, the
+    /// ordinary `<FontString>` region builder the `<Layers>` walker uses, which never writes
+    /// `+0x12c`; `<NormalText>` (tag `0x879978`, `0x778b43`) goes to the inline build
+    /// `[0x778b4c, 0x778bb6)` carrying `0x778b7b mov byte [edi+0x12c],0` — the one site image-wide
+    /// that clears the gate. Cleared, gate B (`0x7710d3 → je 0x771468`) makes the label's own
+    /// `CSimpleFontString::LoadXML 0x770f40` skip `0x7710e1`–`0x771467` wholesale: `font=`,
+    /// `<FontHeight>`, `outline=`, `monochrome=`, the file load, `spacing=`, **`justifyV=`,
+    /// `justifyH=`**, `<Color>` and `<Shadow>`. That node is fed instead to the button's
+    /// Normal-state `CSimpleFont` at `+0x33c` (`0x778ba9`/`0x778baf call 0x783c30`).
+    ///
+    /// So the creation post-step `0x771480` reads the `<NormalText>` label's **untouched ctor
+    /// default** `0x212` = CENTER|MIDDLE (`0x770dd3`) and seats a single CENTER→CENTER anchor
+    /// (point 4, `0x7714dc`/`0x7714e4`). The authored `justifyH="LEFT"` still reaches the *paint*
+    /// and `GetJustifyH()` — `0x783c30`'s tail notify writes the resolved word into the label's own
+    /// `+0x120` (`0x784111` → `0x784180` → `0x773530` → `0x770800` at `0x770876`) — but that runs
+    /// downstream of the anchor, and a FontString pinned at one point is exactly as wide as its
+    /// text, so a left justify inside it has nothing to move.
+    ///
+    /// The live case is Gatherer 1.0.0's minimap quick-menu, transcribed here: every row is a
+    /// `GathererUI_PopupButtonTemplate`, all rows are `SetWidth` to one common width and stacked
+    /// TOP-to-BOTTOM so they share a centreline, and the template's only alignment statement is
+    /// `<NormalText inherits=… justifyH="LEFT"/>`. Applying that word to the label seated all
+    /// seven rows LEFT→LEFT and the menu read as a left-aligned list against the reference's
+    /// centred one.
+    ///
+    /// Two controls, and the second is why this test carries both spellings: an ordinary
+    /// `<Layers>` `<FontString justifyH="LEFT">` still seats LEFT
+    /// (`anchorless_fontstring_seats_at_its_justify_point` above), and so does a
+    /// `<ButtonText justifyH="LEFT"/>` — the gate is the `<NormalText>` leg's alone.
+    #[test]
+    fn a_button_label_element_does_not_own_its_justify() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <Font name="GatherFont" font="Fonts\FRIZQT__.TTF" virtual="true">
+                    <FontHeight><AbsValue val="10"/></FontHeight>
+                </Font>
+                <Button name="GathererUI_PopupButtonTemplate" virtual="true">
+                    <Size><AbsDimension x="64" y="12"/></Size>
+                    <NormalText inherits="GatherFont" justifyH="LEFT"/>
+                    <HighlightText inherits="GatherFont" justifyH="LEFT"/>
+                    <DisabledText inherits="GatherFont" justifyH="LEFT"/>
+                </Button>
+                <Button name="OwnLabelTemplate" virtual="true">
+                    <Size><AbsDimension x="64" y="12"/></Size>
+                    <ButtonText inherits="GatherFont" justifyH="LEFT"/>
+                </Button>
+                <Frame name="GathererUI_Popup">
+                    <Size><AbsDimension x="120" y="60"/></Size>
+                    <Anchors>
+                        <Anchor point="BOTTOMLEFT"><Offset><AbsDimension x="0" y="0"/></Offset></Anchor>
+                    </Anchors>
+                    <Frames>
+                        <Button name="GathererUI_PopupButton1" inherits="GathererUI_PopupButtonTemplate" text="Minimap [on]">
+                            <Anchors><Anchor point="TOP"/></Anchors>
+                        </Button>
+                        <Button name="OwnLabelButton" inherits="OwnLabelTemplate" text="Minimap [on]">
+                            <Anchors><Anchor point="BOTTOM"/></Anchors>
+                        </Button>
+                    </Frames>
+                </Frame>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        // 1 · The anchor — the whole mechanism, read straight off the label.
+        let (point, rel_point, x, y) = s
+            .eval::<(String, String, f64, f64)>(
+                "local p, rel, rp, x, y = GathererUI_PopupButton1:GetFontString():GetPoint(1) \
+                 return p, rp, x, y",
+            )
+            .unwrap();
+        assert_eq!(
+            (point.as_str(), rel_point.as_str(), x, y),
+            ("CENTER", "CENTER", 0.0, 0.0),
+            "<NormalText>'s justifyH is disowned, so 0x771480 seats the ctor's CENTER"
+        );
+
+        // 2 · ...and the authored word still reaches the label's PAINT and its getter, through the
+        // Normal-state font's link. Only the anchor was ever the reference's answer here.
+        assert_eq!(
+            s.eval::<String>("return GathererUI_PopupButton1:GetFontString():GetJustifyH()")
+                .unwrap(),
+            "LEFT",
+            "the state font's justify still reaches the label"
+        );
+
+        // 3 · The CONTROL, and the half the byte round corrected: `<ButtonText>` is built by the
+        // ordinary FontString builder (`0x6f2780`), which never clears `+0x12c`, so its own
+        // justifyH lands on the label and the same post-step seats it LEFT.
+        let (point, rel_point) = s
+            .eval::<(String, String)>(
+                "local p, rel, rp = OwnLabelButton:GetFontString():GetPoint(1) return p, rp",
+            )
+            .unwrap();
+        assert_eq!(
+            (point.as_str(), rel_point.as_str()),
+            ("LEFT", "LEFT"),
+            "<ButtonText> owns its font attributes — the gate is the <NormalText> leg's alone"
+        );
+
+        // 4 · The visible consequence, in resolved coordinates. The popup is [0,0]..[120,60] and
+        // the rows are 64 wide, centred on x=60 → [28,92]. A 40-wide label centred in that is
+        // [40,80]; seated LEFT it is [28,68] — the left edge every Gatherer row shared before this.
+        s.run(
+            "GathererUI_PopupButton1:GetFontString():SetWidth(40) \
+             OwnLabelButton:GetFontString():SetWidth(40)",
+        )
+        .unwrap();
+        s.resolve();
+        let (cl, cr, ll, lr) = s
+            .eval::<(f64, f64, f64, f64)>(
+                "local c = GathererUI_PopupButton1:GetFontString() \
+                 local l = OwnLabelButton:GetFontString() \
+                 return c:GetLeft(), c:GetRight(), l:GetLeft(), l:GetRight()",
+            )
+            .unwrap();
+        assert_eq!(
+            (cl, cr),
+            (40.0, 80.0),
+            "the Gatherer row's label is centred on the button, not hugging its left edge"
+        );
+        assert_eq!(
+            (ll, lr),
+            (28.0, 68.0),
+            "the <ButtonText> row's label still hugs the button's left edge"
         );
     }
 
@@ -1950,6 +2669,8 @@ mod chunk_name_tests {
         let report = load_in(&s, &doc, "Bagnon/src/main.xml", &no_files);
         let err = report.errors.join("\n");
         // The file, in the shape an addon's own `debugstack()` matches (backslashes, no `@`).
+        // The `:<Scripts>` suffix and the `[string "…"]` wrapper are the reference's own
+        // (`"%s:<Scripts>"` `0x871074`, `luaO_chunkid`'s third branch), not decoration of ours.
         assert!(
             err.contains("Bagnon\\src\\main.xml:"),
             "the raise must name the document, got: {err}"
@@ -1957,7 +2678,7 @@ mod chunk_name_tests {
         // Line 5 of the literal above is `error("boom")` — the body starts on line 4 and the
         // padding carries it there. Without the pad this reads `:2:`.
         assert!(
-            err.contains("main.xml:5:"),
+            err.contains("main.xml:<Scripts>\"]:5:"),
             "the line must be the FILE's line, not the block's, got: {err}"
         );
     }
@@ -1976,7 +2697,7 @@ mod chunk_name_tests {
         let report = load_in(&s, &doc, "Addon/outer.xml", &files);
         let err = report.errors.join("\n");
         assert!(
-            err.contains("Addon\\sub\\inner.xml:3:"),
+            err.contains("Addon\\sub\\inner.xml:<Scripts>\"]:3:"),
             "the INCLUDED file and its line, not the includer's: {err}"
         );
         assert!(
@@ -2006,7 +2727,7 @@ mod chunk_name_tests {
         let report = load_in(&s, &doc, "Ours/Bag.xml", &no_files);
         let err = report.errors.join("\n");
         assert!(
-            err.contains("Ours\\Bag.xml:6:"),
+            err.contains("Ours\\Bag.xml:<Scripts>\"]:6:"),
             "line 6 is `error(\"cdata boom\")` in the literal above, got: {err}"
         );
     }

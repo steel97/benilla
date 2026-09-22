@@ -57,11 +57,21 @@ pub struct WorldAssets {
     /// re-walks the chain per frame). Separate from `textures`: sprites are sRGB/clamped, world
     /// art is Unorm/repeat — the same BLP can legitimately live in both.
     sprites: HashMap<String, Option<Handle<Image>>>,
-    /// Decoded UI sprite textures sampled with **repeat** addressing (frame `Backdrop` pieces —
-    /// tiled edges/bg). Separate cache from `sprites`: the *same* BLP can be wanted clamp-sampled as
-    /// a plain sprite and repeat-sampled as a backdrop piece, and the two need distinct GPU images
-    /// (the sampler is baked into the `Image`). See [`Self::sprite_texture_tiled`].
-    tiled_sprites: HashMap<String, Option<Handle<Image>>>,
+    /// Decoded UI sprite textures sampled with **repeat** addressing on one or both axes (frame
+    /// `Backdrop` pieces — tiled edges/bg — and the reference's `SetTexCoord(0, n, 0, 1)` strips).
+    /// Keyed by resolved path **and** the per-axis wrap, separate from `sprites`: the *same* BLP
+    /// can be wanted clamp-sampled as a plain sprite and repeat-sampled as a backdrop piece, and
+    /// each address-mode pair needs its own GPU image (the sampler is baked into the `Image`).
+    /// See [`Self::sprite_texture_wrapped`].
+    tiled_sprites: HashMap<(String, bool, bool), Option<Handle<Image>>>,
+    /// Sprites RESAMPLED to an exact physical size, by `(path, w, h)` — the nameplate border's
+    /// 0188 sharpen and nothing else so far. Keyed by size because that is the whole point: the
+    /// art is re-rasterised whenever the plate's pixel size moves, and reused on every frame in
+    /// between (a resize is rare; a plate is drawn 60 times a second).
+    resampled_sprites: HashMap<(String, u32, u32), Option<Handle<Image>>>,
+    /// The decoded source pixels behind [`Self::resampled_sprites`], so a resize re-samples
+    /// instead of re-decoding the BLP.
+    resample_sources: HashMap<String, Option<(u32, u32, Vec<u8>)>>,
     /// Decoded **portrait** sprites — [`Self::sprite_texture`]'s clamp/sRGB sprite with a circular
     /// alpha mask baked in ([`portrait_image`]). Its own cache, like `tiled_sprites`: the mask bakes
     /// into the GPU image, so the same BLP wanted as a plain icon and as a portrait needs two images.
@@ -76,7 +86,7 @@ pub struct WorldAssets {
     /// here — the caller supplies the RGBA — so this stays a cache, not a second art pipeline.
     generated: HashMap<&'static str, Handle<Image>>,
     /// The **loose-file root for `Interface\AddOns\` sprite paths** — the AddOns folder, installed
-    /// by the app ([`Self::set_loose_sprite_root`]), `None` until then and in every capture run
+    /// by the app ([`Self::set_loose_addon_root`]), `None` until then and in every capture run
     /// (the app resolves it through `local_state`, which is hermetic under `$WOW_CAPTURE`).
     ///
     /// Addon art never lives in an MPQ: the reference's Storm open reads loose files from the game
@@ -188,14 +198,15 @@ pub fn sprite_dimensions(
 /// *before* inserting — so the warning is self-limiting by construction (one line per distinct key
 /// for the process's life), with no separate "already warned" set to keep.
 ///
-/// It exists because the renderer's fallback for an unresolvable path is **silent and looks like
-/// art**: a `Texture` region whose file can't be found still pushes a quad, which `ui_pass` draws
-/// with the shared 1×1 white image tinted white — an opaque WHITE RECTANGLE at the region's exact
-/// rect. That fallback can't itself be made loud (it is what lets flat-shaded quads batch into one
-/// texture run), so a miss has to be reported here instead. Bug B221 — macro-chooser icons
-/// rendering as white squares — was invisible to every layer of the client until this line existed:
-/// `shipped_xml_tests` sweeps only static XML `file=` attributes, never a path that arrives at
-/// runtime from a DBC.
+/// It exists because the renderer's fallback for an unresolvable path is **silent**. It used to be
+/// silent *and* look like art: a `Texture` region whose file could not be found still pushed a
+/// quad, which `ui_pass` drew with the shared 1×1 white image tinted white — an opaque WHITE
+/// RECTANGLE at the region's exact rect, which is how bug B221's macro-chooser icons looked. That
+/// half is gone (`ui_script::extract` now drops the quad outright when the resolve misses), so the
+/// miss draws *nothing* rather than a white square. It is no less silent for that: nothing on
+/// screen and nothing in Lua says why, and `shipped_xml_tests` sweeps only static XML `file=`
+/// attributes, never a path that arrives at runtime from a DBC or from an addon. So the report
+/// still belongs here.
 ///
 /// Walks [`sprite_candidates`] in order and takes the first that both reads and decodes; only when
 /// **all** fail is it a miss. A candidate that reads but won't decode falls through exactly like
@@ -203,7 +214,7 @@ pub fn sprite_dimensions(
 /// can't poison the second.
 ///
 /// Each candidate is asked of **two stores**: the patch chain, then — for `Interface\AddOns\`
-/// paths — the loose addon folder ([`loose_sprite_file`], decision 1322). The chain never holds an
+/// paths — the loose addon folder ([`loose_addon_file`], decision 1322). The chain never holds an
 /// `AddOns\` path (Blizzard's own `Blizzard_*` stubs aside, addon art only exists on disk), so the
 /// order between the stores is unobservable; chain-first keeps every non-addon path on exactly the
 /// code it always ran.
@@ -220,7 +231,7 @@ fn decode_sprite(
                 return Some(decoded);
             }
         }
-        if let Some(file) = loose_root.and_then(|root| loose_sprite_file(root, candidate)) {
+        if let Some(file) = loose_root.and_then(|root| loose_addon_file(root, candidate)) {
             if let Ok(decoded) = std::fs::read(&file)
                 .map_err(anyhow::Error::from)
                 .and_then(|bytes| decode_sprite_bytes(&bytes))
@@ -229,15 +240,38 @@ fn decode_sprite(
             }
         }
     }
-    warn!(
-        "texture miss: '{path}' does not resolve in the patch chain{} (tried {})",
-        if loose_root.is_some() {
-            " or the AddOns folder"
-        } else {
-            ""
-        },
-        candidates.join(", ")
-    );
+    // **"Not there" and "there but would not decode" are different faults, and saying only the
+    // first sends the reader hunting a path that is sitting on disk.** Three colour-mapped TGAs in
+    // the addon corpus read fine and failed to decode for years while this line asserted they did
+    // not resolve (decision 2128).
+    let found_but_undecodable: Vec<&String> = candidates
+        .iter()
+        .filter(|c| {
+            chain.read_file(c).is_ok()
+                || loose_root.is_some_and(|root| loose_addon_file(root, c).is_some())
+        })
+        .collect();
+    if found_but_undecodable.is_empty() {
+        warn!(
+            "texture miss: '{path}' does not resolve in the patch chain{} (tried {})",
+            if loose_root.is_some() {
+                " or the AddOns folder"
+            } else {
+                ""
+            },
+            candidates.join(", ")
+        );
+    } else {
+        warn!(
+            "texture miss: '{path}' RESOLVES but will not decode ({}) — the file is there and the \
+             decoder refused it",
+            found_but_undecodable
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     None
 }
 
@@ -253,16 +287,45 @@ fn decode_sprite_bytes(bytes: &[u8]) -> anyhow::Result<(u32, u32, Vec<u8>)> {
     }
 }
 
-/// Map a **normalized** sprite candidate (`interface\addons\<addon>\<…>.blp`, lowercase,
+/// Map a **normalized** addon-relative path (`interface\addons\<addon>\<…>`, lowercase,
 /// backslashed — [`normalize_path`] has run) onto a file under the loose addon root, or `None` if
 /// it is not an `Interface\AddOns\` path or nothing is there.
+///
+/// **Not sprite-specific, and named for that** (decision 2103): 1322 built this for addon-shipped
+/// Read one file from the **two stores the client's file layer has**: the patch chain, then — for
+/// an `Interface\AddOns\` path — the loose addon folder ([`loose_addon_file`]).
+///
+/// The rule shared by every by-path asset an addon can ship: art (the sprite decoder), fonts (the
+/// face loader) and **audio** (`PlayMusic`/`PlaySoundFile`) all reach a file the same way, and
+/// three copies of that would be three things to keep in step — the font leg was already a
+/// hand-rolled second copy of the sprite leg's order when audio became the third caller.
+///
+/// The reference asks the install tree *before* the archive (`0x647e60`'s attempt #4 is the MPQ —
+/// wow-re `ui/scratch/include-lua-dispatch.md` §4.1); the order is flipped here for the same
+/// reason [`decode_sprite`] flips it, and it is unobservable: the chain carries no `AddOns\` path,
+/// so every non-addon read stays on exactly the code it always ran.
+pub fn read_chain_or_loose(
+    chain: &Mutex<Chain>,
+    loose_root: Option<&Path>,
+    path: &str,
+) -> Option<Vec<u8>> {
+    if let Ok(bytes) = chain.lock_recover().read(path) {
+        return Some(bytes);
+    }
+    let file = loose_addon_file(loose_root?, &normalize_path(path))?;
+    std::fs::read(file).ok()
+}
+
+/// BLP/TGA art, and an addon's own TTFs reach the client by exactly the same route — a loose file
+/// under the one AddOns root, named by a virtual `Interface\AddOns\…` path no MPQ carries. One
+/// resolver, one prefix rule, one sandbox.
 ///
 /// The walk matches each component **case-insensitively** (exact join first — free on the
 /// case-insensitive filesystems macOS installs default to — then a `read_dir` scan): the reference
 /// is a Windows client and addons reference their own art in arbitrary case. The candidate cannot
 /// escape the root — `normalize_path` leaves no `/`, and any dot-component is refused before a
 /// filesystem call happens (same lexical posture as `ui_script::addons::read_under`).
-pub fn loose_sprite_file(root: &Path, candidate: &str) -> Option<PathBuf> {
+pub fn loose_addon_file(root: &Path, candidate: &str) -> Option<PathBuf> {
     let rel = candidate.strip_prefix("interface\\addons\\")?;
     let mut at = root.to_path_buf();
     for comp in rel.split('\\') {
@@ -354,6 +417,8 @@ impl WorldAssets {
             chain: Arc::new(Mutex::new(chain)),
             textures: SpatialCache::default(),
             sprites: HashMap::new(),
+            resampled_sprites: HashMap::new(),
+            resample_sources: HashMap::new(),
             tiled_sprites: HashMap::new(),
             portraits: HashMap::new(),
             masks: HashMap::new(),
@@ -368,7 +433,13 @@ impl WorldAssets {
     /// [`Self::loose_root`] field doc. Called by the app once it knows the AddOns folder; evicts
     /// cached **misses** so a path asked before the root existed gets a second look (a cached hit
     /// can only have come from the chain and stays right).
-    pub fn set_loose_sprite_root(&mut self, root: Option<PathBuf>) {
+    /// [`read_chain_or_loose`] over this store's own two halves — the by-path read for an asset
+    /// class with no decoder of its own here (audio: `PlayMusic`, `PlaySoundFile`).
+    pub fn read_file_or_loose(&self, path: &str) -> Option<Vec<u8>> {
+        read_chain_or_loose(&self.chain, self.loose_root.as_deref(), path)
+    }
+
+    pub fn set_loose_addon_root(&mut self, root: Option<PathBuf>) {
         if self.loose_root == root {
             return;
         }
@@ -435,22 +506,69 @@ impl WorldAssets {
         decode_sprite(&self.chain, self.loose_root.as_deref(), path)
     }
 
-    /// A UI sprite decoded with **repeat** (wrap) addressing — the frame `Backdrop` tiled pieces
-    /// (`backdrop-mechanism.md`): a border edge strip samples UVs `[0..N]` and a tiled bg `[0..w/period]`,
-    /// so the texture must wrap, not clamp. Same sRGB/no-mip decode + extensionless→`.blp` resolve
-    /// as [`Self::sprite_texture`], but its own cache (the sampler is baked into the `Image`, so a
-    /// path wanted both clamp and repeat needs two GPU images). Cached hits **and** misses.
+    /// A UI sprite **resampled to an exact pixel size** by the caller's own kernel, cached by that
+    /// size — the nameplate border (decision 0188).
+    ///
+    /// The plate's frame art is a 128 × 32 BLP drawn at whatever size the plate is, which past the
+    /// 1024×768 knee (and always on a retina framebuffer) is a magnification: the GPU's bilinear
+    /// filter smears the 1 px gold bevel across several soft output pixels, which is the director's
+    /// "blurry border". Resampling the SAME pixels to the target size with a sharp kernel keeps the
+    /// art and loses the smear. This lives here rather than in the plate driver because since
+    /// decision 2148 the plate is a widget like any other and its border is an ordinary texture
+    /// region — the substitution has to happen where a texture path becomes an image.
+    pub fn resampled_sprite(
+        &mut self,
+        path: &str,
+        (w, h): (u32, u32),
+        images: &mut Assets<Image>,
+        resample: impl FnOnce(&[u8], u32, u32, u32, u32) -> Vec<u8>,
+    ) -> Option<Handle<Image>> {
+        let key = (path.to_string(), w, h);
+        if let Some(cached) = self.resampled_sprites.get(&key) {
+            return cached.clone();
+        }
+        if !self.resample_sources.contains_key(path) {
+            let decoded = decode_sprite(&self.chain, self.loose_root.as_deref(), path);
+            self.resample_sources.insert(path.to_string(), decoded);
+        }
+        let made = self.resample_sources[path]
+            .as_ref()
+            .map(|(sw, sh, src)| images.add(sprite_image(w, h, resample(src, *sw, *sh, w, h))));
+        self.resampled_sprites.insert(key, made.clone());
+        made
+    }
+
+    /// A UI sprite decoded with **repeat** (wrap) addressing on both axes — the frame `Backdrop`
+    /// tiled pieces (`backdrop-mechanism.md`): a border edge strip samples UVs `[0..N]` and a tiled
+    /// bg `[0..w/period]`, so the texture must wrap, not clamp. [`Self::sprite_texture_wrapped`]
+    /// with both axes on; see there for the cache and the decode.
     pub fn sprite_texture_tiled(
         &mut self,
         path: &str,
         images: &mut Assets<Image>,
     ) -> Option<Handle<Image>> {
-        let key = sprite_key(path);
+        self.sprite_texture_wrapped(path, (true, true), images)
+    }
+
+    /// A UI sprite decoded with **repeat** addressing on the axes `wrap` names and clamp on the
+    /// rest — the reference's one-axis tiling idiom (`SetTexCoord(0, n, 0, 1)` on the stance
+    /// shelf's middle strip) wraps along its length and must clamp across it, or the strip's
+    /// bottom row bleeds into its top edge (decision 2000; [`sprite_image_wrapped`]). Same
+    /// sRGB/no-mip decode + extensionless→`.blp` resolve as [`Self::sprite_texture`], but its
+    /// own cache keyed by the wrap pair (the sampler is baked into the `Image`, so a path wanted
+    /// under two address modes needs two GPU images). Cached hits **and** misses.
+    pub fn sprite_texture_wrapped(
+        &mut self,
+        path: &str,
+        wrap: (bool, bool),
+        images: &mut Assets<Image>,
+    ) -> Option<Handle<Image>> {
+        let key = (sprite_key(path), wrap.0, wrap.1);
         if let Some(cached) = self.tiled_sprites.get(&key) {
             return cached.clone();
         }
         let loaded = decode_sprite(&self.chain, self.loose_root.as_deref(), path)
-            .map(|(w, h, rgba)| images.add(sprite_image_tiled(w, h, rgba)));
+            .map(|(w, h, rgba)| images.add(sprite_image_wrapped(w, h, rgba, wrap)));
         self.tiled_sprites.insert(key, loaded.clone());
         loaded
     }
@@ -500,6 +618,33 @@ impl WorldAssets {
         loaded
     }
 
+    /// The tabard designer's emblem cell (decision 1977): the emblem BLP decoded and rewritten to
+    /// **white carrying its own alpha** — `(a << 24) | 0x00FFFFFF` per texel, the reference's
+    /// `0x503431` loop — as an ordinary clamped sprite the caller tints. Cached per path like a
+    /// sprite; a file that fails to open yields `None` (the reference installs its static array's
+    /// stale contents instead; nothing here has a previous emblem to show).
+    pub fn emblem_mask_texture(
+        &mut self,
+        path: &str,
+        images: &mut Assets<Image>,
+    ) -> Option<Handle<Image>> {
+        let key = format!("emblem-mask:{}", sprite_key(path));
+        if let Some(cached) = self.sprites.get(&key) {
+            return cached.clone();
+        }
+        let loaded =
+            decode_sprite(&self.chain, self.loose_root.as_deref(), path).map(|(w, h, mut rgba)| {
+                for px in rgba.as_chunks_mut::<4>().0 {
+                    px[0] = 0xFF;
+                    px[1] = 0xFF;
+                    px[2] = 0xFF;
+                }
+                images.add(sprite_image(w, h, rgba))
+            });
+        self.sprites.insert(key, loaded.clone());
+        loaded
+    }
+
     /// A coverage **mask** ([`mask_image`] — linear/clamp, the texel bytes handed to the shader
     /// 1:1): the minimap's `MinimapMask.blp` circle (decision 0203, [`crate::ui_pass::UiQuadMask`]).
     /// Same extensionless→`.blp` resolve as [`Self::sprite_texture`]; its own cache, hits AND misses.
@@ -539,8 +684,6 @@ impl WorldAssets {
     /// A `StandardMaterial` for a model submesh, deduped by (texture, blend) so submeshes/models
     /// sharing a texture share one material handle (enabling draw-call batching). A missing/failed
     /// texture falls back to a single shared untextured material.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn model_material(
         &mut self,
         texture: Option<&str>,
@@ -682,7 +825,7 @@ mod tests {
     /// (as [`sprite_candidates`] always hands it over) — the walk must land on the file anyway,
     /// because the reference is a Windows client and addon authors never matched their own case.
     #[test]
-    fn loose_sprite_file_maps_addon_paths_case_insensitively() {
+    fn loose_addon_file_maps_addon_paths_case_insensitively() {
         let root =
             std::env::temp_dir().join(format!("benilla-loose-sprite-test-{}", std::process::id()));
         let dir = root.join("Atlas").join("Images").join("Maps");
@@ -692,7 +835,7 @@ mod tests {
         // The returned SPELLING is filesystem-dependent (a case-insensitive filesystem answers
         // the exact-join fast path with the candidate's own casing), so the claim is that the
         // path opens the right file, not how it is spelt.
-        let hit = loose_sprite_file(
+        let hit = loose_addon_file(
             &root,
             "interface\\addons\\atlas\\images\\maps\\blackrockdepths.blp",
         )
@@ -700,20 +843,66 @@ mod tests {
         assert_eq!(std::fs::read(&hit).unwrap(), b"x");
 
         // Not an AddOns path → not this store's question.
-        assert_eq!(loose_sprite_file(&root, "interface\\icons\\foo.blp"), None);
+        assert_eq!(loose_addon_file(&root, "interface\\icons\\foo.blp"), None);
         // A directory is not a file, and a missing file is a miss, not an error.
-        assert_eq!(loose_sprite_file(&root, "interface\\addons\\atlas"), None);
+        assert_eq!(loose_addon_file(&root, "interface\\addons\\atlas"), None);
         assert_eq!(
-            loose_sprite_file(&root, "interface\\addons\\atlas\\images\\maps\\nope.blp"),
+            loose_addon_file(&root, "interface\\addons\\atlas\\images\\maps\\nope.blp"),
             None
         );
         // Dot-components never reach the filesystem (the read_under posture; `normalize_path`
         // already forbids `/`, so this is the one lexical escape left to refuse).
         assert_eq!(
-            loose_sprite_file(&root, "interface\\addons\\..\\..\\etc\\passwd"),
+            loose_addon_file(&root, "interface\\addons\\..\\..\\etc\\passwd"),
             None
         );
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The by-path read every addon-shipped asset resolves by** — chain first, then the one
+    /// loose folder ([`read_chain_or_loose`]). Audio is that rule's third caller, after art and
+    /// fonts, and an addon's own track is exactly the file no MPQ can hold: this leg is the whole
+    /// reason `PlayMusic("Interface\\AddOns\\…")` can make a sound at all.
+    ///
+    /// Against the **real** chain, because both legs matter — a client file must still come from
+    /// the archive, and only a real chain can show the loose folder is a *fallback* rather than a
+    /// shadow over it.
+    #[test]
+    fn read_chain_or_loose_asks_the_chain_then_an_addons_own_file_on_disk() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let chain = Mutex::new(Chain::open(&data).expect("open the chain"));
+        let root =
+            std::env::temp_dir().join(format!("benilla-loose-audio-test-{}", std::process::id()));
+        let addons = root.join("AddOns");
+        std::fs::create_dir_all(addons.join("Jukebox")).unwrap();
+        std::fs::write(addons.join("Jukebox").join("Track.mp3"), b"ID3!").unwrap();
+
+        // The archive leg: a client track the chain does carry.
+        let theme = read_chain_or_loose(
+            &chain,
+            Some(&addons),
+            "Sound\\Music\\GlueScreenMusic\\wow_main_theme.mp3",
+        )
+        .expect("the glue theme lives in sound.MPQ");
+        assert!(theme.len() > 1_000_000, "the theme is a ~3 MB stored MP3");
+
+        // The loose leg: an addon's own track, named by the virtual path, spelt in its own case.
+        assert_eq!(
+            read_chain_or_loose(
+                &chain,
+                Some(&addons),
+                "Interface\\AddOns\\Jukebox\\Track.mp3"
+            )
+            .as_deref(),
+            Some(&b"ID3!"[..])
+        );
+        // In neither store: a plain miss, which every caller renders as silence.
+        assert!(read_chain_or_loose(&chain, Some(&addons), "Sound\\Music\\nope.mp3").is_none());
+        // No folder configured (a capture run — `local_state` is hermetic there): chain only.
+        assert!(
+            read_chain_or_loose(&chain, None, "Interface\\AddOns\\Jukebox\\Track.mp3").is_none()
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

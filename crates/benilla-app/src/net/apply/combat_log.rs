@@ -17,11 +17,13 @@
 use bevy::prelude::*;
 
 use benilla_protocol::messages::{
-    DamageShield, ExplorationXp, LevelUpInfo, PeriodicAuraLog, PeriodicTick, SpellDamageLog,
-    SpellEnergizeLog, SpellHealLog, SpellLogMiss, XpGain,
+    power_display_scale, DamageShield, ExplorationXp, LevelUpInfo, PeriodicAuraLog, PeriodicTick,
+    SpellDamageLog, SpellEnergizeLog, SpellHealLog, SpellLogMiss, XpGain,
 };
 
-use crate::combat_text::{damage_color, miss_word, spell_text, CombatTextSpawn, DamageSource};
+use crate::combat_text::{
+    damage_color, miss_word, spell_text, CombatTextSpawn, DamageSource, DamageTextGates,
+};
 use crate::names::NameCache;
 use crate::ui_chat::ChatLog;
 use crate::ui_unit::{CombatTextEvent, UnitCombatFeedback};
@@ -61,18 +63,12 @@ pub(super) fn classify_source(
 // attacker swing clip's impact keyframe with the rest of the victim feedback
 // (`crate::combat_text::melee_impact_text`, fed by `creature_anim::impact`).
 
-/// The color law's `B` bit for a spell-packet emit (`0x6128b0`: `recordPtr == 0 ||
-/// sign(byte[SpellRec+0x25])`): melee-styled (white) when the spell id resolves to no record —
-/// the client's NULL-record half — or the record carries `AttributesEx3 & 0x8000`
-/// ([`benilla_formats::SpellDisplay::melee_white_damage`] — how a ranged basic shot's
-/// `SMSG_SPELLNONMELEEDAMAGELOG` floats white; decision 0376). No catalog at all degrades the
-/// same way the client degrades with no record: melee-styled.
-fn melee_styled(spells: Option<&crate::ui_action::Spells>, spell_id: u32) -> bool {
-    let Some(spells) = spells else { return true };
-    spells
-        .catalog
-        .get(spell_id)
-        .is_none_or(|d| d.melee_white_damage())
+/// The color law's `B` bit for a spell-packet emit, over the catalog the arms carry: resolve the
+/// spell's record and hand it to [`crate::combat_text::melee_styled`] (which owns the law and its
+/// NULL-record degradation). This is how a ranged basic shot's `SMSG_SPELLNONMELEEDAMAGELOG`
+/// floats white (decision 0376) while an ordinary spell floats gold.
+pub(super) fn melee_styled(spells: Option<&crate::ui_action::Spells>, spell_id: u32) -> bool {
+    crate::combat_text::melee_styled(spells.and_then(|s| s.catalog.get(spell_id)))
 }
 
 /// The spell arms' shared `UNIT_COMBAT` split: a landed amount is `WOUND` (`CRITICAL` descriptor
@@ -179,13 +175,13 @@ fn power_message_type(power: u32) -> Option<&'static str> {
 /// the zero-damage ABSORB/RESIST word, over the target (`0x5e85e0`). Source-classified: only my
 /// (gold) or my pet's (gold, PetSpellDamage-gated) spells draw. The handler pushes the same
 /// record/source to number and word twin alike, so the override colors both.
-#[allow(clippy::too_many_arguments)] // one dispatch arm's full writer set
 pub(super) fn spell_damage_log(
     s: SpellDamageLog,
     index: &GuidIndex,
     self_guid: &SelfGuid,
     stores: &Query<&mut ObjectStore>,
     spells: Option<&crate::ui_action::Spells>,
+    gates: DamageTextGates,
     text: &mut MessageWriter<CombatTextSpawn>,
     feedback: &mut MessageWriter<UnitCombatFeedback>,
     center: &mut MessageWriter<CombatTextEvent>,
@@ -231,7 +227,7 @@ pub(super) fn spell_damage_log(
     };
     // B = the melee-styled bit: a ranged basic shot (Throw/Auto Shot — AttributesEx3 & 0x8000)
     // floats WHITE off this spell packet, exactly like the client (decision 0376).
-    let Some(color) = damage_color(source, melee_styled(spells, s.spell_id)) else {
+    let Some(color) = damage_color(gates, source, melee_styled(spells, s.spell_id)) else {
         return; // the CombatDamage / PetSpellDamage gates
     };
     if let (Some(anchor), Some((category, body))) = (
@@ -249,17 +245,17 @@ pub(super) fn spell_damage_log(
 
 /// `SMSG_PERIODICAURALOG` → DoT ticks float like direct damage (`0x626dd0`, never crit-category);
 /// heal/energize/leech ticks float **nothing** (heals never float in 5875).
-#[allow(clippy::too_many_arguments)] // one dispatch arm's full writer set
 pub(super) fn periodic_aura_log(
     s: PeriodicAuraLog,
     index: &GuidIndex,
     self_guid: &SelfGuid,
     stores: &Query<&mut ObjectStore>,
     spells: Option<&crate::ui_action::Spells>,
+    gates: DamageTextGates,
     text: &mut MessageWriter<CombatTextSpawn>,
     feedback: &mut MessageWriter<UnitCombatFeedback>,
     center: &mut MessageWriter<CombatTextEvent>,
-    names: &mut NameCache,
+    names: &NameCache,
     net: &NetCommands,
 ) {
     if benilla_assets::trace::enabled() {
@@ -301,10 +297,14 @@ pub(super) fn periodic_aura_log(
                     ),
                     extra: Some(amount.to_string()),
                 }),
+                // The displayed figure, not the wire's — `0x626dd0` divides by
+                // `0x6e7130(powerType)` at `0x627087` **before** it pushes the COMBAT_TEXT tag
+                // (`0x494770`) and before it words the chat line, so both consumers see the same
+                // number (decision 2117).
                 PeriodicTick::Energize { power, amount } => {
                     power_message_type(power).map(|message_type| CombatTextEvent {
                         message_type,
-                        data: Some(amount.to_string()),
+                        data: Some((amount / power_display_scale(power)).to_string()),
                         extra: None,
                     })
                 }
@@ -353,7 +353,7 @@ pub(super) fn periodic_aura_log(
     };
     // Same B computation as the direct-damage emit (the periodic emitter `0x626dd0` pushes the
     // resolved record to the same `0x6128b0` law).
-    let Some(color) = damage_color(source, melee_styled(spells, s.spell_id)) else {
+    let Some(color) = damage_color(gates, source, melee_styled(spells, s.spell_id)) else {
         return;
     };
     let Some(anchor) = gated_anchor(s.target, index, self_guid) else {
@@ -389,6 +389,7 @@ pub(super) fn damage_shield(
     index: &GuidIndex,
     self_guid: &SelfGuid,
     stores: &Query<&mut ObjectStore>,
+    gates: DamageTextGates,
     text: &mut MessageWriter<CombatTextSpawn>,
     feedback: &mut MessageWriter<UnitCombatFeedback>,
 ) {
@@ -409,7 +410,7 @@ pub(super) fn damage_shield(
     let Some(source) = classify_source(s.victim, index, self_guid, stores) else {
         return; // K = other: never drawn
     };
-    let Some(color) = damage_color(source, true) else {
+    let Some(color) = damage_color(gates, source, true) else {
         return;
     };
     if let Some(anchor) = gated_anchor(s.attacker, index, self_guid) {
@@ -432,7 +433,7 @@ pub(super) fn spell_heal_log(
     self_guid: &SelfGuid,
     feedback: &mut MessageWriter<UnitCombatFeedback>,
     center: &mut MessageWriter<CombatTextEvent>,
-    names: &mut NameCache,
+    names: &NameCache,
     net: &NetCommands,
 ) {
     if let Some(&unit) = index.0.get(&s.target) {
@@ -462,6 +463,10 @@ pub(super) fn spell_heal_log(
 /// NO `UNIT_COMBAT` fires here: the 5875 engine has no ENERGIZE emission — the string is absent
 /// from the whole binary (§5-verified, wow-re `unit-combat-event-law.md`; the shipped
 /// CombatFeedback.lua ENERGIZE arm is dead code in 1.12).
+///
+/// The amount is the **displayed** figure: the handler `0x5e8a90` divides by
+/// `0x6e7130(powerType)` at `0x5e8af3` and hands that one number to the COMBAT_TEXT push
+/// (`0x494770`) and to the chat formatter (`0x62ca00`) alike (decision 2117).
 pub(super) fn spell_energize_log(
     s: SpellEnergizeLog,
     self_guid: &SelfGuid,
@@ -471,7 +476,7 @@ pub(super) fn spell_energize_log(
         if let Some(message_type) = power_message_type(s.power) {
             center.write(CombatTextEvent {
                 message_type,
-                data: Some(s.amount.to_string()),
+                data: Some((s.amount / power_display_scale(s.power)).to_string()),
                 extra: None,
             });
         }
@@ -516,13 +521,16 @@ fn miss_action(code: u8) -> Option<&'static str> {
 
 /// `SMSG_SPELLLOGMISS` → one outcome word per missed target (`0x5e7e00`). Disjoint from the
 /// SPELL_GO miss list in practice: vmangos routes only impact-time outcomes (immune, evade) here.
-/// Source-classified like every emitter (the classifier lives inside the word twin too); the
-/// site's record push is unpinned, so the words keep the row-default white (flagged open).
+/// Source-classified like every emitter (the classifier lives inside the word twin too), and
+/// **coloured by the same B/K law as a number** — `0x5e7f63 mov ecx,[ebp-0x8]; 0x5e7f66 push ecx`
+/// pushes the resolved SpellRec, not NULL, so this site's words are spell-GOLD (decision 2229).
 pub(super) fn spell_log_miss(
     s: SpellLogMiss,
     index: &GuidIndex,
     self_guid: &SelfGuid,
     stores: &Query<&mut ObjectStore>,
+    spells: Option<&crate::ui_action::Spells>,
+    gates: DamageTextGates,
     text: &mut MessageWriter<CombatTextSpawn>,
     feedback: &mut MessageWriter<UnitCombatFeedback>,
     center: &mut MessageWriter<CombatTextEvent>,
@@ -550,9 +558,17 @@ pub(super) fn spell_log_miss(
             }
         }
     }
-    if classify_source(s.caster, index, self_guid, stores).is_none() {
+    // **The WORD emitter carries the same three CVar gates as the number emitter.** `0x607140`
+    // reads `CombatDamage` (`0x60718f`), `PetSpellDamage` (`0x6071a6`) and `PetMeleeDamage`
+    // (`0x6071c5`) exactly as `0x6128b0` does, and each failure jumps to the epilogue — so a miss
+    // word is suppressed by the same settings that suppress a number. It made no difference while
+    // the three were `const bool` = true; it does now.
+    let Some(source) = classify_source(s.caster, index, self_guid, stores) else {
         return; // K = other: never drawn
-    }
+    };
+    let Some(color) = damage_color(gates, source, melee_styled(spells, s.spell_id)) else {
+        return; // the CombatDamage / Pet* gates
+    };
     for &(target, code) in &s.misses {
         if let (Some(anchor), Some((word, category))) =
             (gated_anchor(target, index, self_guid), miss_word(code))
@@ -561,7 +577,7 @@ pub(super) fn spell_log_miss(
                 anchor,
                 text: word.to_string(),
                 category,
-                color: None,
+                color,
             });
         }
     }
@@ -600,7 +616,6 @@ pub(super) fn xp_gain(
 ///   path as `SMSG_PLAY_SOUND`.
 ///
 /// No floating text (the XP itself still arrives via the non-kill `SMSG_LOG_XPGAIN`).
-#[allow(clippy::too_many_arguments)] // one arm of the dispatch — its param list IS its input set
 pub(super) fn exploration_xp(
     x: ExplorationXp,
     area_table: Option<&crate::area::AreaTableRes>,
@@ -649,5 +664,116 @@ pub(super) fn exploration_xp(
 /// this packet.
 pub(super) fn level_up(l: LevelUpInfo, chat_log: &mut ChatLog) {
     let talent_points = u32::from(l.level >= 10);
-    chat_log.push_level_up(&l, talent_points);
+    // Park the raw tuple for `ui_unit`'s `PLAYER_LEVEL_UP`, whose nine args the reference's own
+    // `ChatFrame_OnEvent` reads (1884). **That is the whole of the ding's chat output.**
+    //
+    // This used to compose and print the five-line block in Rust as well, under a comment saying
+    // the Rust lines would stay "until that window migrates and can take over printing them".
+    // The window migrated — `benilla.toc` sources `Interface\FrameXML\ChatFrame.xml` and our own
+    // transcription is gone (1948) — and nobody came back to the condition, so the block was on
+    // screen **twice** (`ui_chat::tests::the_ding_block_is_printed_once` reproduces it: four lines
+    // from each side). A deliberate temporary that outlives its trigger is indistinguishable from
+    // a permanent one; this is what one looks like when it is found.
+    chat_log.push_level_up_gains(&l, talent_points);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::combat_text::COLOR_SPELL_GOLD;
+    use crate::net::{Guid, SelfPlayer};
+    use bevy::ecs::system::RunSystemOnce;
+
+    /// **`SMSG_SPELLLOGMISS`'s word is spell GOLD** (decision 2229) — the third and last of the
+    /// three word paths this client had drawing white on a hardcoded `color: None`.
+    ///
+    /// `0x5e7f63 mov ecx,[ebp-0x8]` / `0x5e7f66 push ecx` hands `0x607140` the resolved SpellRec,
+    /// not the literal NULL the melee swing site pushes — so the emitter's `B` bit comes from the
+    /// spell's own `AttributesEx3` and an ordinary spell's word is gold, exactly like its number.
+    /// Unlike the GO's inline emit there is **no Speed test** at this site: the word prints on
+    /// receipt whatever the spell's travel time.
+    #[test]
+    fn the_spell_log_miss_word_is_spell_gold() {
+        const IMMOLATE: u32 = 348;
+
+        let spells = crate::ui_action::Spells {
+            catalog: benilla_formats::SpellCatalog::from_displays(
+                [(
+                    IMMOLATE,
+                    benilla_formats::SpellDisplay {
+                        name: "Immolate".into(),
+                        speed: 24.0, // travels, and it still prints here
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            forms: Default::default(),
+            ranges: Default::default(),
+            cast_times: Default::default(),
+            durations: Default::default(),
+            radii: Default::default(),
+        };
+
+        let mut app = App::new();
+        app.add_message::<CombatTextSpawn>()
+            .add_message::<UnitCombatFeedback>()
+            .add_message::<CombatTextEvent>()
+            .init_resource::<GuidIndex>()
+            .init_resource::<SelfGuid>();
+        let self_e = app
+            .world_mut()
+            .spawn((Guid(10), SelfPlayer, ObjectStore::default()))
+            .id();
+        let victim_e = app
+            .world_mut()
+            .spawn((Guid(20), ObjectStore::default()))
+            .id();
+        {
+            let mut index = app.world_mut().resource_mut::<GuidIndex>();
+            index.0.insert(10, self_e);
+            index.0.insert(20, victim_e);
+        }
+        app.world_mut().resource_mut::<SelfGuid>().0 = Some(10);
+
+        app.world_mut()
+            .run_system_once(
+                move |index: Res<GuidIndex>,
+                      self_guid: Res<SelfGuid>,
+                      stores: Query<&mut ObjectStore>,
+                      mut text: MessageWriter<CombatTextSpawn>,
+                      mut feedback: MessageWriter<UnitCombatFeedback>,
+                      mut center: MessageWriter<CombatTextEvent>| {
+                    spell_log_miss(
+                        SpellLogMiss {
+                            spell_id: IMMOLATE,
+                            caster: 10,
+                            misses: vec![(20, 7)], // IMMUNE — the outcome vmangos routes here
+                        },
+                        &index,
+                        &self_guid,
+                        &stores,
+                        Some(&spells),
+                        DamageTextGates::default(),
+                        &mut text,
+                        &mut feedback,
+                        &mut center,
+                    );
+                },
+            )
+            .unwrap();
+
+        let spawned: Vec<_> = app
+            .world_mut()
+            .resource_mut::<Messages<CombatTextSpawn>>()
+            .drain()
+            .map(|s| (s.text, s.category, s.color, s.anchor))
+            .collect();
+        assert_eq!(
+            spawned,
+            vec![("Immune".to_string(), 3, Some(COLOR_SPELL_GOLD), victim_e)],
+            "gold, category 3, over the immune target"
+        );
+    }
 }

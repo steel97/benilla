@@ -19,10 +19,12 @@ mod chaincensus;
 mod charatlas;
 mod charprocs;
 mod glueextent;
+mod kitanim;
 mod m2dump;
 mod scan;
 mod shakecensus;
 mod spellvis;
+mod thudcensus;
 
 /// Read WoW 1.12.1 asset archives (MPQ).
 #[derive(Parser)]
@@ -56,6 +58,12 @@ enum Command {
         internal_path: String,
         /// Output `.png` file.
         output: PathBuf,
+        /// Also write every authored mip level (`<stem>.mip<N>.png`) and print a per-level
+        /// texel census: how many texels the author left transparent vs not, the luma range of
+        /// each class, and how many sit below 128 — the set that DARKENS under a Mod2x lane,
+        /// which reads no alpha. The "what does the far sampler see" instrument (B358).
+        #[arg(long)]
+        mips: bool,
     },
     /// Composite ONE character's body atlas off the chain and report what painted what: the
     /// equipment blits in blit order (with the file each region name resolved to, or `MISSING`),
@@ -137,11 +145,28 @@ enum Command {
     /// shakes no screen"), and the check that fields 11/12 really are `CameraShakes` keys — every
     /// live value must land on a real row.
     Shakecensus,
+    /// Census the **death thud** — the body-fall sound a corpse makes on landing (`$DTH` →
+    /// `0x6236e0`, the sibling of the camera shake above). Two halves: the `DeathThudLookups.dbc`
+    /// matrix in full (`SizeClass × TerrainTypeSoundID` → the named land/water `SoundEntries`
+    /// kits), and the population sweep of which creature M2s key a `$DTH` at all, with the size
+    /// class their displays resolve to. The scope instrument for "a big corpse hits the ground
+    /// silently": it separates authored silence (an empty water column) from a real gap.
+    Thudcensus,
     /// Census the `SpellVisualKit` **CharProc** columns (a kit's effect on the BODY — its alpha,
     /// its tint): which proc types the shipped table carries, which lifecycle stage reaches each
     /// from a live spell, and every state-stage (aura-lifetime) proc in full. The scope instrument
     /// for the aura-state CharProc system.
     Charprocs,
+    /// Census the `SpellVisualKit` **animation** column (field 2) — the half of a kit that plays a
+    /// clip on the unit's own BODY, as opposed to its attach-point effect models, its CharProcs or
+    /// its camera shake. Which anim ids the shipped table asks for, which lifecycle stage reaches
+    /// each (the stage picks the consumer: a `cast`/`impact` anim is a one-shot on the
+    /// caster/victim, a `state` anim belongs to an aura's whole life), then the state set in full
+    /// and the impact set ranked. The scope instrument for "the spell landed on me and my
+    /// character did nothing" — an anim that is never asked for leaves no trace to grep, unlike an
+    /// effect model that fails to spawn. `ANIM-ONLY` marks the state kits whose whole visual is the
+    /// anim, the class a "does this kit do anything?" test drops (the B114 shape one level over).
+    Kitanim,
     /// Dump an M2's collision hull as the mover collides with it: vertex/triangle counts, the
     /// model-space AABB (WoW axes, Z up), and its extents — the "what does walking into this
     /// actually hit" instrument (the step-up climb-vs-slide asset question, decision 0195; a
@@ -155,6 +180,15 @@ enum Command {
     /// the variation/replay instrument (decisions 0114/0117; sequences sharing an id are its
     /// variation chain).
     M2seq {
+        /// Internal path to the `.m2` (forward or back slashes accepted).
+        internal_path: String,
+    },
+    /// Dump an M2's **camera table** by raw file index — the index space a `<Model>` widget's
+    /// `Model:SetCamera(n)` walks (decision 2027): type, rest eye/target, diagonal fov, near/far,
+    /// roll, and each track's key count (which says still rig vs authored path). The
+    /// `cameraLookup` table is printed beside it — the portrait bake selects through that, the
+    /// pane does not.
+    M2cam {
         /// Internal path to the `.m2` (forward or back slashes accepted).
         internal_path: String,
     },
@@ -322,6 +356,26 @@ enum Command {
     /// Also counts the models whose pose depends on the §2c remap (benilla plays nothing there today,
     /// i.e. bind pose) and the ones reaching a rate-0 freeze leg.
     Goanimscan,
+    /// Sweep every `.m2` and census the **event table's positional half**: the `bone` and
+    /// `position` every `M2Event` record carries beside its 4CC. The reference's event dispatchers
+    /// hand their arms the event's own world point (the authored `position` through its bone's live
+    /// matrix and the model's placement), while a consumer that plays at the model root uses the
+    /// placement alone — so this reports, per 4CC, how many records sit off the origin and how many
+    /// ride a bone any sequence keys. Where both are zero the two are the same point.
+    Eventmarkerscan {
+        /// Internal-path prefix filter (e.g. `creature`), case-insensitive; all models if omitted.
+        prefix: Option<String>,
+    },
+    /// Census the **GameObject display sound slots** (`GameObjectDisplayInfo.Sound[0..9]`) against
+    /// the only thing that can reach them. Exactly one function in the reference reads those
+    /// columns (`0x5f4010`) and it is called only from the GO M2 anim-event dispatcher
+    /// (`0x5f3e20`): `$GO0..5` -> slots 0..5, `$GC0..3` -> slots 6..9 (wow-re
+    /// `go-display-sound-events.md` §1/§3). So a filled column is audible only when the display's
+    /// own model authors the matching event tag AND that tag sits on a sequence the GameObject
+    /// animation arm can actually play. Reports, per slot: columns filled, of those how many are
+    /// tagged, how many of those are on an armable sequence, and how many name a LOOPING (0x200)
+    /// kit — the flag that selects `0x5f4010`'s emitter-pool lane over its one-shot lane.
+    Goslotscan,
     /// Sweep every `.m2` (optionally under a path prefix) and census the models whose batch
     /// visibility is PER SEQUENCE — geometry the reference draws in one animation and skips in
     /// another (the verified `A <= 0` alpha cull). The population instrument for "a single-sequence
@@ -432,6 +486,120 @@ enum Command {
         /// Internal-path prefix filter (e.g. `world`), case-insensitive; all models if omitted.
         prefix: Option<String>,
     },
+    /// Sweep every model the **spell-visual chain** can reach — every `SpellVisualEffectName`
+    /// path a kit's ten effect slots, a `SpellVisual` row's missile model or its dest-anchored
+    /// model names — and census the batches whose **texture transform animates**, then classify
+    /// each by what a consumer that runs NONE of it renders.
+    ///
+    /// Decision 0271 deferred this channel on the claim that "no effect model in the current
+    /// corpus needs it"; this is that claim, made countable — it is what 2282 read to size the
+    /// missing scroll, and it is how the same question was re-asked of the unit / GameObject /
+    /// held-item corpus that 2295 then fixed (`entityuvscan`, its twin). It asks the **bake**,
+    /// not a transcription of it: a batch is in scope
+    /// exactly when `tex_anim` emitted a loop on any of the three channels, the same test the
+    /// lanes that DO run them use (`ui_models` 2019, `spell_fx` 2282).
+    ///
+    /// The classes are what a frozen batch draws, judged from the texture's own alpha through its
+    /// authored address mode — because a CLAMP-authored sheet's border is what a UV outside `0..1`
+    /// samples, and on this corpus that border is transparent:
+    ///
+    /// - **INVISIBLE** — frozen, every texel the batch reaches is transparent, while the scroll
+    ///   reaches painted ones: the batch renders **nothing at all**. `Spells\SwipeCaster.m2`
+    ///   (druid Swipe) is the class: two 51-vertex claw-trail strips whose UVs are authored at
+    ///   `u[+0.945..+1.944]` over a 16×16 CLAMP sheet, so frozen they sample column 15 alone —
+    ///   alpha 0 — and the whole of their visible existence is the `−0.97` U scroll.
+    /// - **FROZEN** — it draws, statically: the scroll is the motion it loses.
+    /// - **HELD** — keyed to a constant non-identity offset, so a lane that seeds none draws it
+    ///   mis-registered rather than still.
+    /// - **NEVER** / **UNKNOWN** — flagged, never counted as INVISIBLE: nothing painted at any
+    ///   point of the loop, or no alpha lane to judge from (`Mod`/`Mod2x`, an undecodable sheet).
+    ///
+    /// Each batch prints its per-axis reasoning (address mode, authored and frozen UV spans, the
+    /// texel indices those reach) so the call is checkable, and the report closes with the INVISIBLE
+    /// listing joined back through the chain: which spells reach it, and through which lifecycle
+    /// stage (`precast`/`cast`/`impact`/`state`/`channel`/`missile`/`area`).
+    Fxuvscan {
+        /// Internal-path prefix filter (e.g. `spells`), case-insensitive; all reachable effect
+        /// models if omitted.
+        prefix: Option<String>,
+    },
+    /// Sweep every model the **ENTITY lane** can render — every `CreatureDisplayInfo` →
+    /// `CreatureModelData` body (NPCs, critters, mounts, and every PLAYER, which resolves through
+    /// the same chain, decision 0041), every `GameObjectDisplayInfo` model, every
+    /// `ItemDisplayInfo` left/right model joined to the `Item\ObjectComponents\` folder the
+    /// archives actually hold it in, and the corpse lane's `<Race><Sex>DeathSkeleton` bone piles —
+    /// and census the batches whose **texture transform animates**, then classify each by what a
+    /// consumer that runs NONE of it renders.
+    ///
+    /// The twin of `Fxuvscan`, asked of the corpus that record's fix did NOT reach. Decision 2282
+    /// gave the spell-effect lane its texture transform and named this as its first deferral:
+    /// `model_render::batch::Materials::entity_variants` passed `play_uv = false`, and `build`
+    /// does `play_uv.then_some(sub.uv_anim.as_ref()).flatten()` — so every unit, player,
+    /// GameObject and held-item batch was handed no loop and drew its authored UVs, untransformed,
+    /// for ever. Nobody had measured how much content that is; this is that measurement, it is
+    /// what sized **decision 2295**, which closed it, and it shares `fxuvscan`'s whole per-batch
+    /// reader (`uv_batch`) so the two corpora cannot be judged by two different rules. It stays
+    /// because the census is how the claim "this lane needs no channel" is kept checkable — which
+    /// is the one thing 0271's deferral was missing.
+    ///
+    /// **Read the corpus from the tables, never from a path prefix.** "The path looks broken" and
+    /// "the path is reachable" are different questions and only the second one is worth a session
+    /// (2282's own closing note). A held item's directory is not even a column — the equipment lane
+    /// picks `Weapon`/`Shield`/`Shoulder`/`Head`/`Ammo`/`Quiver` from the slot the item is worn in
+    /// — so the sweep asks the archives which folder holds each display's basename, and expands a
+    /// helm stem into its sixteen per-race/sex files the way the attach does.
+    ///
+    /// The classes are `fxuvscan`'s, judged the same way — from the texture's own alpha through the
+    /// batch's authored address mode (INVISIBLE / NEVER / FROZEN / HELD / UNKNOWN; that command's
+    /// doc is where they are explained) — with one thing this corpus adds: a CREATURE batch's
+    /// `Monster1/2/3` sheet is **blank in the M2** and filled per display from
+    /// `CreatureDisplayInfo.textureVariation`, so one batch has as many sheets as the model has
+    /// skins and the verdict is asked once per skin. A character composite (body atlas, hair,
+    /// object skin) has no authored sheet at all and reads UNKNOWN, which is the honest answer
+    /// rather than a silent pass.
+    ///
+    /// **The load-bearing column is the CLOCK**, because it decides the SHAPE of the fix and not
+    /// merely its size:
+    ///
+    /// - **GSEQ** — every live loop rides a global sequence, a free-running per-scene clock the
+    ///   reference anchors once per instance at attach. One shared material uniform is faithful
+    ///   there; that is 0136 choice 1's lane, already built.
+    /// - **BAND** — every live loop rides its sequence band, i.e. the instance's own play head. Two
+    ///   units playing different animations, or the same one at different phases, are at different
+    ///   offsets, and no shared uniform can serve both: that is 2282's per-instance `UvLoop`.
+    /// - **MIXED** / **HOLD** — the batch's channels disagree, or it is keyed to a constant
+    ///   non-identity offset that needs a seed and no clock at all.
+    ///
+    /// Each affected batch prints its three channels (translation / rotation / scaling — a sweep
+    /// that looked only at translation would have missed `GroundingTotem_Impact` entirely, which is
+    /// scale-only), its per-axis texel reasoning, both frozen verdicts, its clock, which file
+    /// sequence slots carry the keys and what those sequences are *called*, and — where the bake
+    /// refused the shared lane — `uvslotscan`'s own `uniform()` verdict for the same set. The
+    /// report closes with every affected model sorted by POPULATION: how many table rows can put it
+    /// on screen, which is the difference between one gnome terminal and every murloc in the game.
+    ///
+    /// **And then the same corpus again for the M2COLOR TINT**, because the UV channel is not the
+    /// only one this lane drops. `build` passes `sub.rgb_anim.as_ref()` *unconditionally* — there
+    /// is no `play_rgb` to flip — so a tint-animating entity batch is seeded at the loop's first
+    /// key and then never re-sampled, because `doodad_anim::register_tint`'s only call sites (like
+    /// `register_uv`'s) are in the world streamer's `assemble.rs`. The hole is the missing
+    /// REGISTRATION, not a missing argument, which is why flipping `play_uv` alone would only
+    /// trade one frozen frame for another.
+    ///
+    /// A tint is a **multiply**, so its failure mode is the wrong colour rather than missing
+    /// geometry, and the classes say how wrong: BLACK (the frozen tint kills the batch), STRONG,
+    /// SLIGHT, NEGLIGIBLE — bands over one printed number, the worst per-channel distance between
+    /// the frozen value and anything the loop reaches. Two qualifications the raw count would
+    /// overstate without: a batch whose slot 0 bakes nothing seeds **white**, so it is the right
+    /// colour until a later slot's animation plays and wrong only *during* it (the `slots` line
+    /// names which); and the **ALPHA** channel is counted beside them precisely because this lane
+    /// DOES serve it — `attach::dress::spawn_part` gives every part a `MatAnim` that
+    /// `sample_mat_anim` ticks per instance. One of the three material-animation channels runs.
+    Entityuvscan {
+        /// Internal-path prefix filter (e.g. `creature`), case-insensitive; all reachable entity
+        /// models if omitted.
+        prefix: Option<String>,
+    },
     /// Sweep every `.m2` (optionally under a path prefix) and census the batches whose texture
     /// coordinates are **GENERATED, not authored** — the sphere-map environment stages
     /// (`texture_unit_lookup[texCoordSet] > 2`, the reference's gate at `0x70b8bd`). Such a batch
@@ -487,8 +655,8 @@ enum Command {
         prefix: Option<String>,
     },
     /// Sweep every `.m2` and census the **animation-driven sound emitters**: the models whose
-    /// sequences carry a `$DSL` (doodad sound loop) / `$DSO` (doodad sound one-shot) / `$SND`
-    /// (generic one-shot) marker, the `SoundEntries` kit each names with its 3D parameters, and —
+    /// sequences carry a `$DSL` (doodad sound loop) / `$DSE` (its release token) / `$DSO` (doodad
+    /// sound one-shot) / `$SND` (generic one-shot) marker, the `SoundEntries` kit each names with its 3D parameters, and —
     /// the column this exists for — whether the carrying sequence is REST-posed, i.e. one the
     /// render content gate (decision 0130) never builds a rig for. A placed lamp's hum is a single
     /// `$DSL` on a sequence that keys no bone at all, so the whole class is unreachable through an
@@ -806,14 +974,41 @@ fn main() -> Result<()> {
         Command::Blp {
             internal_path,
             output,
+            mips,
         } => {
             let name = normalize(&internal_path);
             let data = chain
                 .read_file(&name)
                 .with_context(|| format!("reading '{name}' from chain"))?;
-            let (w, h) = benilla_formats::blp_to_png(&data, &output)
-                .with_context(|| format!("decoding BLP '{name}'"))?;
-            eprintln!("decoded {w}x{h} -> {}", output.display());
+            if mips {
+                let stats = benilla_formats::blp_mips_to_png(&data, &output)
+                    .with_context(|| format!("decoding BLP '{name}'"))?;
+                let luma = |l: Option<(u8, f32, u8)>| match l {
+                    Some((lo, mean, hi)) => format!("{lo:>3}/{mean:>6.1}/{hi:>3}"),
+                    None => "      —       ".to_string(),
+                };
+                println!(
+                    "level  size      outside(a=0)  luma lo/mean/hi   inside(a>0)  luma lo/mean/hi   below128"
+                );
+                for s in &stats {
+                    println!(
+                        "{:>5}  {:>4}x{:<4}  {:>12}  {:>14}  {:>11}  {:>14}  {:>8}",
+                        s.level,
+                        s.width,
+                        s.height,
+                        s.outside,
+                        luma(s.outside_luma),
+                        s.inside,
+                        luma(s.inside_luma),
+                        s.below_128,
+                    );
+                }
+                eprintln!("wrote {} level(s) beside {}", stats.len(), output.display());
+            } else {
+                let (w, h) = benilla_formats::blp_to_png(&data, &output)
+                    .with_context(|| format!("decoding BLP '{name}'"))?;
+                eprintln!("decoded {w}x{h} -> {}", output.display());
+            }
         }
         Command::Dbc {
             internal_path,
@@ -831,6 +1026,7 @@ fn main() -> Result<()> {
         }
         Command::Glueextent { batches } => glueextent::glueextent(&mut chain, batches)?,
         Command::M2coll { internal_path } => m2dump::m2coll(&mut chain, &internal_path)?,
+        Command::M2cam { internal_path } => m2dump::m2cam(&mut chain, &internal_path)?,
         Command::M2seq { internal_path } => m2dump::m2seq(&mut chain, &internal_path)?,
         Command::M2events { internal_path } => m2dump::m2events(&mut chain, &internal_path)?,
         Command::M2attach { internal_path } => m2dump::m2attach(&mut chain, &internal_path)?,
@@ -852,12 +1048,18 @@ fn main() -> Result<()> {
         Command::Alphascan { prefix } => scan::alphascan(&mut chain, prefix.as_deref())?,
         Command::Fxlifescan { prefix } => scan::fxlifescan(&mut chain, prefix.as_deref())?,
         Command::Goanimscan => scan::goanimscan(&mut chain)?,
+        Command::Eventmarkerscan { prefix } => {
+            scan::eventmarkerscan(&mut chain, prefix.as_deref())?
+        }
+        Command::Goslotscan => scan::goslotscan(&mut chain)?,
         Command::Bonescan { prefix } => scan::bonescan(&mut chain, prefix.as_deref())?,
         Command::Partcensus { prefix } => scan::partcensus(&mut chain, prefix.as_deref())?,
         Command::Partslotscan { prefix } => scan::partslotscan(&mut chain, prefix.as_deref())?,
         Command::Uvslotscan { prefix } => scan::uvslotscan(&mut chain, prefix.as_deref())?,
         Command::Seqclockscan { prefix } => scan::seqclockscan(&mut chain, prefix.as_deref())?,
         Command::Uvwrapscan { prefix } => scan::uvwrapscan(&mut chain, prefix.as_deref())?,
+        Command::Fxuvscan { prefix } => scan::fxuvscan(&mut chain, prefix.as_deref())?,
+        Command::Entityuvscan { prefix } => scan::entityuvscan(&mut chain, prefix.as_deref())?,
         Command::Envmapscan { prefix } => scan::envmapscan(&mut chain, prefix.as_deref())?,
         Command::Texmodescan { prefix } => scan::texmodescan(&mut chain, prefix.as_deref())?,
         Command::Fxordercensus { prefix } => scan::fxordercensus(&mut chain, prefix.as_deref())?,
@@ -928,7 +1130,9 @@ fn main() -> Result<()> {
         Command::Spellvis { spell_id } => spellvis::run(&mut chain, spell_id)?,
         Command::Chaincensus => chaincensus::run(&mut chain)?,
         Command::Shakecensus => shakecensus::shakecensus(&mut chain)?,
+        Command::Thudcensus => thudcensus::thudcensus(&mut chain)?,
         Command::Charprocs => charprocs::run(&mut chain)?,
+        Command::Kitanim => kitanim::run(&mut chain)?,
     }
 
     Ok(())

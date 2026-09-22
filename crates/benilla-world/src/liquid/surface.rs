@@ -24,7 +24,9 @@ use bevy::pbr::ExtendedMaterial;
 use bevy::prelude::*;
 
 use super::query::{wet_footprint, FoamPatch, LiquidSource, WmoPool};
+use crate::collision::liquid_layers;
 use crate::lighting::WATER_SHININESS;
+use avian3d::prelude::{Collider, RigidBody};
 use benilla_assets::coords::wow_to_bevy;
 use benilla_assets::materials::{LiquidExt, LiquidMaterial};
 use benilla_assets::LockRecover;
@@ -292,7 +294,41 @@ pub(crate) fn spawn_liquids<'a>(
                 .entity(*entities.last().expect("just pushed"))
                 .insert(FoamPatch);
         }
+        // **The waterline the camera sweep can hit** under `cameraWaterCollision` — inert to every
+        // other query, because nothing else asks for [`CollisionLayer::Liquid`].
+        if let Some(collider) = liquid_collider(lq) {
+            commands
+                .entity(*entities.last().expect("just pushed"))
+                .insert((collider, RigidBody::Static, liquid_layers()));
+        }
     }
+}
+
+/// The **collision** shape for one [`LiquidMesh`] — the same wet-cell triangles the render mesh
+/// draws, as a parry trimesh on [`CollisionLayer::Liquid`](crate::collision::CollisionLayer).
+///
+/// `lq.indices` is already the wet derivative (6 per wet cell), so this is the waterline exactly
+/// where there is water and nothing over the dry cells of a part-flooded chunk — which is the
+/// difference between a camera that stops at a lake's edge and one that stops in mid-air over the
+/// shore. Built inline rather than through [`crate::terrain_stream::PendingCollider`]'s async pool:
+/// an MCNK layer's 9×9 lattice is at most 64 cells, 128 triangles, next to the 256 a terrain chunk
+/// defers, and a WMO pool's MLIQ is the same order.
+///
+/// `None` for a degenerate layer with no triangles, which is a real case (an MCLQ layer whose cells
+/// are all dry) and not a failure.
+fn liquid_collider(lq: &LiquidMesh) -> Option<Collider> {
+    let tris: Vec<[u32; 3]> = lq
+        .indices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|c| [c[0], c[1], c[2]])
+        .collect();
+    if tris.is_empty() {
+        return None;
+    }
+    let verts: Vec<Vec3> = lq.positions.iter().map(|p| wow_to_bevy(*p)).collect();
+    Some(Collider::trimesh(verts, tris))
 }
 
 /// Build the Bevy render mesh for one [`LiquidMesh`]: positions mapped WoW→Bevy (`lq.positions` are
@@ -354,7 +390,6 @@ fn liquid_bevy_mesh(lq: &LiquidMesh, body_color: Option<[f32; 3]>) -> Mesh {
 /// floor. A liquid footprint has no floor of its own, so an unscoped pool claims every position
 /// under its XY forever — the Uldaman entrance read as submerged under a mushroom cave's water
 /// 186 yd overhead (0696), and Undercity's upper slime submerged the rooms 115 yd below it (0701).
-#[allow(clippy::too_many_arguments)] // one param per concern: assets, placement, fog block, scope
 pub(crate) fn spawn_wmo_liquids<'a>(
     commands: &mut Commands,
     liquids: impl Iterator<Item = &'a LiquidMesh>,
@@ -439,6 +474,15 @@ pub(crate) fn spawn_wmo_liquids<'a>(
         if !lq.kind.is_fullbright() {
             commands.entity(surface).insert(FoamPatch);
         }
+        // The camera's waterline, as on the ADT path. The shape is MODEL-LOCAL here and the
+        // entity carries the placement `transform`, so avian lifts it into the world the same way
+        // it lifts the render mesh — no second bake, and a rotated pool stays consistent with the
+        // surface the player sees.
+        if let Some(collider) = liquid_collider(lq) {
+            commands
+                .entity(surface)
+                .insert((collider, RigidBody::Static, liquid_layers()));
+        }
         entities.push(surface);
     }
 }
@@ -475,7 +519,7 @@ pub(super) fn setup_liquid(
     let mut assets = LiquidAssets::default();
     for &(kind, dir, stem, count) in FRAME_SETS {
         let Some((frames, frame_count)) =
-            load_frame_array(&mut world_assets, &mut images, dir, stem, count)
+            load_frame_array(&mut world_assets, &mut images, kind, dir, stem, count)
         else {
             warn!("liquid: no frames for {stem} — {kind:?} water will not render");
             continue;
@@ -597,6 +641,7 @@ pub(super) fn setup_liquid(
 fn load_frame_array(
     world_assets: &mut WorldAssets,
     images: &mut Assets<Image>,
+    kind: LiquidKind,
     dir: &str,
     stem: &str,
     count: u32,
@@ -623,7 +668,12 @@ fn load_frame_array(
         return None;
     }
     let loaded = frames.len() as u32;
-    Some((images.add(liquid_frame_array(frames)), loaded))
+    // Flatten the per-frame DC for the WATER kinds only: mipping turns the shipped frames' drifting
+    // means into a whole-sheet brightness breath once per animation loop, which reads as a flicker on
+    // distant water. Magma/slime draw the sheet AS their body colour, where that swing is the intended
+    // pulse — so they keep theirs (`assets::flatten_frame_dc`).
+    let normalize_dc = !kind.is_fullbright();
+    Some((images.add(liquid_frame_array(frames, normalize_dc)), loaded))
 }
 
 #[cfg(test)]

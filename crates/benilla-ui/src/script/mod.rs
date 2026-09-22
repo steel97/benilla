@@ -43,20 +43,27 @@ mod auction;
 mod aura;
 mod backdrop;
 mod bank;
+mod battlefield_positions;
+mod battlefield_queue;
+mod battlefield_score;
 mod bind_confirm;
 mod binder;
 mod binding_abi;
+mod dialog_verbs;
+mod tutorial;
+mod worldmap_arrow;
 // The five camera views + FlipCameraYaw — the reference's `UIUtil\Camera.cpp` Lua surface.
 mod button;
 mod camera_view;
 mod channel;
 mod char_stats;
+mod chat_misc;
 mod chat_send;
+mod chat_types;
 mod chat_window;
 mod clip;
 mod colorselect;
 mod container;
-mod cooldown;
 mod craft;
 mod cursor;
 mod death;
@@ -80,7 +87,13 @@ mod gossip;
 mod guild;
 mod handler_prof;
 mod screenshot;
+mod tabard;
 pub use handler_prof::HandlerRow;
+
+/// The widget-method surface measurement — shared by the `dump_widget_methods` example and the
+/// widget-surface gate (decision 2142).
+mod surface;
+pub use surface::widget_method_census;
 mod inspect;
 mod item_stats;
 mod item_text;
@@ -97,10 +110,12 @@ mod measure;
 mod merchant;
 mod messageframe;
 mod minimap;
+pub mod nameplate;
+pub use nameplate::{PlateGeometry, PlateState};
 mod model;
 mod modelframe;
 mod net_stats;
-mod object;
+pub(crate) mod object;
 pub use object::frame_kind_from_tag;
 mod party;
 mod pet;
@@ -144,6 +159,9 @@ mod trainer;
 mod types;
 mod unit;
 mod weapon_enchant;
+/// The `/who` list's seven-key sort chain and its comparator — its header is the whole
+/// mechanism, including why a repeated header click reverses (decision 2030).
+mod who_sort;
 mod worldmap;
 mod worldstate;
 mod worn_display;
@@ -158,24 +176,35 @@ pub use auction::{
 pub use aura::{AuraState, TrackingState};
 pub use backdrop::{inset_atlas_bleed, pieces, Backdrop, BackdropPiece, Insets};
 pub use bank::BankState;
+pub use battlefield_positions::{BattlefieldFlagView, BattlefieldPositionView};
+pub use battlefield_queue::{BattlefieldListView, BattlefieldMapInfo, BattlefieldQueueSlot};
+pub use battlefield_score::{BattlefieldScoreRow, BattlefieldScores, BattlefieldStatColumn};
 pub use bind_confirm::PendingEquipAnswer;
 pub use camera_view::{CameraViewRequest, CAMERA_VIEW_COUNT};
+pub use channel::{ChannelCommand, ZoneChannelRow};
 pub use char_stats::{
     weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, UnitCombatStats,
     BANK_BAG_SLOT_COUNT, INVENTORY_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
 };
+pub use chat_misc::EmoteRequest;
 pub use chat_send::ChatSend;
-pub use chat_window::ChatWindowLook;
+pub use chat_types::ChatTypeColor;
+pub use chat_window::{message_group_index, ChatWindowLook, MESSAGE_GROUPS};
 pub use container::{
-    BagAutoStore, ContainerMove, ContainerSlot, ContainerState, EnchantView, PetitionSlotView,
-    RandomPropertyView, UiCursorMode,
+    BagAutoStore, ContainerMove, ContainerSlot, ContainerState, EnchantView, PendingWrap,
+    PetitionSlotView, RandomPropertyView, UiCursorMode,
 };
 pub use craft::{CraftReagent, CraftRecipe, CraftState, CraftTooltip};
+pub use cursor::money::coin_icon;
 pub use cursor::{
-    CursorAction, CursorItem, CursorMacro, CursorMerchantItem, CursorPayload, CursorPetAction,
-    CursorSpell, CursorStablePet, EnchantConfirm, WorldPick, EQUIPMENT_BAG,
+    CursorAction, CursorItem, CursorMacro, CursorMerchantItem, CursorMoney, CursorPayload,
+    CursorPetAction, CursorSpell, CursorStablePet, EnchantConfirm, WorldPick, EQUIPMENT_BAG,
 };
-pub use cvars::{MultisampleFormat, CVAR_NAMEPLATE_ENEMIES, CVAR_NAMEPLATE_FRIENDS};
+pub use cvars::{
+    MultisampleFormat, ScreenResolution, SeededCvar, VideoCaps, CVAR_FRILL_DENSITY, CVAR_GAMMA,
+    CVAR_NAMEPLATE_ENEMIES, CVAR_NAMEPLATE_FRIENDS, CVAR_WORLD_DETAIL, VIDEO_DEFAULT_CVARS,
+    WORLD_DETAIL_STOPS,
+};
 pub use death::{DeathAction, DeathUiState};
 pub use dressup::DressUpIntent;
 pub use duel::DuelRequest;
@@ -186,11 +215,18 @@ pub use guild::{
     GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildRequest, GuildState, LastOnline, UnitGuild,
     MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
 };
+pub use modelframe::ModelPaneFrame;
 pub use petition::{
     validate_guild_name, PetitionRecordView, PetitionRequest, PetitionState, PETITION_TYPE_CHARTER,
     PETITION_TYPE_PETITION,
 };
+pub use tabard::{
+    emblem_mask_path, TabardHost, TabardIntent, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
+    TABARD_CREATION_COST,
+};
+pub use worldmap_arrow::ARROW_MODEL;
 
+pub(crate) use button::{set_label_font_justify_h_lua, LabelFont};
 pub use inspect::{InspectView, UnitReach};
 pub use item_stats::{item_usable, ItemSetView, ItemTemplateView, PlayerReqState};
 pub use item_text::ItemTextState;
@@ -198,16 +234,18 @@ pub use layout_cache::{FrameLayout, LayoutPoint};
 pub use loot::{LootRow, LootState};
 pub use loot_roll::{LootRollEntry, LootRollsState};
 pub use macros::{MacroState, MacroView, MAX_MACROS, MAX_MACRO_BODY, MAX_MACRO_NAME};
-pub use mail::{MailInboxRow, MailInvoice, MailSendRequest, MailState};
+pub use mail::{MailInboxRow, MailInvoice, MailSendRequest, MailState, StationeryView};
 pub use measure::TextMeasure;
 pub use merchant::{ItemStatsHead, MerchantItem, MerchantState};
 pub(crate) use minimap::apply_model_attrs as apply_minimap_model_attrs;
 pub(crate) use model::Model;
-pub use model::{TextureProbe, TextureSizeProbe};
+pub use model::{FontProbe, TextureProbe, TextureSizeProbe};
 pub use party::{PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, SavedInstanceInfo};
 pub use pet::{PetActionView, PetStats};
 pub use pvp::{HonorState, InspectHonorData};
-pub use quest::{QuestAction, QuestItemView, QuestPanel, QuestSelect, QuestState};
+pub use quest::{
+    QuestAction, QuestItemView, QuestPanel, QuestRewardSpell, QuestSelect, QuestState,
+};
 pub use quest_log::{QuestLogDetail, QuestLogEntryView, QuestLogObjectiveView, QuestLogState};
 pub(crate) use region::{apply_font_parts, implicit_creation_anchor_lua};
 pub use reputation::{FactionEntry, ReputationSend, ReputationState};
@@ -219,7 +257,7 @@ pub(crate) use simplehtml::{
 };
 pub use skills::{SkillEntry, SkillsState};
 pub use social::{FriendInfo, SocialRequest, SocialState, WhoInfo};
-pub use sound::SoundRequest;
+pub use sound::{MusicRequest, SoundRequest};
 pub use spellbook::{
     resolve_spell_by_name, PetBookState, SpellBookState, SpellSlotView, SpellTabView,
 };
@@ -235,15 +273,17 @@ pub use trainer::{
     TrainerState, TrainerTooltip, TRAINER_GROUP_KNOWN,
 };
 pub use types::{
-    EditAction, EditBoxTextUi, EditOutcome, EditUnit, ExtractedQuad, FontObject, FontShadow,
-    Gradient, JustifyH, JustifyV, LineMeasureRequest, MeasureRequest, Outline, QuadContent,
-    ScriptValue, TexCoords,
+    BlendMode, EditAction, EditBoxTextUi, EditOutcome, EditUnit, ExtractedQuad, FontObject,
+    FontShadow, Gradient, JustifyH, JustifyV, LineMeasureRequest, MeasureRequest, Outline,
+    QuadContent, ScriptValue, TexCoords,
 };
 pub(crate) use types::{FontExplicit, MeasuredText, RegionData};
 pub use unit::{
-    grey_band, level_reads_unknown, power_token, unit_is_grey, SelectionRequest, UnitState,
+    grey_band, level_reads_unknown, power_token, unit_is_grey, PlayerRecord, SelectionRequest,
+    UnitState,
 };
 pub use weapon_enchant::WeaponEnchant;
+pub use who_sort::{WhoSortChain, WhoSortKey};
 pub use worldmap::{
     WorldMapContinentView, WorldMapLandmarkView, WorldMapOverlayView, WorldMapState,
     WorldMapZoneView,
@@ -308,11 +348,20 @@ pub(crate) const REGION_LEAF_SHARED: [&str; 9] = [
 /// has `SetGradientAlpha` where FontString has `SetAlphaGradient`: a near-miss pair, and we install
 /// only the FontString one.
 ///
-/// The tail three are OURS, not 1.12's, and are parked here rather than pruned: `SetPortraitToTexture`
-/// and `SetRotation` are texture verbs the carve's 22 does not list, and `SetSize` is an Era
-/// geometry verb absent from the Region map. Removing a superset is a separate question per name —
-/// this landing partitions, it does not prune.
-pub(crate) const TEXTURE_ONLY_METHODS: [&str; 11] = [
+/// **Every name here is the client's own now.** Three of ours were parked in this list pending a
+/// per-name check, and all three are gone: `SetRotation` (1.12 registers it only on PlayerModel,
+/// `0x84f1fc`/`0x505f00`, and the world-map arrow that justified it is a Model frame now — see
+/// `region/paint.rs` at its old site), `SetPortraitToTexture` (1.12 has it as an engine GLOBAL,
+/// never a Texture method — `region.rs` registers it there, and a test pins the absence), and
+/// `SetSize`, the Era geometry verb that was in neither client map and that nothing outside our
+/// own test scaffolding called (decision 2142's census). The 1244/1245 landing partitioned rather
+/// than pruned and said the pruning was a separate question per name; this is the answer to three
+/// of them.
+///
+/// Going the other way: `GetBlendMode`, `SetTexCoordModifiesRect` and `GetTexCoordModifiesRect`
+/// joined the list, all three of them in the client's Texture map `0x87c128` (`0x79a890` /
+/// `0x79c080` / `0x79c120`), and all three of them missing here until then.
+pub(crate) const TEXTURE_ONLY_METHODS: [&str; 12] = [
     "SetGradient",
     "SetGradientAlpha",
     "GetTexture",
@@ -320,22 +369,22 @@ pub(crate) const TEXTURE_ONLY_METHODS: [&str; 11] = [
     "GetTexCoord",
     "SetTexCoord",
     "SetBlendMode",
+    "GetBlendMode",
+    "SetTexCoordModifiesRect",
+    "GetTexCoordModifiesRect",
     "SetDesaturated",
     "GetVertexColor",
-    "SetRotation",
-    "SetSize",
 ];
 
 /// **FontString-only** — the font/text/justify/shadow block plus the string metrics.
 ///
-/// The tail two are OURS: `SetFormattedText` is not in the client's 32, and `SetSize` is the same
-/// Era geometry verb the Texture list carries. Parked, not pruned, pending their own checks.
-///
-/// `GetStringHeight` was here and is GONE (1251's first prune): byte-verified absent from 1.12 in
-/// every encoding, ours was a byte-identical duplicate of `GetHeight`, and every call site — two of
-/// our own XML files, two tests, and `Button:GetTextHeight`'s delegate — now goes through the
-/// Region method the reference itself uses.
-pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 23] = [
+/// **Every name here is the client's own now.** Three of ours were parked in this list:
+/// `GetStringHeight` went first (1251 — byte-verified absent, and ours was a byte-identical
+/// duplicate of `GetHeight`), and `SetFormattedText` (not among the client's 32) and
+/// `SetSize` (the Era geometry verb the Texture list carried too) went with 2142's census, which
+/// found neither in the stock chain nor in either addon corpus. The era spelling of
+/// `SetFormattedText` is `SetText(format(fmt, ...))`; of `SetSize`, `SetWidth` + `SetHeight`.
+pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 21] = [
     "SetFont",
     "GetFont",
     "SetFontObject",
@@ -357,8 +406,6 @@ pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 23] = [
     "SetNonSpaceWrap",
     "CanNonSpaceWrap",
     "SetAlphaGradient",
-    "SetFormattedText",
-    "SetSize",
 ];
 
 pub(crate) const REGION_MAP_METHODS: [&str; 19] = [
@@ -398,7 +445,10 @@ pub const SCREEN: crate::layout::Handle = 0;
 /// each kind dispatching to its own value-changed slot. The eight
 /// `On*Pressed`/text/focus slots are the EditBox's specialized scripts (RF-0082 §2): a focused EditBox
 /// fires ONLY these, never generic `OnKeyDown`/`OnChar` (its C++ override replaces those slots).
-/// `OnVerticalScroll`/`OnScrollRangeChanged` are the ScrollFrame's own slots (decision 0112).
+/// `OnHorizontalScroll`/`OnVerticalScroll`/`OnScrollRangeChanged` are the ScrollFrame's own slots
+/// (decision 0112; the reference's `[+0x32c]`/`[+0x334]`/`[+0x33c]`, script-name map `0x786c40`).
+/// `OnHorizontalScroll` joined the other two with the horizontal offset pair — it is fired by
+/// `SetHorizontalScroll`, which is what earns it the row below.
 /// `OnDragStart`/`OnDragStop`/`OnReceiveDrag` are the drag trio (decision 0216 §3) — driven by
 /// `RegisterForDrag` + the same mouse path as the six mouse handlers above, not a separate one.
 /// `OnColorSelect` is the ColorSelect's own slot (RF-28 `+0x338`), fired by its `SetColorRGB`.
@@ -423,10 +473,15 @@ pub const SCREEN: crate::layout::Handle = 0;
 /// corpus call sites across 91 addons); it removes working behaviour from the 23 sites that remain,
 /// so it is still a change to make deliberately rather than as a side effect of widening this list
 /// — but the FrameXML half of "with FrameXML fixed first" is most of the way there now.
-const SCRIPT_KINDS: [&str; 35] = [
+const SCRIPT_KINDS: [&str; 39] = [
     "OnLoad",
     "OnEvent",
     "OnUpdate",
+    // The model pane's two: fired by the tick's model pass — `OnUpdateModel` at the top of every
+    // paint of a visible pane, `OnAnimFinished` when a clamped sequence completes (decision 2007;
+    // `object::events_regions::set_script`'s doc has the sites).
+    "OnUpdateModel",
+    "OnAnimFinished",
     "OnShow",
     "OnHide",
     "OnClick",
@@ -442,8 +497,14 @@ const SCRIPT_KINDS: [&str; 35] = [
     "OnTabPressed",
     "OnTextChanged",
     "OnTextSet",
+    // The caret flush's own (`0x77da80`), fired by the tick's `drain_cursor_changed` when the
+    // caret has moved — the edge `ScrollingEdit_OnCursorChanged` + `ScrollingEdit_OnUpdate` scroll
+    // a multiline box by. It earns its row here the way this list's rule requires: together with
+    // the code that fires it (decisions 2135/2141).
+    "OnCursorChanged",
     "OnEditFocusGained",
     "OnEditFocusLost",
+    "OnHorizontalScroll",
     "OnVerticalScroll",
     "OnScrollRangeChanged",
     "OnDragStart",
@@ -553,6 +614,8 @@ impl UiScript {
         addon::install(&lua)?;
         addon_message::install(&lua)?;
         chat_send::install(&lua)?;
+        chat_types::install(&lua)?;
+        chat_misc::install(&lua)?;
         channel::install(&lua)?;
         chat_window::install(&lua)?;
         client::install(&lua)?;
@@ -596,6 +659,12 @@ impl UiScript {
         spellbook::install(&lua)?;
         macros::install(&lua)?;
         talent::install(&lua)?;
+        dialog_verbs::install(&lua)?;
+        battlefield_score::install(&lua)?;
+        battlefield_queue::install(&lua)?;
+        battlefield_positions::install(&lua)?;
+        tutorial::install(&lua)?;
+        worldmap_arrow::install(&lua)?;
         shapeshift::install(&lua)?;
         pet::install(&lua)?;
         gossip::install(&lua)?;
@@ -610,6 +679,7 @@ impl UiScript {
         trade::install(&lua)?;
         inspect::install(&lua)?;
         dressup::install(&lua)?;
+        tabard::install(&lua)?;
         tradeskill::install(&lua)?;
         craft::install(&lua)?;
         reputation::install(&lua)?;
@@ -628,7 +698,6 @@ impl UiScript {
         colorselect::install(&lua)?;
         minimap::install(&lua)?;
         modelframe::install(&lua)?;
-        cooldown::install(&lua)?;
         tooltip::install(&lua)?;
         worldmap::install(&lua)?;
         worldstate::install(&lua)?;
@@ -652,11 +721,25 @@ impl UiScript {
 
     /// **Which VM this is** — a fresh number for every [`UiScript::new`], never reused.
     ///
-    /// The client destroys its Lua state at logout and builds another at the next world entry
-    /// (the reference's own `0x490bd0` ↔ `0x48fbf0` pair), so a host that remembers *what it last
-    /// pushed into the VM* is remembering something that may no longer exist. Anything the host
-    /// seeded — a registry, a catalog, a change-detection memo — is only valid for the session it
-    /// was seeded into, and this number is what says so.
+    /// The client destroys its Lua state and builds another several times over a login cycle, so a
+    /// host that remembers *what it last pushed into the VM* is remembering something that may no
+    /// longer exist. Anything the host seeded — a registry, a catalog, a change-detection memo — is
+    /// only valid for the session it was seeded into, and this number is what says so.
+    ///
+    /// **The addresses, corrected** (2226; this doc carried `0x490bd0` ↔ `0x48fbf0` from 1290 and
+    /// that pair is wrong). `ds:0xceef74` is a single global *slot* holding successive instances,
+    /// written at exactly two sites image-wide: `0x7039ed` opens, `0x703bab` closes. The reset
+    /// choke point `0x703b80` closes-if-present and then **tail-jmps** into the open — which is why
+    /// a `call`-only census of it reads "one state per process" and is wrong. Its three callers are
+    /// `0x48fe97` (inside `UI_Init 0x48fbf0`, unconditional), `0x491231` (`ShutdownGame`,
+    /// unconditional) and `0x46a87b` (the glue builder, gated on its arg). `0x490bd0` destroys the
+    /// frame-script *owner object* (`0x490c97`, vtable `0x81c380` slot+4 = `0x764360`) and nils the
+    /// 216 bindings; it never touches `ds:0xceef74`.
+    ///
+    /// So the boundary is `0x48fe97` ↔ `0x491231`/`0x46a87b`: **the rebuild replaces the state, the
+    /// teardown does not** — and the rebuild lives *inside* the function that loads FrameXML, which
+    /// is why benilla's world entry mints its VM at the top of its own load (2226) rather than
+    /// adopting the character screen's. GlueXML and FrameXML never share an instance.
     ///
     /// A host keying its memory on this cannot go stale by omission: a new VM simply does not
     /// match, so the seed happens again. That is the property, and it is why this is a VM-side fact
@@ -755,6 +838,9 @@ impl UiScript {
         }
         model.screen = new;
         model.touch_layout();
+        drop(model);
+        // The implicit rects are measured in layout units, which follow the aspect (2015).
+        self.reapply_implicit_rects();
         true
     }
 
@@ -764,17 +850,8 @@ impl UiScript {
     /// a click handler's modifier fork (the reference's shift-split / ctrl-dressup /
     /// shift-pickup) reads the state as of the click.
     pub fn set_modifiers(&mut self, shift: bool, ctrl: bool, alt: bool) {
-        let shift_was = {
-            let mut model = self.model_mut();
-            let was = model.modifiers.0;
-            model.modifiers = (shift, ctrl, alt);
-            was
-        };
-        // The shift EDGE drives the shopping-compare tooltips (0274 P4): press over a live
-        // equippable item hover fires SHOW_COMPARE_TOOLTIP, release hides the pair.
-        if shift_was != shift {
-            tooltip_item::on_shift_edge(&self.lua, shift);
-        }
+        let mut model = self.model_mut();
+        model.modifiers = (shift, ctrl, alt);
     }
 
     /// Push the player's WMO-containment state onto every Minimap widget (the client's `0xceaa60`).
@@ -842,7 +919,7 @@ impl UiScript {
     ///
     /// One field, not one per widget: there is exactly one ping (decision 1596), and the old
     /// per-widget push walked the whole ~3k-frame arena every frame a ping was live.
-    pub fn set_minimap_ping(&mut self, ping: Option<(f32, f32)>) {
+    pub fn set_minimap_ping(&mut self, ping: (f32, f32)) {
         self.model_mut().minimap_ping = ping;
     }
 
@@ -931,6 +1008,28 @@ impl UiScript {
     /// Load and evaluate a Lua chunk, returning its result. Primarily for tests / one-shot queries.
     pub fn eval<T: mlua::FromLuaMulti>(&self, chunk: &str) -> mlua::Result<T> {
         self.lua.load(chunk).set_mode(mlua::ChunkMode::Text).eval()
+    }
+
+    /// **How many values does `expr` return?** — the return-shape question, asked at the host
+    /// boundary instead of inside Lua.
+    ///
+    /// This is what `select('#', expr)` used to answer in ~170 of our own tests. `select` is not a
+    /// 1.12 global and is gone (`lua50::install`), and the replacement is not a workaround: a
+    /// binding's arity is a fact about the **binding ABI**, and on this side of it a multiple
+    /// return already *is* a `MultiValue` whose length nothing can round off. It keeps the property
+    /// the arity gates rest on — **zero values and one `nil` are different answers**, `0` and `1`
+    /// (`binding_abi`'s §2), which is exactly what a `Option<T>` return type cannot tell apart.
+    ///
+    /// `expr` is a Lua **expression**, not a chunk: pass `"GetItemInfo(1)"`, not `"return …"`.
+    /// A raise propagates — a call that errors has no arity, and swallowing that into `0` is how a
+    /// broken binding scores as a zero-return verb.
+    ///
+    /// The one place this cannot serve is a probe that has to hold the count *inside* Lua (a
+    /// `pcall` loop over generated calls, as `shape_gate` runs). There the 5.0 spelling is 1.12's
+    /// own and reads the same: `(function(...) return arg.n end)(expr)`.
+    pub fn arity(&self, expr: &str) -> mlua::Result<usize> {
+        let values: mlua::Variadic<mlua::Value> = self.eval(&format!("return {expr}"))?;
+        Ok(values.len())
     }
 
     /// The owning frame's name for an [`ExtractedQuad`] target — a debugging affordance for
@@ -1027,6 +1126,32 @@ impl UiScript {
     /// holds the `OnLoad` `Function` directly (to fire it bottom-up) rather than through the registry:
     /// this keeps the convention in one home instead of duplicating it. Errors are returned so the
     /// caller routes them (the loader records them in its own report).
+    /// Whether the frame with this global name is effectively visible — shown, with every ancestor
+    /// shown (`IsVisible()`'s answer, read host-side). `false` for a name no live frame carries.
+    /// The read side of a window for a host that keeps state per window: the dressing-room feed
+    /// empties its booth when `DressUpFrame` hides, and the stock file has no hook of ours in its
+    /// OnHide to say so (1969). A linear scan, like [`Self::model_pane`], for the same reason.
+    pub fn frame_visible(&self, name: &str) -> bool {
+        self.model_ref()
+            .arena
+            .iter_frames()
+            .any(|(_, f)| f.name.as_deref() == Some(name) && f.effective_visible)
+    }
+
+    /// The effective alpha of the frame with this global name while it is effectively visible,
+    /// `None` when it is hidden or no live frame carries the name. The read side of a frame whose
+    /// pixels a host draws for the engine: the stock `MiniMapPing` is a `<Model>` this engine
+    /// renders nothing for, so the app's ping sprite follows the frame's own show/hide and alpha
+    /// — the lifetime the reference's `Minimap.lua` owns — instead of keeping a clock of its own
+    /// (1974). A linear scan, like [`Self::frame_visible`].
+    pub fn frame_effective_alpha(&self, name: &str) -> Option<f32> {
+        self.model_ref()
+            .arena
+            .iter_frames()
+            .find(|(_, f)| f.name.as_deref() == Some(name) && f.effective_visible)
+            .map(|(_, f)| f.effective_alpha)
+    }
+
     /// Resolve every frame's rect: sync each frame's effective scale from the arena into its layout
     /// input, run the [`crate::layout`] graph (screen root as the external base), and cache the
     /// resolved rects. `GetWidth`/`GetHeight`/`extract` read this cache.
@@ -1187,7 +1312,14 @@ impl UiScript {
             self.fire_drag_stop(source);
         }
         let mut model = self.model_mut();
+        let held: Vec<crate::widget::FrameHandle> = model.mouse_down_on.values().copied().collect();
         model.mouse_down_on.clear();
+        // Every button that capture was holding down goes back to NORMAL — the release edge the
+        // OS never fed us (`0x7793de`), without which a button walked off the window edge
+        // mid-press keeps its pushed art for the rest of the session.
+        for h in held {
+            button::edge(&mut model, h, crate::widget::ButtonState::on_mouse_up);
+        }
         // …and its one-slot twin `root+0x80`, which the mouse-down raise reads: a capture left
         // behind would aim the next press's raise at whatever the pointer was last holding.
         model.mouse_capture = None;
@@ -1292,6 +1424,21 @@ impl UiScript {
             .is_some_and(|h| model.arena.frame(h).is_some_and(|f| f.effective_visible))
     }
 
+    /// **Which** EditBox holds the focus, by name — [`Self::has_keyboard_focus`] answers
+    /// *whether*. Unfiltered by visibility, because the focus cell itself is: a box that hides
+    /// while focused keeps the cell until something clears it, and the tests that watch the
+    /// hand-off between two boxes are watching exactly that cell.
+    ///
+    /// This is the host-side read of `Model::focused_editbox`. There is no Lua verb for it and
+    /// there must not be: 1.12's EditBox table has `SetFocus`/`ClearFocus` and no getter, which
+    /// is why `pfQuest/browser.lua:760` ships its own focus flag rather than asking (decision
+    /// 2142).
+    pub fn focused_editbox_name(&self) -> Option<String> {
+        let model = self.model_ref();
+        let h = model.focused_editbox?;
+        model.arena.frame(h)?.name.clone()
+    }
+
     /// How many resolves the layout change gate has let through (`Model::layout_solves`) — the
     /// gate's effectiveness, readable by tests and the app's cost meters (a per-frame delta of 0
     /// means the fingerprint judged the frame quiet).
@@ -1384,6 +1531,8 @@ impl UiScript {
         if let Some(h) = model.arena.lookup(name) {
             return model.arena.frame(h).map(|f| match f.kind {
                 crate::widget::FrameKind::Frame => "Frame",
+                // A `Frame` to Lua (1984): the registered name never becomes a class identity.
+                crate::widget::FrameKind::WorldFrame => "Frame",
                 crate::widget::FrameKind::Button => "Button",
                 crate::widget::FrameKind::CheckButton => "CheckButton",
                 // `GetObjectType 0x495b60` is two instructions and returns `"LootButton"`
@@ -1395,6 +1544,8 @@ impl UiScript {
                 crate::widget::FrameKind::ScrollFrame => "ScrollFrame",
                 crate::widget::FrameKind::Model => "Model",
                 crate::widget::FrameKind::PlayerModel => "PlayerModel",
+                crate::widget::FrameKind::DressUpModel => "DressUpModel",
+                crate::widget::FrameKind::TabardModel => "TabardModel",
                 crate::widget::FrameKind::MessageFrame => "MessageFrame",
                 crate::widget::FrameKind::ScrollingMessageFrame => "ScrollingMessageFrame",
                 crate::widget::FrameKind::ColorSelect => "ColorSelect",
@@ -1402,7 +1553,6 @@ impl UiScript {
                 crate::widget::FrameKind::MovieFrame => "MovieFrame",
                 crate::widget::FrameKind::GameTooltip => "GameTooltip",
                 crate::widget::FrameKind::Minimap => "Minimap",
-                crate::widget::FrameKind::Cooldown => "Cooldown",
             });
         }
         // The region leaves publish into their own name table (`region_names`), not the arena's —
@@ -1449,14 +1599,15 @@ impl UiScript {
     /// Its silent sibling is [`Self::report_load_failure`] (decision 1495) — same retention, no
     /// dispatch, for the load failures that never raise at all.
     pub fn report_script_error(&self, msg: &str) {
-        let mut model = self.model_mut();
         // Retained as a **Load** row, not an Error one (decision 1495): every caller of this is
         // the load walk, and from the player's side "the addon's file scope raised" and "the
-        // addon's file was missing" are the same fact — the addon is not running.
-        model
-            .diagnostics
-            .record(diagnostics::DiagnosticKind::Load, msg);
-        model.pending_error_dispatch.push(msg.to_string());
+        // addon's file was missing" are the same fact — the addon is not running. The retention
+        // half is `diagnostics::record_load_failure`, shared with the demand-load path so the
+        // rule has one implementation (2107); the dispatch is what makes this the loud sibling.
+        diagnostics::record_load_failure(&self.lua, msg);
+        self.model_mut()
+            .pending_error_dispatch
+            .push(msg.to_string());
     }
 
     /// Hand every queued script error to the Lua-side error handler — the reference's own shape:

@@ -10,9 +10,15 @@
 //! decorative: it keys the deposit rate the sell pane displays, and the six faction houses charge
 //! 5% where the neutral goblin house charges 25%.
 //!
-//! **Three lists, one session.** Browse (`"list"`), Bids (`"bidder"`) and Auctions (`"owner"`) are
-//! three independent server queries into one window. Each holds at most one 50-row page — the
-//! server's own cap — plus the pre-cap match count the pager needs, plus its own sort stack.
+//! **Three lists, one session — and three separate events.** Browse (`"list"`), Bids (`"bidder"`)
+//! and Auctions (`"owner"`) are three independent server queries into one window. Each holds at
+//! most one 50-row page — the server's own cap — plus the pre-cap match count the pager needs,
+//! plus its own sort stack, plus its own update event. The reference keeps them just as far apart
+//! (wow-re's auction node §1: three arrays, three counts, three sort stacks, and a fire-site
+//! census in which every `AUCTION_*_LIST_UPDATE` is fired by whatever just touched *its* array).
+//! So a list-update event here is a statement about **one** list; firing the other two runs the
+//! stock addon's other tabs over state they were never given, and the Auctions tab answers that
+//! by crashing (decision 2308).
 //!
 //! **Sorting is ours and paging is the server's**, which is the split that shapes this module: a
 //! header click re-orders rows we already hold and sends nothing ([`sort`]), while a page turn
@@ -24,7 +30,8 @@
 //! refusal. The window opening clears the gate, so the first search is always allowed. (INTERIM,
 //! decision 1511 — pinned to the in-flight §5's TU-2.)
 //!
-//! The net bridge ([`crate::net::apply::auction`]) fills [`AuctionOpen`] from the wire. Each frame
+//! The packet handlers ([`net`], in the net handler table — decision 2305) fill [`AuctionOpen`]
+//! from the wire. Each frame
 //! [`feed_auction`] resolves each [`AuctionListEntry`] to a Lua-facing row (name/quality/icon via
 //! the ask-once item-template cache + `ItemDisplayInfo.dbc`, seller via the ask-once name cache,
 //! the time-left bucket from the wire's milliseconds), applies the sort, pushes the snapshot, and
@@ -49,12 +56,14 @@ use crate::items::Items;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, NetCommands, ObjectStore, SelfPlayer};
 use crate::ui_action::{show_messages, ui_error_text, MessageSink, Shown, UiError};
-use crate::ui_script::UiInput;
+use crate::ui_script::{UiFeed, UiInput};
 use crate::ui_session::{close_npc_session_out_of_range, NpcSession};
 
 mod sort;
 
 use sort::SortStack;
+
+mod net;
 
 /// The browse query rate limit, in seconds. **VERIFIED** (wow-re §5 TU-2): the reference arms the
 /// gate with `tick + 0x1388` *after* the packet goes out, re-checks it inside the query itself,
@@ -161,6 +170,11 @@ pub(crate) struct AuctionListSlot {
     pub(crate) entries: Vec<AuctionListEntry>,
     /// `totalCount` — the pre-cap match count, which is what tells the pager there is a page 2.
     pub(crate) total: u32,
+    /// A result for **this** list has landed since the window opened — the interface asked for it
+    /// and the server answered. `false` is "we hold no such list", which is *not* "the list is
+    /// empty": an empty page still arrives, and still counts. It is what the server-driven
+    /// refreshes gate on (decision 2308).
+    received: bool,
     sort: SortStack,
 }
 
@@ -206,15 +220,23 @@ pub(crate) struct AuctionOpen {
     show_requested: bool,
     /// Fire `NEW_AUCTION_UPDATE` next feed — the sell slot changed.
     sell_slot_dirty: bool,
-    /// A list result landed, so the list events are owed **whether or not the snapshot changed**.
+    /// A list result landed **for that list**, so *its* event is owed whether or not the snapshot
+    /// changed. Indexed [`LIST`]/[`BIDDER`]/[`OWNER`].
     ///
     /// Diffing the snapshot is not enough and the live probe is what proved it: an empty auction
     /// house, or re-running the same search, produces a result identical to what we already hold.
     /// The window's Browse pane clears its "Searching…" state only on `AUCTION_ITEM_LIST_UPDATE`,
-    /// so on an empty server a search animated its dots forever and never reported a result. The
-    /// reference has no diff here at all — one routine invalidates all three lists and fires all
-    /// three events.
-    list_result_landed: bool,
+    /// so on an empty server a search animated its dots forever and never reported a result.
+    ///
+    /// **Per list — that is the whole point** (decision 2308). This was one flag driving all three
+    /// fires, on 1511's reading that "one routine invalidates all three lists". The reference has
+    /// no such routine: three arrays, three counts, three sort stacks, **three separate events**,
+    /// each fired by whatever just touched *its* array. Firing the other two crashed the stock
+    /// `Blizzard_AuctionUI` outright — `AuctionFrameAuctions_Update` multiplies by
+    /// `AuctionFrameAuctions.page`, which the addon initialises only in that tab's `OnShow`, so a
+    /// browse result arriving while the player had never opened the Auctions tab raised
+    /// `attempt to perform arithmetic on field 'page' (a nil value)`.
+    list_result_landed: [bool; 3],
     /// Empty the sell slot next feed — a listing was accepted, so the staged item is *gone*.
     ///
     /// Also from the probe: without this the pane kept painting a phantom stack after a successful
@@ -301,10 +323,11 @@ impl AuctionOpen {
         self.show_requested = true;
     }
 
-    /// Replace one list's page. Always owes the list events, even for an identical page.
+    /// Replace one list's page. Always owes **that list's** event, even for an identical page.
     pub(crate) fn set_list(&mut self, which: usize, entries: Vec<AuctionListEntry>, total: u32) {
-        self.list_result_landed = true;
+        self.list_result_landed[which] = true;
         let slot = &mut self.lists[which];
+        slot.received = true;
         slot.entries = entries;
         // A server that reports fewer total matches than it just sent us is not a case worth
         // trusting over our own eyes; the pager reads the larger of the two.
@@ -326,13 +349,20 @@ impl AuctionOpen {
     }
 
     /// Mark our own listings stale — the drain re-queries next frame.
+    ///
+    /// **Only a list we hold can be stale** (decision 2308). A notification says "the page you are
+    /// showing is now wrong"; if the interface has never asked for the owned list, there is no
+    /// such page, and re-asking would *introduce* one — landing an `AUCTION_OWNED_LIST_UPDATE` on
+    /// a tab whose `page` field the stock addon has not initialised yet. The reference cannot
+    /// reach that state at all: its notification handlers patch the cached row in place, so an
+    /// array it never fetched has nothing to patch and announces nothing.
     pub(crate) fn refresh_owner(&mut self) {
-        self.pending_owner_refresh = true;
+        self.pending_owner_refresh |= self.lists[OWNER].received;
     }
 
-    /// Mark the bids we hold stale.
+    /// Mark the bids we hold stale — under the same rule as [`Self::refresh_owner`].
     pub(crate) fn refresh_bidder(&mut self) {
-        self.pending_bidder_refresh = true;
+        self.pending_bidder_refresh |= self.lists[BIDDER].received;
     }
 
     /// Close the window (a client-side close — vanilla sends nothing).
@@ -345,7 +375,7 @@ impl AuctionOpen {
         self.query_gate = None;
         self.pending_owner_refresh = false;
         self.pending_bidder_refresh = false;
-        self.list_result_landed = false;
+        self.list_result_landed = [false; 3];
         self.sell_slot_taken = false;
     }
 
@@ -371,6 +401,7 @@ pub(crate) struct UiAuctionPlugin;
 
 impl Plugin for UiAuctionPlugin {
     fn build(&self, app: &mut App) {
+        net::register(app);
         app.init_resource::<AuctionOpen>().add_systems(
             Update,
             (
@@ -380,7 +411,16 @@ impl Plugin for UiAuctionPlugin {
                 // out the same frame. After the UnitFeed set so a row's tooltip reads a landed
                 // item-template store.
                 close_npc_session_out_of_range::<AuctionOpen>.before(feed_auction),
-                feed_auction.after(crate::ui_unit::UnitFeed).before(UiInput),
+                // Gated on the interface being up (decision 2279): `AuctionOpen::messages` is
+                // filled by the server's unprompted sold/outbid/expired notices, and one landing
+                // in the same drain as the login burst would be resolved and shown on the boot
+                // VM — lost — if this ran in 2214's one-frame window. The queue is bounded by
+                // what the server sends while no interface is up, and the refresh flags the same
+                // packets set survive as wire re-asks either way.
+                feed_auction
+                    .after(crate::ui_unit::UnitFeed)
+                    .in_set(UiFeed)
+                    .run_if(crate::ui_script::ingame_ui_up),
                 drain_auction.after(UiInput),
             ),
         );
@@ -411,13 +451,12 @@ fn time_left_bucket(ms: u32) -> u32 {
 /// row's full enchant/property/suffix tail (an auction row carries all three, so it gets the
 /// complete link rather than the zeroed one a bag slot settles for). `None`s stay `None` while a
 /// query is in flight — the row shows a placeholder and fills in when the answer lands.
-#[allow(clippy::too_many_arguments)] // one resolve per ask-once cache the row reads
 fn resolve_row(
     entry: &AuctionListEntry,
     self_guid: Option<u64>,
-    items: &mut Items,
+    items: &Items,
     icons: Option<&ItemDisplays>,
-    names: &mut NameCache,
+    names: &NameCache,
     commands: &NetCommands,
     rolls: crate::items::RollCatalogs,
 ) -> AuctionRow {
@@ -464,7 +503,9 @@ fn resolve_row(
 }
 
 /// Build the Browse tab's category tree from the player's own DBCs (decision 1511 §5).
-fn categories(
+/// `pub(crate)`: the addon-corpus survey seats the same tree off the player's chain (2167), and a
+/// second copy of the class set would be a second thing to keep right.
+pub(crate) fn categories(
     classes: Option<&crate::ui_items::ItemClasses>,
     subclasses: Option<&crate::ui_items::ItemSubClasses>,
 ) -> Vec<AuctionCategory> {
@@ -505,13 +546,12 @@ fn categories(
 }
 
 /// Resolve + sort one list into its display rows.
-#[allow(clippy::too_many_arguments)] // one resolve per ask-once cache the row reads
 fn rows_for(
     slot: &AuctionListSlot,
     self_guid: Option<u64>,
-    items: &mut Items,
+    items: &Items,
     icons: Option<&ItemDisplays>,
-    names: &mut NameCache,
+    names: &NameCache,
     commands: &NetCommands,
     rolls: crate::items::RollCatalogs,
 ) -> Vec<AuctionRow> {
@@ -559,13 +599,12 @@ type AuctionCatalogs<'w> = (
 
 /// Push the current auction house into the VM and fire the show/close/list-update events on a
 /// transition or content change. Diffed against a `VmMemo`, exactly like the merchant/mail feeds.
-#[allow(clippy::too_many_arguments)] // one parameter per ask-once cache a row reads
 fn feed_auction(
     script: Option<NonSendMut<UiScript>>,
     mut auction: ResMut<AuctionOpen>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     icons: Option<Res<ItemDisplays>>,
-    mut names: ResMut<NameCache>,
+    names: Res<NameCache>,
     commands: Res<NetCommands>,
     time: Res<Time>,
     catalogs: AuctionCatalogs,
@@ -576,6 +615,7 @@ fn feed_auction(
     mut last_open: Local<crate::ui_script::VmMemo<Option<u64>>>,
     mut last_can_query: Local<crate::ui_script::VmMemo<bool>>,
     mut last_sell: Local<crate::ui_script::VmMemo<Option<(i64, u32)>>>,
+    mut last_classes: Local<crate::ui_script::VmMemo<Vec<AuctionCategory>>>,
 ) {
     let Some(mut script) = script else {
         return;
@@ -584,6 +624,17 @@ fn feed_auction(
     let last_open = last_open.get(&script);
     let last_can_query = last_can_query.get(&script);
     let last_sell = last_sell.get(&script);
+
+    // The Browse tab's class tree is login-scoped: the stock `AuctionFrameBrowse_OnLoad` reads
+    // `GetAuctionItemClasses()` at the addon's LOAD — the first auctioneer, before the session's
+    // snapshot lands — and the client answers off `ItemClass.dbc` with no session at all (1971).
+    // Pushed once the two catalogs exist and whenever they change (a diff, like the inbox's).
+    let classes_now = categories(catalogs.0.as_deref(), catalogs.1.as_deref());
+    let last_classes = last_classes.get(&script);
+    if *last_classes != classes_now {
+        *last_classes = classes_now.clone();
+        script.set_auction_item_classes(classes_now);
+    }
 
     // The queued client messages (decision 1523). Resolved against the VM's own GlobalStrings and
     // shown on the surface the message's catalog row names — the `ui_quest` shape (0669).
@@ -608,10 +659,9 @@ fn feed_auction(
                 },
             };
             let get = |key: &str| script.lua().globals().get::<String>(key).ok();
-            let err = UiError {
-                key: msg.key,
-                fill_s: fill,
-                fill_d: None,
+            let err = match fill {
+                Some(s) => UiError::s(msg.key, s),
+                None => UiError::key(msg.key),
             };
             if let Some(text) = ui_error_text(&err, &get) {
                 lines.push(Shown::keyed(msg.key, text));
@@ -622,7 +672,6 @@ fn feed_auction(
     }
 
     let self_guid = self_q.iter().next().map(|g| g.0);
-    let (classes, subclasses) = (&catalogs.0, &catalogs.1);
     let rolls = crate::items::RollCatalogs {
         props: catalogs.2.as_deref(),
         enchants: catalogs.3.as_deref(),
@@ -633,9 +682,9 @@ fn feed_auction(
             let rows = rows_for(
                 slot,
                 self_guid,
-                &mut items,
+                &items,
                 icons.as_deref(),
-                &mut names,
+                &names,
                 &commands,
                 rolls,
             );
@@ -647,7 +696,6 @@ fn feed_auction(
         });
         AuctionState {
             lists,
-            categories: categories(classes.as_deref(), subclasses.as_deref()),
             // The rate this house charges, keyed by the id the hello reply carried.
             deposit_percent: houses
                 .as_deref()
@@ -659,8 +707,16 @@ fn feed_auction(
     let opened = last_open.is_none() && auction.auctioneer.is_some();
     let closed = last_open.is_some() && auction.auctioneer.is_none();
     let show_requested = std::mem::take(&mut auction.show_requested);
-    let result_landed = std::mem::take(&mut auction.list_result_landed);
+    let landed = std::mem::take(&mut auction.list_result_landed);
     let changed = fresh != *last;
+    // **Which events are owed, per list.** A landed result owes its own list's event outright; a
+    // changed list owes it because an async name or template just filled one of its rows in. The
+    // diff is per list rather than over the whole snapshot for the same reason the fires are
+    // (2308): an event names one list, and firing the other two runs the stock Lua's other tabs
+    // over state they were never given.
+    let owed: [bool; 3] = std::array::from_fn(|i| {
+        landed[i] || fresh.as_ref().map(|s| &s.lists[i]) != last.as_ref().map(|s| &s.lists[i])
+    });
     if changed {
         script.set_auction(fresh.clone());
     }
@@ -673,21 +729,19 @@ fn feed_auction(
         if show_requested {
             script.fire_event("AUCTION_HOUSE_SHOW", vec![]);
         }
-        // A landed result owes the events outright; a change owes them because an async name or
-        // template just filled a row in. Diffing ALONE was the bug: an empty house and a repeated
-        // search both produce a result identical to what we hold, and the Browse pane waits on
-        // this event to stop saying "Searching…".
-        if changed || result_landed {
-            // One routine invalidates all three lists in the reference too — the three events fire
-            // together rather than being diffed apart, and each tab's handler repaints only if it
-            // is the visible one.
-            for event in [
-                "AUCTION_ITEM_LIST_UPDATE",
-                "AUCTION_BIDDER_LIST_UPDATE",
-                "AUCTION_OWNED_LIST_UPDATE",
-            ] {
-                script.fire_event(event, vec![]);
-            }
+        // Three literal fires, not a loop over names: the producer tripwire
+        // (`reference_ui::every_event_a_chain_file_registers_has_a_producer`) reads fire sites by
+        // their literal, and the stock addon registers all three (1971). Browse first, then Bids,
+        // then Auctions — the array's own order; the reference never fires two in one pass either,
+        // so nothing rests on it.
+        if owed[LIST] {
+            script.fire_event("AUCTION_ITEM_LIST_UPDATE", vec![]);
+        }
+        if owed[BIDDER] {
+            script.fire_event("AUCTION_BIDDER_LIST_UPDATE", vec![]);
+        }
+        if owed[OWNER] {
+            script.fire_event("AUCTION_OWNED_LIST_UPDATE", vec![]);
         }
     }
     *last = fresh;
@@ -716,15 +770,14 @@ fn feed_auction(
 }
 
 /// Drain the Lua intents into the auction `CMSG`s.
-#[allow(clippy::too_many_arguments)]
 fn drain_auction(
     script: Option<NonSendMut<UiScript>>,
     mut auction: ResMut<AuctionOpen>,
     commands: Res<NetCommands>,
     time: Res<Time>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     icons: Option<Res<ItemDisplays>>,
-    mut names: ResMut<NameCache>,
+    names: Res<NameCache>,
     self_q: Query<(&ObjectStore, &crate::net::Guid), With<SelfPlayer>>,
     // The click→auction-id map re-derives the same sorted rows the feed pushed, so it resolves
     // them the same way, roll included (1547).
@@ -817,9 +870,9 @@ fn drain_auction(
             let rows = rows_for(
                 &auction.lists[bid.list],
                 self_guid,
-                &mut items,
+                &items,
                 icons.as_deref(),
-                &mut names,
+                &names,
                 &commands,
                 rolls,
             );
@@ -835,9 +888,9 @@ fn drain_auction(
             let rows = rows_for(
                 &auction.lists[OWNER],
                 self_guid,
-                &mut items,
+                &items,
                 icons.as_deref(),
-                &mut names,
+                &names,
                 &commands,
                 rolls,
             );
@@ -907,7 +960,7 @@ mod tests {
         );
     }
 
-    /// An identical list result still owes its events. Diffing the snapshot was the bug: an empty
+    /// An identical list result still owes its event. Diffing the snapshot was the bug: an empty
     /// auction house and a repeated search both produce a page identical to the one we hold, and
     /// the Browse pane clears its "Searching…" state only when the event arrives — so on an empty
     /// server a search animated forever and never reported a result. Found by the live probe,
@@ -918,17 +971,82 @@ mod tests {
         open.open(0x1234, 1);
 
         open.set_list(LIST, Vec::new(), 0);
-        assert!(open.list_result_landed, "the first empty page");
+        assert!(open.list_result_landed[LIST], "the first empty page");
 
         // The feed consumes the flag when it fires.
-        open.list_result_landed = false;
+        open.list_result_landed = [false; 3];
 
         // The very same empty page again — nothing to diff, and still owed.
         open.set_list(LIST, Vec::new(), 0);
         assert!(
-            open.list_result_landed,
+            open.list_result_landed[LIST],
             "an identical page owes the event too — this is the whole bug"
         );
+    }
+
+    /// **A result owes its OWN list's event and no other** (decision 2308).
+    ///
+    /// The regression this guards is a crash, not a repaint: the stock `Blizzard_AuctionUI`'s
+    /// `AuctionFrameAuctions_Update` multiplies by `AuctionFrameAuctions.page`, and that field is
+    /// initialised only in the Auctions tab's `OnShow`. A browse result that also fired
+    /// `AUCTION_OWNED_LIST_UPDATE` therefore ran that tab's repaint before it had ever been
+    /// shown — `attempt to perform arithmetic on field 'page' (a nil value)`, on screen, on the
+    /// first search of the session. `auction_frame.rs` holds the Lua half of this.
+    #[test]
+    fn a_result_owes_only_its_own_lists_event() {
+        let mut open = AuctionOpen::default();
+        open.open(0x1234, 1);
+
+        open.set_list(LIST, Vec::new(), 0);
+        assert_eq!(
+            open.list_result_landed,
+            [true, false, false],
+            "a browse result is not news about the player's bids or listings"
+        );
+
+        open.list_result_landed = [false; 3];
+        open.set_list(OWNER, Vec::new(), 0);
+        assert_eq!(open.list_result_landed, [false, false, true]);
+
+        open.list_result_landed = [false; 3];
+        open.set_list(BIDDER, Vec::new(), 0);
+        assert_eq!(open.list_result_landed, [false, true, false]);
+    }
+
+    /// **A refresh can only re-ask for a list we hold** (decision 2308) — the other half of the
+    /// same crash.
+    ///
+    /// "Your auction sold" arrives whenever the server feels like it, including while the player
+    /// is standing on the Browse tab having never opened the Auctions one. Turning that into a
+    /// fresh owner query would land an `AUCTION_OWNED_LIST_UPDATE` on that never-shown tab — the
+    /// nil `page` again, by a slower road. The reference cannot get there: its notification
+    /// handlers patch the cached row, and an array it never fetched has no row to patch.
+    #[test]
+    fn a_refresh_never_introduces_a_list_the_interface_never_asked_for() {
+        let mut open = AuctionOpen::default();
+        open.open(0x1234, 1);
+
+        open.refresh_owner();
+        open.refresh_bidder();
+        assert!(
+            !open.pending_owner_refresh && !open.pending_bidder_refresh,
+            "we hold neither list, so neither can have gone stale"
+        );
+
+        // The Auctions tab has now been shown once and the server answered — even with nothing in
+        // it. From here a sale really does invalidate what the player is looking at.
+        open.set_list(OWNER, Vec::new(), 0);
+        open.refresh_owner();
+        assert!(open.pending_owner_refresh, "a list we hold can go stale");
+        assert!(
+            !open.pending_bidder_refresh,
+            "and the other one still cannot"
+        );
+
+        // Closing forgets all of it — a notice landing after the window is gone re-asks nothing.
+        open.clear();
+        open.refresh_owner();
+        assert!(!open.pending_owner_refresh);
     }
 
     /// An accepted listing releases the sell slot. Without it the pane kept painting a phantom

@@ -3,13 +3,17 @@
 //!
 //! - NAME (gold — FrameXML recolors `TextLeft1` by reaction on `UPDATE_MOUSEOVER_UNIT`, exactly
 //!   like the reference's `GameTooltip_UnitColor`; the guild line is likewise FrameXML's and
-//!   joins when guild data streams);
+//!   joins when guild data streams). A name still in flight reads `UNKNOWNOBJECT`, never an
+//!   empty line — the builder's name read is `0x609210`, the same resolver `UnitName` uses, and
+//!   its miss tail is the same string (decisions 2002/2040);
 //! - the creature SUBTITLE ("Stable Master") — white;
-//! - the LEVEL line, composed from three slots over the four `TOOLTIP_UNIT_LEVEL*` templates:
+//! - the LEVEL line, filled from three slots into one of the four `TOOLTIP_UNIT_LEVEL*` templates
+//!   the player's own `GlobalStrings.lua` carries (decision 2045 — the keys are the builder's,
+//!   read off `0x52a622`/`0x52a64d`/`0x52a682`/`0x52a6ac`, never matched on their English):
 //!   level text (`"??"` for a world boss, a much-higher hostile, or level ≤ 0 — the hostile
 //!   delta is INTERIM at +10 pending a byte pin of the comparison), the class slot (the creature
-//!   TYPE word for hostile/neutral creatures, `"Race Class"` for players, `"Corpse"` when dead),
-//!   and the type slot (the rank word `{"", Elite, Elite, Boss, ""}`; `"Player"` for players);
+//!   TYPE word for hostile/neutral creatures, `"Race Class"` for players, `CORPSE` when dead),
+//!   and the type slot (the rank key table `{"", ELITE, ELITE, BOSS, ""}`; `PLAYER` for players);
 //! - the FACTION NAME ("Stormwind", white) — the builder-tail block `0x52a7a0..` the law's §2
 //!   order originally omitted: the app resolves it (`faction_name`), every gate applied;
 //! - "PvP" (white) · "Skinnable" (**red**) · "Civilian" (green, `0x612550`: PvP-flagged +
@@ -27,13 +31,14 @@
 use mlua::{Lua, Table};
 
 use super::object::frame_handle_of;
-use super::tooltip::{append_line, clear_content, fire_cleared, show_or_hide_empty};
+use super::tooltip::{append_line, clear_content, fire_cleared, show_or_hide_empty, tip_mut};
 // The grey band + trivial/GREY check (`0x5f0700`, the CIVILIAN line's last gate: a green-or-
 // better con never warns of a dishonorable kill) and the "??" gate live in one shared home
 // (`unit.rs`), alongside `UnitLevel`'s −1 return and the `GetQuestGreenRange` binding.
-use super::unit::{is_civilian_kill, level_reads_unknown};
+use super::unit::{is_civilian_kill, level_reads_unknown, unknownobject};
 use super::{KindState, Model, UnitState};
 use crate::layout::{Anchor, Point};
+use crate::strings::{fill, Arg};
 use crate::widget::FrameHandle;
 
 const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -63,19 +68,31 @@ pub enum TooltipTint {
     LockOpen,
 }
 
-/// The rank word table — byte-verified `0x854158[]`: rare-elite prints ELITE, rare prints
-/// nothing (there is no distinct "Rare Elite" word in 1.12's builder).
-fn rank_word(rank: u32) -> Option<&'static str> {
+/// The rank word's GlobalString **key** — byte-verified `0x854158[]`, the pointer table the
+/// builder indexes by rank at `0x52a5bd`/`0x52a5d4`. Its entries are key names, not words: index 0
+/// and 4 are the pre-seeded empty string `0x882748`, 1 and 2 are both `ELITE` (rare-elite prints
+/// ELITE, rare prints nothing — there is no distinct "Rare Elite" word in 1.12's builder), 3 is
+/// `BOSS`.
+fn rank_key(rank: u32) -> Option<&'static str> {
     match rank {
-        1 | 2 => Some("Elite"),
-        3 => Some("Boss"),
+        1 | 2 => Some("ELITE"),
+        3 => Some("BOSS"),
         _ => None,
     }
 }
 
-/// The level line — three slots over the four `TOOLTIP_UNIT_LEVEL*` templates ("Level %s" /
-/// "Level %s %s" / "Level %s (%s)" / "Level %s %s (%s)", the extracted enUS strings).
-fn level_line(u: &UnitState, player_level: u32) -> String {
+/// The level line — three slots over the four `TOOLTIP_UNIT_LEVEL*` templates, each resolved off
+/// the player's own `GlobalStrings.lua` (decision 2045). The keys are the builder's own, pushed at
+/// `0x52a622` (`_CLASS_TYPE`), `0x52a64d` (`_CLASS`), `0x52a682` (`_TYPE`) and `0x52a6ac` (the
+/// bare one) — which matters, because `TOOLTIP_UNIT_LEVEL_CLASS`'s enUS "Level %s %s" is also the
+/// wording of `FRIENDS_LEVEL_TEMPLATE`, `UNIT_TYPE_LEVEL_TEMPLATE` and `CHARACTER_SELECT_INFO`,
+/// and the bare one collides with `ITEM_LEVEL`, `LEVEL_GAINED` and `UNIT_LEVEL_TEMPLATE`. Seven
+/// wrong keys are reachable by matching the English here; none by reading the builder.
+///
+/// `None` = the install's string table carries no template for the slot combination in hand, and
+/// the plate shows no level row rather than a composed one.
+fn level_line(lua: &Lua, u: &UnitState, player_level: u32) -> Option<String> {
+    let get = |key: &str| crate::strings::global(lua, key);
     // The "??" gate, byte-pinned (0x529fe0 §2-LEVEL): much-higher HOSTILE — internal reaction
     // ≤ 1 = hated/hostile = UnitReaction ≤ 2 on our 1..8 API scale (the UnitIsEnemy mapping) —
     // with playerLevel ≤ targetLevel−10; OR WorldBoss; OR level ≤ 0. Players NEVER read "??".
@@ -90,7 +107,7 @@ fn level_line(u: &UnitState, player_level: u32) -> String {
     // creatures (a friendly creature shows none — the byte law's hostile/neutral-only gate);
     // "Corpse" when dead.
     let class_slot = if u.dead {
-        Some("Corpse".to_string())
+        get("CORPSE")
     } else if u.is_player {
         match (&u.race, &u.class) {
             (Some(r), Some(c)) => Some(format!("{r} {c}")),
@@ -103,18 +120,28 @@ fn level_line(u: &UnitState, player_level: u32) -> String {
     } else {
         None
     };
-    // The type slot: the rank word, or "Player" for players.
+    // The type slot: the rank word, or PLAYER for players.
     let type_slot = if u.is_player {
-        Some("Player".to_string())
+        get("PLAYER")
     } else {
-        rank_word(u.rank).map(str::to_string)
+        rank_key(u.rank).and_then(&get)
     };
-    match (class_slot, type_slot) {
-        (Some(c), Some(t)) => format!("Level {level_text} {c} ({t})"),
-        (Some(c), None) => format!("Level {level_text} {c}"),
-        (None, Some(t)) => format!("Level {level_text} ({t})"),
-        (None, None) => format!("Level {level_text}"),
-    }
+    let (key, args): (&str, Vec<Arg<'_>>) = match (&class_slot, &type_slot) {
+        (Some(c), Some(t)) => (
+            "TOOLTIP_UNIT_LEVEL_CLASS_TYPE",
+            vec![Arg::S(&level_text), Arg::S(c), Arg::S(t)],
+        ),
+        (Some(c), None) => (
+            "TOOLTIP_UNIT_LEVEL_CLASS",
+            vec![Arg::S(&level_text), Arg::S(c)],
+        ),
+        (None, Some(t)) => (
+            "TOOLTIP_UNIT_LEVEL_TYPE",
+            vec![Arg::S(&level_text), Arg::S(t)],
+        ),
+        (None, None) => ("TOOLTIP_UNIT_LEVEL", vec![Arg::S(&level_text)]),
+    };
+    Some(fill(&get(key)?, &args))
 }
 
 /// Render the unit tooltip for `token`'s current snapshot; returns whether the unit existed.
@@ -138,23 +165,29 @@ fn render_unit(lua: &Lua, this: &Table, token: &str) -> mlua::Result<bool> {
         show_or_hide_empty(lua, h);
         return Ok(false);
     };
-    append_line(
-        lua,
-        this,
-        (u.name.clone().unwrap_or_default(), GOLD),
-        None,
-        false,
-    )?;
+    // The NAME line. A unit whose name query has not answered yet does NOT title an empty plate:
+    // the builder resolves the name through `CGUnit_C::GetUnitName 0x609210` (`0x52a187`), and
+    // every one of that function's misses — a creature whose `creaturecache.wdb` record
+    // (`CGUnit+0xb30`) is still null, a pet whose `petnamecache.wdb` row is absent or stale, a
+    // player row `namecache.wdb` has not answered — falls to the SAME
+    // `FrameScript_GetText("UNKNOWNOBJECT")` tail `UnitName` falls to. One seam, one resolver
+    // ([`unknownobject`], decisions 2002/2040), so the verb and the plate can never disagree.
+    //
+    // The builder has no counterpart to `UnitName`'s two nils: the `"player"` fast path is the
+    // *binding's* (`0x517083`, before any resolve), and a token resolving to GUID 0 never reaches
+    // a builder at all — the entry gate `0x468460(typemask 8)` hands back no object, `SetUnit`
+    // answers nil and no plate is drawn (the `unit` early-return above).
+    let title = match &u.name {
+        Some(n) => n.clone(),
+        None => unknownobject(lua)?.to_str()?.to_string(),
+    };
+    append_line(lua, this, (title, GOLD), None, false)?;
     if let Some(sub) = &u.subtitle {
         append_line(lua, this, (sub.clone(), WHITE), None, false)?;
     }
-    append_line(
-        lua,
-        this,
-        (level_line(&u, player_level), WHITE),
-        None,
-        false,
-    )?;
+    if let Some(level) = level_line(lua, &u, player_level) {
+        append_line(lua, this, (level, WHITE), None, false)?;
+    }
     // The faction-name line ("Stormwind", white) sits between the level line and "PvP" — the
     // builder-tail block at `0x52a7a0`. The app resolved every gate into `faction_name`.
     if let Some(faction) = &u.faction_name {
@@ -364,7 +397,7 @@ impl super::UiScript {
         lines: &[(String, TooltipTint)],
         cursor: Option<(f32, f32)>,
     ) -> bool {
-        let (h, id, root_id) = {
+        let (h, id, root, root_id) = {
             let mut model = self.model_mut();
             let Some(h) = model.arena.lookup("GameTooltip") else {
                 return false;
@@ -373,13 +406,37 @@ impl super::UiScript {
                 return false;
             };
             let (id, root_id) = (model.frame_id(h), model.frame_id(root));
-            (h, id, root_id)
+            (h, id, root, root_id)
         };
         match cursor {
             // The cursor arm: seated centred above the pointer, clamped by the tooltip frame's own
             // flag. Compare-then-touch so a still pointer never re-layouts.
             Some((ui_x, ui_y)) => {
                 let mut model = self.model_mut();
+                // **The OWNER, which this arm used to skip** (decision 2255). The
+                // reference's cursor arm is `0x492a01 → 0x52ffe0(owner, 6, 0, 0)` — the SetOwner
+                // CORE, not a bare re-anchor — and the core's `0x53000c` stores that owner into
+                // `+0x314`. Every OTHER world plate we build reaches an owner by accident: the
+                // corner arm below and the unit flow both fire `OnTooltipSetDefaultAnchor`, whose
+                // FrameXML handler calls `GameTooltip:SetOwner(UIParent, …)` in Lua. This arm
+                // fires nothing, so `+0x314` stayed NULL on exactly the cursor-seated objects —
+                // a signpost, a mailbox, every GENERIC(5).
+                //
+                // A null owner is not cosmetic, because **`:Show()` is an existence gate**:
+                // `0x530a80` shows only when `+0x314` AND `+0x31c` are both non-zero, and
+                // otherwise takes the effective-hide `0x530a60` — which we implement faithfully
+                // (see the `Show` verb). So any Lua that reached `GameTooltip:Show()` while one of
+                // these plates was up HID IT, and hid it through our own correct code.
+                //
+                // That is not hypothetical: `!Questie` hooks GameTooltip's `OnShow` at
+                // PLAYER_LOGIN (`Questie:hookTooltip`, installed because stock GameTooltip has no
+                // OnShow of its own) and its handler ends in `GameTooltip:Show()`. So the plate's
+                // own show event hid the plate, ~26 ms after the engine built it, on every
+                // signpost, for the whole session — the director's report. The reference cannot
+                // reach that state: `0x492a01` writes the owner before the plate is ever shown.
+                if let Ok(t) = tip_mut(&mut model, h) {
+                    t.owner = Some(root);
+                }
                 let input = model.layout_inputs.entry(h).or_default();
                 let new = Anchor::new(Point::Bottom, root_id, Point::BottomLeft, ui_x, ui_y);
                 let same = input.anchors.len() == 1
@@ -448,7 +505,7 @@ impl super::UiScript {
     /// one GOLD line (the reference's engine SetText gold; a cross-interior dot renders FAINT
     /// gold — the byte law's `|cffb0b0b0` wrap modulating the gold base, director-matched),
     /// seated centred ABOVE the cursor: the tooltip's BOTTOM at the given UI-space point. The
-    /// plate FOLLOWS the pointer — [`Self::minimap_tooltip_move`] re-seats it as the cursor
+    /// plate FOLLOWS the pointer — `Self::minimap_tooltip_move` re-seats it as the cursor
     /// drifts within one blip. Same world-owned fade lifecycle as the mouseover tooltip:
     /// hover loss arms [`Self::world_tooltip_fade`].
     pub fn minimap_tooltip(&mut self, text: &str, ui_x: f32, ui_y: f32, grey: bool) -> bool {
@@ -550,6 +607,24 @@ impl super::UiScript {
             input.anchors = vec![new];
             model.touch_layout();
         }
+    }
+
+    /// **Is `GameTooltip` still the plate a world hover put up?** — world-owned (no Lua
+    /// `SetOwner`, no content `Set*` and no `Hide` has taken it since) and still shown.
+    ///
+    /// The world-hover driver keeps a host-side memo of which plate it put up so it does not
+    /// rebuild one per frame; that memo is about the HOVER, and this is the other half of the
+    /// question — whether the plate that memo describes is still on the screen.
+    pub fn world_tooltip_up(&mut self) -> bool {
+        let model = self.model_mut();
+        let Some(h) = model.arena.lookup("GameTooltip") else {
+            return false;
+        };
+        model
+            .arena
+            .frame(h)
+            .map(|f| matches!(&f.kind_state, KindState::Tooltip(t) if t.world_owned) && f.shown)
+            .unwrap_or(false)
     }
 
     /// Arm the mouseover tooltip's fade-out (hover loss — the byte law arms a timestamped fade,

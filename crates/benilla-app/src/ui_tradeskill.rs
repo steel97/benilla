@@ -19,8 +19,11 @@
 //! Craft-vs-TradeSkill routing are all byte-confirmed. **The header law landed too:** rows group
 //! by the created item's `(ItemClass, ItemSubClass)`, named from `ItemSubClass.dbc`, two-level
 //! sort (0446; the filter family on top of it, 0452) — this feed resolves each recipe's `group`
-//! ([`resolve_recipe`]), so the book is no longer flat. Remaining gap: the spell-focus tool never
-//! rendered red (no client-side proximity model — the server refuses the cast).
+//! ([`resolve_recipe`]), so the book is no longer flat. The spell-focus tool never renders red, and
+//! that is **faithful, not a gap** (wow-re `tradeskill-tools-and-spell-focus.md`, §5-carved): the
+//! reference's own `hasTool` for a focus is the literal `1.0` with no predicate anywhere, and the
+//! client holds neither a focus id nor a radius to test proximity with. The server refusing the
+//! cast is the whole of the feedback, there as here.
 
 use std::time::Instant;
 
@@ -93,7 +96,7 @@ impl Plugin for UiTradeSkillPlugin {
                     // the same frame; the feed pushes before the input pass (the trainer's order);
                     // the drain + repeat machine run after it so a Create click casts this frame.
                     open_trade_skill.before(feed_trade_skill),
-                    feed_trade_skill.in_set(UnitFeed).before(UiInput),
+                    feed_trade_skill.in_set(UnitFeed),
                     drain_trade_skill.after(UiInput),
                 ),
             );
@@ -224,7 +227,7 @@ pub(crate) fn difficulty(rank: u32, low: u32, high: u32) -> TradeSkillDifficulty
 fn recipe_icon(
     d: &benilla_formats::SpellDisplay,
     icons: Option<&ItemDisplays>,
-    items: &mut Items,
+    items: &Items,
     commands: &NetCommands,
 ) -> Option<String> {
     let item = d.effect_item_type[0];
@@ -237,7 +240,6 @@ fn recipe_icon(
 
 /// Build one recipe row: reagents/tools/product resolved through the ask-once template cache
 /// (`None` names re-resolve next frame when the template lands — the item-row precedent).
-#[allow(clippy::too_many_arguments)] // the resolver's full catalog set
 fn resolve_recipe(
     spell_id: u32,
     rank: u32,
@@ -247,7 +249,7 @@ fn resolve_recipe(
     icons: Option<&ItemDisplays>,
     subclasses: Option<&crate::ui_items::ItemSubClasses>,
     store: &ObjectStore,
-    items: &mut Items,
+    items: &Items,
     commands: &NetCommands,
     cooldowns: &crate::cooldowns::Cooldowns,
     now: Instant,
@@ -310,18 +312,33 @@ fn resolve_recipe(
         .flatten()
         .map_or((None, 0, 0), |(g, it, il)| (Some(g), it, il));
 
-    // Tools: the two totem items (present-not-consumed — a Blacksmith Hammer) + the spell focus
-    // (Anvil/Forge/Cooking Fire; never red — module doc INTERIM).
+    // Tools — **the spell FOCUS first, then `Totem[0]`, then `Totem[1]`** (wow-re
+    // `tradeskill/scratch/tradeskill-tools-and-spell-focus.md`, §5-carved: `0x4ff980`'s own push
+    // order). We had the totems leading, which reverses the Requirements line for every recipe
+    // that needs both — a Blacksmithing anvil recipe reads "Blacksmith Hammer, Anvil" instead of
+    // "Anvil, Blacksmith Hammer".
+    //
+    // **The focus is unconditionally satisfied, and that is VERIFIED rather than a gap.** Its
+    // `hasTool` is the instruction immediate `push 0x3ff00000 / push 0` — the literal `1.0`, with
+    // no predicate at all: an exhaustive absence (17 calls, 7 absolute operands, **zero FPU**;
+    // `SpellRec+0x3c` has exactly two readers image-wide; the GameObject descriptor block carries
+    // no focus id or radius, so the client could not test proximity even if it wanted to). The
+    // reference NEVER reddens an Anvil line. `BuildColoredListString` is still byte-faithful and
+    // still reds an unmet TOTEM — that half is live.
+    //
+    // A tool whose template has not landed contributes **no pair at all** (the reference drops it
+    // and fires `CMSG_ITEM_QUERY_SINGLE`, so the arity grows between calls) — which is what the
+    // `if let Some(info)` below already does, for the same reason.
     let mut tools = Vec::new();
+    if d.requires_spell_focus != 0 {
+        if let Some(name) = focus.and_then(|f| f.catalog.name(d.requires_spell_focus)) {
+            tools.push((name.to_string(), true));
+        }
+    }
     for &t in d.totems.iter().filter(|&&t| t != 0) {
         let have = count_of(&store.0, items, t, InventoryScope::CARRIED) > 0;
         if let Some(info) = items.template(t, 0, commands) {
             tools.push((info.name.clone(), have));
-        }
-    }
-    if d.requires_spell_focus != 0 {
-        if let Some(name) = focus.and_then(|f| f.catalog.name(d.requires_spell_focus)) {
-            tools.push((name.to_string(), true));
         }
     }
 
@@ -347,7 +364,6 @@ fn resolve_recipe(
 /// Build the book: the known attr-`0x20` recipes of the open line, difficulty-banded against the
 /// current rank. No sort applied here — the engine owns ALL ordering (group + tier + name, the
 /// VERIFIED two-level law, decision 0446 wow-re `tradeskill` TU-B).
-#[allow(clippy::too_many_arguments)] // a Bevy system's full input set (the feed precedent)
 fn feed_trade_skill(
     script: Option<NonSendMut<UiScript>>,
     open: Res<TradeSkillOpen>,
@@ -359,7 +375,7 @@ fn feed_trade_skill(
     subclasses: Option<Res<crate::ui_items::ItemSubClasses>>,
     repeat: Res<TradeSkillRepeat>,
     self_store: Query<&ObjectStore, With<SelfPlayer>>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     commands: Res<NetCommands>,
     cooldowns: Res<crate::cooldowns::Cooldowns>,
     mut last: Local<crate::ui_script::VmMemo<Option<TradeSkillState>>>,
@@ -400,7 +416,7 @@ fn feed_trade_skill(
                     icons.as_deref(),
                     subclasses.as_deref(),
                     store,
-                    &mut items,
+                    &items,
                     &commands,
                     &cooldowns,
                     now,
@@ -427,6 +443,14 @@ fn feed_trade_skill(
         return;
     }
     script.set_trade_skill(fresh.clone());
+    // The client has every product's and reagent's template cached by the time its list shows,
+    // and `GetTradeSkillItemLink`/`GetTradeSkillReagentItemLink` never query — so the feed asks
+    // for the templates the store lacks when the list lands, and the verbs read the answers (1973).
+    if let Some(f) = &fresh {
+        script.ask_item_templates(f.recipes.iter().flat_map(|r| {
+            std::iter::once(r.product_item).chain(r.reagents.iter().map(|re| re.item))
+        }));
+    }
     match (&*last, &fresh) {
         (None, Some(f)) => {
             debug!(
@@ -559,7 +583,7 @@ mod tests {
         let icons = landed_item(&mut deps);
         let d = recipe(SPELL_EFFECT_CREATE_ITEM, 777);
         assert_eq!(
-            recipe_icon(&d, Some(&icons), &mut deps.items, &deps.commands),
+            recipe_icon(&d, Some(&icons), &deps.items, &deps.commands),
             Some("ITEM".into()),
         );
     }
@@ -574,7 +598,7 @@ mod tests {
         let icons = landed_item(&mut deps);
         let d = recipe(SPELL_EFFECT_ENCHANT_ITEM, 777);
         assert_eq!(
-            recipe_icon(&d, Some(&icons), &mut deps.items, &deps.commands),
+            recipe_icon(&d, Some(&icons), &deps.items, &deps.commands),
             Some("ITEM".into()),
         );
     }
@@ -590,24 +614,24 @@ mod tests {
         // EffectItemType[0] == 0: 0x55ba30 short-circuits on a zero id before hashing.
         let none = recipe(SPELL_EFFECT_ENCHANT_ITEM, 0);
         assert_eq!(
-            recipe_icon(&none, Some(&icons), &mut deps.items, &deps.commands),
+            recipe_icon(&none, Some(&icons), &deps.items, &deps.commands),
             None,
         );
 
         // A template that never lands (the async row) — nil, and the ask goes out exactly once.
         let missing = recipe(SPELL_EFFECT_CREATE_ITEM, 999);
         assert_eq!(
-            recipe_icon(&missing, Some(&icons), &mut deps.items, &deps.commands),
+            recipe_icon(&missing, Some(&icons), &deps.items, &deps.commands),
             None,
         );
         assert_eq!(
-            recipe_icon(&missing, Some(&icons), &mut deps.items, &deps.commands),
+            recipe_icon(&missing, Some(&icons), &deps.items, &deps.commands),
             None,
         );
         assert_eq!(deps.queried_entries(), vec![999], "ask-once, not ask-often");
 
         // The template landed but ItemDisplayInfo is unresolved — still nil, still not "SPELL".
         let d = recipe(SPELL_EFFECT_CREATE_ITEM, 777);
-        assert_eq!(recipe_icon(&d, None, &mut deps.items, &deps.commands), None);
+        assert_eq!(recipe_icon(&d, None, &deps.items, &deps.commands), None);
     }
 }

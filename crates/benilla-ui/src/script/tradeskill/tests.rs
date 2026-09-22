@@ -2,7 +2,6 @@ use super::*;
 use crate::script::UiScript;
 
 /// One recipe fixture — a single-reagent, single-tool row, distinct spell/product ids per name.
-#[allow(clippy::too_many_arguments)]
 fn recipe(
     spell_id: u32,
     name: &str,
@@ -266,11 +265,7 @@ fn do_trade_skill_and_getters_no_op_on_a_header_index() {
     assert!(s
         .eval::<bool>("return GetTradeSkillReagentInfo(1, 1) == nil")
         .unwrap());
-    assert_eq!(
-        s.eval::<i64>("return select('#', GetTradeSkillTools(1))")
-            .unwrap(),
-        0
-    );
+    assert_eq!(s.arity("GetTradeSkillTools(1)").unwrap(), 0);
 
     s.run("DoTradeSkill(1, 5)").unwrap();
     assert!(
@@ -298,8 +293,7 @@ fn do_trade_skill_and_getters_no_op_on_a_header_index() {
 fn get_trade_skill_sub_classes_returns_group_names_in_order() {
     let mut s = UiScript::new().unwrap();
     assert_eq!(
-        s.eval::<i64>("return select('#', GetTradeSkillSubClasses())")
-            .unwrap(),
+        s.arity("GetTradeSkillSubClasses()").unwrap(),
         0,
         "no window open, no groups"
     );
@@ -563,22 +557,14 @@ fn get_trade_skill_tools_multivalue_shape() {
         ("Anvil", Some(1), "Mining Pick", None)
     );
 
-    // A recipe with no tools returns an empty multivalue (select('#', ...) == 0).
+    // A recipe with no tools returns an empty multivalue (arity 0, not one nil).
     let mut t2 = two_recipe_state();
     t2.recipes[0].tools.clear();
     s.set_trade_skill(Some(t2));
-    assert_eq!(
-        s.eval::<i64>("return select('#', GetTradeSkillTools(3))")
-            .unwrap(),
-        0
-    );
+    assert_eq!(s.arity("GetTradeSkillTools(3)").unwrap(), 0);
 
     // A HEADER index (row 1) also returns an empty multivalue.
-    assert_eq!(
-        s.eval::<i64>("return select('#', GetTradeSkillTools(1))")
-            .unwrap(),
-        0
-    );
+    assert_eq!(s.arity("GetTradeSkillTools(1)").unwrap(), 0);
 }
 
 /// The verified persistence story (wow-re `tradeskill` TU-G §6, the `0xbde064` cache key):
@@ -648,8 +634,7 @@ fn subclass_filter_exclusive_narrows_list_but_not_vocabulary() {
     assert_eq!(s.eval::<i64>("return GetNumTradeSkills()").unwrap(), 3);
     assert_eq!(row_kind(&mut s, 1), ("Armor Kit".into(), "header".into()));
     assert_eq!(
-        s.eval::<i64>("return select('#', GetTradeSkillSubClasses())")
-            .unwrap(),
+        s.arity("GetTradeSkillSubClasses()").unwrap(),
         4,
         "the dropdown vocabulary stays full under a filter"
     );
@@ -677,12 +662,38 @@ fn subclass_filter_exclusive_narrows_list_but_not_vocabulary() {
     );
 }
 
+/// A stand-in string table for the `0x84dd70` token family — **deliberately not the shipped
+/// wording**, because what these tests establish is *which token* each slot bit reaches, never
+/// what the word says (decision 2045, "assert the identifier, not the sentence"). Naming each
+/// value after its own key is the point: `SECONDARYHANDSLOT`, `INVTYPE_SHIELD` and
+/// `INVTYPE_WEAPONOFFHAND` all read "Off Hand" in enUS, so an assertion on the English could not
+/// tell a correct table from one wired to the item tooltip's family.
+fn seed_slot_tokens(s: &mut UiScript) {
+    s.run(
+        r#"
+        HEADSLOT = "<HEADSLOT>";       NECKSLOT = "<NECKSLOT>"
+        SHOULDERSLOT = "<SHOULDERSLOT>"; SHIRTSLOT = "<SHIRTSLOT>"
+        CHESTSLOT = "<CHESTSLOT>";     WAISTSLOT = "<WAISTSLOT>"
+        LEGSSLOT = "<LEGSSLOT>";       FEETSLOT = "<FEETSLOT>"
+        WRISTSLOT = "<WRISTSLOT>";     HANDSSLOT = "<HANDSSLOT>"
+        FINGER0SLOT = "<FINGER0SLOT>"; FINGER1SLOT = "<FINGER1SLOT>"
+        TRINKET0SLOT = "<TRINKET0SLOT>"; TRINKET1SLOT = "<TRINKET1SLOT>"
+        BACKSLOT = "<BACKSLOT>";       MAINHANDSLOT = "<MAINHANDSLOT>"
+        SECONDARYHANDSLOT = "<SECONDARYHANDSLOT>"; RANGEDSLOT = "<RANGEDSLOT>"
+        TABARDSLOT = "<TABARDSLOT>";   BAGSLOT = "<BAGSLOT>"
+        NONEQUIPSLOT = "<NONEQUIPSLOT>"
+    "#,
+    )
+    .unwrap();
+}
+
 /// The InvSlot filter: the vocabulary is the distinct slot words ascending by slot bit; an
 /// exclusive set drops every recipe on other slots AND any group that empties — header
 /// included.
 #[test]
 fn invslot_filter_drops_recipes_and_emptied_groups() {
     let mut s = UiScript::new().unwrap();
+    seed_slot_tokens(&mut s);
     let mut st = state();
     // Wind Cloak is the one Back product (16 → bit 14); everything else stays Robe/Chest.
     st.recipes
@@ -695,7 +706,7 @@ fn invslot_filter_drops_recipes_and_emptied_groups() {
     assert_eq!(
         s.eval::<(String, String)>("return GetTradeSkillInvSlots()")
             .unwrap(),
-        ("Chest".to_string(), "Back".to_string()),
+        ("<CHESTSLOT>".to_string(), "<BACKSLOT>".to_string()),
         "ascending slot-bit order (4 before 14)"
     );
     assert_eq!(
@@ -723,6 +734,7 @@ fn invslot_filter_drops_recipes_and_emptied_groups() {
 #[test]
 fn one_hand_weapon_spans_both_hand_slots() {
     let mut s = UiScript::new().unwrap();
+    seed_slot_tokens(&mut s);
     let mut st = two_recipe_state();
     st.recipes[0].product_inv_type = 13; // Bolt of Linen Cloth becomes a one-hand weapon
     s.set_trade_skill(Some(st));
@@ -731,9 +743,10 @@ fn one_hand_weapon_spans_both_hand_slots() {
         s.eval::<(String, String, String)>("return GetTradeSkillInvSlots()")
             .unwrap(),
         (
-            "Chest".to_string(),
-            "Main Hand".to_string(),
-            "Off Hand".to_string()
+            "<CHESTSLOT>".to_string(),
+            "<MAINHANDSLOT>".to_string(),
+            // Not `INVTYPE_WEAPONOFFHAND`: this dropdown is the paper-doll family.
+            "<SECONDARYHANDSLOT>".to_string()
         )
     );
     // Exclusive "Off Hand" (index 3): the weapon row survives, the robe row hides.
@@ -813,4 +826,88 @@ fn same_tier_recipes_order_by_product_item_level_before_name() {
         })
         .collect();
     assert_eq!(names, ["Cloth", "Mmm Robe", "Zzz Robe", "Aaa Robe"]);
+}
+
+/// The link pair (wow-re `tradeskill-craft-item-links.md`, 1973): the product's link in its
+/// quality colour with zero tokens; ZERO values for a header, a missing product or an uncached
+/// template; the reagent link nil on the same misses and always exactly one value; the typo'd
+/// reagent Usage; the number gate.
+#[test]
+fn the_link_verbs_answer_the_clients_shapes() {
+    let mut s = UiScript::new().unwrap();
+    s.set_trade_skill(Some(state()));
+    // Row 1 is a header; row 2 the first VISIBLE recipe — found by the name the API answers for
+    // it, since the visible order is the grouped one, not the pushed one. Seed its product's and
+    // one reagent's templates.
+    let st = state();
+    let row2 = s.eval::<String>("return (GetTradeSkillInfo(2))").unwrap();
+    let r = st
+        .recipes
+        .iter()
+        .find(|r| r.name == row2)
+        .expect("row 2 is a pushed recipe");
+    s.set_item_template(
+        r.product_item,
+        crate::script::ItemTemplateView {
+            name: "Copper Chain Belt".into(),
+            quality: 2,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        s.arity("GetTradeSkillItemLink(1)").unwrap(),
+        0,
+        "a header row answers zero values"
+    );
+    let link = s
+        .eval::<String>("return (GetTradeSkillItemLink(2))")
+        .unwrap();
+    assert_eq!(
+        link,
+        format!(
+            "|cff1eff00|Hitem:{}:0:0:0|h[Copper Chain Belt]|h|r",
+            r.product_item
+        )
+    );
+    assert!(
+        s.eval::<bool>("return GetTradeSkillReagentItemLink(2, 1) == nil")
+            .unwrap(),
+        "an uncached reagent template is nil, and nothing is queried"
+    );
+    assert!(s.take_item_stat_asks().is_empty());
+    s.set_item_template(
+        r.reagents[0].item,
+        crate::script::ItemTemplateView {
+            name: "Copper Bar".into(),
+            quality: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        s.eval::<String>("return GetTradeSkillReagentItemLink(2, 1)")
+            .unwrap(),
+        format!(
+            "|cffffffff|Hitem:{}:0:0:0|h[Copper Bar]|h|r",
+            r.reagents[0].item
+        )
+    );
+    assert_eq!(
+        s.arity("GetTradeSkillReagentItemLink(2, 9)").unwrap(),
+        1,
+        "past the reagents: still exactly one value"
+    );
+    assert!(
+        s.eval::<bool>("return GetTradeSkillReagentItemLink(2, 9) == nil")
+            .unwrap(),
+        "past the reagents: that one value is nil"
+    );
+    let err = s
+        .run("GetTradeSkillReagentItemLink(2, nil)")
+        .expect_err("non-number")
+        .to_string();
+    assert!(
+        err.contains("Usage: GetTradeReagentSkillItemLink("),
+        "{err}"
+    );
+    assert!(s.run("GetTradeSkillItemLink('x')").is_err());
 }

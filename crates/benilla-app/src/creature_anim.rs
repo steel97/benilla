@@ -69,6 +69,15 @@ mod lod;
 /// (or non-item) hand. Written by the held-item resolution ([`crate::entities`], decision 0072) from
 /// the same descriptor data that places the weapon models; read by the swing/ready animation
 /// selectors (decision 0073 — the byte-verified `GetWeapon` byte pair `0x605e30`).
+///
+/// **The two readings of a hand** (decision 1863). The reference's accessor takes a `visFlag`:
+/// `GetWeapon(slot, 1)` is what is *worn* there, `GetWeapon(slot, 0)` is what the unit can
+/// *fight* with — and the two differ by exactly one live descriptor bit, [`UNIT_FLAG_DISARMED`].
+/// The fields below are the `visFlag == 1` reading — what the paperdoll and the dress-up model
+/// show, the two surfaces that keep the weapon while disarmed because they read the flag nowhere.
+/// Everything that decides how the unit *behaves* — swing, Ready idle, parry, the sheath machine,
+/// the swing sound, the attached model — goes through [`Wielded::armed_main`] /
+/// [`Wielded::armed_off`], which apply the ladder.
 #[derive(Component, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Wielded {
     pub(crate) main: Option<(u8, u8)>,
@@ -99,13 +108,101 @@ pub(crate) struct Wielded {
     /// for players, the `UNIT_VIRTUAL_ITEM_INFO` byte triple for creatures — so nothing here is a
     /// guess. Indexed by held slot: 0 mainhand · 1 offhand · 2 ranged.
     pub(crate) materials: [u8; 3],
+    /// `UNIT_FIELD_FLAGS & `[`UNIT_FLAG_DISARMED`] — a rogue's Disarm, up on the unit's own
+    /// descriptor and therefore replicated for **every** unit, not just ours (CGUnit's ladder is
+    /// byte-identical to CGPlayer's, so a disarmed creature behaves exactly like a disarmed
+    /// player). Resolved beside the hands because that is where the reference reads it: inside
+    /// `GetWeapon` itself (`[[unit+0x110]+0xa0] & 0x200000`), off the same descriptor these pairs
+    /// come from.
+    pub(crate) disarmed: bool,
+}
+
+/// `UNIT_FIELD_FLAGS` bit 21 — **`UNIT_FLAG_DISARMED`** (vmangos `UnitDefines.h`), read by the
+/// reference inside `GetWeapon` at `0x5ec2b8` (CGPlayer) and `0x605e58`/`0x605e98` (CGUnit):
+/// `test dword ptr [ecx+0xa0], 0x200000`. `0xa0 = 4 × 0x28` pins it to field `UNIT_FIELD_FLAGS`
+/// off the descriptor base `[unit+0x110]`.
+pub(crate) const UNIT_FLAG_DISARMED: u32 = 0x0020_0000;
+
+/// `ItemClass` 2 — **WEAPON**. The class byte the reference's disarm ladder tests, and the whole
+/// of its test: no subclass, no inventory type, nothing else. Disarm takes weapons, so a shield or
+/// a held-in-off-hand trinket is never the hand it hides.
+pub(crate) const ITEM_CLASS_WEAPON: u8 = 2;
+
+/// **The disarm ladder** — which single held slot `UNIT_FLAG_DISARMED` hides, given what each
+/// melee hand holds (decision 1863; wow-re `disarm-weapon-gate-law.md` §2, byte-verified by a
+/// trio including a cold decoder-first read, both class bodies identical).
+///
+/// The reference does not "empty a disarmed unit's hands". `GetWeapon(slot, visFlag = 0)` runs a
+/// **two-probe ladder with main-hand precedence**, and the off-hand probe's polarity is the
+/// opposite of the main hand's:
+///
+/// ```text
+/// ; slot 0 (MAIN HAND) — one probe, 0x5ec2ae
+/// 5ec2b8: test dword ptr [ecx+0xa0],0x200000  ; disarmed?
+/// 5ec2cc: call [edx+0x98]                     ; GetWeapon(0, 1) — vis=1 skips the gate
+/// 5ec2d6: cmp byte ptr [eax],2 ; je 0x5ec346  ; class 2 -> RETURN NULL
+///
+/// ; slot 1 (OFF HAND) — two probes, 0x5ec262, MAIN HAND asked FIRST
+/// 5ec280: call [edx+0x98]                     ; GetWeapon(0, 1)   <<< slot 0, not 1
+/// 5ec28a: cmp byte ptr [eax],2 ; je 0x5ec2aa  ; main hand IS a weapon -> PROCEED (keep the off hand)
+/// 5ec297: call [eax+0x98]                     ; GetWeapon(1, 1)
+/// 5ec2a1: cmp byte ptr [eax],2 ; je 0x5ec346  ; off hand IS a weapon -> RETURN NULL
+/// ```
+///
+/// So **exactly one weapon is hidden — the first one found scanning main hand → off hand** — and
+/// a disarmed dual-wielder keeps swinging their off-hand weapon, model and all. vmangos agrees
+/// from the other side: `Unit::CanUseEquippedWeapon` returns `!DISARMED` for `BASE_ATTACK` and an
+/// unconditional `true` for `OFF_ATTACK` and `RANGED_ATTACK`. The **ranged slot is never gated**
+/// (`0x5ec25e` pushes equip index `0x11` and jumps past both tests).
+///
+/// Stated over classes rather than over [`Wielded`] because two layers need the same law from two
+/// different data sources — the animation layer off the resolved hands, the action bar's
+/// equipped-item test off the raw inventory (`0x5ea5d0`'s slot 0/1/2 loop).
+pub(crate) fn disarmed_hand(main_class: Option<u8>, off_class: Option<u8>) -> Option<usize> {
+    if main_class == Some(ITEM_CLASS_WEAPON) {
+        return Some(0);
+    }
+    if off_class == Some(ITEM_CLASS_WEAPON) {
+        return Some(1);
+    }
+    None
+}
+
+impl Wielded {
+    /// The held slot this unit's disarm hides right now — [`disarmed_hand`] over its own hands,
+    /// `None` while the flag is down. The equipment layer reads it to know which weapon the
+    /// reference's flag reflex takes off the hand ([`crate::entities`]).
+    pub(crate) fn disarmed_hand(&self) -> Option<usize> {
+        self.disarmed
+            .then(|| disarmed_hand(self.main.map(|(c, _)| c), self.off.map(|(c, _)| c)))
+            .flatten()
+    }
+
+    /// The **mainhand** as `GetWeapon(0, 0)` sees it — the reading the swing (`0x6246a0`), the
+    /// Ready idle (`0x5fcdc0`), the parry LUT, the sheath machine and the swing sound all take.
+    pub(crate) fn armed_main(&self) -> Option<(u8, u8)> {
+        self.main.filter(|_| self.disarmed_hand() != Some(0))
+    }
+
+    /// The **offhand** as `GetWeapon(1, 0)` sees it. Nulled only when the main hand did *not*
+    /// claim the disarm — see [`disarmed_hand`].
+    pub(crate) fn armed_off(&self) -> Option<(u8, u8)> {
+        self.off.filter(|_| self.disarmed_hand() != Some(1))
+    }
 }
 
 /// The unit is engaged in melee auto-attack (`SMSG_ATTACKSTART` .. `ATTACKSTOP`, decision 0073):
 /// standing still it plays the weapon-class Ready idle — the client's `0x5fd360` arm gates on the
 /// auto-attack-target GUID being set, i.e. engagement, **not** sheath state.
+///
+/// **It carries that GUID**, because the reference's `[+0xc48]` is the target and not a flag, and
+/// a second reader wants the unit and not just the fact: `0x6e3480`'s melee arm resolves
+/// `[caster+0xc48]` and uses THAT unit's combat reach, which is what the spell tooltip's range
+/// cell prints while you are auto-attacking (wow-re
+/// `tooltip-damage-matrix-and-container-slots.md` §D4.2b). Every animation reader still asks only
+/// `With`/`Has`, which is unchanged by the payload.
 #[derive(Component)]
-pub(crate) struct Engaged;
+pub(crate) struct Engaged(pub(crate) u64);
 
 /// The local player has fired an auto-repeat spell (Auto Shot / wand Shoot) — the client's
 /// `[+0xd58] & 0x200`, whose **only writer binary-wide** is the local cast-send tail (`0x6e593b`,
@@ -293,7 +390,6 @@ pub(crate) fn stop_attack_local(
 /// `0x6131d9`). `0x5ecb70`'s own validator legs — the target's alive-or-feign + `CanAttack
 /// 0x606980` walk, and the `[0xb4b3e4]` world gate — stay with the callers that already compute
 /// them (`target::scan`'s `new_attackable`, the drain's `attack_actor_refusal`).
-#[allow(clippy::too_many_arguments)] // the tail writes four sinks; the alternative is a bundle
 pub(crate) fn start_attack_local(
     entity: Entity,
     target: u64,
@@ -347,7 +443,6 @@ pub(crate) fn start_attack_local(
 /// `[0xb4b3e4]` — the reference's second condition on the stop arm, a world/session global also
 /// tested at `0x5ecbc0` — is unmodelled; nothing in benilla can be false there while a press is
 /// being drained.
-#[allow(clippy::too_many_arguments)] // the seams' write set, minus the bundle a caller can't hold
 pub(crate) fn toggle_attack_local(
     entity: Entity,
     target: u64,
@@ -485,7 +580,9 @@ pub(crate) enum CastEventKind {
     /// — the `0x60d450` fallback a basic shot's impact kit resolves through (decision 0370).
     Impact { weapon_visual: Option<u32> },
     /// A projectile arrived at a **ground point** instead of on a unit — the client's per-tick
-    /// missile dispatch taking its ground arm (`0x61e1d0` → `0x61d870`), reached by the single
+    /// missile dispatch taking `0x61e1d0` → `0x61d870`, which is the **no-live-target** arm, not
+    /// a ground arm as such (a target that despawned mid-flight lands there too; wow-re
+    /// `missile-arrival-dispatch.md`). Ours is reached only by the single
     /// missile a dest-targeted GO with an empty hit list launches
     /// ([`spell_visual::MissileSpawn::ground_aim`]). `entity` is the **caster** — `0x61d870`
     /// plays the kit on it, not on anything at the point — and `pos` is the arrival position,
@@ -555,6 +652,12 @@ pub(crate) struct SwingMessage {
     /// 7 immune · 8 deflects (decision 0279's byte-verified consequence table keys off it).
     pub(crate) victim_state: u32,
     pub(crate) damage: u32,
+    /// `0x625e40`'s verdict, carried from the packet because **the floating number is gated by it
+    /// too** ([`benilla_protocol::messages::AttackerState::displayed`]): `0x62440d` is the first
+    /// thing the worldtext builder `0x6243e0` does. Everything else this message drives — the
+    /// animation, the flinch, the blood, the sounds, the timers — runs regardless, which is why
+    /// the verdict rides along instead of suppressing the message.
+    pub(crate) displayed: bool,
     /// [`PlaySeq`] stamp at emission (the wire drain, in packet order).
     pub(crate) seq: u64,
 }
@@ -575,6 +678,34 @@ pub(crate) struct EmoteAnim {
     /// [`PlaySeq`] stamp — a kit anim inherits its [`CastEvent`]'s; scene-time emitters stamp
     /// fresh at fire time. The driver's same-frame swing collision resolves by the higher stamp.
     pub(crate) seq: u64,
+}
+
+/// A **state kit's animation id, which is a comparison and never a play** — `PlaySpellVisualKit`'s
+/// stage-2 leg (VERIFIED, wow-re `state-kit-anim-and-stun-pose.md` §1/§2; decision 2085).
+///
+/// `0x60edf0`'s tail has exactly one site that hands a kit's `+0x8` to the play primitive
+/// (`0x60f3c5 call 0x5fe2f0`), and **stage 2 is diverted around it**: `0x60f387 jne` takes the
+/// stage-2 leg, which compares the unit's currently-armed id (`0x5fdb50` — upper-body key bone
+/// preferred, bone 0 as the fallback) against `kit.AnimID` and either does nothing (`je 0x60f3ca`,
+/// already playing it) or runs `0x5fd9e0(unit, -1)` — a **base-animation recompute** — before
+/// leaving the block for good. Both `SpellVisual` field-4 consumers hardcode stage 2 (the aura
+/// watcher `0x5ff4c6` and the impact hand-off `0x61dced`), so no path in the image ever plays a
+/// state kit's anim.
+///
+/// It is therefore an animation-**cutting** mechanism, and the cut is not incidental: Charge
+/// (22911) plays `Knockdown`(121) from its impact kit and then cuts it with its own state kit's
+/// `Stun`(14), because 121 ≠ 14 forces the recompute. That is also why no stun ever shows the
+/// `Stun` pose despite 23 kits naming it — the selector `0x5fd8b0` cannot produce 14 (its literal
+/// outputs are enumerated in the note), so the recompute lands on `Stand`.
+///
+/// The driver holds the comparison because the armed id lives there. An aura **refresh** in place
+/// emits nothing: the watcher `0x604d00` fires neither arm when a slot is rewritten with the same
+/// id and a non-zero flags nibble, which our per-unit armed-id diff reproduces by construction.
+#[derive(Message, Clone, Copy)]
+pub(crate) struct BaseAnimRecompute {
+    pub(crate) entity: Entity,
+    /// The state kit's `AnimID` — the right-hand side of `0x60f390`'s compare, never played.
+    pub(crate) anim_id: u16,
 }
 
 /// Rear up a rider's mount (decision 0441 P2): resolved to a [`EmoteAnim`] one-shot of
@@ -615,18 +746,21 @@ fn flourish_to_anim(
     }
 }
 
-/// Play a **wound-flinch** on a unit: the given `AnimationData.dbc` id (8–10, the CombatWound
-/// family) laid into the wound SECONDARY-blend slot — a decaying overlay that never interrupts
-/// what plays underneath (decision 0111). The spell pipeline's counterpart to the melee flinch:
-/// the client's kit player itself branches here (`0x60edf0` @ `0x60f3ad`: anim in `[8,10]` →
-/// the wound trigger `0x60ea70`, anything else → `PlayAnimation`), so an impact kit's wound anim
-/// must never ride the [`EmoteAnim`] one-shot route — that replaces the base track, the exact
-/// routing decision 0111 falsified. Written by [`spell_visual::route_cast_visuals`]; consumed by
-/// [`driver::drive_animations`] into the same per-frame wound slot as a melee hit.
+/// A **spell-side wound flinch** on `entity` — the client's `0x60ea70(unit, severity = 0)`
+/// reached from three spell paths (decision 2058): the kit player's own branch (`0x60edf0` @
+/// `0x60f3ad`: a kit anim in `[8,10]` goes here instead of `PlayAnimation`), the instant-hit
+/// impact loop (`0x6e8bf0` @ `0x6e8c89` — after the impact kit, iff the spell targets enemies,
+/// [`benilla_formats::SpellDisplay::is_harmful`]), and the missile impact hand-off (`0x61dc50` @
+/// `0x61dc74` — before the impact kit, every living target). All three pass **severity 0**, so
+/// the id is never the kit's own column: the trigger picks CombatWound(9) / StandWound(8) by the
+/// victim's engagement exactly like a non-crit melee hit ([`select::wound_anim`]) and lays it
+/// into the SECONDARY-blend slot — a decaying overlay that never interrupts what plays
+/// underneath (decision 0111). Never the [`EmoteAnim`] one-shot route: that replaces the base
+/// track, the exact routing 0111 falsified. Written by [`spell_visual::route_cast_visuals`];
+/// consumed by [`driver::drive_animations`] into the same per-frame wound slot as a melee hit.
 #[derive(Message, Clone, Copy)]
 pub(crate) struct WoundAnim {
     pub(crate) entity: Entity,
-    pub(crate) anim_id: u16,
 }
 
 /// The target lists off one `SMSG_SPELL_GO` (decision 0099 phase 4) — the payload [`CastEvent`]'s
@@ -696,7 +830,7 @@ mod events;
 use events::fire_anim_events;
 pub(crate) use events::{
     advance_track, footfall_culls, footfall_side, is_footstep_sound, scan_events, AnimSoundEvent,
-    TrackMemory,
+    EventFrame, TrackMemory,
 };
 
 /// The `$BTH` breath puffs — a unit's visible cold vapour in a snow zone (B233, decision 1149).
@@ -713,7 +847,7 @@ pub(crate) use impact::{DefenseAnim, PendingImpacts, SwingFlush, SwingImpact, Sw
 /// one-shots ([`EmoteAnim`]) and kit sounds ([`spell_visual::SpellKitSound`]).
 mod blood;
 mod env_damage;
-mod spell_visual;
+pub(crate) mod spell_visual;
 use blood::{blood_spurts, load_blood_tables};
 use env_damage::{hard_landing_dust, load_env_damage_table};
 pub(crate) use env_damage::{EnvDamageTable, HardLanding, HARD_LANDING_DESCENT};
@@ -751,6 +885,11 @@ pub(crate) struct AnimDriver {
     /// the cast keeps bone 0 — where the reference's next base request overwrites it and leaves the
     /// character neutral.
     gait_flags: u32,
+    /// The **base-animation lock** ([`driver::play::BaseAnimLock`]) — the reference's
+    /// `[unit+0xd58] & 0xc0000`. While a `Knockdown`/`LiftOff`/`Land` holds it, every base request
+    /// is refused outright, which is how a stunned victim's knockdown survives the root's own
+    /// `Stand` recompute (decision 2096).
+    base_lock: driver::play::BaseAnimLock,
     /// The unit's **client-side sheath state** — the mirror of the client's committed CUR cache
     /// (`[unit+0xd40]`, decision 0080): what the weapon placement renders (absent a
     /// [`VisualSheath`] ceremony pin) and what the setter/reconcile test against. Seeded from
@@ -763,6 +902,20 @@ pub(crate) struct AnimDriver {
     sheath_byte: Option<u8>,
     /// The pending mid-animation weapon swap, while a draw/stow one-shot is in flight.
     sheath_swap: Option<SheathSwap>,
+    /// **Did this unit start an animation THIS frame** — of any kind: a one-shot, a masked
+    /// overlay, a cast/channel hold, or the mode machine's own base/gait play. Rewritten every
+    /// pass by [`driver::drive_animations`], so a reader one system later sees exactly the
+    /// frame's edge.
+    ///
+    /// Its one consumer is the weapon-trail latch ([`crate::weapon_trail`], decision 2076). The
+    /// reference consumes `unit+0xd1c`/`+0xd20` inside `CGUnit::PlayAnimation 0x5fe2f0` itself
+    /// (`0x5fe48e`, the fields' only reader), and `0x5fe2f0` is the **single** animation entry
+    /// point in the image — 40 call sites, locomotion among them (`0x602c60` → `0x5fd9e0` →
+    /// `0x5fd8b0` → `0x5fd100`), which is why this is not a one-shot flag: a unit that simply
+    /// starts running consumes the arm, and that is what starts Charge's trail (wow-re
+    /// `charproc8-trail-draw-state.md` §11.5/§11.6). benilla's driver is one batched system, not
+    /// a per-play function, so the arm cannot be read at the call the way the reference reads it.
+    started_anim: bool,
     /// A **masked upper-body one-shot** in flight (decision 0087): a swing/emote the live-state route
     /// sent to the SpineLow overlay (moving / seated / airborne-in-combat), playing *beside* [`Mode`]
     /// while the base track keeps driving the legs (run / sit / jump-arc). `None` = no overlay; a
@@ -926,9 +1079,11 @@ impl Default for AnimDriver {
             mode: Mode::Gait,
             gait: None,
             gait_flags: 0,
+            base_lock: driver::play::BaseAnimLock::default(),
             sheath_cur: None,
             sheath_byte: None,
             sheath_swap: None,
+            started_anim: false,
             overlay: None,
             overlay_fade: None,
             wound: None,
@@ -985,6 +1140,18 @@ impl AnimDriver {
         self.sheath_cur
     }
 
+    /// Did this unit start an animation this frame — see [`Self::started_anim`].
+    pub(crate) fn started_anim(&self) -> bool {
+        self.started_anim
+    }
+
+    /// Stand in for the driver's own write, so a consumer's test can raise the edge without
+    /// standing up the whole animation pass to produce it.
+    #[cfg(test)]
+    pub(crate) fn set_started_anim(&mut self, played: bool) {
+        self.started_anim = played;
+    }
+
     /// Whether a draw/stow ceremony is in flight — the manual toggle's mid-ceremony debounce
     /// (guards 11–12 of the client's `ToggleSheath` chain, decision 0080d).
     pub(crate) fn sheath_ceremony_active(&self) -> bool {
@@ -1018,6 +1185,7 @@ impl Plugin for CreatureAnimPlugin {
             .init_resource::<PlaySeq>()
             .init_resource::<gesture::GestureQueue>()
             .add_message::<EmoteAnim>()
+            .add_message::<BaseAnimRecompute>()
             .add_message::<MountFlourish>()
             .add_message::<WoundAnim>()
             .add_message::<SheathSwapMessage>()
@@ -1079,6 +1247,12 @@ impl Plugin for CreatureAnimPlugin {
                     // one-shot lands the same frame the packet (or space press) arrived.
                     flourish_to_anim,
                     drive_animations,
+                    // The weapon-trail latch (decision 2076) — immediately after the driver,
+                    // because the edge it consumes is `AnimDriver::played_anim`, which the driver
+                    // rewrites every pass. The reference reads the latch *inside*
+                    // `PlayAnimation 0x5fe2f0` itself; one system later is as close as a
+                    // batched driver gets, and it is still the same frame.
+                    crate::weapon_trail::fire_weapon_trails,
                     drive_hand_grip,
                     fire_anim_events,
                     // After the event scan: consume this frame's impact tags; the SwingImpact
@@ -1089,6 +1263,26 @@ impl Plugin for CreatureAnimPlugin {
                     // entity-visuals chain so the arrow appears/vanishes the frame the keyframe
                     // lands, not one behind.
                     drive_nock_latch,
+                    // …and, off the same two keys, the RANGED PROP's own clip (decision 2281):
+                    // the bow's limbs bend on `$BWP`, and on `$BWR` a gun fires the muzzle blast
+                    // its BowRelease(161) sequence carries. Beside the latch because the reference
+                    // arms both from one handler each, and ahead of the entity-visuals chain so the
+                    // prop's pose is this frame's before the rider lane reads it.
+                    crate::ranged_flex::flex_ranged_props
+                        // The per-sequence material samplers (`SeqHosts`) ask an anim host which
+                        // slot it is playing; a prop that armed 161 this frame must be answering
+                        // for 161, not for last frame's Stand. The chain's own `.before(
+                        // EntityVisualsSet)` does not reach them — they hang off `ModelVisSet`.
+                        .before(benilla_world::model_render::ModelVisSet),
+                    // …and the un-nock's reset (`0x60f59d`), which the reference reaches from the
+                    // SAME `$BWR` it just armed on. It must run AFTER the arm, or its skip-while-
+                    // releasing guard has nothing to read and a gun's blast is cancelled on the
+                    // frame it starts — the chain gives it that order by construction.
+                    crate::ranged_flex::reset_ranged_props_on_unnock
+                        // Same edge as the arm above, and for the same reason: this writes the
+                        // prop's player too, and the per-sequence material samplers must answer
+                        // for the clip it leaves armed.
+                        .before(benilla_world::model_render::ModelVisSet),
                     // …and the `$BTH` puff off the same scan: another SpellKitFx writer, so it
                     // belongs ahead of the entity-visuals chain like its `arm_*_fx` siblings.
                     fire_breath,
@@ -1216,6 +1410,8 @@ mod nock_latch_tests {
             entity: unit,
             ident: *b"$BWP",
             data: 0,
+            anim_id: 0,
+            pos: None,
         });
         app.update();
         assert!(
@@ -1226,6 +1422,8 @@ mod nock_latch_tests {
             entity: unit,
             ident: *b"$BWR",
             data: 0,
+            anim_id: 0,
+            pos: None,
         });
         app.update();
         assert!(
@@ -1239,11 +1437,115 @@ mod nock_latch_tests {
             entity: bare,
             ident: *b"$BWP",
             data: 0,
+            anim_id: 0,
+            pos: None,
         });
         app.update();
         assert!(
             !app.world().entity(bare).contains::<NockLatch>(),
             "no ammo display, no latch"
         );
+    }
+}
+
+#[cfg(test)]
+mod disarm_tests {
+    use super::*;
+
+    /// **The ladder, hand by hand** (decision 1863; wow-re `disarm-weapon-gate-law.md` §2c). The
+    /// reference hides **exactly one weapon**, main hand first — so a disarmed dual-wielder
+    /// punches with the main hand and still swings its off-hand weapon. Every selector downstream
+    /// reaches its own unarmed leg by its own table; there is no disarm case in any of them.
+    #[test]
+    fn disarm_hides_one_weapon_main_hand_first() {
+        let worn = Wielded {
+            main: Some((2, 0x7)),   // 1H sword
+            off: Some((2, 0xf)),    // dagger
+            ranged: Some((2, 0x2)), // bow
+            ..Default::default()
+        };
+        let disarmed = Wielded {
+            disarmed: true,
+            ..worn
+        };
+
+        // CONTROL — the weapon tables, untouched while the flag is down.
+        assert_eq!(worn.disarmed_hand(), None);
+        assert_eq!(select::swing_anim_main(worn.armed_main()), 17); // Attack1H
+        assert_eq!(select::swing_anim_off(worn.armed_off()), 88); // AttackOffPierce
+        assert_eq!(select::ready_anim(worn.armed_main()), 26); // Ready1H
+
+        // Disarmed, both hands full: the MAIN HAND is the one hidden, and its claim CANCELS the
+        // off-hand probe (`5ec28d je 0x5ec2aa`) — the dagger keeps swinging as a dagger.
+        assert_eq!(disarmed.disarmed_hand(), Some(0));
+        assert_eq!(disarmed.armed_main(), None);
+        assert_eq!(disarmed.armed_off(), Some((2, 0xf)), "the off hand is KEPT");
+        assert_eq!(select::swing_anim_main(disarmed.armed_main()), 16); // AttackUnarmed
+        assert_eq!(select::swing_anim_off(disarmed.armed_off()), 88); // still the dagger
+        assert_eq!(select::ready_anim(disarmed.armed_main()), 25); // ReadyUnarmed
+
+        // The RANGED slot has no gate at all: `0x5ec25e` pushes equip index `0x11` and jumps
+        // straight past both probes, so a disarmed hunter still nocks.
+        assert_eq!(disarmed.ranged, Some((2, 0x2)));
+        assert_eq!(select::ranged_load_anim(disarmed.ranged), 105); // LoadBow
+
+        // …and the WORN reading is untouched throughout — it is what the paperdoll shows.
+        assert_eq!(disarmed.main, worn.main);
+    }
+
+    /// The off hand is hidden only when the main hand does **not** claim the disarm — an empty or
+    /// non-weapon main hand. That is the one case that reaches AttackUnarmedOff(117), whose
+    /// `AnimationData.dbc` row (id 117, fallback 87) is a clip distinct from AttackUnarmed(16).
+    #[test]
+    fn an_empty_main_hand_hands_the_disarm_to_the_off_hand() {
+        let off_only = Wielded {
+            main: None,
+            off: Some((2, 0xf)),
+            disarmed: true,
+            ..Default::default()
+        };
+        assert_eq!(off_only.disarmed_hand(), Some(1));
+        assert_eq!(off_only.armed_off(), None);
+        assert_eq!(select::swing_anim_off(off_only.armed_off()), 117);
+
+        // A NON-WEAPON main hand does not claim it either — the test is `ItemClass == 2` only.
+        let torch = Wielded {
+            main: Some((15, 0)), // class 15 = miscellaneous
+            off: Some((2, 0xf)),
+            disarmed: true,
+            ..Default::default()
+        };
+        assert_eq!(torch.disarmed_hand(), Some(1));
+        assert_eq!(
+            torch.armed_main(),
+            Some((15, 0)),
+            "a non-weapon is not taken"
+        );
+        assert_eq!(torch.armed_off(), None);
+    }
+
+    /// Neither hand holds a weapon: the flag hides nothing at all, and a shield stays a shield.
+    #[test]
+    fn the_ladder_takes_weapons_and_leaves_the_rest() {
+        let shielded = Wielded {
+            main: None,
+            off: Some((4, 6)), // class 4 = ARMOR, subclass 6 = shield
+            disarmed: true,
+            ..Default::default()
+        };
+        assert_eq!(shielded.disarmed_hand(), None);
+        assert_eq!(shielded.armed_off(), Some((4, 6)));
+    }
+
+    /// The pure ladder, over the classes alone — the form the action bar's equipped-item test
+    /// (`0x5ea5d0`'s slot 0/1/2 loop) reads off the raw inventory.
+    #[test]
+    fn the_ladder_over_classes() {
+        assert_eq!(disarmed_hand(Some(2), Some(2)), Some(0));
+        assert_eq!(disarmed_hand(Some(2), None), Some(0));
+        assert_eq!(disarmed_hand(None, Some(2)), Some(1));
+        assert_eq!(disarmed_hand(Some(4), Some(2)), Some(1));
+        assert_eq!(disarmed_hand(None, None), None);
+        assert_eq!(disarmed_hand(Some(4), Some(4)), None);
     }
 }

@@ -262,7 +262,7 @@ pub fn footprint_tri_grids(footprints: &[Option<FootprintTris>]) -> Vec<Option<C
         .iter()
         .map(|fp| {
             let fp = fp.as_ref()?;
-            let tris: Vec<&[u16]> = fp.indices.chunks_exact(3).collect();
+            let tris: Vec<&[u16; 3]> = fp.indices.as_chunks::<3>().0.iter().collect();
             ColumnGrid::build(tris.len(), |i| {
                 let mut lo = [f32::MAX; 2];
                 let mut hi = [f32::MIN; 2];
@@ -589,7 +589,7 @@ impl AssetLoader for WmoModelLoader {
             let mut gidx: Vec<u32> = Vec::new();
             accumulate_wmo_group_collision(&gbytes, &mut gpos, &mut gidx);
             if let Some(tris) = group_collision_tris.get_mut(gi as usize) {
-                for t in gidx.chunks_exact(3) {
+                for t in gidx.as_chunks::<3>().0 {
                     if let (Some(&a), Some(&b), Some(&c)) = (
                         gpos.get(t[0] as usize),
                         gpos.get(t[1] as usize),
@@ -608,7 +608,7 @@ impl AssetLoader for WmoModelLoader {
             let (mut dpos, mut didx): (Vec<[f32; 3]>, Vec<u32>) = (Vec::new(), Vec::new());
             accumulate_wmo_group_camera_only_collision(&gbytes, &mut dpos, &mut didx);
             if let Some(tris) = group_camera_only_tris.get_mut(gi as usize) {
-                for t in didx.chunks_exact(3) {
+                for t in didx.as_chunks::<3>().0 {
                     if let (Some(&a), Some(&b), Some(&c)) = (
                         dpos.get(t[0] as usize),
                         dpos.get(t[1] as usize),
@@ -654,6 +654,7 @@ impl AssetLoader for WmoModelLoader {
                     skin_slot: sub.skin_slot, // always None for WMO groups (no creature skins)
                     geoset_id: 0,             // WMO has no M2 geoset concept
                     char_slot: None,          // WMO is never a character body
+                    icon_slot: false,         // M2-only (texture type 14)
                     blend: sub.blend,
                     two_sided: sub.two_sided,
                     interior: sub.interior,
@@ -669,6 +670,8 @@ impl AssetLoader for WmoModelLoader {
                     alpha_anim: None,           // WMO batches carry no M2 colour/weight tracks
                     uv_anim: None,              // …nor texture transforms
                     uv_seq: None,               // …so no per-sequence set either (1408)
+                    uv_rot_seq: None,
+                    uv_scale_seq: None,
                     rgb_anim: None,
                     rgb_seq: None,            // …nor M2Color tints
                     wmo_batch: sub.wmo_batch, // the MOBA section — an interior group's lighting law

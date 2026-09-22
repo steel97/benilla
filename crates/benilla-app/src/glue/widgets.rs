@@ -15,10 +15,23 @@ use super::backdrop::{backdrop_border, tiled_bg_node};
 
 // ── The shared widget vocabulary ─────────────────────────────────────────────────────────────────
 
-/// A button's highlight overlay (shown on hover — and held while selected where the screen locks
-/// it, the ref's `LockHighlight`). Visibility is the owning screen's to drive.
+/// A button's highlight overlay: the reference's `HighlightTexture`, lit while the cursor is on
+/// the button — or held lit by [`LockHighlight`].
+///
+/// **Its visibility belongs to [`super::glue_hilights`] and to nothing else.** It used to be "the
+/// owning screen's to drive", which is how four screens ended up with four hand-rolled hover
+/// loops, two of them subtly different, and how the realm list ended up with none at all — no
+/// sheen on any of its buttons, because nobody remembered to write the fifth.
 #[derive(Component)]
 pub(crate) struct Hilight;
+/// **`Button:LockHighlight()`** — hold this button's [`Hilight`] lit whether or not the cursor is
+/// on it, which is how every glue list marks its selected row.
+///
+/// The reference's own verb, and the reason the sheen can have one owner: "lit" is
+/// `hovered || locked`, and a screen that knows which row is chosen says exactly that much and
+/// nothing about visibility.
+#[derive(Component, Default)]
+pub(crate) struct LockHighlight(pub(crate) bool);
 /// A button spawned with a plain-fill face because client art is missing — the only buttons whose
 /// `BackgroundColor` a hover pass may shade (every `Node` carries one since Bevy 0.15's required
 /// components, so presence alone can't distinguish the fallback).
@@ -149,7 +162,6 @@ pub(crate) fn outlined_text<W: Bundle, T: Bundle>(
 /// Every *other* wrapped glue string in the shipped XML sets `justifyH="LEFT"` explicitly
 /// (`CharacterCreate.xml`'s race/class/faction bodies, `AddonList.xml`'s title/notes/deps), which
 /// is why [`outlined_text`] stays left and this is the exception rather than the default.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn outlined_text_centered<W: Bundle, T: Bundle>(
     parent: &mut ChildSpawnerCommands,
     node: Node,
@@ -244,7 +256,6 @@ pub(crate) fn markup_spans(text: &str, base: Color, wrap: bool) -> Vec<(String, 
 ///
 /// **Private**: [`outlined_text`] is the one door in, so no caller can hand-build spans and skip
 /// the markup decode (B273's shape — see [`markup_spans`]).
-#[allow(clippy::too_many_arguments)]
 fn outlined_spans<W: Bundle, T: Bundle>(
     parent: &mut ChildSpawnerCommands,
     node: Node,
@@ -342,7 +353,13 @@ fn outlined_spans<W: Bundle, T: Bundle>(
 /// visual), and the name label along the bottom (the ref's `HighlightText`, `GlueFontNormalSmall`,
 /// anchored BOTTOM +1 — over the icon's bottom edge). `dyn_icon`/`label_dyn` are the screen's
 /// refresh markers, spawned onto the face / real label text.
-#[allow(clippy::too_many_arguments)]
+///
+/// **It carries its own [`LockHighlight`]**, because the reference does: these are the
+/// `CheckButton`s that `SetCharacterRace`/`SetCharacterClass`/`SetCharacterGender` lock and
+/// unlock by hand (`CharacterCreate.lua` l.171/254/326). Leaving the flag to the screen is how
+/// the create screen lost every selected sheen *and* every icon name for ten days — 2072 added a
+/// `&mut LockHighlight` term to the screen's own visuals query and this spawn site had none, so
+/// the query matched nothing at all.
 pub(crate) fn icon_button<A: Component, I: Bundle, L: Bundle>(
     parent: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
@@ -358,6 +375,7 @@ pub(crate) fn icon_button<A: Component, I: Bundle, L: Bundle>(
     let mut b = parent.spawn((
         action,
         Button,
+        LockHighlight::default(),
         Node {
             width: px(48.0),
             height: px(48.0),
@@ -699,7 +717,6 @@ pub(crate) fn paint_glue_field<'a>(
 /// onto all five row items ([`GlueFieldPart`]) so the screen's refresh can query them as a set and
 /// hand them to [`paint_glue_field`]. Plain-fill fallback without art. Focus and typing are the
 /// owning screen's systems — this is chrome only, so the screens' boxes can never fork.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn glue_edit_box<E: Bundle, T: Bundle + Clone>(
     parent: &mut ChildSpawnerCommands,
     art: &GlueArt,
@@ -808,7 +825,6 @@ pub(crate) fn glue_edit_box<E: Bundle, T: Bundle + Clone>(
 /// Returns the button's entity, so a screen can reach back into what it just built — the login
 /// screen marks its realmlist button [`GlueDisabled`] when `$WOW_HOST` owns the session (1667).
 /// Ignoring the return is the norm; nothing is `#[must_use]`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn glue_button<A: Component>(
     parent: &mut ChildSpawnerCommands,
     art: &GlueArt,

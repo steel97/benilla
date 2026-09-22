@@ -128,6 +128,8 @@ fn load_item_sounds(mut commands: Commands, assets: Option<Res<WorldAssets>>) {
 /// payload transition (decision 0216) — an Item transition always plays its own per-item kit
 /// instead, never this pair.
 const INTERFACESOUND_CURSORGRABOBJECT: u32 = 902;
+/// `LOOTWINDOWCOINSOUND` — SoundEntries kit 895, the coin clink the money pickup names (1962).
+const LOOTWINDOWCOINSOUND: u32 = 895;
 const INTERFACESOUND_CURSORDROPOBJECT: u32 = 903;
 
 /// Which half of a gesture pair a transition plays: the payload landing on the cursor (`Gain`,
@@ -151,11 +153,10 @@ enum CursorGesture {
 /// missing link (template in flight, unknown display, group 0, kit 0, absent catalog) is the
 /// client's own silent return, never an error. The previous payload is tracked here (a `Local`),
 /// not in the VM — the engine-free model owns the state, the app owns the sound.
-#[allow(clippy::too_many_arguments)]
 fn play_item_gesture_sounds(
     script: Option<NonSend<UiScript>>,
     mut prev: Local<crate::ui_script::VmMemo<Option<CursorPayload>>>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     displays: Option<Res<ItemDisplays>>,
     sounds: Option<Res<ItemSounds>>,
     kits: Option<ResMut<SoundKits>>,
@@ -224,10 +225,15 @@ fn play_item_gesture_sounds(
         | CursorPayload::PetAction(_)
         // Mode 10 joins them: the stabled-pet grab `0x495010` calls the same generic path and
         // names no per-item kit (decision 1677).
-        | CursorPayload::StablePet(_) => {
-            let kit_id = match gesture {
-                CursorGesture::Gain => INTERFACESOUND_CURSORGRABOBJECT,
-                CursorGesture::Loss => INTERFACESOUND_CURSORDROPOBJECT,
+        | CursorPayload::StablePet(_)
+        // Mode 2 (1962, 1965): the money pickup AND drop both play `LOOTWINDOWCOINSOUND` — the
+        // same kit 895 the purse plays on a change (`sound/money.rs`) — and never the generic drop
+        // kit (wow-re `money-cursor-law.md` §2).
+        | CursorPayload::Money(_) => {
+            let kit_id = match (&payload, gesture) {
+                (CursorPayload::Money(_), _) => LOOTWINDOWCOINSOUND,
+                (_, CursorGesture::Gain) => INTERFACESOUND_CURSORGRABOBJECT,
+                (_, CursorGesture::Loss) => INTERFACESOUND_CURSORDROPOBJECT,
             };
             if let Err(e) = kit::play_kit(
                 &mut kits,
@@ -260,7 +266,6 @@ fn play_item_gesture_sounds(
 /// through the byte-verified chain `ItemGroupSounds[ItemDisplayInfo[displayId].group_sounds]
 /// .kit[gesture]` and play it 2D on the SFX bucket. Every missing link (unknown display, group 0,
 /// kit 0) is the client's own silent return, never an error.
-#[allow(clippy::too_many_arguments)]
 fn play_item_gesture(
     display_id: u32,
     gesture: ItemGesture,

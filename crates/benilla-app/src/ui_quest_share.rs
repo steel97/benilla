@@ -48,7 +48,7 @@ use bevy::prelude::*;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, NetCommands};
 use crate::ui_action::{show_messages, ui_error_text, MessageSink, Shown, UiError};
-use crate::ui_script::UiInput;
+use crate::ui_script::{UiFeed, UiInput};
 
 /// How many frames a queued line waits for its `%s` before it is dropped — [`crate::ui_loot`]'s
 /// `RECEIVE_MAX_TRIES`, and the same reasoning: a name query is one round trip, so any real answer
@@ -131,6 +131,71 @@ fn verdict_message(msg: QuestShareMsg) -> Option<&'static str> {
     Some(key)
 }
 
+/// The party quest-share's packet handlers (decision 1733; in the net handler table since 2320,
+/// moved out of the drain's quests arm file): one member's verdict on a quest we pushed, and the
+/// escort-quest confirm. Both park in [`QuestShare`] for this module to name and raise — the guid
+/// needs a name query a packet handler cannot await.
+mod net {
+    use benilla_protocol::messages::{QuestConfirmAccept, QuestShareMsg};
+    use benilla_protocol::{SessionEvent, SessionEventKind};
+    use bevy::prelude::*;
+
+    use super::QuestShare;
+    use crate::net::NetHandlerApp;
+
+    /// Register the handlers and the session-end listener — called from
+    /// [`super::QuestSharePlugin`].
+    pub(super) fn register(app: &mut App) {
+        use SessionEventKind as K;
+        app.net_handler(K::QuestPushResult, on_push_result)
+            .net_handler(K::QuestConfirmAccept, on_confirm_accept)
+            .net_handler(K::Disconnected, on_session_end);
+    }
+
+    fn on_push_result(In(ev): In<SessionEvent>, mut share: ResMut<QuestShare>) {
+        if let SessionEvent::QuestPushResult { member, msg } = ev {
+            quest_push_result(member, msg, &mut share);
+        }
+    }
+
+    fn on_confirm_accept(In(ev): In<SessionEvent>, mut share: ResMut<QuestShare>) {
+        if let SessionEvent::QuestConfirmAccept(c) = ev {
+            quest_confirm_accept(c, &mut share);
+        }
+    }
+
+    /// A verdict on a share nobody is listening for any more, and a confirm whose server-side
+    /// latch died with the socket (decision 1733). A listener on the session end
+    /// ([`crate::net::handlers::BROADCAST`]).
+    fn on_session_end(In(_): In<SessionEvent>, mut share: ResMut<QuestShare>) {
+        share.clear_session();
+    }
+
+    /// One party member's verdict on a quest we shared (`MSG_QUEST_PUSH_RESULT`, decision 1733).
+    ///
+    /// Parked rather than shown: the line's `%s` is the member's NAME, which may still need a
+    /// `CMSG_NAME_QUERY` round trip, and this pass has no VM to resolve GlobalStrings through either.
+    /// [`crate::ui_quest_share`] owns both.
+    fn quest_push_result(member: u64, msg: QuestShareMsg, share: &mut QuestShare) {
+        debug!(
+            "net: quest push result — member {member:#x} verdict {}",
+            msg.0
+        );
+        share.push_verdict(member, msg);
+    }
+
+    /// A party member started a `QUEST_FLAGS_PARTY_ACCEPT` (escort) quest and we are being asked
+    /// whether to start it too (`SMSG_QUEST_CONFIRM_ACCEPT`). Parked for the same reason: the popup
+    /// names the member, and the name may not be cached yet.
+    fn quest_confirm_accept(c: QuestConfirmAccept, share: &mut QuestShare) {
+        debug!(
+            "net: quest confirm accept — quest {} ({:?}) from {:#x}",
+            c.quest_id, c.title, c.sender
+        );
+        share.set_confirm(c);
+    }
+}
+
 /// Owns [`QuestShare`] and its two systems — a plugin of its own rather than a lodger in
 /// [`crate::ui_quest`]'s, because nothing here is bound to the questgiver window: the verdicts are
 /// fired from the quest LOG and the confirm has no window at all.
@@ -138,13 +203,14 @@ pub(crate) struct QuestSharePlugin;
 
 impl Plugin for QuestSharePlugin {
     fn build(&self, app: &mut App) {
+        net::register(app);
         // The [`crate::ui_duel`] shape exactly: feed before the input pass so a verdict line and
         // a confirm are on screen the same frame the packet landed, drain after it so the popup's
         // Yes goes out the same frame it was clicked.
         app.init_resource::<QuestShare>().add_systems(
             Update,
             (
-                feed_quest_share.before(UiInput),
+                feed_quest_share.in_set(UiFeed),
                 drain_quest_share.after(UiInput),
             ),
         );
@@ -156,7 +222,7 @@ impl Plugin for QuestSharePlugin {
 fn feed_quest_share(
     script: Option<NonSendMut<UiScript>>,
     mut share: ResMut<QuestShare>,
-    mut names: ResMut<NameCache>,
+    names: Res<NameCache>,
     commands: Res<NetCommands>,
     mut sink: MessageSink,
 ) {
@@ -177,11 +243,7 @@ fn feed_quest_share(
         };
         match names.resolve(v.member, &commands).map(str::to_string) {
             Some(name) => {
-                let err = UiError {
-                    key,
-                    fill_s: Some(name),
-                    fill_d: None,
-                };
+                let err = UiError::s(key, name);
                 let get = |k: &str| script.lua().globals().get::<String>(k).ok();
                 if let Some(text) = ui_error_text(&err, &get) {
                     lines.push(Shown::keyed(err.key, text));
@@ -292,14 +354,7 @@ mod tests {
         // the answer a decline produces.
         let line = |raw: u8| {
             let key = verdict_message(QuestShareMsg(raw)).unwrap();
-            ui_error_text(
-                &UiError {
-                    key,
-                    fill_s: Some("Mate".into()),
-                    fill_d: None,
-                },
-                &g,
-            )
+            ui_error_text(&UiError::s(key, "Mate"), &g)
         };
         assert_eq!(
             line(QuestShareMsg::SHARING_QUEST.0).as_deref(),

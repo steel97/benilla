@@ -119,7 +119,10 @@ pub(super) fn spell_view_of(lua: &Lua, spell_id: u32) -> Option<SpellTooltipView
 /// builder law, after the rank line), the "Next rank:" block, and the green learn hint.
 #[derive(Clone, Debug, Default)]
 pub(super) struct TalentLines {
-    pub rank_line: String,
+    /// `TOOLTIP_TALENT_RANK` = "Rank %d/%d", already filled by the caller off the player's own
+    /// string table. `None` = the table does not carry the key, and the plate shows no rank row
+    /// (decision 2045 — never an invented one).
+    pub rank_line: Option<String>,
     pub reqs: Vec<String>,
     /// The next rank's spell id (0 = none) — asked from the spell store when its description
     /// hasn't landed yet, so the hover's re-enter completes the block.
@@ -187,7 +190,9 @@ fn render_spell(
     // The talent head: "Rank r/m" (builder line 2, TOOLTIP_TALENT_RANK white) + the red
     // requirement lines while locked (position CONFIRMED, decision 0305 — TalentLines doc).
     if let Some(t) = talent {
-        append_line(lua, this, (t.rank_line.clone(), WHITE), None, false)?;
+        if let Some(rank) = &t.rank_line {
+            append_line(lua, this, (rank.clone(), WHITE), None, false)?;
+        }
         for req in &t.reqs {
             append_line(lua, this, (req.clone(), RED), None, true)?;
         }
@@ -250,21 +255,22 @@ fn render_spell(
         let color = if aura { WHITE } else { GOLD };
         append_line(lua, this, (desc.clone(), color), None, true)?;
     }
-    // The talent tail: the "Next rank:" block (TOOLTIP_TALENT_NEXT_RANK white + the next rank's
-    // gold description) and the green learn hint (builder line 13, TOOLTIP_TALENT_LEARN).
+    // The talent tail: the TOOLTIP_TALENT_NEXT_RANK header (white, `0x854a10` pushed at
+    // `0x52b2cd`) over the next rank's gold description, and the green learn hint (builder
+    // line 13, TOOLTIP_TALENT_LEARN `0x8549f8` at `0x52b362`). Both are keys into the player's
+    // own string table (decision 2045); an install without them shows the description alone
+    // rather than a sentence of ours.
     if let Some(t) = talent {
         if let Some(next) = &t.next_desc {
-            append_line(lua, this, ("Next rank:".to_string(), WHITE), None, false)?;
+            if let Some(header) = crate::strings::global(lua, "TOOLTIP_TALENT_NEXT_RANK") {
+                append_line(lua, this, (header, WHITE), None, false)?;
+            }
             append_line(lua, this, (next.clone(), GOLD), None, true)?;
         }
         if t.learn {
-            append_line(
-                lua,
-                this,
-                ("Click to learn".to_string(), GREEN),
-                None,
-                false,
-            )?;
+            if let Some(hint) = crate::strings::global(lua, "TOOLTIP_TALENT_LEARN") {
+                append_line(lua, this, (hint, GREEN), None, false)?;
+            }
         }
     }
     // The duration-remaining line (`SetPlayerBuff` only) is GOLD `0xffffd200` — the same gold as
@@ -309,7 +315,9 @@ pub(super) fn set_spell_with_talent(
         None => {
             // The view hasn't landed: show the talent head alone (the ask is recorded; the
             // hover's re-enter repaints complete) — the spell channel's own fallback shape.
-            append_line(lua, this, (talent.rank_line.clone(), WHITE), None, false)?;
+            if let Some(rank) = &talent.rank_line {
+                append_line(lua, this, (rank.clone(), WHITE), None, false)?;
+            }
         }
     }
     super::tooltip::show_or_hide_empty(lua, h);
@@ -318,7 +326,28 @@ pub(super) fn set_spell_with_talent(
 
 /// Shared entry: clear, render (or record the ask and show nothing but the name if the caller
 /// knows one), show.
-fn set_spell_by_id(
+/// The reward-spell hover: the spell by id with the quest's own name as the fallback, or an
+/// empty tooltip.
+fn set_reward_spell(
+    lua: &Lua,
+    this: &Table,
+    spell: Option<(u32, Option<String>)>,
+) -> mlua::Result<()> {
+    match spell {
+        Some((id, name)) => set_spell_by_id(lua, this, id, name, SpellRenderOpts::default(), None),
+        None => {
+            let h = frame_handle_of(lua, this)?;
+            {
+                let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+                clear_content(&mut model, h);
+            }
+            super::tooltip::show_or_hide_empty(lua, h);
+            Ok(())
+        }
+    }
+}
+
+pub(super) fn set_spell_by_id(
     lua: &Lua,
     this: &Table,
     spell_id: u32,
@@ -614,6 +643,37 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
     // table). Not the spell title's gold, and nothing about the bound spell: 1.12 has no
     // `#showtooltip`. This arm was a `_ => Ok(())` left from before 0983 shipped macros, which is
     // why a macro on the bar hovered to nothing (the director, 2026-08-27, after 1636).
+    // GameTooltip:SetQuestRewardSpell() / SetQuestLogRewardSpell() — the hover of the reward
+    // slot stock marks `rewardType = "spell"` (QuestFrameTemplates.xml:150, QuestLogFrame.xml:115;
+    // bindings 0x535bb0 / 0x535c60, self only, 0 returns): the quest's reward spell by id through
+    // the spell renderer, an empty tooltip when the quest rewards none.
+    m.set(
+        "SetQuestRewardSpell",
+        lua.create_function(|lua, this: Table| {
+            let id = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                model
+                    .quest
+                    .as_ref()
+                    .and_then(|q| q.reward_spell.as_ref())
+                    .map(|s| (s.spell_id, s.name.clone()))
+            };
+            set_reward_spell(lua, &this, id)
+        })?,
+    )?;
+    m.set(
+        "SetQuestLogRewardSpell",
+        lua.create_function(|lua, this: Table| {
+            let id = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                model
+                    .selected_quest_detail()
+                    .and_then(|d| d.reward_spell.as_ref())
+                    .map(|s| (s.spell_id, s.name.clone()))
+            };
+            set_reward_spell(lua, &this, id)
+        })?,
+    )?;
     m.set(
         "SetAction",
         lua.create_function(|lua, (this, slot): (Table, u32)| {
@@ -636,7 +696,7 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                 ),
                 0x80 => {
                     // Route through the shared item renderer (the id-keyed entry).
-                    let f: mlua::Function = this.get("SetItemById")?;
+                    let f: mlua::Function = this.get("BenillaSetItemById")?;
                     f.call::<()>((this.clone(), a.action))
                 }
                 0x40 => {
@@ -688,7 +748,7 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                 // `0x52b650`. No fallback name: an item id of 0 or a template still in flight
                 // renders an EMPTY tooltip, which is the builder's own early-out.
                 TrainerTooltip::Item(item_id) => {
-                    let f: mlua::Function = this.get("SetItemById")?;
+                    let f: mlua::Function = this.get("BenillaSetItemById")?;
                     f.call::<()>((this.clone(), item_id))
                 }
                 TrainerTooltip::Spell {
@@ -734,7 +794,7 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
             };
             match subject {
                 CraftTooltip::Item(item_id) => {
-                    let f: mlua::Function = this.get("SetItemById")?;
+                    let f: mlua::Function = this.get("BenillaSetItemById")?;
                     f.call::<()>((this.clone(), item_id))
                 }
                 CraftTooltip::Spell(spell_id) => {

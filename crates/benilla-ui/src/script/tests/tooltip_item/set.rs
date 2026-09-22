@@ -5,11 +5,15 @@
 use super::{lines_of, script};
 use crate::script::*;
 
-/// The §22 SET block, byte-read: a blank gold line, the gold "name (owned/total)" header, the
-/// skill line (white/red) between header and the member ladder (cream when equipped / gray;
-/// in-flight names wait), a second blank, then the threshold bonuses SORTED ascending — green
-/// only when the skill requirement is met AND owned ≥ threshold — plus the ask-once for an
-/// unseen set id.
+/// The §22 SET block, byte-read: a blank gold line, the gold `ITEM_SET_NAME` header, the skill
+/// line (white/red) between header and the member ladder (cream when equipped / gray; in-flight
+/// names wait), a second blank, then the threshold bonuses SORTED ascending — green only when the
+/// skill requirement is met AND owned ≥ threshold — plus the ask-once for an unseen set id.
+///
+/// **The two bonus arms are two different keys** (`0x52e056..0x52e0d6`): an ACTIVE bonus formats
+/// `ITEM_SET_BONUS` = "Set: %s" with no count at all, and only an inactive one formats
+/// `ITEM_SET_BONUS_GRAY` = "(%d) Set: %s". Watching the (2) bonus move between them as the skill
+/// gate opens and closes is what these assertions are for.
 #[test]
 fn item_set_block_counts_and_colors() {
     let mut s = script();
@@ -56,23 +60,25 @@ fn item_set_block_counts_and_colors() {
     s.set_item_set(161, set_view.clone());
     s.run(
         r#"
-        local a = CreateFrame("Button", "Slot10"); a:SetPoint("CENTER", 0, 0); a:SetSize(10, 10)
+        local a = CreateFrame("Button", "Slot10"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
         local tt = CreateFrame("GameTooltip", "TT")
         tt:SetOwner(a, "ANCHOR_RIGHT")
-        tt:SetItemById(6303)
+        tt:BenillaSetItemById(6303)
         -- The spacer is the reference's own literal `0x854b2c` — a space and a newline, which is
         -- ONE row carrying one space, not the empty string (an empty AddLine adds no line at all
         -- in the reference: `0x530270` bails before its `inc [esi+0x31c]`).
         assert(TTTextLeft3:GetText() == " \n", "blank before the header, got "
                .. string.format("%q", tostring(TTTextLeft3:GetText())))
-        assert(TTTextLeft4:GetText() == "Defias Leather (2/5)", "got " .. tostring(TTTextLeft4:GetText()))
+        assert(TTTextLeft4:GetText() == "[SET_NAME Defias Leather 2/5]", "got " .. tostring(TTTextLeft4:GetText()))
         assert(TTTextLeft5:GetText() == "  Defias Mark")
         assert(TTTextLeft8:GetText() == "  Defias Boots", "in-flight member renders no line")
         assert(TTTextLeft9:GetText() == " \n", "blank before the bonuses, got "
                .. string.format("%q", tostring(TTTextLeft9:GetText())))
-        assert(TTTextLeft10:GetText() == "(2) Set: Increases movement speed slightly.",
+        -- Owned 2 of 5: the (2) bonus is ACTIVE and takes the countless ITEM_SET_BONUS; the
+        -- (4) one is not and takes ITEM_SET_BONUS_GRAY, which is the arm that carries the count.
+        assert(TTTextLeft10:GetText() == "[SET_BONUS Increases movement speed slightly.]",
                "thresholds sort ascending, got " .. tostring(TTTextLeft10:GetText()))
-        assert(TTTextLeft11:GetText() == "(4) Set: +10 Attack Power.")
+        assert(TTTextLeft11:GetText() == "[SET_BONUS_GRAY 4 +10 Attack Power.]")
     "#,
     )
     .unwrap();
@@ -90,7 +96,7 @@ fn item_set_block_counts_and_colors() {
     let green = [0.0, 1.0, 0.0, 1.0];
     let red = [1.0, 32.0 / 255.0, 32.0 / 255.0, 1.0];
     assert_eq!(
-        color(&lines, "Defias Leather (2/5)"),
+        color(&lines, "[SET_NAME Defias Leather 2/5]"),
         gold,
         "set name is gold"
     );
@@ -105,12 +111,12 @@ fn item_set_block_counts_and_colors() {
         "unowned member is gray"
     );
     assert_eq!(
-        color(&lines, "(2) Set: Increases movement speed slightly."),
+        color(&lines, "[SET_BONUS Increases movement speed slightly.]"),
         green,
         "active bonus is green"
     );
     assert_eq!(
-        color(&lines, "(4) Set: +10 Attack Power."),
+        color(&lines, "[SET_BONUS_GRAY 4 +10 Attack Power.]"),
         gray,
         "inactive bonus is gray"
     );
@@ -123,34 +129,38 @@ fn item_set_block_counts_and_colors() {
     s.set_item_set(161, gated);
     s.run(
         r#"
-        TT:SetOwner(Slot10, "ANCHOR_RIGHT"); TT:SetItemById(6303)
-        assert(TTTextLeft5:GetText() == "Requires Leatherworking (250)",
+        TT:SetOwner(Slot10, "ANCHOR_RIGHT"); TT:BenillaSetItemById(6303)
+        assert(TTTextLeft5:GetText() == "[MIN_SKILL Leatherworking 250]",
                "the skill line sits between header and members")
         assert(TTTextLeft6:GetText() == "  Defias Mark")
     "#,
     )
     .unwrap();
     let lines = lines_of(&mut s);
-    assert_eq!(color(&lines, "Requires Leatherworking (250)"), red);
+    assert_eq!(color(&lines, "[MIN_SKILL Leatherworking 250]"), red);
+    // The gate also moves it onto the OTHER key: an inactive bonus is the counted spelling.
     assert_eq!(
-        color(&lines, "(2) Set: Increases movement speed slightly."),
+        color(
+            &lines,
+            "[SET_BONUS_GRAY 2 Increases movement speed slightly.]"
+        ),
         gray,
         "an unmet skill grays even a met threshold"
     );
     let mut req = PlayerReqState::default();
     req.skills.insert(165, 300);
     s.set_player_req_state(req);
-    s.run(r#"TT:SetOwner(Slot10, "ANCHOR_RIGHT"); TT:SetItemById(6303)"#)
+    s.run(r#"TT:SetOwner(Slot10, "ANCHOR_RIGHT"); TT:BenillaSetItemById(6303)"#)
         .unwrap();
     let lines = lines_of(&mut s);
     assert_eq!(
-        color(&lines, "Requires Leatherworking (250)"),
+        color(&lines, "[MIN_SKILL Leatherworking 250]"),
         [1.0, 1.0, 1.0, 1.0]
     );
     assert_eq!(
-        color(&lines, "(2) Set: Increases movement speed slightly."),
+        color(&lines, "[SET_BONUS Increases movement speed slightly.]"),
         green,
-        "meeting the skill restores the green"
+        "meeting the skill restores the green — and the countless key with it"
     );
     // An unseen set id records the ask-once.
     s.set_item_template(
@@ -161,8 +171,78 @@ fn item_set_block_counts_and_colors() {
             ..Default::default()
         },
     );
-    s.run(r#"TT:SetOwner(Slot10, "ANCHOR_RIGHT"); TT:SetItemById(9999)"#)
+    s.run(r#"TT:SetOwner(Slot10, "ANCHOR_RIGHT"); TT:BenillaSetItemById(9999)"#)
         .unwrap();
     assert_eq!(s.take_item_set_asks(), vec![1], "the set ask recorded");
     assert!(s.take_errors().is_empty());
+}
+
+/// `GameTooltip:SetQuestItem(type, index)` and `SetQuestLogItem(type, index)` — the quest-giver
+/// panels' and the quest log's reward hovers (stock QuestFrameTemplates.xml:148,
+/// QuestLogFrame.xml:113): the row's item by id through the shared renderer; a row that is not
+/// there leaves the tooltip empty (1944).
+#[test]
+fn quest_item_hovers_render_the_rows_item_by_id() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_item_template(
+        2024,
+        ItemTemplateView {
+            name: "Militia Hammer".into(),
+            quality: 1,
+            ..Default::default()
+        },
+    );
+    let row = || QuestItemView {
+        item_id: 2024,
+        name: Some("Militia Hammer".into()),
+        quality: 1,
+        ..Default::default()
+    };
+    s.set_quest(Some(QuestState {
+        panel: QuestPanel::Detail,
+        choices: vec![row()],
+        ..QuestState::default()
+    }));
+    s.run(
+        r#"
+        local a = CreateFrame("Button", "Q1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
+        local tt = CreateFrame("GameTooltip", "TT")
+        tt:SetOwner(a, "ANCHOR_RIGHT"); tt:SetQuestItem("choice", 1)
+        "#,
+    )
+    .unwrap();
+    assert_eq!(lines_of(&mut s)[0].0, "Militia Hammer");
+
+    s.run(r#"TT:SetOwner(Q1, "ANCHOR_RIGHT"); TT:SetQuestItem("choice", 2)"#)
+        .unwrap();
+    assert_eq!(
+        s.eval::<i64>("return TT:NumLines()").unwrap(),
+        0,
+        "an out-of-range row shows nothing"
+    );
+    s.run(r#"TT:SetOwner(Q1, "ANCHOR_RIGHT"); TT:SetQuestItem("reward", 1)"#)
+        .unwrap();
+    assert_eq!(s.eval::<i64>("return TT:NumLines()").unwrap(), 0);
+
+    s.set_quest_log(QuestLogState {
+        entries: vec![QuestLogEntryView {
+            quest_id: 7,
+            detail: Some(QuestLogDetail {
+                rewards: vec![row()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    // The detail hangs on the row now, so the tooltip reads it through the selection (2247).
+    s.run("SelectQuestLogEntry(1)").unwrap();
+    s.run(r#"TT:SetOwner(Q1, "ANCHOR_RIGHT"); TT:SetQuestLogItem("reward", 1)"#)
+        .unwrap();
+    assert_eq!(lines_of(&mut s)[0].0, "Militia Hammer");
+    s.run(r#"TT:SetOwner(Q1, "ANCHOR_RIGHT"); TT:SetQuestLogItem("choice", 1)"#)
+        .unwrap();
+    assert_eq!(s.eval::<i64>("return TT:NumLines()").unwrap(), 0);
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }

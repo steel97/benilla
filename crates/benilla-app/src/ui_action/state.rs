@@ -23,7 +23,7 @@
 //! §2a fold-back: reagents, forms, stealth, aura states (the Execute-family target dependence),
 //! the works.
 
-use crate::ui_items::{count_of, InventoryScope};
+use crate::ui_items::carried_counts;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -41,14 +41,6 @@ use crate::target::Selection;
 
 use super::{usable, AutoRepeatActive, PlayerActions, Spells};
 
-/// `GetMinMaxRange 0x6e3480`'s byte constants (wow-re `wave-cooldown.md` + the decomp
-/// `FUN_006e3480`, VERIFIED): the **melee-branch-only** reach pad (`0x80b058`; the ranged
-/// branch pads by the bare reach sum), the melee floor, and the self-cast short-circuit's
-/// flat max.
-const MELEE_REACH_PAD: f32 = 1.3333;
-const MELEE_RANGE_FLOOR: f32 = 5.0;
-const SELF_CAST_MAX: f32 = 100.0;
-
 /// The feed's memory: what was last pushed, and the edge detectors.
 #[derive(Default)]
 pub(super) struct StateMemory {
@@ -61,7 +53,7 @@ pub(super) struct StateMemory {
 }
 
 /// The client's cast-fail reasons for the two range refusals ("Out of range." / "Target too
-/// close" in [`super::cast_error_text`]'s table) — what `CanTargetUnit 0x6e4440` emits when
+/// close" in `super::cast_error_text`'s table) — what `CanTargetUnit 0x6e4440` emits when
 /// `IsTargetInRange 0x6e47b0` fails on its max² / min² compare.
 pub(super) const ERR_OUT_OF_RANGE: u8 = 0x59;
 pub(super) const ERR_TOO_CLOSE: u8 = 0x76;
@@ -70,7 +62,7 @@ pub(super) const ERR_TOO_CLOSE: u8 = 0x76;
 /// → `IsTargetInRange 0x6e47b0` BEFORE `ArmCast`/`SendCast` (`wave-cast.md`, byte-verified), so
 /// an out-of-range or too-close press fails locally and the commit tail — the ranged sheath
 /// snap `0x6e5930` included — never runs. This is why a too-close Throw/Auto Shot must NOT draw
-/// the ranged weapon. Squared 3D distance against [`resolve_range`]'s {min, max}: beyond max² →
+/// the ranged weapon. Squared 3D distance against [`benilla_formats::min_max_range`]'s {min, max}: beyond max² →
 /// [`ERR_OUT_OF_RANGE`], inside a nonzero min² → [`ERR_TOO_CLOSE`]. Untestable inputs (no range
 /// row, unknown distance) pass — the server still judges the cast.
 pub(super) fn cast_range_refusal(
@@ -80,7 +72,7 @@ pub(super) fn cast_range_refusal(
     target_reach: Option<f32>,
     dist_sq: Option<f32>,
 ) -> Option<u8> {
-    let (min, max) = resolve_range(spell, row, self_reach, target_reach)?;
+    let (min, max) = benilla_formats::min_max_range(spell, row, self_reach, target_reach)?;
     let d2 = dist_sq?;
     if d2 > max * max {
         return Some(ERR_OUT_OF_RANGE);
@@ -90,6 +82,125 @@ pub(super) fn cast_range_refusal(
     }
     None
 }
+
+/// `PreventionType` values (`Spell.dbc` column 165): which crowd-control flag can refuse this
+/// spell locally. `0` = neither.
+const PREVENTION_SILENCE: u32 = 1;
+const PREVENTION_PACIFY: u32 = 2;
+
+/// The **crowd-control leg** of the same requirement validator `0x6094f0`, sitting **above** its
+/// mounted block (`0x609c6c`) — so a stunned mounted caster is told about the stun (decision 1904;
+/// wow-re `equipped-item-and-cc-cast-gates.md` §2.1, byte-verified). It refuses before any packet,
+/// which is why it must be local.
+///
+/// **Six arms, in the reference's order, first match wins** — 1863's fold-back recorded four:
+///
+/// | # | arm | gate | reason |
+/// |---|---|---|---|
+/// | 1 | CHARMED | `UNIT_FIELD_CHARMEDBY != 0` and the charmer is not us | `0x14` |
+/// | 2 | STUNNED | bit 18 — **no per-spell gate, every spell** | `0x64` |
+/// | 3 | SILENCED | bit 13 **and** `PreventionType == 1` | `0x60` |
+/// | 4 | PACIFIED | bit 17 **and** `PreventionType == 2` | `0x5a` |
+/// | 5 | FLEEING | bit 23 | `0x1e` |
+/// | 6 | CONFUSED | bit 22 | `0x16` |
+///
+/// The asymmetry is the finding: STUNNED, FLEEING, CHARMED and CONFUSED carry no per-spell gate at
+/// all, while SILENCED and PACIFIED run only where the spell's own `PreventionType` names them —
+/// so a silence stops casts and leaves melee abilities alone, and a pacify does the reverse.
+/// Reading `UNIT_FLAG_SILENCED` as "no casting" is the mistake this replaces.
+///
+/// **A dead caster skips all six** (`0x60980d`, a `jle` on `UNIT_FIELD_HEALTH`).
+///
+/// This ladder is **TryCast-only** — one caller, no address-takes — so a button does **not** grey
+/// while stunned, silenced or pacified: it refuses on the press. (Fear, confuse and charm *are*
+/// greyed, by a second copy of the same helpers inside `0x6e3d60`; that copy is not built here.)
+///
+/// Its byte-shape was nearly missed by a census twice: SILENCED's read is `f6 c4 20 test ah,0x20`,
+/// a sub-register byte-lane form with no dword immediate, invisible to an immediate scan.
+///
+/// **The exemption scan is built** (decision 1946, closing 1925's deferral): each arm first asks
+/// whether any of the caster's own auras grants immunity to what is blocking it — a scan of
+/// `UNIT_FIELD_AURA[0..47]`'s raw spell ids for an aura of the arm's own type, then
+/// [`benilla_formats::grants_immunity`] on each match. A hit **lifts** the refusal; a rejection
+/// names the blocking mechanic and turns the arm's own reason into `0x8d`. Each arm scans for a
+/// different set of aura types — charm `{6, 177, 2}`, stun `{12}`, silence `{27, 12, 60}`, pacify
+/// `{25, 12, 60}`, fear `{7}`, confuse `{5}` — and those sets are the reference's, not a family
+/// resemblance.
+pub(crate) fn cast_cc_refusal(
+    unit_flags: u32,
+    health: Option<u32>,
+    charmed_by_other: bool,
+    spell: Option<&SpellDisplay>,
+    exempt: &mut impl FnMut(&[u32]) -> benilla_formats::CcExemption,
+) -> Option<(u8, Option<u32>)> {
+    use crate::player::UNIT_FLAG_STUNNED;
+    /// `UNIT_FIELD_FLAGS` bits 13/17/22/23 (vmangos `UnitDefines.h`).
+    const UNIT_FLAG_SILENCED: u32 = 0x0000_2000;
+    const UNIT_FLAG_PACIFIED: u32 = 0x0002_0000;
+    const UNIT_FLAG_CONFUSED: u32 = 0x0040_0000;
+    const UNIT_FLAG_FLEEING: u32 = 0x0080_0000;
+
+    // The dead caster's skip (`0x60980d`): a corpse is refused by an earlier rung, not this one.
+    if health == Some(0) {
+        return None;
+    }
+    let prevention = spell.map_or(0, |d| d.prevention_type);
+    // One arm: ask its exemption scan first, and let its answer pick between silence and one of
+    // two messages. `exempt` returning `exempt: true` means one of the caster's own auras grants
+    // immunity to whatever is blocking — the arm is SKIPPED and the cast proceeds. Otherwise the
+    // refusal is `0x8d` "Can't do that while %s" when the scan named a mechanic, and the arm's own
+    // reason when it did not (decision 1946).
+    let mut arm = |aura_types: &[u32], own_reason: u8| -> Option<(u8, Option<u32>)> {
+        let scan = exempt(aura_types);
+        if scan.exempt {
+            return None;
+        }
+        Some(if scan.mechanic != 0 {
+            // The mechanic rides along as the message's `%s` — the one client-LOCAL refusal that
+            // carries an argument word (decision 1948).
+            (REASON_PREVENTED_BY_MECHANIC, Some(scan.mechanic))
+        } else {
+            (own_reason, None)
+        })
+    };
+
+    if charmed_by_other {
+        if let Some(r) = arm(&[6, 177, 2], 0x14) {
+            return Some(r);
+        }
+    }
+    if unit_flags & UNIT_FLAG_STUNNED != 0 {
+        if let Some(r) = arm(&[12], 0x64) {
+            return Some(r);
+        }
+    }
+    if unit_flags & UNIT_FLAG_SILENCED != 0 && prevention == PREVENTION_SILENCE {
+        if let Some(r) = arm(&[27, 12, 60], 0x60) {
+            return Some(r);
+        }
+    }
+    if unit_flags & UNIT_FLAG_PACIFIED != 0 && prevention == PREVENTION_PACIFY {
+        if let Some(r) = arm(&[25, 12, 60], 0x5a) {
+            return Some(r);
+        }
+    }
+    if unit_flags & UNIT_FLAG_FLEEING != 0 {
+        if let Some(r) = arm(&[7], 0x1e) {
+            return Some(r);
+        }
+    }
+    if unit_flags & UNIT_FLAG_CONFUSED != 0 {
+        if let Some(r) = arm(&[5], 0x16) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// `SPELL_FAILED_PREVENTED_BY_MECHANIC` — "Can't do that while %s", `%s` being the blocking aura's
+/// `SpellMechanic.dbc` name. Every crowd-control arm carries this **as well as** its own reason,
+/// and which one appears is decided by whether the exemption scan named a mechanic.
+const REASON_PREVENTED_BY_MECHANIC: u8 = 0x8d;
 
 /// The **pre-send** mounted refusal (decision 0481) — the requirement validator `0x6094f0`'s
 /// mounted block (`0x609c6c`, wow-re `mounted-action-gate.md` §5): a live
@@ -225,50 +336,6 @@ pub(super) fn cast_moving_refusal(
             || d.channel_interrupt_flags & AURA_INTERRUPT_MOVING_TURNING != 0)
 }
 
-/// The resolved {min, max} for one action against one target — the `GetMinMaxRange 0x6e3480`
-/// law over our descriptor reaches.
-///
-/// Two decomp legs are deliberately UNMODELED (0426): the PvP max bonus (`6e3648` — +2.6667 yd
-/// when both units carry the `[unit+0x118]+0x40 & 0x200d` flags and the pair is hostile; its
-/// gate helpers `0x5fc350` are un-RE'd, so modeling it would be a guess) and the
-/// `Attributes & 2` item-scaling leg (`6e36aa` — `max *= item range-mod %` off the resolved
-/// item record; verified a data no-op 2026-07-16: vmangos `item_template.range_mod` is 100 on
-/// all 513 player-obtainable ranged weapons, 0 only on nine NPC "Monster -" wands). The melee
-/// no-target reach fallback also simplifies: the real client re-resolves the current-target
-/// global (`0x47bf60(0x498)`) and failing that doubles the caster's own reach — we default the
-/// missing side to 1.5.
-fn resolve_range(
-    spell: &SpellDisplay,
-    range: Option<&SpellRange>,
-    self_reach: f32,
-    target_reach: Option<f32>,
-) -> Option<(f32, f32)> {
-    // The self-cast short-circuit's attribute test (`SpellRec+0x18 & 0x404` at `0x6e34fb`) —
-    // the same on-next-swing mask the queue tracking reads, tested here by the range law.
-    if spell.on_next_swing() {
-        return Some((0.0, SELF_CAST_MAX));
-    }
-    let row = range?;
-    if row.is_melee() {
-        let reach_sum = self_reach + target_reach.unwrap_or(1.5) + MELEE_REACH_PAD;
-        return Some((0.0, reach_sum.max(MELEE_RANGE_FLOOR)));
-    }
-    if row.min == 0.0 && row.max == 0.0 {
-        return None; // the self row (id 1): no range to test
-    }
-    // The ranged branch (0x6e35ee) pads by the BARE reach sum — no 1.3333, that constant is
-    // melee-only — added to the max unconditionally but to the min ONLY when the row's min is
-    // already nonzero (the fcomp-vs-0.0 guard, decomp `if (*min != 0.0)`): a min-0 spell
-    // (Fireball, Shadow Bolt) must never grow a min range, or point-blank casts refuse
-    // TOO_CLOSE.
-    let Some(target_reach) = target_reach else {
-        return Some((row.min, row.max));
-    };
-    let pad = self_reach + target_reach;
-    let min = if row.min == 0.0 { 0.0 } else { row.min + pad };
-    Some((min, row.max + pad))
-}
-
 /// What a slot *is* once the MACRO indirection is applied — the reference's slot→spell resolver
 /// `0x4e5a50` plus the leg of the usable compute `0x4e5050` that reads its zero (decision 1636).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,7 +384,7 @@ fn resolve_through_macro(
 }
 
 /// Compute + diff-push every occupied slot's dynamic state, and fire the reference event edges.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)] // a Bevy system's full input set
+#[allow(clippy::type_complexity)] // a Bevy system's full input set
 pub(super) fn feed_action_state(
     script: Option<NonSendMut<UiScript>>,
     actions: Res<PlayerActions>,
@@ -328,13 +395,15 @@ pub(super) fn feed_action_state(
     // One tuple param (Bevy's 16-SystemParam ceiling): our own cast tracking — the in-flight
     // guard, the queued on-next-swing strike, the running channel, and the awaiting-click
     // ground targeting — plus the macro→spell binding the MACRO arm resolves through
-    // (decision 0983), which rides here for the same ceiling reason.
+    // (decision 0983) and the talent spell-modifier tables that leg 12's cost reads through,
+    // both of which ride here for the same ceiling reason.
     cast_state: (
         Res<crate::ui_cast::PendingCast>,
         Res<crate::ui_cast::QueuedMeleeSpell>,
         Res<crate::ui_cast::ActiveChannel>,
         Res<super::SpellTargeting>,
         Res<crate::ui_macro::MacroBoundSpells>,
+        Res<crate::spell_mods::SpellModifiers>,
     ),
     self_q: Query<(&ObjectStore, &Transform, Has<Engaged>, Option<&Casting>), With<SelfPlayer>>,
     selection: Res<Selection>,
@@ -342,7 +411,7 @@ pub(super) fn feed_action_state(
     units: Query<(&ObjectStore, &Transform), Without<SelfPlayer>>,
     factions: Option<Res<crate::target::Factions>>,
     reputations: Res<crate::net::Reputations>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     commands: Res<NetCommands>,
     mut memory: Local<crate::ui_script::VmMemo<StateMemory>>,
 ) {
@@ -367,8 +436,14 @@ pub(super) fn feed_action_state(
         memory.last_cd_trace = Some(now);
     }
 
-    let (pending, queued_melee, channel, targeting, bound) = &cast_state;
+    let (pending, queued_melee, channel, targeting, bound, spell_mods) = &cast_state;
     let me = self_q.iter().next();
+    // The bags, walked ONCE for the frame: every reagent, totem and item-count question below
+    // reads this table. It used to be one whole walk per question — per reagent per spell slot,
+    // per item slot — for the same bags each time (1697 item 13).
+    let carried = me
+        .map(|(s, _, _, _)| carried_counts(&s.0, &items))
+        .unwrap_or_default();
     let engaged = me.is_some_and(|(_, _, e, _)| e);
     let form_byte = me
         .map(|(s, _, _, _)| s.0.unit_shapeshift_form())
@@ -457,9 +532,11 @@ pub(super) fn feed_action_state(
                         factions: factions.as_deref(),
                         reputations: &reputations,
                         cooldowns: &cooldowns,
+                        carried: &carried,
+                        spell_mods,
                     };
                     let (u, oom) =
-                        usable::spell_usable(button.action, d, sp, &ctx, &mut items, &commands);
+                        usable::spell_usable(button.action, d, sp, &ctx, &items, &commands);
                     st.usable = u;
                     st.not_enough_mana = oom;
                 } else {
@@ -467,7 +544,7 @@ pub(super) fn feed_action_state(
                 }
                 // C4: the range verdict vs the current target; nil without one.
                 let row = spells.as_ref().and_then(|s| s.ranges.get(d.range_index));
-                let resolved = resolve_range(d, row, self_reach, target_reach);
+                let resolved = benilla_formats::min_max_range(d, row, self_reach, target_reach);
                 st.has_range = resolved
                     .is_some_and(|(min, max)| min.abs() > f32::EPSILON || max.abs() > f32::EPSILON);
                 st.in_range = match (resolved, dist_sq) {
@@ -491,15 +568,15 @@ pub(super) fn feed_action_state(
                 }
             }
             ACTION_KIND_ITEM => {
-                let template = items.template(button.action, 0, &commands).cloned();
+                // Only the on-use spell leaves the template (`ItemUseSpell` is `Copy`) — not a
+                // clone of the whole `ItemInfo` (its Strings and Vecs) per item slot per frame.
+                let use_spell = items
+                    .template(button.action, 0, &commands)
+                    .and_then(|t| t.use_spell);
                 // `IsConsumableAction` is NOT fed from here. It reads nothing but this template
                 // (`0x4e5250`), so it is slot IDENTITY, and it rides the identity feed's push
                 // beside the count it gates — `super::feed`'s ITEM arm, decision 1301.
-                let count = me
-                    .map(|(s, _, _, _)| {
-                        count_of(&s.0, &items, button.action, InventoryScope::CARRIED)
-                    })
-                    .unwrap_or(0);
+                let count = carried.get(&button.action).copied().unwrap_or(0);
                 // Worn on any equipment slot (0..18) — the green border's IsEquippedAction.
                 st.equipped = me.is_some_and(|(s, _, _, _)| {
                     (0..19).any(|i| {
@@ -509,8 +586,34 @@ pub(super) fn feed_action_state(
                             == Some(button.action)
                     })
                 });
-                st.usable = count > 0 || st.equipped;
-                if let Some(u) = template.as_ref().and_then(|t| t.use_spell) {
+                // The rest of `0x4e5050`'s ITEM arm — the count gate, `IsItemOnCooldown`, and
+                // the item's on-use spell run through the SAME `0x6e3d60` walk a spell slot
+                // takes ([`super::usable::item_usable`]). Food greys in combat from leg 8 there.
+                // No active player and the reference answers (0,0) before resolving anything
+                // (§2a P0) — which is `ActionState::default()`'s `usable`.
+                if let Some((store, _, _, _)) = me {
+                    let ctx = usable::UsableCtx {
+                        store,
+                        target_store: target.map(|(s, _)| s),
+                        factions: factions.as_deref(),
+                        reputations: &reputations,
+                        cooldowns: &cooldowns,
+                        carried: &carried,
+                        spell_mods,
+                    };
+                    let (u, oom) = usable::item_usable(
+                        button.action,
+                        use_spell.as_ref(),
+                        count > 0 || st.equipped,
+                        &ctx,
+                        spells.as_deref(),
+                        &items,
+                        &commands,
+                    );
+                    st.usable = u;
+                    st.not_enough_mana = oom;
+                }
+                if let Some(u) = use_spell {
                     let d = spells.as_ref().and_then(|s| s.catalog.get(u.spell_id));
                     let info = cooldowns.info(u.spell_id, button.action, d, now);
                     st.cooldown = info.ui_triple(anchor, ui_now);
@@ -611,69 +714,6 @@ mod tests {
             attributes,
             ..Default::default()
         }
-    }
-
-    /// The `GetMinMaxRange 0x6e3480` transcription: melee reach floor, the ranged reach pad on
-    /// both bounds, the self-cast short-circuit, and the rangeless self row.
-    #[test]
-    fn resolve_range_follows_the_byte_law() {
-        let melee = SpellRange {
-            min: 0.0,
-            max: 5.0,
-            flags: 1,
-        };
-        // Two naked-reach units (1.5 + 1.5 + 1.3333 = 4.333) floor at 5.0…
-        let d = spell_with_range(2, 0);
-        assert_eq!(
-            resolve_range(&d, Some(&melee), 1.5, Some(1.5)),
-            Some((0.0, MELEE_RANGE_FLOOR))
-        );
-        // …a big pair (4 + 4 + 1.3333) exceeds it.
-        let (_, max) = resolve_range(&d, Some(&melee), 4.0, Some(4.0)).unwrap();
-        assert!((max - 9.3333).abs() < 1e-3);
-
-        // Charge's 8–25 row pads both bounds by the BARE reach sum (no 1.3333 — melee-only)
-        // against a unit target.
-        let charge_row = SpellRange {
-            min: 8.0,
-            max: 25.0,
-            flags: 0,
-        };
-        let (min, max) = resolve_range(&d, Some(&charge_row), 1.5, Some(1.5)).unwrap();
-        assert!((min - (8.0 + 3.0)).abs() < 1e-3);
-        assert!((max - (25.0 + 3.0)).abs() < 1e-3);
-
-        // A min-0 row (Fireball's 0–35) pads the max only — the fcomp-vs-0.0 guard keeps the
-        // min at zero, so a point-blank cast never reads a min range.
-        let fireball_row = SpellRange {
-            min: 0.0,
-            max: 35.0,
-            flags: 0,
-        };
-        let (min, max) = resolve_range(&d, Some(&fireball_row), 1.5, Some(1.5)).unwrap();
-        assert_eq!(min, 0.0);
-        assert!((max - 38.0).abs() < 1e-3);
-
-        // No unit target: the row's raw bounds, unpadded.
-        assert_eq!(
-            resolve_range(&d, Some(&charge_row), 1.5, None),
-            Some((8.0, 25.0))
-        );
-
-        // The self-cast attribute short-circuits to a flat 100 without touching the row.
-        let selfish = spell_with_range(1, 0x400);
-        assert_eq!(
-            resolve_range(&selfish, None, 1.5, None),
-            Some((0.0, SELF_CAST_MAX))
-        );
-
-        // The self row (0, 0, no melee flag) resolves to no range at all.
-        let self_row = SpellRange {
-            min: 0.0,
-            max: 0.0,
-            flags: 0,
-        };
-        assert_eq!(resolve_range(&d, Some(&self_row), 1.5, None), None);
     }
 
     /// The pre-send refusal (`IsTargetInRange 0x6e47b0`'s two compares over the resolved
@@ -806,6 +846,7 @@ mod tests {
         app.insert_resource(actions)
             .insert_resource(bound)
             .init_resource::<Cooldowns>()
+            .init_resource::<crate::spell_mods::SpellModifiers>()
             .init_resource::<crate::ui_script::UiClock>()
             .init_resource::<AutoRepeatActive>()
             .init_resource::<crate::ui_cast::PendingCast>()
@@ -840,6 +881,118 @@ mod tests {
                 .eval::<bool>("local _, oom = IsUsableAction(2) return oom and true or false")
                 .unwrap(),
             "grey, not the out-of-power blue: notEnoughMana stays 0 on the spell-less leg"
+        );
+    }
+
+    /// **Food on the bar greys in combat** — the feed end to end, at the symptom. An ITEM slot's
+    /// usable verdict is the reference's `0x4e5050` ITEM arm, which resolves the item's on-use
+    /// spell (`0x4e5a50`) and walks it through `Spell_C::IsSpellUsableNow 0x6e3d60`; every
+    /// Food/Drink spell in the shipped `Spell.dbc` carries `Attributes` bit 28
+    /// (`ATTR_NOT_IN_COMBAT`, the walk's leg 8), so a stack of food is grey while
+    /// `UNIT_FLAG_IN_COMBAT` is up and full-colour the moment it drops. Before this test the
+    /// ITEM arm answered `count > 0 || equipped` and nothing else, and food stayed lit.
+    #[test]
+    fn food_on_the_bar_greys_while_the_player_is_in_combat() {
+        use benilla_protocol::messages::{ActionButton, ItemUseSpell};
+        use benilla_protocol::ObjectFields;
+
+        // `Conjured Muffin`-shaped: one ON_USE block casting spell 433 "Food", which the shipped
+        // DBC gives `Attributes = 0x18000100` — bit 28 among them.
+        const FOOD_ITEM: u32 = 1487;
+        const FOOD_SPELL: u32 = 433;
+        // Descriptor indices, raw (the codebase's test idiom): `ITEM_FIELD_STACK_COUNT` and
+        // `PLAYER_FIELD_PACK_SLOT_1` — the backpack's first slot, the walker's CARRIED section.
+        const STACK: u16 = 14;
+        const PACK_SLOT_1: u16 = 532;
+
+        let lit = |in_combat: bool| {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let mut app = App::new();
+            let mut actions = PlayerActions::default();
+            actions.buttons.insert(
+                0,
+                ActionButton {
+                    slot: 0,
+                    action: FOOD_ITEM,
+                    kind: ACTION_KIND_ITEM,
+                },
+            );
+            let mut items = Items::default();
+            items.insert_object(
+                0xF0,
+                ObjectFields::from_pairs(&[(3, FOOD_ITEM), (STACK, 10)]),
+            );
+            items.insert_template(
+                FOOD_ITEM,
+                Some(benilla_protocol::messages::ItemInfo {
+                    use_spell: Some(ItemUseSpell {
+                        spell_id: FOOD_SPELL,
+                        cooldown_ms: -1,
+                        category: 0,
+                        category_cooldown_ms: -1,
+                    }),
+                    ..crate::items::test_template("Conjured Muffin")
+                }),
+            );
+            let food = SpellDisplay {
+                attributes: 0x1800_0100,
+                ..Default::default()
+            };
+            app.insert_resource(actions)
+                .insert_resource(crate::ui_macro::MacroBoundSpells::default())
+                .insert_resource(Spells {
+                    catalog: benilla_formats::SpellCatalog::from_displays(
+                        [(FOOD_SPELL, food)].into_iter().collect(),
+                    ),
+                    forms: Default::default(),
+                    ranges: Default::default(),
+                    cast_times: Default::default(),
+                    durations: Default::default(),
+                    radii: Default::default(),
+                })
+                .init_resource::<Cooldowns>()
+                .init_resource::<crate::spell_mods::SpellModifiers>()
+                .init_resource::<crate::ui_script::UiClock>()
+                .init_resource::<AutoRepeatActive>()
+                .init_resource::<crate::ui_cast::PendingCast>()
+                .init_resource::<crate::ui_cast::QueuedMeleeSpell>()
+                .init_resource::<crate::ui_cast::ActiveChannel>()
+                .init_resource::<crate::ui_action::SpellTargeting>()
+                .init_resource::<Selection>()
+                .init_resource::<GuidIndex>()
+                .init_resource::<crate::net::Reputations>()
+                .insert_resource(items)
+                .insert_resource(NetCommands(tx));
+            // The player: alive, with the ten muffins in backpack slot 1.
+            let flags = (1u32 << 3)
+                | if in_combat {
+                    crate::player::UNIT_FLAG_IN_COMBAT
+                } else {
+                    0
+                };
+            app.world_mut().spawn((
+                SelfPlayer,
+                Transform::default(),
+                ObjectStore(ObjectFields::from_pairs(&[
+                    (22, 100),
+                    (23, 500),
+                    (46, flags),
+                    (PACK_SLOT_1, 0xF0),
+                ])),
+            ));
+            app.insert_non_send_resource(UiScript::new().unwrap());
+            app.add_systems(Update, feed_action_state);
+            app.update();
+            app.world()
+                .non_send_resource::<UiScript>()
+                .eval::<bool>("return (IsUsableAction(1)) and true or false")
+                .unwrap()
+        };
+
+        assert!(lit(false), "out of combat the muffins are full-colour");
+        assert!(
+            !lit(true),
+            "in combat the food's on-use spell fails leg 8 and the button greys"
         );
     }
 
@@ -1065,5 +1218,271 @@ mod tests {
         assert!(!cast_moving_refusal(mf::FORWARD, 0, Some(&auto_shot)));
         // No record: nothing to read, the press passes (the server stays the net).
         assert!(!cast_moving_refusal(mf::FORWARD, 1500, None));
+    }
+}
+
+#[cfg(test)]
+mod cc_refusal_tests {
+    use super::*;
+
+    const STUNNED: u32 = 0x0004_0000;
+    const SILENCED: u32 = 0x0000_2000;
+    const PACIFIED: u32 = 0x0002_0000;
+    const CONFUSED: u32 = 0x0040_0000;
+    const FLEEING: u32 = 0x0080_0000;
+
+    fn spell(prevention_type: u32) -> SpellDisplay {
+        SpellDisplay {
+            prevention_type,
+            ..Default::default()
+        }
+    }
+
+    /// A scan that finds no aura at all — `exempt: false, mechanic: 0`, so every arm falls to its
+    /// OWN reason. This is the ordinary case: the exemption only ever fires for a caster wearing
+    /// an immunity.
+    fn no_auras() -> impl FnMut(&[u32]) -> benilla_formats::CcExemption {
+        |_: &[u32]| benilla_formats::CcExemption::default()
+    }
+
+    /// The reason alone, dropping the mechanic — most of these tests are about which arm fires.
+    fn reason_of(v: Option<(u8, Option<u32>)>) -> Option<u8> {
+        v.map(|(r, _)| r)
+    }
+
+    /// A live caster, nobody else at the reins, no auras.
+    fn cc(flags: u32, d: &SpellDisplay) -> Option<u8> {
+        cast_cc_refusal(flags, Some(100), false, Some(d), &mut no_auras()).map(|(r, _)| r)
+    }
+
+    /// **The arms are not symmetric** (decision 1904, widened by 1925): stun, fear, charm and
+    /// confuse refuse EVERY spell; silence and pacify only the rows whose `PreventionType` names
+    /// them. Reading `UNIT_FLAG_SILENCED` as "no casting at all" — which our own preflight banner
+    /// used to say — is the mistake this pins.
+    #[test]
+    fn crowd_control_refuses_by_prevention_type_except_the_unconditional_arms() {
+        // Fireball-shaped (silence-preventable), Heroic-Strike-shaped (pacify-preventable), and
+        // the auto-attack's neither — the three real values, pinned in `spell_catalog`.
+        let cast = spell(1);
+        let melee = spell(2);
+        let neither = spell(0);
+
+        // The four arms with NO per-spell gate: every row refuses.
+        for (flags, reason) in [(STUNNED, 0x64), (FLEEING, 0x1e), (CONFUSED, 0x16)] {
+            for d in [&cast, &melee, &neither] {
+                assert_eq!(cc(flags, d), Some(reason), "flags {flags:#x}");
+            }
+        }
+        // …and charm, which is not a flag at all but "somebody else holds the reins".
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                0,
+                Some(100),
+                true,
+                Some(&neither),
+                &mut no_auras()
+            )),
+            Some(0x14)
+        );
+
+        // SILENCED takes the casts and leaves the rest alone.
+        assert_eq!(cc(SILENCED, &cast), Some(0x60));
+        assert_eq!(cc(SILENCED, &melee), None);
+        assert_eq!(cc(SILENCED, &neither), None);
+
+        // PACIFIED is the mirror.
+        assert_eq!(cc(PACIFIED, &melee), Some(0x5a));
+        assert_eq!(cc(PACIFIED, &cast), None);
+
+        // Nothing up, nothing refused; and no record claims no prevention.
+        assert_eq!(cc(0, &cast), None);
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                SILENCED,
+                Some(100),
+                false,
+                None,
+                &mut no_auras()
+            )),
+            None
+        );
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                STUNNED,
+                Some(100),
+                false,
+                None,
+                &mut no_auras()
+            )),
+            Some(0x64),
+            "the stun needs no record"
+        );
+    }
+
+    /// **The order is the reference's, first match wins** — charm outranks the stun, the stun
+    /// outranks everything below it. When several hold at once the player sees exactly one line,
+    /// and which one is not arbitrary.
+    #[test]
+    fn the_arms_are_tried_in_the_references_order() {
+        let cast = spell(1);
+        // Charm is arm 1: it beats a simultaneous stun.
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                STUNNED | SILENCED,
+                Some(100),
+                true,
+                Some(&cast),
+                &mut no_auras()
+            )),
+            Some(0x14)
+        );
+        // Stun is arm 2: it beats silence, pacify, fear and confuse.
+        assert_eq!(
+            cc(STUNNED | SILENCED | PACIFIED | FLEEING | CONFUSED, &cast),
+            Some(0x64)
+        );
+        // Silence (3) beats fear (5) and confuse (6).
+        assert_eq!(cc(SILENCED | FLEEING | CONFUSED, &cast), Some(0x60));
+        // With the spell out of silence's reach, fear takes it before confuse.
+        assert_eq!(cc(SILENCED | FLEEING | CONFUSED, &spell(0)), Some(0x1e));
+    }
+
+    /// **What the exemption does to an arm** (decision 1946) — the three outcomes, at the arm.
+    #[test]
+    fn the_exemption_skips_an_arm_or_renames_its_refusal() {
+        let cast = spell(1);
+        let scan = |exempt: bool, mechanic: u32| {
+            move |_: &[u32]| benilla_formats::CcExemption { exempt, mechanic }
+        };
+
+        // No aura of the arm's type: the arm's OWN reason, as everywhere else.
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                STUNNED,
+                Some(100),
+                false,
+                Some(&cast),
+                &mut scan(false, 0)
+            )),
+            Some(0x64)
+        );
+        // A blocking aura the cast does NOT counter: the refusal survives but is renamed to
+        // `0x8d` "Can't do that while %s", the mechanic naming the aura.
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                STUNNED,
+                Some(100),
+                false,
+                Some(&cast),
+                &mut scan(false, 12)
+            )),
+            Some(0x8d)
+        );
+        // The cast grants immunity: the arm is SKIPPED and the cast goes out. This is the whole
+        // point — Ice Block cast while stunned.
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                STUNNED,
+                Some(100),
+                false,
+                Some(&cast),
+                &mut scan(true, 0)
+            )),
+            None
+        );
+        // …and skipping one arm does not skip the ladder: a silenced-and-stunned caster whose
+        // spell counters only the stun still refuses on silence below it.
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                STUNNED | SILENCED,
+                Some(100),
+                false,
+                Some(&cast),
+                &mut |types: &[u32]| {
+                    // Exempt from the stun arm `{12}` only; the silence arm `{27, 12, 60}` is not.
+                    benilla_formats::CcExemption {
+                        exempt: types == [12],
+                        mechanic: 0,
+                    }
+                }
+            )),
+            Some(0x60)
+        );
+    }
+
+    /// **The mechanic rides out with the refusal** (decision 1948) — the half that turns
+    /// "Can't do that while %s" into a sentence. It is the ONE client-local refusal that carries
+    /// an argument word, and it is `None` for every arm that fell to its own reason.
+    #[test]
+    fn the_renamed_refusal_carries_the_mechanic_and_the_others_carry_nothing() {
+        let cast = spell(1);
+        let scan = |exempt: bool, mechanic: u32| {
+            move |_: &[u32]| benilla_formats::CcExemption { exempt, mechanic }
+        };
+
+        // Rejected by a blocking aura: reason `0x8d` AND the mechanic that names it.
+        assert_eq!(
+            cast_cc_refusal(STUNNED, Some(100), false, Some(&cast), &mut scan(false, 12)),
+            Some((0x8d, Some(12)))
+        );
+        // No aura: the arm's own reason, and NO argument — the message has no `%s` to fill.
+        assert_eq!(
+            cast_cc_refusal(STUNNED, Some(100), false, Some(&cast), &mut scan(false, 0)),
+            Some((0x64, None))
+        );
+        // Exempt: nothing at all.
+        assert_eq!(
+            cast_cc_refusal(STUNNED, Some(100), false, Some(&cast), &mut scan(true, 0)),
+            None
+        );
+    }
+
+    /// **A dead caster skips all six** (`0x60980d`'s `jle` on `UNIT_FIELD_HEALTH`) — a corpse is
+    /// refused by an earlier rung, and reporting a stun over it would be the wrong line.
+    #[test]
+    fn a_dead_caster_takes_no_crowd_control_refusal() {
+        let cast = spell(1);
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                STUNNED,
+                Some(0),
+                false,
+                Some(&cast),
+                &mut no_auras()
+            )),
+            None
+        );
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                0,
+                Some(0),
+                true,
+                Some(&cast),
+                &mut no_auras()
+            )),
+            None
+        );
+        // Alive again, and the arm is back.
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                STUNNED,
+                Some(1),
+                false,
+                Some(&cast),
+                &mut no_auras()
+            )),
+            Some(0x64)
+        );
+        // No health field at all is not death — the descriptor simply has not landed.
+        assert_eq!(
+            reason_of(cast_cc_refusal(
+                STUNNED,
+                None,
+                false,
+                Some(&cast),
+                &mut no_auras()
+            )),
+            Some(0x64)
+        );
     }
 }

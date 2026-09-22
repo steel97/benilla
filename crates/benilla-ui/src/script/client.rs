@@ -42,6 +42,57 @@ const BUILD_DATE: &str = "Sep 19 2006";
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 
+    // `GetLocale()` -> one string, and `IsMacClient()` -> nil, both ARITY-EXACT in the reference's
+    // own shape table (`re/audit/binding-shapes.tsv`: `GetLocale 0x46ce40`/`0x48d8b0` is
+    // `0 -> 1 (string?)`, `IsMacClient 0x48c980` is `0 -> 1 (nil)`, both `exact`/`agree`).
+    //
+    // **`IsMacClient` answering nil is the whole verb, not a placeholder.** The table records the
+    // return KIND as `(nil)` — this binding pushes nil on the PC build the reference was carved
+    // from, and there is nothing else for it to say. FrameXML branches on it for Mac-only key
+    // labels; nil takes the PC arm, which is the arm this client wants.
+    //
+    // `GetLocale` is the two-registration case the shape gate warns about (1843): a glue copy and
+    // an in-game copy, same shape. Ours answers the one locale this client ships against — the
+    // enUS `GlobalStrings.lua` the manifest loads and 1804's reference defaults are read from.
+    // Decision 1880.
+    g.set(
+        "GetLocale",
+        lua.create_function(|lua, ()| lua.create_string("enUS"))?,
+    )?;
+    g.set("IsMacClient", lua.create_function(|_, ()| Ok(Value::Nil))?)?;
+
+    // **`FrameXML_Debug([v])` — the XML loader's own trace switch, get-or-set** (decision 2160,
+    // wow-re `ui/scratch/framexml-debug-trace-flag.md`). `0x488440` reads the global `[0xceea30]`
+    // through `0x6edb40`, and:
+    //
+    // - a **Lua-truthy** argument takes the SET arm (`0x48845d je` after `lua_toboolean 0x6f34d0`)
+    //   — so `FrameXML_Debug(0)` genuinely disables it rather than being a masked no-op, because
+    //   the NUMBER zero is truthy in Lua; only `nil`/`false` are not;
+    // - the stored value is `lua_tonumber` truncated **toward zero** (`0x40a2b0`), so `1.9` is 1
+    //   and a non-numeric string is 0, which is 5.0's `tonumber` coercion;
+    // - an absent, nil or false argument is a pure GET and leaves the flag alone;
+    // - it always returns ONE number — the flag's value *after* the call
+    //   (`re/audit/binding-shapes.tsv`: `argc 1 exact, returns 1, (number), agree`).
+    //
+    // The reference ships a call to it commented out in its own `BasicControls.xml:20`; the
+    // corpus's consumer is `ImprovedErrorFrame`, which drives it off a saved `XMLDebug` CVar at
+    // its OnLoad and died on the missing global. What it gates is
+    // [`crate::loader::LoadReport::traces`].
+    g.set(
+        "FrameXML_Debug",
+        lua.create_function(|lua, v: Value| {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let truthy = !matches!(v, Value::Nil | Value::Boolean(false));
+            if truthy {
+                // `lua_tonumber`'s coercion, then truncate toward zero. Anything that will not
+                // coerce is 0 — the same answer `0x6f3620` gives for a non-numeric argument.
+                let n = lua.coerce_number(v)?.unwrap_or(0.0);
+                model.framexml_debug.set(n.trunc() as i32);
+            }
+            Ok(model.framexml_debug.get())
+        })?,
+    )?;
+
     // version, build, date — three, and no fourth (decision 1842)
     g.set(
         "GetBuildInfo",
@@ -61,21 +112,65 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     // `RunScript(text)` — compile and run a chunk in the shared global state.
     //
-    // The reference's is `RunScript 0x7044c0`, and it is how a macro body, a `/script` slash
-    // command, and every addon's "evaluate this snippet" helper reach Lua. It is the same
-    // `loadstring`+call our own chunk loader does, so it inherits the same sandbox: there is no
-    // `setfenv` here and none in the reference either — a script runs with full API access.
+    // `RunScript 0x48b980` (pair `0x83e288`, name `0x83ea60`) is how a macro body, a `/script`
+    // slash command and every addon's "evaluate this snippet" helper reach Lua. It inherits the
+    // same sandbox as our chunk loader: there is no `setfenv` here and none in the reference
+    // either — a script runs with full API access.
     //
-    // A compile or runtime error is **raised**, not swallowed. The reference propagates it to the
-    // caller's error handler, which is what puts a red line in the chat frame; returning nil would
-    // make a broken macro look like a working one that did nothing.
+    // Read end to end, its contract is four facts, and three of them were wrong here (2136's
+    // "left open", closed at the bytes):
+    //
+    // **1 · The chunk name is the SOURCE ITSELF, verbatim.** `0x48b9c7 mov edx,eax` and
+    // `0x48b9c9 mov ecx,eax` hand `lua_tostring 0x6f3690`'s one return to
+    // `0x704cd0 FrameScript_Execute(code, chunkname)` as BOTH arguments. `0x704cd0` strlens the
+    // code (`0x704cd7`) and passes the name straight through `FS_DoBuffer 0x704ae0`
+    // (`0x704b06 push ecx`, the fourth argument of `luaL_loadbuffer 0x6f5690` at `0x704b0c`)
+    // untouched. No `=`, no `@` — so `luaO_chunkid 0x6f5c40` renders it by its third rule,
+    // `[string "…"]`, exactly as `loadstring`'s default source-name does (2136 §4). `=[RunScript]`
+    // was a placeholder that rendered plausibly; `=` is chunkid's *print-verbatim* marker and
+    // `[RunScript]` is not a literal the image contains.
+    //
+    // **2 · A bad argument is a SILENT NO-OP, not a raise.** `0x48b988 call 0x6f3510`
+    // (`lua_isstring` — tag-based, so a *number* passes) failing takes `0x48b98f je` straight to
+    // `0x48b9f3 xor eax,eax; ret`. So does a NULL from `lua_tostring` (`0x48b99f`) and an EMPTY
+    // string (`0x48b9a1 cmp byte ptr [eax],0`). There is no `luaL_error 0x6f4940` anywhere in the
+    // function — `RunScript(nil)` does nothing at all.
+    //
+    // **3 · An error does NOT reach the caller.** `0x704ae0` pushes the registered error handler
+    // from the registry first (`0x704afe`, `[0x8722c8]` at `LUA_REGISTRYINDEX 0xffffd8f0`) and
+    // runs the chunk as `lua_pcall(L, 0, 0, -2)` (`0x704b68`); a *compile* failure takes the other
+    // leg and pcalls that same handler with the message (`0x704b42`). Either way the raise is
+    // consumed, the red line is the handler's doing, and the caller's next statement runs. Raising
+    // here made one bad `RunScript` abort whatever ran it — a macro could take FrameXML down with
+    // it.
+    //
+    // **4 · It answers zero values on every path** (`xor eax,eax` at both exits).
     g.set(
         "RunScript",
-        lua.create_function(|lua, text: String| {
-            lua.load(&text)
-                .set_name("=[RunScript]")
+        lua.create_function(|lua, text: Value| {
+            // `lua_isstring` + `lua_tostring`, in one: strings and numbers coerce, everything
+            // else is `None` — and `None` is the silent return, per fact 2.
+            let Some(s) = lua.coerce_string(text)? else {
+                return Ok(());
+            };
+            let raw = s.as_bytes();
+            if raw.is_empty() {
+                return Ok(());
+            }
+            // The name is the source bytes as given. Same rule as `loadstring`'s default
+            // (`stdlib::loadstring`), and for the same reason: the image passes one pointer twice.
+            let name = String::from_utf8_lossy(&raw).into_owned();
+            if let Err(e) = lua
+                .load(&*raw)
+                .set_name(name)
                 .set_mode(mlua::ChunkMode::Text)
                 .exec()
+            {
+                lua.app_data_mut::<crate::script::Model>()
+                    .expect("model")
+                    .record_script_error(super::stdlib::lua_message(&e));
+            }
+            Ok(())
         })?,
     )?;
 
@@ -172,6 +267,31 @@ impl super::UiScript {
     ///
     /// Set at world entry from the realm the session actually connected to. Idempotent, and the
     /// empty string is a legitimate value (no realm yet), not a "clear".
+    /// Seed the **local player record** — the reference's `0xc27d80`, copied from the char-enum
+    /// row at the character-select Enter World commit (decisions 2261/2263, and see
+    /// [`super::PlayerRecord`] for the bytes and the four verbs that read it).
+    ///
+    /// Called from the world-entry UI load beside [`Self::set_realm_name`], and for the same
+    /// reason 1195 put the realm there: the values have to be in the VM before a single addon file
+    /// runs, because `local currentPlayer = UnitName("player")` at file scope is the corpus idiom.
+    /// The reference has them a whole login earlier still.
+    ///
+    /// **A record with no name is refused, not stored.** The only unset state is "no Enter World
+    /// has been committed in this process"; once the record holds a character, nothing in the
+    /// reference's image ever empties it again, so a caller with nothing to say must leave the
+    /// last answer standing rather than blank it. The write is whole-record because the
+    /// reference's is one `rep movsd`: these four fields describe one character and can never
+    /// legitimately be seeded from two.
+    pub fn set_player_record(&mut self, record: super::PlayerRecord) {
+        if record.name.is_empty() {
+            return;
+        }
+        let mut model = self.model_mut();
+        if model.player_record != record {
+            model.player_record = record;
+        }
+    }
+
     pub fn set_realm_name(&mut self, realm: &str) {
         {
             let mut model = self.model_mut();
@@ -185,12 +305,14 @@ impl super::UiScript {
             // `ace.trim(GetCVar("realmName"))` inside `SetGameState`, which EVERY Ace addon runs at
             // PLAYER_ENTERING_WORLD, so the nil became `gsub(nil, ...)` and took the family down.
             //
-            // Written straight into the slot rather than through `set_cvar_host` because that
-            // borrows the model again, and warns on an unknown name — this is the host declaring
-            // the value, not looking it up.
-            if let Some(slot) = model.cvars.get_mut("realmname") {
-                slot.value = realm.to_string();
-            }
+            // Through the **engine-write** path, not a bare slot poke. `realmName` is a persisted
+            // CVar — its whole documented job is to be the last realm connected to — and a slot
+            // written in place never reaches `cvar_changes`, so the host never hears it and never
+            // dirties the config file. The value was therefore correct for exactly as long as the
+            // process lived and absent from `config.toml` forever, which is the one thing a
+            // persisted CVar must not be. `set_from_engine` is the same silent-on-unknown-name
+            // write (a bare test VM registers nothing) and additionally queues the change.
+            super::cvars::set_from_engine(&mut model, "realmName", realm.to_string());
         }
     }
 
@@ -230,7 +352,7 @@ mod tests {
             vec!["1.12.1", "5875", "Sep 19 2006"]
         );
         assert_eq!(
-            s.eval::<i64>("return select('#', GetBuildInfo())").unwrap(),
+            s.arity("GetBuildInfo()").unwrap(),
             3,
             "three values, never a fourth"
         );
@@ -274,16 +396,50 @@ mod tests {
         );
     }
 
-    /// `RunScript` runs its text in the shared global state, and an error in it is raised.
+    /// `RunScript` runs its text in the shared global state, and a failure is **recorded, not
+    /// raised** — `0x704ae0` runs the chunk under `lua_pcall(L, 0, 0, -2)` with the registry's
+    /// error handler, so the raise never reaches the caller. (The full contract, and the three
+    /// silent legs, are in `script::tests::stdlib`.)
+    ///
+    /// This test used to assert the opposite, on the reasoning that "a silent nil is a broken
+    /// macro that looks fine". The reasoning was sound and the premise was not: the reference is
+    /// not silent, it hands the message to the error handler and keeps going. Failing loudly *at
+    /// the caller* is the part it does not do, and doing it meant one bad macro could abort the
+    /// FrameXML function that ran it.
     #[test]
-    fn run_script_evaluates_in_the_shared_state_and_raises() {
-        let s = UiScript::new().unwrap();
+    fn run_script_evaluates_in_the_shared_state_and_reports_without_raising() {
+        let mut s = UiScript::new().unwrap();
         s.run(r#"RunScript("RunScriptProbe = 41 + 1")"#).unwrap();
         assert_eq!(s.eval::<i64>("return RunScriptProbe").unwrap(), 42);
-        // A script that fails must fail loudly — a silent nil is a broken macro that looks fine.
+        s.run(r#"RunScript("this is not lua")"#)
+            .expect("a malformed script is caught inside RunScript, not raised at its caller");
+        let errs = s.take_errors();
         assert!(
-            s.run(r#"RunScript("this is not lua")"#).is_err(),
-            "a malformed script must raise, not vanish"
+            errs.iter()
+                .any(|e| e.starts_with("[string \"this is not lua\"]:1:")),
+            "it must not vanish either — the handler channel gets it: {errs:?}"
+        );
+    }
+
+    /// `GetLocale` answers one string and `IsMacClient` answers nil — the reference's own shapes
+    /// (`binding-shapes.tsv`, both `exact`/`agree`), and the arity is the half a caller branches on.
+    #[test]
+    fn the_client_identity_pair_answers_its_reference_arity() {
+        let s = UiScript::new().unwrap();
+        assert_eq!(
+            s.arity("GetLocale()").unwrap(),
+            1,
+            "GetLocale pushes exactly one value"
+        );
+        assert_eq!(s.eval::<String>("return GetLocale()").unwrap(), "enUS");
+        assert_eq!(
+            s.arity("IsMacClient()").unwrap(),
+            1,
+            "IsMacClient pushes one value, and it is nil"
+        );
+        assert!(
+            s.eval::<bool>("return IsMacClient() == nil").unwrap(),
+            "nil is the PC arm, which is the arm this client wants"
         );
     }
 }

@@ -7,16 +7,20 @@
 //! `UnitHealth("player")` therefore resolves against a [`UnitState`] the Bevy side deposited that
 //! frame — the same shape a real addon sees, with none of the coupling.
 //!
-//! Return shapes follow the live API (warcraft.wiki.gg): `UnitName` returns the name *or nil*;
+//! Return shapes follow the reference: `UnitName` returns the name *or nil*;
 //! `UnitHealth`/`UnitHealthMax`/`UnitLevel` return numbers (`UnitLevel` returns **−1** for a
 //! unit whose level "can't be told" — [`level_reads_unknown`], the target frame's skull gate);
-//! a unit that doesn't exist reports `UnitExists` false and the numbers `0` (nil for the name),
+//! a unit that doesn't exist reports `UnitExists` nil and the numbers `0` (nil for the name),
 //! exactly as the client does for an absent unit token. Tokens (`"player"`, `"target"`, …) are opaque strings the host never
 //! interprets — the app decides what each maps to.
 //!
+//! **Every predicate in this family answers the number `1` or `nil`, never a Lua boolean**, and it
+//! answers it through the one helper — [`unit_predicate`], over
+//! [`super::binding_abi::flag`]. Decision 2043; the law is 1830's, which settled the same
+//! question for the widget predicates a family earlier.
+//!
 //! v1 gaps, stated not hidden: the snapshot carries only the *active* power slot (see the
-//! `UnitMana` note below); `UnitIsDead` returns a Lua boolean rather than the client's `1`/nil
-//! (truthy either way — the shape a caller branches on is identical); `UnitIsConnected`'s backing
+//! `UnitMana` note below); `UnitIsConnected`'s backing
 //! field defaults `false`, and no app-side feed sets it `true` for live units yet (decision 0434
 //! §2's party-frame predicates land the binding first, the feed follows — see the field doc).
 
@@ -41,8 +45,65 @@ pub enum SelectionRequest {
     /// `AssistUnit(unit)` — select the token's own `UNIT_FIELD_TARGET`; a basis with no target is
     /// a silent no-op (the reference's shared assist tail bails before any send).
     Assist(String),
+    /// `AssistByName(name)` (`0x489c40`) — the `/assist Bob` handler's verb: select what the
+    /// *named player* is targeting. A name, not a unit token, so it is the app's name→unit
+    /// resolution (`AssistRequest`) rather than `Assist`'s token walk.
+    AssistByName(String),
     /// `TargetLastEnemy()` — select the last *attackable* unit that was committed.
     LastEnemy,
+}
+
+/// **The local player record — `0xc27d80`, ours** (decision 2263).
+///
+/// A copy of ONE `SMSG_CHAR_ENUM` `CHARACTER_INFO` row, and the source the reference answers four
+/// `"player"` verbs from. Each opens with the identical full-string, case-insensitive compare of
+/// the token against `0x847894` (`b"player\0"`) whose **match is the fall-through**, and each is
+/// unconditional — there is no arm that re-routes `"player"` to the unit resolver, so the
+/// descriptor never supersedes this record even once the object exists:
+///
+/// | verb | fast path | accessor | byte |
+/// |---|---|---|---|
+/// | `UnitName` `0x517020` | `0x51708c` | `0x5abdc0` | `+0x08` name |
+/// | `UnitRace` `0x518200` | `0x518269` | `0x5abdd0` | `+0x100` → `ChrRaces` |
+/// | `UnitClass` `0x518350` | `0x5183b9` | `0x5abde0` | `+0x101` → `ChrClasses` |
+/// | `UnitSex` `0x517e90` | `0x517ef9` | `0x5abdf0` | `+0x102` gender |
+///
+/// One writer image-wide — `0x5abd9e` (`rep movsd`, 0x44 dwords) inside `CGlueMgr::EnterWorld`,
+/// at the character-select commit — and **no instruction anywhere clears it**. It is filled before
+/// FrameXML loads and before `CMSG_PLAYER_LOGIN` is sent, which is why the reference can run addon
+/// `OnUpdate` for many frames with no local player object and still answer all four (wow-re
+/// `ui/scratch/unitname-player-seed-window.md` §6).
+///
+/// **`UnitLevel` is deliberately NOT here.** The record carries the level at `+0x108` and the
+/// client ships an accessor for it, `0x5abe00`, that **nothing calls** — so `UnitLevel("player")`
+/// reads the descriptor and answers `0` in exactly the window the four answer in.
+///
+/// **Resolved strings, not the raw bytes**, because this crate has no DBC: the reference resolves
+/// `+0x100`/`+0x101` through `ChrRaces`/`ChrClasses` at call time, and the app does that same
+/// resolution once when it seeds the record (it is the identical lookup
+/// `ui_unit::race_names`/`class_names` already does for the unit snapshot, so the two cannot
+/// disagree about what a race byte means).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlayerRecord {
+    /// `+0x08` — the NUL-terminated name buffer at `0xc27d88`. Empty is the record's only unset
+    /// state, and the reference's only `UnitName("player")` nil: `lua_pushstring(NULL)` at
+    /// `0x517095` tail-jumps into `lua_pushnil`. Unreachable from Lua in the real client, because
+    /// the verb is not registered until `UI_Init` and only an Enter World commit gets there.
+    pub name: String,
+    /// `+0x100` resolved — `UnitRace`'s `(localized, file token)` pair, e.g.
+    /// `("Night Elf", "NightElf")`. `None` is the all-zero record: race 0 has no `ChrRaces` row,
+    /// and the reference's bound/NULL-row arms push `nil, nil` rather than reaching the resolver.
+    pub race: Option<(String, String)>,
+    /// `+0x101` resolved — `UnitClass`'s `(localized, UPPERCASE token)` pair, e.g.
+    /// `("Warrior", "WARRIOR")`. `None` for the all-zero record, same shape as [`Self::race`].
+    pub class: Option<(String, String)>,
+    /// `+0x102` on `UnitSex`'s scale (2 male, 3 female) — **not** the wire's 0/1.
+    ///
+    /// `0` is our unset marker and reads as `2`, which is not a fudge: `0x517ef9`'s accessor feeds
+    /// `fild [4*eax+0x808be4]` over `{2,3,1,6}` with **no bounds check at all**, so an all-zero
+    /// record answers `2` ("male") in the reference too. It is the one of the four with no
+    /// validity guard.
+    pub sex: u8,
 }
 
 /// One unit-token's game-state snapshot, pushed by the app each frame and read by the `Unit*`
@@ -191,6 +252,45 @@ pub struct UnitState {
     /// player-options newbie tip. `UnitIsPlayer`'s note used to call this reach a gap we did not
     /// carry; the unit-frame migration is what closed it.
     pub player_controlled: bool,
+    /// `UNIT_FIELD_FLAGS`, raw — what `UNIT_FLAGS` fires on (the app's `fire_transitions`); the
+    /// three readings above are bits of it.
+    pub flags: u32,
+    /// `PLAYER_FLAGS` (descriptor index 190), raw — what **`PLAYER_FLAGS_CHANGED`** fires on, the
+    /// [`Self::flags`] pattern one field over. `0` on a creature, which has no PLAYER block.
+    ///
+    /// The reference watches this dword type-wide over TYPEID_PLAYER (`0x468070(ecx=4, edx=8,
+    /// width 4)` registered at `0x5e25d7`), and its handler `0x5ee990` fires the event from
+    /// `0x5eea35`-`0x5eea3d` — **unguarded by any bit test, and above the local-player GUID gate
+    /// at `0x5eea93`** — so *any* bit moving on *any* player announces itself, remote players
+    /// included. Decision 2078.
+    ///
+    /// Raw, not a decoded subset, and that is the point: [`Self::group_leader`] (`0x1`) and
+    /// [`Self::ghost`] (`0x10`) are the only bits this struct decodes, while `0x2`/`0x4` (the
+    /// chat AFK/DND flags), `0x8` (GM), `0x200` (PvP-desired), `0x400`/`0x800` (hide helm/cloak)
+    /// and `0x1000`/`0x2000` (the play-time regimes) all move without touching either. Firing off
+    /// the decoded pair would silently under-announce every one of them.
+    pub player_flags: u32,
+    /// `UNIT_DYNAMIC_FLAGS` (descriptor index 143), raw — what **`UNIT_DYNAMIC_FLAGS`** the
+    /// *event* fires on, the [`Self::flags`] pattern a hundred fields over.
+    ///
+    /// The event is id **137**, and the id is not arbitrary: the reference's generic bridge
+    /// `0x51bbb0` registers one watch per unit-window field whose name-table slot is non-NULL, and
+    /// the id it dispatches is that field's own window index — `137 + 6 = 143`, this field.
+    /// Byte-verified here rather than taken from the note: `0xbe1198 + 137*4 = 0xbe13bc` has
+    /// exactly one writer image-wide (`0x51ad8b`), and the pointer it stores resolves to
+    /// `"UNIT_DYNAMIC_FLAGS"`. The watch **length** is 4 — selector byte `[0x51bc98 + 137] = 4`,
+    /// jump-table entry `0x51bbf9 mov eax,4` — so the gate is a `repe cmpsb` over exactly this one
+    /// dword against the object's shadow copy (`0x4655bb`), and **any** bit moving fires it.
+    ///
+    /// Raw for the same reason [`Self::player_flags`] is, and the cost of getting it wrong is
+    /// larger here: this struct decodes four of its bits ([`Self::tapped`],
+    /// [`Self::tapped_by_player`], and — through the store — lootable `0x1` and dead-looking
+    /// `0x20`), while `0x2` (tracked, Hunter's Mark) and `0x10` moves without touching any of
+    /// them. Firing off the decoded subset would silently under-announce those.
+    pub dynamic_flags: u32,
+    /// The unit's owner — `UNIT_FIELD_SUMMONEDBY`, else its charmer, else its creator; `0` for
+    /// nobody's. What `UnitPlayerOrPetInParty`/`InRaid` read for the "or pet" half (1958).
+    pub owner: u64,
     /// The unit's guild membership (`GetGuildInfo(unit)`, decision 1257). `None` = guildless, or
     /// a creature, or a player whose `PLAYER_GUILDID` has not streamed yet. Filled from the
     /// PUBLIC descriptor fields 191/192 joined against the app's guild-identity cache — see
@@ -294,6 +394,24 @@ pub struct UnitState {
     /// return, which stock uses as display text (`PlayerFrame.lua`'s PvP hit-area tooltip title).
     /// Never interchangeable with the English half above.
     pub faction_group_localized: Option<String>,
+    /// The unit's **PvP team digit** — `0x5efe00`'s tri-state: `0` Horde, `1` Alliance, `-1` a
+    /// unit with no side. The second `%d` of `PVP_RANK_<rank>_<team>`, and **not**
+    /// [`Self::faction_group`] restated.
+    ///
+    /// The two answer different questions and the difference is a shipped bug's whole cause
+    /// (report B378, decision 2227): `UnitFactionGroup` reads the unit's LIVE
+    /// `UNIT_FIELD_FACTIONTEMPLATE` (`0x5166b8`/`0x5166be`), while every rank-title surface reads
+    /// the unit's **RACE** and walks `ChrRaces` → `FactionTemplate` → factionGroupMask
+    /// (`0x5efe00`, `[obj+0x110]+0x78`). A vmangos GM is forced to template 35 and so genuinely
+    /// loses the PvP flag icon — and keeps his rank title, because his race did not move. Wiring
+    /// this to the faction group instead read `NONE` at every rank for a Grand Marshal.
+    ///
+    /// **`Default` is `0`, and that is the reference's answer too, not a placeholder.** A literal
+    /// snapshot is one the object manager could not resolve (the out-of-range roster leg), and
+    /// `GetPVPRankInfo`'s team register is left at its initial `0` on exactly that edge
+    /// (`0x51a9af`'s lookup failing) — so a roster-only unit is named off the Horde list on both
+    /// clients. Every snapshot built from a live descriptor fills it (`ui_unit::snapshot`).
+    pub pvp_team: i8,
     /// The unit's GUID (`OBJECT_FIELD_GUID`) — the identity the cross-token predicates compare
     /// (`UnitIsUnit`, `UnitInParty`; decision 0434 §5's popup gating). `0` = the app's feed didn't
     /// resolve one; two zero guids never compare equal.
@@ -326,6 +444,46 @@ pub struct UnitState {
     /// identical bit. One wire flag answers this for every token, which is what this one field
     /// is; `benilla::ui_action::usable` already reads the same bit off the same descriptor.
     pub in_combat: bool,
+}
+
+/// `FrameScript_GetText("UNKNOWNOBJECT")` as the client's name resolvers call it — the VM's own
+/// GlobalString, read out of `_G` exactly as `0x703bf0` reads it (so a translated
+/// `GlobalStrings.lua` translates this too; enUS `"Unknown"`, `GlobalStrings.lua:4444`), falling
+/// back to the binary's own literal `"Unknown Being"` (`0x860fa4`) when the global is missing or
+/// empty. Always a string — this is the "name not yet known" state, never a nil.
+///
+/// **ONE home, two callers**, the same reason [`is_civilian_kill`] is a function. `UnitName`
+/// `0x517020` reaches it at `0x517220`, and `CGUnit_C::GetUnitName 0x609210` — which the UNIT
+/// TOOLTIP builder `0x529fe0` calls for its title line (`0x52a187`) — reaches the *same* tail at
+/// `0x609324`, from every one of its misses:
+///
+/// ```text
+/// 609353  je 0x609324        ; creature: [CGUnit+0xb30] (creaturecache.wdb) still null
+/// 6092ce  je 0x609324        ; pet: petnamecache.wdb row absent, or its stamp stale
+/// 609265  je 0x609324        ; player: namecache.wdb has not answered
+/// 609324  push 0x0 / or edx,-1 / mov ecx,0x850ed0 ("UNKNOWNOBJECT") / call 0x703bf0
+/// 60933c  mov eax,0x860fa4   ; the global missing or empty -> "Unknown Being"
+/// ```
+///
+/// One resolver, so the verb and the plate can never disagree about what a unit whose name is
+/// still in flight is called (decisions 2002, 2040).
+///
+/// **Both halves of that tail are here, and both are load-bearing.** The lookup is the rule
+/// (decision 2045: the sentence is the install's, not ours); the literal beside it is the
+/// reference's own `0x860fa4`, which is what "a literal is legitimate only as a fallback beside a
+/// lookup" means. Spelled `globals().get::<String>` — the shape `benilla-app`'s
+/// `reference_strings` tripwire recognises as a resolver — so the fallback reads as the fallback
+/// it is rather than as undeclared drift. It answers the same three cases the `mlua::Value` read
+/// it replaces did: a non-empty string is returned, and both a missing global and a present-but-
+/// EMPTY one take `0x860fa4` (the binary tests the pointer and then its first byte).
+pub fn unknownobject(lua: &Lua) -> mlua::Result<mlua::String> {
+    // One expression, deliberately: `globals().get::<String>` is what the tripwire matches on,
+    // and a line break inside it would hide this resolver from the walk again.
+    let global = lua.globals().get::<String>("UNKNOWNOBJECT").ok();
+    lua.create_string(match global.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => "Unknown Being",
+    })
 }
 
 /// The grey-band table `0x80ae98` (a byte-identical twin at `0x81dda8` drives the nameplate's
@@ -434,6 +592,33 @@ impl super::UiScript {
                 // canonical lowercase token, so a feed that ever pushed `"Target"` could not create
                 // a second, shadowing entry.
                 Some(s) => {
+                    // **A `"player"` push keeps the record in step, field by field** (2261,
+                    // widened by 2263). The reference writes `0xc27d80` once per Enter World
+                    // commit and never clears it; our VM is rebuilt per login, so the entry load
+                    // seeds it — and this keeps it true for any later push that KNOWS a field,
+                    // without ever letting one that doesn't blank it.
+                    //
+                    // That asymmetry is the whole mechanism: 2260's nameless player snapshot is
+                    // exactly the push that must not be able to reach these four verbs. It is also
+                    // what keeps every fixture in the workspace correct without touching them — a
+                    // test that seats a full player is, by this rule, also seating the record.
+                    if token.eq_ignore_ascii_case("player") {
+                        let rec = &mut model.player_record;
+                        if let Some(name) = s.name.as_deref().filter(|n| !n.is_empty()) {
+                            if rec.name != name {
+                                rec.name = name.to_string();
+                            }
+                        }
+                        if let Some(race) = s.race.clone().zip(s.race_file.clone()) {
+                            rec.race = Some(race);
+                        }
+                        if let Some(class) = s.class.clone().zip(s.class_file.clone()) {
+                            rec.class = Some(class);
+                        }
+                        if s.sex != 0 {
+                            rec.sex = s.sex;
+                        }
+                    }
                     model.units_by_lower.insert(token.to_ascii_lowercase(), s);
                 }
                 None => {
@@ -679,6 +864,29 @@ fn with_unit<T>(
         Some(u) => f(u),
         None => default,
     })
+}
+
+/// A unit **predicate** binding's whole body: resolve the token, map its snapshot to a bool, and
+/// push the family's one return shape — the number `1` or `nil`, never a Lua boolean.
+///
+/// [`with_unit`] answers whatever `f` answers, so a predicate written on it *directly* hands mlua a
+/// Rust `bool`, and mlua pushes tag 1. That is the one shape 1.12 cannot produce: `UnitExists`
+/// (`0x515fb0`) pushes `lua_pushnumber` (`0x6f3810`, tag 3, the double `1.0`) or `lua_pushnil`
+/// (`0x6f37f0`, tag 0) and nothing else, and so does every other predicate in the family. So the
+/// whole family goes through [`super::binding_abi::flag`] — 1830's widget law, which is the
+/// *same* law, finally applied to the unit surface (decision 2043). A predicate that hand-computes
+/// its own bool calls that helper directly; one that reads a snapshot field calls this. Both end at
+/// the one push site, which is what stops the family drifting apart again.
+///
+/// **Not every unit binding is a predicate.** `UnitReaction` answers the reaction *number*,
+/// `UnitLevel` a level (with `-1` for "can't be told"), `UnitPowerType` a power index whose miss is
+/// the number `0` and never nil. Those keep their own shapes and must not be routed here.
+fn unit_predicate(
+    lua: &Lua,
+    token: &Option<String>,
+    f: impl FnOnce(&UnitState) -> bool,
+) -> mlua::Result<mlua::Value> {
+    Ok(super::binding_abi::flag(with_unit(lua, token, false, f)?))
 }
 
 /// The `Unit*`/`GetQuestGreenRange` Lua binding registrations — split from this module's

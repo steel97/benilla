@@ -60,28 +60,24 @@ pub struct EditBoxState {
     /// Selection end (`E+0x360`). A non-empty selection is `sel_start != sel_end`; every insert
     /// replaces it first (RF-0082 §3).
     pub sel_end: usize,
-    /// `autoFocus` (`flags@E+0x318` bit0). Two acquisition paths, and benilla implements only the
-    /// second:
+    /// `autoFocus` (`flags@E+0x318` bit0). Two acquisition paths, and both are built:
     ///
     /// 1. **On SHOW** — the box self-focuses when it becomes visible, gated on nothing else holding
     ///    focus. The EditBox's own OnShow vtable override (`0x81c910` slot +0x30, `0x77a750`) fires
     ///    the Lua handler and then tail-jumps `SetFocus`:
     ///    `if ([0xcf4dc8] == 0 && (flags & 1)) jmp 0x77e3d0` @`0x77a76d`. The mirror slot +0x34
     ///    (`0x77a780`) tail-jumps `ClearFocus`, so **hiding an edit box releases the keyboard**.
+    ///    Ours is [`crate::script::editbox`]'s `visibility_focus`.
     /// 2. **On the first key/char event** while nothing is focused — the self-acquire guard; the box
     ///    grabs focus and processes that same event.
     ///
-    /// **This corrects what stood here.** Both this comment and wow-re's own `ui.md`/RF-0082 said
-    /// autoFocus does NOT focus on show, "verified by absence" — a census written over `call` alone,
-    /// which cannot see a tail-`jmp`. A `(call|jmp)` census finds the eleventh site (wow-re
-    /// `editbox-selection-focus-law.md` §6, 2026-08-29, dispatched from benilla's login work). Path 1
-    /// is a real behavioural gap here, not just a stale sentence.
-    ///
-    /// **`false` at construction is OUR value, not a verified one.** The client's construction-time
-    /// bit0 is unrecorded, and every `autoFocus` in the shipped 1.12.1 chain is `="false"` — ten
-    /// opt-outs, no opt-ins — which is the authoring signature of a default that is ON. Out to wow-re;
-    /// until it answers, this default and the missing path 1 are deliberately left alone together,
-    /// because turning path 1 on under a wrong default is what would actually break something.
+    /// **Both corrections landed together, decision 1686 (2026-08-29).** wow-re's own
+    /// `ui.md`/RF-0082 had published "autoFocus does NOT focus on show, verified by absence" off a
+    /// census written over `call` alone, which cannot see a tail-`jmp`; a `(call|jmp)` census finds
+    /// the eleventh site (`editbox-selection-focus-law.md` §6). The construction default came with
+    /// it and is byte-read, not chosen — see [`Default`]'s `flags = 1` note below. Every
+    /// `autoFocus` in the shipped 1.12.1 chain is `="false"`, ten opt-outs and no opt-ins, which is
+    /// the authoring signature of exactly that default.
     pub auto_focus: bool,
     /// `multiLine` (bit1): Enter inserts a newline (rather than firing `OnEnterPressed`) and `\n` is
     /// accepted into the buffer.
@@ -190,6 +186,11 @@ pub struct EditBoxState {
     /// The row pitch in px (the snapped font em — the same `N·S` block law the host's measure
     /// uses), answered with [`Self::advances`]. `0.0` until answered.
     pub cell_h: f32,
+    /// The `(row, x)` the last `OnCursorChanged` was fired with — the caret-flush edge's memory
+    /// (`0x77da80`, whose one caller `0x77d475` is gated on dirty bit 2, so the fire is per
+    /// *change*, not per frame). `None` = never fired, which is what makes the first flush after
+    /// a focus fire even though the caret is at the home position.
+    pub cursor_fired: Option<(usize, f32)>,
     /// First visible byte of the display window (`E+0x348` display/scroll start index) — the
     /// char-granular h-scroll. Clamped each read so the cursor stays inside the window
     /// (`0x77da80`'s early-out hides the caret outside `[start, start+visible]`).
@@ -314,6 +315,7 @@ impl Default for EditBoxState {
             advances_key: 0,
             rows: vec![0],
             cell_h: 0.0,
+            cursor_fired: None,
             scroll_start: 0,
             drag_active: false,
             blink_period: 0.5,

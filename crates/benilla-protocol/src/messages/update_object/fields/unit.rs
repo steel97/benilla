@@ -8,7 +8,7 @@ use super::*;
 /// reads it as "this body is a corpse" wherever it reads health for display; the server sets it for
 /// **feign death** and for `CREATURE_FLAG_EXTRA_APPEAR_DEAD` spawns, in both cases with health left
 /// intact. Every consumer goes through [`ObjectFields::unit_reads_dead`] (decision 1022).
-const UNIT_DYNFLAG_DEAD: u32 = 0x20;
+pub const UNIT_DYNFLAG_DEAD: u32 = 0x20;
 
 /// `UNIT_STAND_STATE_DEAD` (vmangos `UnitDefines.h:109`) — the third leg of the client's
 /// reads-dead predicate `0x605f90`. vmangos never writes it, so it is inert against our server.
@@ -26,15 +26,30 @@ const STAND_STATE_DEAD: u8 = 7;
 /// ×1000 (vmangos `GetCreatePowers`: `POWER_RAGE → 1000`, `POWER_HAPPINESS → 1050000`), so the real
 /// client's 100 rage and 1050 happiness are this divide, not a different field.
 ///
-/// Applied by `UnitMana`/`UnitManaMax` only — the raw accessors stay raw, and the pet happiness
-/// bucket thresholds are on the RAW scale, which is why both forms have to exist (decision 1034).
+/// **This is a whole-client law, not one getter's private step** (decision 2117). `0x6e7130` is
+/// called from *every* place a power figure becomes something a player reads, and the wire number
+/// is raw at all of them:
 ///
-/// **Two callers, because the getters have two sources** (decision 1640): the live descriptor
-/// legs below, and the party roster record's ([`crate::messages::PartyMemberStatsInfo::shown_power`])
-/// — `UnitMana 0x517670` divides by this on *both* its object leg (`0x51770f`) and its
-/// record leg (`0x517744`-`0x51775e`), so an out-of-range warrior's rage is not ten times
-/// an in-range one's.
-pub fn power_display_scale(ty: u8) -> u32 {
+/// | caller | what it scales |
+/// |---|---|
+/// | `UnitMana 0x517670` (`0x51770f`), `UnitManaMax 0x5177e0` (`0x517864`) | the live descriptor's power slot |
+/// | the same pair's party-record legs (`0x517748`, `0x5178a8`, `0x5178ee`) | [`crate::messages::PartyMemberStatsInfo::shown_power`] (decision 1640) |
+/// | `SMSG_SPELLENERGIZELOG`'s handler `0x5e8a90` (`0x5e8af3`) | the amount, **once**, before both the chat line (`0x62ca00`) and the `COMBAT_TEXT_UPDATE` push (`0x494770`) |
+/// | `SMSG_PERIODICAURALOG`'s handler `0x626dd0` (`0x627087`) | an energize tick's amount, the same way |
+/// | the power leech/drain formatter `0x627930` | `drained = amount / div` and `gained = trunc(amount·multiplier) / div` |
+/// | the spell tooltip's cost cell `0x52e610` (`0x52e8d2`, `0x52e8e7`) | the flat and per-level costs alike |
+///
+/// (wow-re `system/object-layer/scratch/combat-log-chat-law.md` §4.6 — *"Amounts are divided by
+/// `0x6e7130(powerType)`"* — plus the disassembly at each address above.)
+///
+/// The **raw** accessors stay raw: the pet happiness bucket thresholds are on the raw scale, which
+/// is why both forms have to exist (decision 1034).
+///
+/// The argument is a full 32-bit power tag because the wire's is (`SMSG_SPELLENERGIZELOG` ships a
+/// `u32`) and because the reference's own compare is signed — `POWER_HEALTH (-2)` reaches
+/// `0x6e7130` as a negative and takes the `1`. Arriving here as a large `u32` it takes the same
+/// `1` off the same `_` arm.
+pub fn power_display_scale(ty: u32) -> u32 {
     match ty {
         1 => 10,   // rage
         4 => 1000, // happiness
@@ -228,12 +243,12 @@ impl ObjectFields {
         if self.unit_dynamic_flags() & UNIT_DYNFLAG_DEAD != 0 {
             return (ty < 5).then_some(0);
         }
-        Some(self.unit_power(ty)? / power_display_scale(ty))
+        Some(self.unit_power(ty)? / power_display_scale(u32::from(ty)))
     }
     /// Maximum power **as the UI reads it** — `UnitManaMax 0x5177e0`: the same
     /// [`power_display_scale`] divide (`0x517864`), and deliberately **no** dead gate.
     pub fn unit_shown_max_power(&self, ty: u8) -> Option<u32> {
-        Some(self.unit_max_power(ty)? / power_display_scale(ty))
+        Some(self.unit_max_power(ty)? / power_display_scale(u32::from(ty)))
     }
     /// `UNIT_FIELD_LEVEL` — the unit's level.
     pub fn unit_level(&self) -> Option<u32> {
@@ -283,6 +298,19 @@ impl ObjectFields {
     pub fn unit_auras(&self) -> impl Iterator<Item = UnitAuraSlot> + '_ {
         (0..UNIT_AURA_SLOTS).filter_map(|slot| self.unit_aura(slot))
     }
+    /// Every `UNIT_FIELD_AURA` slot's **raw** spell id, unfiltered — no `AURAFLAGS` nibble test,
+    /// no zero-skip, in ascending slot order.
+    ///
+    /// This is deliberately NOT [`Self::unit_auras`], and the difference is the reference's, not
+    /// ours: the cast validator's crowd-control exemption scan (`0x6e9ca0`) reads these slots
+    /// straight and **does not consult `UNIT_FIELD_AURAFLAGS`** — it skips no "inactive" slot and
+    /// reads no duration, stack or caster state. Any non-zero, in-range id counts, husk or not.
+    /// The buff bar wants the filtered view; that scan wants this one (decision 1946).
+    pub fn unit_aura_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..UNIT_AURA_SLOTS)
+            .map(|slot| self.get_u32(FIELD_UNIT_AURA + u16::from(slot)).unwrap_or(0))
+    }
+
     /// The unit's active power type (`UNIT_FIELD_BYTES_0` byte 3): `0` mana, `1` rage, `2` focus,
     /// `3` energy, `4` happiness. Absent (no bytes_0 on the wire yet) reads as mana, the descriptor's
     /// zero-initialized default.
@@ -340,6 +368,19 @@ impl ObjectFields {
     /// V-plate gates.
     pub fn unit_is_ghost_visual(&self) -> bool {
         (self.get_u32(FIELD_UNIT_BYTES_1).unwrap_or(0) >> 24) & 0x1 != 0
+    }
+
+    /// `UNIT_FIELD_BYTES_1` byte 3's **`0x4`** — the third neighbour of the ghost (`0x1`) and creep
+    /// (`0x2`) bits above. Byte-VERIFIED as the minimap object-dot classifier's own third
+    /// precondition (wow-re `questgiver-marker.md` §W15: `byte [eax+0x213] & 4`, where `eax` is the
+    /// descriptor block base — `0x210/4 = 132` = `UNIT_FIELD_BYTES_1`; the only `& 4` site on this
+    /// byte image-wide, by two independent censuses). Set ⇒ the unit draws **no minimap dot at
+    /// all**, quest or tracking.
+    ///
+    /// The *name* is INFERRED from vmangos's `UNIT_VIS_FLAGS_UNTRACKABLE`, like its two siblings —
+    /// no flag-name string exists in the image. The bit and its effect are verified.
+    pub fn unit_is_untrackable(&self) -> bool {
+        (self.get_u32(FIELD_UNIT_BYTES_1).unwrap_or(0) >> 24) & 0x4 != 0
     }
 
     /// `UNIT_FIELD_AURASTATE` ([`FIELD_UNIT_AURASTATE`]) — the aura-state bit set (defense 1,

@@ -71,7 +71,6 @@ type SpawnTables<'w> = (
     Option<ResMut<'w, crate::static_gx::StaticGx>>,
 );
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_loaded_placements(
     mut commands: Commands,
     placements: ResMut<Placements>,
@@ -161,19 +160,40 @@ pub(super) fn spawn_loaded_placements(
                         continue;
                     }
                     // Resolve the MCSH ground-shade the reference way: a GLOBAL world→tile→chunk lookup at
-                    // the doodad's origin, independent of which tile registered it or in what order. An ADT
-                    // map doodad on lit ground takes the boosted ADT sun level (`ShadeSel::Lit` — the
-                    // binary's 2.5, wow-re m2-interior-doodad-base-light §6).
+                    // the doodad's origin, independent of which tile registered it or in what order.
+                    //
+                    // **An ADT map doodad is the FIXED-1.0 family, not the boosted one** (2050).
+                    // This site read `ShadeSel::Lit` (the 2.5 target) on the strength of wow-re
+                    // `m2-interior-doodad-base-light` §6, and §6 was wrong: a `CMapDoodadDef`'s
+                    // `[+0xa4]` is only ever {0.0, 0.5, 1.0}, and the class does not merely fail to
+                    // ramp — at `+0xf8`, where the ramp `0x69e770` reads its target, the doodad
+                    // class holds `m[2][3]` of its own world matrix. The 2.5 and the 3.3333/s chase
+                    // belong to the WENTITY light node (vtable `0x810810`, hung off `[obj+0xe0]`),
+                    // which a doodad has none of. Measured as well as read: 111 identified MDDF
+                    // placements over six trace frames, 356 draws, gains only ∈ {0.5, 1.0}, none
+                    // changing — while an entity walking out of shadow climbed 0.5 → 0.81 → 1.09 →
+                    // 1.3367 in the same frames. wow-re `models/scratch/
+                    // adt-doodad-sun-scale-vs-entity-node.md`.
+                    //
+                    // So this is the same family the exterior WMO MODD prop takes, and for the same
+                    // reason: they are one C++ class. Nothing renders differently today — the
+                    // shader's `min(I, 1)` already flattened the two — but the scale being
+                    // per-class is what has to be true BEFORE that cap can come off.
                     let shade =
                         match doodad_ground_shade(&streamer, &adt_tiles, p.transform.translation) {
                             ShadeResolve::Ready(true) => ShadeSel::Shaded,
-                            ShadeResolve::Ready(false) => ShadeSel::Lit,
+                            ShadeResolve::Ready(false) => ShadeSel::Matte,
                             // The doodad's own ground tile is requested but still decoding — wait, so we don't
                             // bake the lit fallback into a straddling tree whose true tile lands a frame later.
                             ShadeResolve::Pending => continue,
                         };
                     let (radius, center) = m2_fade(&m.bounds, p.transform.scale.x);
                     let anim_bound = m2_anim_bound(&m.bounds);
+                    // The placement's ONE draw-set gate, built before the spawn because the
+                    // assembler now takes it too (2059): the mesh lane, the emitters, the ribbons
+                    // and the anim host are admitted or refused together, from one expression. A
+                    // map doodad is nobody's furniture, so it carries no instance and no rooms.
+                    let fade = emitter_fade(p.transform, (radius, center), None, None);
                     // The placement's identity, built BEFORE the spawn: every lane that takes
                     // a batch — entity, merge blob, retained cell — carries this same Arc, so
                     // whichever one draws it, the pick names the placement (decision 1534).
@@ -201,6 +221,7 @@ pub(super) fn spawn_loaded_placements(
                         &object,
                         shade,
                         None, // map doodad: exterior sky lighting (no interior probe)
+                        Some(&fade),
                         radius,
                         center,
                         anim_bound,
@@ -208,7 +229,8 @@ pub(super) fn spawn_loaded_placements(
                         &mut uv_reg,
                         &mut tint_reg,
                         &mut anim_table,
-                        None, // world-static placement: cards bake their world pivot
+                        false, // world-static: not the entity-hosted lane
+                        None,  // world-static placement: cards bake their world pivot
                         Some((&mut *merge, MergeSite::Doodad { owner: p.owner })),
                         // The retained-pass collector (1429/1431) — ADT doodads are its lane.
                         staticgx
@@ -265,7 +287,6 @@ pub(super) fn spawn_loaded_placements(
                     // One gate for both emitter families. `None`/empty: an ADT map doodad
                     // belongs to no building, so neither the window exemption nor the room
                     // term has anything to key on.
-                    let fade = emitter_fade(p.transform, (radius, center), None, None);
                     spawn_emitters_for(
                         &mut commands,
                         &m.emitters,
@@ -318,6 +339,10 @@ pub(super) fn spawn_loaded_placements(
                     // Hoisted above the spawn: the merge site needs it (a portal-gated building's
                     // blobs take `WmoGroupVis`), and the instance logic below reuses it.
                     let has_portals = !m.portal_refs.is_empty() && !m.portal_infos.is_empty();
+                    // A building carries no authored M2 bounds, so its gate is the never-fade
+                    // sphere the `f32::INFINITY` radius below always meant. `m2: None` on this
+                    // lane ⇒ no anim host, so only the mesh half of the gate is ever read.
+                    let fade = emitter_fade(p.transform, (f32::INFINITY, Vec3::ZERO), None, None);
                     // The building's identity, shared by every lane that takes one of its batches
                     // (decision 1534) — see the doodad site above.
                     let object = Arc::new(WorldObject {
@@ -381,6 +406,7 @@ pub(super) fn spawn_loaded_placements(
                         &object,
                         ShadeSel::Matte, // WMO lights on the FFP N·L path — the selector is unread
                         None, // WMO groups carry their own per-submesh interior flag + batch class
+                        Some(&fade),
                         f32::INFINITY,
                         Vec3::ZERO,
                         None, // …and no authored M2 box: group geometry never animates
@@ -388,7 +414,8 @@ pub(super) fn spawn_loaded_placements(
                         &mut uv_reg,
                         &mut tint_reg,
                         &mut anim_table,
-                        None, // world-static placement: cards bake their world pivot
+                        false, // world-static: not the entity-hosted lane
+                        None,  // world-static placement: cards bake their world pivot
                         Some((
                             &mut *merge,
                             MergeSite::Wmo {
@@ -669,6 +696,19 @@ pub(super) fn spawn_loaded_placements(
             };
             let (radius, center) = m2_fade(&m.bounds, d.transform.scale.x);
             let anim_bound = m2_anim_bound(&m.bounds);
+            // One gate for every rider of this prop: the prop rides its building's
+            // exterior-window exemption AND the portal PVS of the rooms that name it — the same
+            // `WmoGroupVis` the submeshes are culled by, so a prop's mesh, its flames, its
+            // streamers and (since 2059) its ANIM HOST are admitted or refused together
+            // (decisions 0786 / 0689 / 1289). Hoisted above the spawn because the assembler takes
+            // it now; a particles-only prop has no submesh to carry a verdict, so this is the only
+            // thing that tells its host it is furniture rather than exterior scene.
+            let fade = emitter_fade(
+                d.transform,
+                (radius, center),
+                portal_instance,
+                Some(&d.groups),
+            );
             // An interior prop's committed light, folded ONCE into its SH probe (the reference folds
             // at doodad create + per-frame light commit; everything here is static, so once): the
             // MODD-colour ambient + the diffuse lobe on the fixed interior axis + the owning group's
@@ -725,6 +765,7 @@ pub(super) fn spawn_loaded_placements(
                 &object,
                 shade,
                 interior_slot, // interior props light off their folded probe, not the sky
+                Some(&fade),
                 radius,
                 center,
                 anim_bound,
@@ -732,7 +773,8 @@ pub(super) fn spawn_loaded_placements(
                 &mut uv_reg,
                 &mut tint_reg,
                 &mut anim_table,
-                None, // world-static placement: cards bake their world pivot
+                false, // world-static: not the entity-hosted lane
+                None,  // world-static placement: cards bake their world pivot
                 // The prop merge site (1418 lane 3): keyed by the rooms that name the prop,
                 // slot baked per vertex for the interior lane.
                 Some((
@@ -835,16 +877,6 @@ pub(super) fn spawn_loaded_placements(
                     welds.add_prop(unique_id, verts, tris);
                 }
             }
-            // One gate for both emitter families: the prop rides its building's exterior-window
-            // exemption AND the portal PVS of the rooms that name it — the same `WmoGroupVis` the
-            // submeshes above are culled by, so a prop's mesh, its flames and its streamers are
-            // admitted or refused together (decisions 0786 / 0689 / 1289).
-            let fade = emitter_fade(
-                d.transform,
-                (radius, center),
-                portal_instance,
-                Some(&d.groups),
-            );
             spawn_emitters_for(
                 &mut commands,
                 &m.emitters,

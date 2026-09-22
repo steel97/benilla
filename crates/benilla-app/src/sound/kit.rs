@@ -160,18 +160,27 @@ pub(super) enum Latch {
     Greeting,
     /// The one-shot creature bark's `[unit+0xb20]` — the per-unit slot of the reference's bark
     /// dispatch `0x623a40` (5-way jump table `0x623afc`; wow-re
-    /// `object-layer/scratch/smsg-ai-reaction.md`).
+    /// `object-layer/scratch/smsg-ai-reaction.md`, `feign-death-dyndead.md` §11).
     ///
-    /// The reference keeps the latched **category** beside the handle in `[unit+0xb24]` and uses
-    /// it for an interrupt rule — only a *strictly higher* category stops what is playing
-    /// (`0x623a8d`, after `0x623a95 call 0x7a5700`). benilla does not carry the category, because
-    /// the ordering of that 5-way table is an open wow-re question and guessing it would invent
-    /// an interrupt the client may not have. Today only the HOSTILE aggro bark (`0x623a40(0)`,
-    /// `CreatureSoundData` col 10) is routed through the slot, and it is byte-verified as the
-    /// table's **lowest** category: it never interrupts a playing bark and is dropped outright
-    /// while this latch is held — which is exactly what plain liveness already gives. When the
-    /// ordering is pinned, the category becomes a payload here.
-    Voice,
+    /// **The payload is the reference's `[unit+0xb24]` — the latched bark STATE**, which is the
+    /// interrupt rule's whole input: `0x623a82`/`0x623a88` abort a new bark whose state is `<=`
+    /// the one already sounding, and let a strictly higher one through (stopping the old at
+    /// `0x623a95`). It was left off until decision 2039 because the table's ordering was an open
+    /// question and inventing an interrupt is worse than missing one; the five arms are now read
+    /// out of the image dword for dword:
+    ///
+    /// | state | `CreatureSoundData` column | what |
+    /// |---|---|---|
+    /// | 0 | 10 | the HOSTILE aggro bark (`SMSG_AI_REACTION`) |
+    /// | 1 | 28 | the pet's ORDER bark (`SMSG_PET_ACTION_SOUND` selector 0) |
+    /// | 2 | 27 | the pet's ATTACK bark (`SMSG_PET_ACTION_SOUND` selector 1) |
+    /// | 3 | — | plays nothing, and *still* stops and latches |
+    /// | 4 | 6 | the death bark — the maximum, so nothing supersedes it |
+    ///
+    /// Carrying it on the channel is equivalent to carrying it on the unit, because the reference
+    /// only ever consults `[0xb24]` while `[0xb20]` holds a live handle (`0x623a74`/`0x623a7d`
+    /// jump past the comparison otherwise).
+    Voice(u8),
     /// A **server-pushed object sound** live on this unit — `SMSG_PLAY_OBJECT_SOUND`
     /// (opcode `0x278`), the `AISOUNDDESC` pool at `[0xb05f38]`.
     ///
@@ -208,9 +217,8 @@ pub(super) fn bark_chance_pass(threshold: u32, roll: u32) -> bool {
 /// The rest of the creature table is `{70, 100, 60, 100, 100, 40, 100, …}` (player twin
 /// `{35, 100, 30, 100, 100, 40, 100, …}`), and only classes 0, 2 and 5 are ever rolled — every
 /// other class carries 100, i.e. `P = 1`, which is why `$WNG`/`$WGG` (classes 7 and 10) and the
-/// ALERT bark (class 8) are faithfully unconditional. Class 2 (injury) is **not** encoded here:
-/// its live trigger route is still unpinned. Class 0 (exertion) now is — see
-/// [`EXERTION_CHANCE_CREATURE`].
+/// ALERT bark (class 8) are faithfully unconditional. Classes 0 and 2 are encoded beside this one
+/// — see [`EXERTION_CHANCE_CREATURE`] and [`INJURY_CHANCE_CREATURE`].
 pub(super) const STAND_CHANCE: u32 = 40;
 
 /// The class-0 (**exertion**) chance thresholds, and the one place in the vocal tables where the
@@ -226,6 +234,29 @@ pub(super) const STAND_CHANCE: u32 = 40;
 pub(super) const EXERTION_CHANCE_CREATURE: u32 = 70;
 /// The player twin of [`EXERTION_CHANCE_CREATURE`] — `0x86424c[0] = 35`.
 pub(super) const EXERTION_CHANCE_PLAYER: u32 = 35;
+
+/// The class-2 (**ordinary injury**) chance thresholds — the victim's wound grunt, and the third
+/// and last rolled class (decision 2073). `0x8626d4[2] = 60` (creature) and `0x86424c[2] = 30`
+/// (player): **P = 61/101 ≈ 60.4 %** and **31/101 ≈ 30.7 %**.
+///
+/// The twin is picked by the **victim's** own type, since the roll runs inside the victim's
+/// `[vtable+0x88]` — `0x623490` for a creature, `0x62f880` for a player — so a player being hit
+/// grunts about half as often as a creature taking the same blow, the same asymmetry class 0 has
+/// on the attacker's side.
+///
+/// Classes **3** (InjuryCritical) and **9** (InjuryCrushingBlow) carry 100 in both twins and are
+/// never rolled: a crit and a crushing blow always vocalise, an ordinary hit does not. That is the
+/// audible shape — the wound grunt thins out under sustained melee while the big hits punch
+/// through it — and playing class 2 unconditionally, which is what benilla did before 2073, is
+/// about 40 % too many grunts on a creature and 70 % too many on a player.
+///
+/// The route that reaches these was the "still unpinned" clause above: `0x624530`'s tail →
+/// `[vtable+0x88]` → the roll `0x623520` / `0x62f940` → the 13-way column selector `0x623020`
+/// (`+0x0c/+0x10/+0x14` = DBC columns 3/4/5). wow-re
+/// `object-layer/scratch/wound-parry-gate-and-injury-vocal.md`.
+pub(super) const INJURY_CHANCE_CREATURE: u32 = 60;
+/// The player twin of [`INJURY_CHANCE_CREATURE`] — `0x86424c[2] = 30`.
+pub(super) const INJURY_CHANCE_PLAYER: u32 = 30;
 
 /// The class-5 cooldown: **10 000 ms on ONE global timestamp** (`0x623290`,
 /// `GetTickCount − [0xc4e0e4] − 0x2710`). Not per unit and not per class — a single window shared
@@ -500,7 +531,7 @@ pub(super) struct PlayExtras {
     /// [`SAME_KIT_MAX`]. Those are the **one-shot lane's** gate (`0x458f40` lifting `SoundEntries`
     /// bit 0x20 into the FMOD flags word, consumed by `0x7a66a0`), and a caller that already
     /// guarantees one channel per kit by construction must not be held to it a second time. The
-    /// ambient emitter pool ([`super::doodad_pool`]) is that caller: it dedupes **structurally**,
+    /// ambient emitter pool ([`super::emitter_pool`]) is that caller: it dedupes **structurally**,
     /// one entry per SoundEntries id (wow-re `doodad-sound-emitters.md` §15), and its opens go
     /// through `0x7a5680` → `0x7a54d0`, which never reaches that gate at all.
     ///
@@ -545,7 +576,6 @@ pub(crate) enum KitRef<'a> {
 /// Silently succeeds without playing when the kit is out of range or duplicate-suppressed
 /// (matching the client: gates are not errors) — `Ok(false)` is that outcome, see
 /// [`play_kit_ext`]'s return.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn play_kit(
     kits: &mut SoundKits,
     assets: &WorldAssets,
@@ -586,7 +616,6 @@ pub(crate) fn play_kit(
 /// per-bus cap, the duplicate walk), and callers that care read that zero. Almost none do, and
 /// `Ok(false)` reads exactly like `Ok(())` did for them; [`super::vocal`]'s escalation counter is
 /// the one place the distinction is the mechanism.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn play_kit_ext(
     kits: &mut SoundKits,
     assets: &WorldAssets,
@@ -731,7 +760,18 @@ pub(super) fn play_kit_ext(
         return Ok(false);
     }
 
-    let mixer = out.mixer.as_mut().context("no audio device")?;
+    // **No device is a no-op, not an error.** Running silent (`WOW_NOSOUND=1`, CI, an unattended
+    // probe — or a player whose device is genuinely gone) is a startup fact `sound::plugin`
+    // already warns about ONCE. Returning `Err` here turned that one fact into a warn PER EVENT
+    // at every one of this module's ~25 call sites: a 75 s lava probe logged 3975 identical
+    // `no audio device` lines, 89% of the file, which is why `liquid_loop` grew a guard of its
+    // own — and a probe sweep still footstepped one warn every half-second. The fix belongs here,
+    // at the one place that knows, rather than as a guard repeated at each caller. `false` is the
+    // signal this function already uses for "the gates dropped it", which is exactly what
+    // happened.
+    let Some(mixer) = out.mixer.as_mut() else {
+        return Ok(false);
+    };
     let (track, handle) = match pos {
         Some(p) => {
             // `EAXDef 0` = no `SoundSamplePreferences` row = the reference's NULL-slot skip at
@@ -786,18 +826,34 @@ pub(super) fn play_kit_ext(
 }
 
 /// Does `unit` hold a **live one-shot voice channel** — the reference's `[unit+0xb20]` handle,
-/// nonzero-gated (wow-re `object-layer/scratch/smsg-ai-reaction.md`)? The slot's liveness IS the
-/// gate: the HOSTILE aggro bark is the lowest category in `0x623a40`'s table, so it never
-/// interrupts what is sounding and is simply dropped while this is true.
+/// nonzero-gated (wow-re `object-layer/scratch/smsg-ai-reaction.md`) — and if so, at which
+/// **state**? `Some(state)` is the pair `[0xb20]` live + `[0xb24]`; `None` is a free slot, which
+/// is `0x623a74`/`0x623a7d`'s "allowed, no comparison" path.
 ///
-/// Scoped to channels that actually latched a category, which is the whole point — the reference
+/// Scoped to channels that actually latched a state, which is the whole point — the reference
 /// keeps this handle separate from the combat drone (`0x623800` carries its own latch) and from
 /// the greeting line (`[unit+0xb1c]`), so a humming elemental or a talking quest-giver must not
 /// mute its own barks.
-pub(super) fn unit_voice_playing(out: &SoundOutput, unit: Entity) -> bool {
-    out.channels
-        .iter()
-        .any(|c| occupies_voice_slot(c.source, c.latch, unit))
+pub(super) fn unit_voice_state(out: &SoundOutput, unit: Entity) -> Option<u8> {
+    out.channels.iter().find_map(|c| match c.latch {
+        Latch::Voice(state) if c.source == Some(unit) => Some(state),
+        _ => None,
+    })
+}
+
+/// Stop whatever holds `unit`'s voice slot — the reference's `0x623a95 call 0x7a5700` on
+/// `&[unit+0xb20]`, which runs on **every** admitted bark, before the column is even read. So a
+/// bark whose column is `0` still silences the one it superseded: the handle is overwritten with
+/// the (null) result of playing nothing (`0x623aee`).
+pub(super) fn stop_unit_voice(out: &mut SoundOutput, unit: Entity) {
+    out.channels.retain_mut(|c| {
+        if occupies_voice_slot(c.source, c.latch, unit) {
+            c.handle.stop(mixer::declick());
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// Does one channel, described by its `(source, voice)` identity, occupy `unit`'s **voice** slot
@@ -806,7 +862,7 @@ pub(super) fn unit_voice_playing(out: &SoundOutput, unit: Entity) -> bool {
 /// them: a bark and a greeting line are different handles in the reference and must not mute each
 /// other.
 pub(super) fn occupies_voice_slot(source: Option<Entity>, latch: Latch, unit: Entity) -> bool {
-    source == Some(unit) && latch == Latch::Voice
+    source == Some(unit) && matches!(latch, Latch::Voice(_))
 }
 
 /// The complement — the greeting latch's own test (see [`source_playing`] for what else currently
@@ -937,7 +993,10 @@ pub(crate) fn play_file(
     if !claim_voice(out, amp) {
         return Ok(());
     }
-    let mixer = out.mixer.as_mut().context("no audio device")?;
+    // No device is a no-op here too — see the note in [`play_kit_ext`].
+    let Some(mixer) = out.mixer.as_mut() else {
+        return Ok(());
+    };
     let handle = mixer.play_2d(data)?;
     if let Some(probe) = out.probe.as_ref() {
         probe.note_play(0, path, "sfx", "2d");
@@ -1045,16 +1104,23 @@ impl SoundKits {
         if let Some(d) = self.cache.get(&key) {
             return Ok(d.clone());
         }
+        // **Two stores, one rule** — the chain, then an addon's own loose file
+        // ([`benilla_assets::read_chain_or_loose`], decision 1322's resolver): `PlaySoundFile` is
+        // a by-path verb, and the audio an addon ships lives on disk, never in an MPQ.
         let bytes = assets
-            .chain
-            .lock_recover()
-            .read_file(path)
+            .read_file_or_loose(path)
             .with_context(|| format!("reading {path}"))?;
         let data = mixer::sfx_from_bytes(bytes)?;
         self.cache.insert(key, data.clone());
+        DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(data)
     }
 }
+
+/// First-play decodes so far — a chain read plus a decode on the main thread, once per
+/// distinct kit file per session. `FPS_PROBE` reads it per frame to annotate a tail frame
+/// (a raid's buff wave meets dozens of distinct spell sounds in its first minute).
+pub(crate) static DECODES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Startup: load the kit catalog off the chain (absent → no resource; every play site tolerates
 /// that, the same optional-catalog rule as `Creatures`).
@@ -1104,11 +1170,19 @@ pub(super) fn pump_channels(
                 }
             }
         }
+        // Compare before the write, on both arms (1362's no-op-write law, the audio edition):
+        // `set_volume` is a command into the audio thread's queue whether or not the value
+        // moved, and on a still frame every live channel's amp is bit-identical to last
+        // frame's — the glide an earlier write started completes on its own. The handle's
+        // volume is `amp_to_db(ch.amp)` from `play` onward, so the field IS the handle's state.
         let Some(p) = ch.pos else {
             // 2D: only the category slider can move under a live channel.
-            ch.amp = config.category_amp(ch.category) * ch.v * ch.gain;
-            ch.handle
-                .set_volume(mixer::amp_to_db(ch.amp), mixer::glide());
+            let amp = config.category_amp(ch.category) * ch.v * ch.gain;
+            if amp != ch.amp {
+                ch.amp = amp;
+                ch.handle
+                    .set_volume(mixer::amp_to_db(ch.amp), mixer::glide());
+            }
             return true;
         };
         let d_sq = math::dist_sq(listener, p);
@@ -1117,16 +1191,19 @@ pub(super) fn pump_channels(
             ch.handle.stop(mixer::declick());
             return false;
         }
-        ch.amp = config.category_amp(ch.category)
+        let amp = config.category_amp(ch.category)
             * ch.v
             * ch.gain
             * math::fmod_rolloff(d_sq, ch.min_dist)
             * near_field(d_sq, ch.cutoff);
-        // Glides, not snaps (decision 1026): this is the per-frame gain feed, and a step here is a
-        // click. It is also the one that scales — every live channel steps together when a frame
-        // hitches, which is what a "crack fest" under OBS actually was.
-        ch.handle
-            .set_volume(mixer::amp_to_db(ch.amp), mixer::glide());
+        if amp != ch.amp {
+            ch.amp = amp;
+            // Glides, not snaps (decision 1026): this is the per-frame gain feed, and a step here
+            // is a click. It is also the one that scales — every live channel steps together when
+            // a frame hitches, which is what a "crack fest" under OBS actually was.
+            ch.handle
+                .set_volume(mixer::amp_to_db(ch.amp), mixer::glide());
+        }
         true
     });
 }
@@ -1142,6 +1219,12 @@ pub(super) fn apply_kit_debug(
     config: Res<SoundConfig>,
     listener: Res<AudioListener>,
 ) {
+    // Read before borrowing mutably: a `&mut` through `ResMut` marks `DebugState` changed, and
+    // this ran every frame — so every still-frame gate that reads `debug.is_changed()`
+    // (decision 1979) saw a changed debug state on every frame of every run.
+    if !debug.sound.play_kit {
+        return;
+    }
     let s = &mut debug.sound;
     if !std::mem::take(&mut s.play_kit) {
         return;
@@ -1356,6 +1439,39 @@ mod tests {
         assert_eq!(admitted(100), 101, "a critical swing always grunts");
     }
 
+    /// The injury pair's shape (decision 2073), and the reason the victim's grunt thins out:
+    /// **class 2 is rolled, classes 3 and 9 are not.** `0x8626d4[2] = 60` for a creature victim
+    /// and `0x86424c[2] = 30` for a player one — so a creature vocalises about three hits in
+    /// five, a player fewer than one in three, while every crit and every crushing blow sounds.
+    ///
+    /// The numbers are the point: benilla played all three unconditionally before 2073, which is
+    /// 40 of every 100 creature grunts too many and 70 of every 100 on a player.
+    #[test]
+    fn an_ordinary_wound_grunt_is_rolled_but_a_crit_and_a_crush_always_sound() {
+        let bucket = |r: u32| ((101u64 * u64::from(r)) >> 32) as u32;
+        let admitted = |threshold: u32| {
+            (0..=100)
+                .filter(|&b| {
+                    let r = ((u64::from(b) << 32) / 101) as u32 + 1;
+                    bucket(r) == b && bark_chance_pass(threshold, r)
+                })
+                .count()
+        };
+        assert_eq!(admitted(INJURY_CHANCE_CREATURE), 61, "P = 61/101 ≈ 60.4 %");
+        assert_eq!(admitted(INJURY_CHANCE_PLAYER), 31, "P = 31/101 ≈ 30.7 %");
+        // Classes 3 (InjuryCritical) and 9 (InjuryCrushingBlow) carry 100 in both twins, which is
+        // why combat.rs skips the roll on a crit and a crushing blow rather than rolling a 100.
+        assert_eq!(
+            admitted(100),
+            101,
+            "a crit and a crushing blow always sound"
+        );
+        // The injury pair is strictly quieter than the exertion pair on the same twin — the
+        // attacker grunts more often than the victim does, in both directions.
+        assert!(admitted(INJURY_CHANCE_CREATURE) < admitted(EXERTION_CHANCE_CREATURE));
+        assert!(admitted(INJURY_CHANCE_PLAYER) < admitted(EXERTION_CHANCE_PLAYER));
+    }
+
     /// **The two per-unit handles are disjoint** (decision 1399): the one-shot bark occupies
     /// `[unit+0xb20]`, the greeting line `[unit+0xb1c]`, and neither may answer the other's
     /// question. This is the regression guard for the way the voice slot was added — tagging the
@@ -1365,7 +1481,7 @@ mod tests {
     fn the_voice_slot_and_the_greeting_latch_are_disjoint() {
         let bear = Entity::from_raw_u32(1).expect("valid entity id");
         let other = Entity::from_raw_u32(2).expect("valid entity id");
-        let bark = (Some(bear), Latch::Voice);
+        let bark = (Some(bear), Latch::Voice(0));
         let greet = (Some(bear), Latch::Greeting);
         // The case decision 1399 was actually about: a channel tagged with the unit for
         // *ownership* — its body loop, a missile's travel loop, a water splash — takes no latch
@@ -1486,7 +1602,7 @@ mod tests {
             "a greeting line holds [unit+0xb1c] — stealing it lets the unit re-greet at once"
         );
         assert!(
-            !stealable(false, Latch::Voice),
+            !stealable(false, Latch::Voice(0)),
             "a bark holds [unit+0xb20] — stealing it lets the unit re-bark at once"
         );
         assert!(

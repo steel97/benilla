@@ -1,14 +1,55 @@
 //! The `Unit*` global registrations (see the parent module's doc for the seam and the return
 //! shapes): every binding reads the per-token [`UnitState`](super::UnitState) snapshot store
 //! through the parent's `with_unit`/`pick_unit_token` helpers.
+//!
+//! **Every predicate here returns through one function** — [`super::unit_predicate`] when it reads
+//! a snapshot field, [`flag`](super::super::binding_abi::flag) when it computes its own bool.
+//! Neither ever hands mlua a Rust `bool`: all 29 of the reference's unit predicates push the
+//! constant double `1.0` (`lua_pushnumber 0x6f3810`) or `nil` (`lua_pushnil 0x6f37f0`), one value
+//! at every live `ret`, and **no binding in the 83-entry table at `0x850438` calls
+//! `lua_pushboolean 0x6f39f0` at all** (decisions 1830, 2043, 2048). A new predicate that open-codes
+//! `Value::Integer(1)`/`Value::Nil`, or returns a `bool`, is the drift those records exist to stop.
+//!
+//! **The scope of that claim is the unit table, not "the binding surface"** — 2043 said the wider
+//! thing and 2048 corrected it. `lua_pushboolean` exists at `0x6f39f0` with seven call sites, and
+//! one of them *is* a registered FrameScript binding: `IsPetAttackActive 0x4be0e0` answers a real
+//! Lua `true`/`false`, never nil (ours already does — `super::super::pet`).
 
 use mlua::{Lua, Value};
 
+use super::super::binding_abi::flag;
 use super::super::Model;
 use super::{
     check_unit_token, classification_word, grey_band, level_reads_unknown, pick_unit_token,
-    with_unit, SelectionRequest,
+    unit_predicate, unknownobject, with_unit, PlayerRecord, SelectionRequest,
 };
+
+/// **The `"player"` fast path, shared by the four verbs that take it** (decision 2263).
+///
+/// `Some(x)` = this token is `"player"` and `x` is the record's answer; `None` = it is any other
+/// token and the caller falls through to the unit resolver. That is the reference's own shape —
+/// a full-string, case-insensitive compare of the token against `0x847894` (`b"player\0"`) whose
+/// **match is the fall-through** — and it is one function rather than four copies for the reason
+/// [`super::super::names::gated_rank`](crate)'s sibling comment gives about rank: four readers of
+/// one record, each testing the token itself, is how they drift apart. `UnitName`, `UnitRace`,
+/// `UnitClass` and `UnitSex` are the whole set; `UnitLevel` is **not** one of them.
+///
+/// The compare is a full string, not a prefix: `"playerfoo"` is a recognised-but-unresolvable
+/// token ([`super::token_recognised`]) and goes to the resolver, not here.
+fn player_record_arm<T>(
+    lua: &Lua,
+    token: &Option<String>,
+    f: impl FnOnce(&PlayerRecord) -> T,
+) -> Option<T> {
+    if !token
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case("player"))
+    {
+        return None;
+    }
+    let model = lua.app_data_ref::<Model>().expect("model app_data");
+    Some(f(&model.player_record))
+}
 
 /// The two class ids `GetComboPoints 0x51a190` accepts — the literals `4` and `0xb` it compares
 /// the class byte `[[player+0x110]+0x79]` against. That byte is `UNIT_FIELD_BYTES_0` byte 1, the
@@ -28,7 +69,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitExists",
         lua.create_function(|lua, token: Option<String>| {
-            with_unit(lua, &token, false, |u| u.exists)
+            unit_predicate(lua, &token, |u| u.exists)
         })?,
     )?;
 
@@ -49,11 +90,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsVisible",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.has_object)? {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            unit_predicate(lua, &token, |u| u.has_object)
         })?,
     )?;
 
@@ -102,7 +139,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 })?;
                 // One value, and it is the NUMBER 1 or nil — never a boolean, the same shape the
                 // rest of this family answers in.
-                Ok(if hit { Value::Integer(1) } else { Value::Nil })
+                Ok(flag(hit))
             })?,
         )?;
     }
@@ -144,11 +181,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 .as_ref()
                 .and_then(|t| model.unit(t))
                 .map_or(0, |u| u.guid);
-            Ok(if by_flag || guid == model.party.leader_guid {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            Ok(flag(by_flag || guid == model.party.leader_guid))
         })?,
     )?;
 
@@ -171,10 +204,52 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             // `GetUnitName(unit, showServerName)` wrapper, which calls this binding with ONE
             // argument. The engine's real second argument is a strict `LUA_TBOOLEAN` and is not
             // modelled — no consumer passes it.
-            let name = with_unit(lua, &token, None, |u| u.name.clone())?;
+            //
+            // Value 1 — and the ONLY two nils a recognised token can produce (`0x517020`, wow-re
+            // `ui/scratch/binding-shape-arity-law.md` §2.1): the `"player"` fast path reads the
+            // local name buffer and pushes nil when it is empty (`0x51708c` → `0x5abdc0`; the
+            // `0x517083` this used to cite is the token's string *compare*, `call 0x64a4c0` —
+            // corrected 2261), and a token that resolves to GUID 0 pushes nil (`0x5170c0`).
+            // The empty-buffer nil is not an explicit push either: `0x517095` is
+            // `lua_pushstring`, which falls through on NULL at `0x6f3895` into `lua_pushnil`. EVERY other path ends in a
+            // string — the cached name, or `FrameScript_GetText("UNKNOWNOBJECT")`: `0x517220` for
+            // a GUID with no object and no cache row, `0x609324` inside `CGUnit_C::GetUnitName`
+            // for a unit whose name cache has not answered or is stale (a pet's is
+            // `petnamecache.wdb`, keyed by `UNIT_FIELD_PETNUMBER`, `pet-action-bar-api.md`
+            // §11c.6). A freshly called pet is that case by construction: `UNIT_PET` fires off the
+            // descriptor and the name lands a `CMSG_PET_NAME_QUERY` round-trip later, and stock
+            // `PetStable.lua:129` concatenates the answer in between.
+            //
+            // "Resolved to a GUID" is a SEATED SNAPSHOT — not `exists`. The reference's
+            // `UnitExists` is a conjunction with `IsSelectable` (the `UnitState::exists` doc's
+            // named gap), so a not-selectable unit reads its name there with `UnitExists` nil; the
+            // name resolver's own nil is GUID 0 and nothing else, and a feed that seats a token
+            // has resolved it. Decision 2002.
+            //
+            // **The `"player"` arm is the BUFFER, not the snapshot** (decision 2261). `0x51708c`
+            // reads `0x5abdc0` — the local name buffer at `0xc27d88` — and returns; it never
+            // reaches the resolver, so no object, no descriptor and no name-query answer is
+            // involved on this path at all. Modelling it off the snapshot (as this did until
+            // 2261) put the one name the client always knows behind the one cache that can miss:
+            // decision 2260's realm-cache load dropped our own guid, the feed pushed a nameless
+            // player over the roster seat, and `UnitName("player")` read nil in the world.
+            //
+            // The buffer's emptiness is still the reference's own nil — it just means something
+            // a snapshot cannot say, and something a client that is in the world never is:
+            // "no Enter World has been committed in this process".
+            if let Some(seeded) = player_record_arm(lua, &token, |r| r.name.clone()) {
+                let name = if seeded.is_empty() {
+                    Value::Nil
+                } else {
+                    Value::String(lua.create_string(&seeded)?)
+                };
+                return Ok((name, Value::Nil));
+            }
+            let name = with_unit(lua, &token, None, |u| Some(u.name.clone()))?;
             let name = match name {
-                Some(n) => Value::String(lua.create_string(&n)?),
                 None => Value::Nil,
+                Some(Some(n)) => Value::String(lua.create_string(&n)?),
+                Some(None) => Value::String(unknownobject(lua)?),
             };
             Ok((name, Value::Nil))
         })?,
@@ -243,11 +318,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsCorpse",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.corpse_object)? {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            unit_predicate(lua, &token, |u| u.corpse_object)
         })?,
     )?;
 
@@ -272,11 +343,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 r#"Usage: UnitCanAttack("unit", "otherUnit")"#,
             )?);
             let token = pick_unit_token(&a, &b);
-            Ok(if with_unit(lua, &token, false, |u| u.can_attack)? {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            unit_predicate(lua, &token, |u| u.can_attack)
         })?,
     )?;
 
@@ -300,7 +367,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitIsDead("unit")"#,
             )?);
-            with_unit(lua, &token, false, |u| u.dead)
+            unit_predicate(lua, &token, |u| u.dead)
         })?,
     )?;
 
@@ -314,7 +381,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitIsGhost("unit")"#,
             )?);
-            with_unit(lua, &token, false, |u| u.ghost)
+            unit_predicate(lua, &token, |u| u.ghost)
         })?,
     )?;
     g.set(
@@ -325,15 +392,25 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitIsDeadOrGhost("unit")"#,
             )?);
-            with_unit(lua, &token, false, |u| u.dead || u.ghost)
+            unit_predicate(lua, &token, |u| u.dead || u.ghost)
         })?,
     )?;
 
-    // UnitReaction(unit, other) → 1..8 (hated..exalted) or nil. The live API is directional (unit's
+    // UnitReaction(unit, other) → the reaction scale, or nil. The live API is directional (unit's
     // reaction toward `other`); our feed only resolves it for the "target" token toward the player,
     // which is the sole caller (`TargetFrame_CheckFaction`), so the `other` arg is accepted and
-    // unused. `0` (unknown / not yet streamed) reports as nil, the API's "can't tell" — the target
-    // frame paints its name plate blue then, exactly like the reference.
+    // unused.
+    //
+    // **NOT a 1/nil predicate, and its nil does not mean "reaction 0"** (decision 2048, correcting
+    // 2043's aside). `0x5167e0` pushes `0x6061e0(u1, u2)` **plus one** (`0x51683e inc eax`,
+    // `0x516842 fild`) — a self-compare answers **5** — so the value is 1-based and **0 is
+    // unreachable**. Its nil leg (`0x51685f`) means only that a token failed to resolve to a live
+    // UNIT.
+    //
+    // Ours maps our own `reaction == 0` to nil because that is our sentinel for "not yet fed", and
+    // the observable is the same nil an unresolved token gives. The gap is the feed's, not the
+    // shape's: a resolved unit whose reaction has not streamed answers nil here where the reference
+    // answers a number. The target frame paints its name plate blue on that nil.
     g.set(
         "UnitReaction",
         lua.create_function(|lua, (token, _other): (Value, Value)| {
@@ -383,11 +460,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             )?);
             let token = pick_unit_token(&a, &b);
             let r = with_unit(lua, &token, 0u8, |u| u.reaction)?;
-            Ok(if (1..=2).contains(&r) {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            Ok(flag((1..=2).contains(&r)))
         })?,
     )?;
     g.set(
@@ -407,11 +480,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             )?);
             let token = pick_unit_token(&a, &b);
             let r = with_unit(lua, &token, 0u8, |u| u.reaction)?;
-            Ok(if r >= 5 {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            Ok(flag(r >= 5))
         })?,
     )?;
 
@@ -441,10 +510,10 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             )?);
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let player_level = model.player_req.level;
-            Ok(match unit.and_then(|u| model.unit(&u)) {
-                Some(u) if super::is_civilian_kill(u, player_level) => Value::Integer(1),
-                _ => Value::Nil,
-            })
+            Ok(flag(
+                unit.and_then(|u| model.unit(&u))
+                    .is_some_and(|u| super::is_civilian_kill(u, player_level)),
+            ))
         })?,
     )?;
     // UnitPlayerControlled(unit) → 1 if a PLAYER is driving this unit, else nil. `UNIT_FIELD_FLAGS`
@@ -456,20 +525,46 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         "UnitPlayerControlled",
         lua.create_function(|lua, unit: Option<String>| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(match unit.and_then(|u| model.unit(&u)) {
-                Some(u) if u.player_controlled => Value::Integer(1),
-                _ => Value::Nil,
-            })
+            Ok(flag(
+                unit.and_then(|u| model.unit(&u))
+                    .is_some_and(|u| u.player_controlled),
+            ))
         })?,
     )?;
     g.set(
         "UnitIsPlayer",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.is_player)? {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            unit_predicate(lua, &token, |u| u.is_player)
+        })?,
+    )?;
+    // UnitIsPlusMob(unit) → 1 if this unit is a "plus" mob, else nil (`0x516d40`, extent
+    // `[0x516d40,0x516d8f)`). One bit of the SAME `UNIT_FIELD_FLAGS` word `UnitPlayerControlled`
+    // reads: `shr ecx,6; test cl,1` — bit 6, `UNIT_FLAG_PLUS_MOB 0x40`.
+    //
+    // **It is not a rank read**, which is the trap the name sets. `UnitClassification` is its
+    // table neighbour and answers off the gated creature rank (decision 0782), so the obvious
+    // implementation is `rank > 0` — but `0x516d40` never calls the rank getter `0x605620` (whose
+    // six callers are enumerated) and never touches the creature cache. The two agree in practice
+    // because the SERVER derives the bit from the rank — vmangos `Creature::UpdateEntry` sets it
+    // on `!IsPet() && rank > 0` (`Creature.cpp:634`, INFERRED from source) — so **rare** answers 1
+    // here alongside elite, rare-elite and world boss, while a player, a pet and a normal mob
+    // answer nil. Where they part is the unstreamed unit: a creature whose cache record has not
+    // arrived still carries its own flags, so this answers truthfully where a rank read would say
+    // "normal". No client code writes the bit (zero bitwise RMWs at `+0xa0` image-wide), so it is
+    // the server's word verbatim.
+    //
+    // No stock FrameXML file calls it, which is why nothing shipped ever raised on its absence;
+    // addons do (`FuBar_DakSmak` colours its tooltip with it), and calling the nil global is what
+    // B385 reported. Last of the three verbs decision 1834 left loudly absent.
+    // Decision 2209 (wow-re `9f84e7e4`,
+    // `system/ui/scratch/unit-verbs-controlled-charmed-creaturetype.md` §4.2).
+    g.set(
+        "UnitIsPlusMob",
+        lua.create_function(|lua, token: Option<String>| {
+            // One of 1834's quiet thirteen: no `lua_isstring` gate and no `Usage:` arm, so a nil
+            // or absent token is a quiet nil. An UNRECOGNISED one still raises — the body reaches
+            // the shared resolver through `0x515940`, and that is `unit_predicate`'s own gate.
+            unit_predicate(lua, &token, |u| u.flags & 0x40 != 0)
         })?,
     )?;
 
@@ -503,11 +598,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             if !ua.exists || !ub.exists {
                 return Ok(Value::Nil);
             }
-            if a == b || (ua.guid != 0 && ua.guid == ub.guid) {
-                Ok(Value::Integer(1))
-            } else {
-                Ok(Value::Nil)
-            }
+            Ok(flag(a == b || (ua.guid != 0 && ua.guid == ub.guid)))
         })?,
     )?;
 
@@ -531,7 +622,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 "Usage: UnitAffectingCombat(\"unit\")",
             )?;
             let hot = with_unit(lua, &Some(token), false, |u| u.exists && u.in_combat)?;
-            Ok(if hot { Value::Integer(1) } else { Value::Nil })
+            Ok(flag(hot))
         })?,
     )?;
 
@@ -553,6 +644,57 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     //    string, unlike its `GetRaidRosterInfo` sibling.
     //  * **The player is in the roster array**, so no `t == "player"` special case is needed here
     //    — unlike `UnitInParty` below, whose roster excludes the recipient.
+    // HasFullControl() → 1 | nil: the reference's `[0xb4b3e4]` read at `0x51a158` (wow-re
+    // `control-loss-and-restore.md`) — the control flag `SMSG_CLIENT_CONTROL_UPDATE` writes for
+    // the local player, which the stock unit menu greys its follow/trade rows on (1958).
+    g.set(
+        "HasFullControl",
+        lua.create_function(|lua, ()| {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            Ok(flag(model.player_control))
+        })?,
+    )?;
+
+    // UnitPlayerOrPetInParty(unit) / UnitPlayerOrPetInRaid(unit) → 1 | nil: the unit is a
+    // member of the group, or a member's pet — its owner (`UNIT_FIELD_SUMMONEDBY`, else the
+    // charmer, else the creator: `UnitState::owner`) is. The bindings are registered
+    // (`0x5162f0` / `0x5163b0`) and delegate to a C++ predicate wow-re has not carved; the
+    // owner reading is this file's, flagged in 1958.
+    for (name, raid) in [
+        ("UnitPlayerOrPetInParty", false),
+        ("UnitPlayerOrPetInRaid", true),
+    ] {
+        g.set(
+            name,
+            lua.create_function(move |lua, token: Option<String>| {
+                check_unit_token(&token)?;
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                let Some(u) = token.as_ref().and_then(|t| model.unit(t)) else {
+                    return Ok(Value::Nil);
+                };
+                if !u.exists || u.guid == 0 {
+                    return Ok(Value::Nil);
+                }
+                let me = model.unit("player").map(|p| p.guid).unwrap_or(0);
+                let in_group = |guid: u64| {
+                    guid != 0
+                        && if raid {
+                            model.party.raid.iter().any(|m| m.guid == guid)
+                        } else {
+                            guid == me || model.party.members.iter().any(|m| m.guid == guid)
+                        }
+                };
+                let grouped = if raid {
+                    !model.party.raid.is_empty()
+                } else {
+                    !model.party.members.is_empty()
+                };
+                let hit = grouped && (in_group(u.guid) || in_group(u.owner));
+                Ok(flag(hit))
+            })?,
+        )?;
+    }
+
     g.set(
         "UnitInRaid",
         lua.create_function(|lua, token: Option<String>| {
@@ -569,7 +711,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                         .iter()
                         .any(|m| m.guid != 0 && m.guid == u.guid)
                 });
-            Ok(if hit { Value::Integer(1) } else { Value::Nil })
+            Ok(flag(hit))
         })?,
     )?;
 
@@ -599,7 +741,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                             .members
                             .iter()
                             .any(|m| m.guid != 0 && m.guid == u.guid)));
-            Ok(if hit { Value::Integer(1) } else { Value::Nil })
+            Ok(flag(hit))
         })?,
     )?;
 
@@ -626,7 +768,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             let ok = with_unit(lua, &token, false, |u| {
                 u.exists && u.is_player && u.reaction >= 5
             })?;
-            Ok(if ok { Value::Integer(1) } else { Value::Nil })
+            Ok(flag(ok))
         })?,
     )?;
 
@@ -652,8 +794,16 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // The party-frame status predicates (decision 0434 §2/§3): connection, AFK/DND, and the two PvP
-    // flags. All 1/nil, the live API's own shape for these — unlike UnitIsDead/UnitIsGhost above (a
-    // stated v1 shortcut, module doc), these are new and follow the era shape from the start.
+    // flags. All 1/nil, through the family's one push site (2043).
+    //
+    // **`UnitIsAFK`/`UnitIsDND` are OURS, not the reference's** — this comment used to claim they
+    // "follow the era shape from the start", which named the wrong authority. wow-re's raw byte
+    // census over the whole image finds ZERO occurrences of `UnitIsAFK`, `UnitIsDND`, `IsAFK` or
+    // `IsDND`, as bindings or as strings (positive control: `UnitIsPVP\0` and `UnitIsGhost\0`
+    // each return exactly 1) — `ui/scratch/nil-unit-token-arg-law.md` §11. 1.12 surfaces a
+    // member's AFK/DND state through `GetGuildRosterInfo` and the `CHAT_FLAG_AFK`/`CHAT_FLAG_DND`
+    // GlobalStrings; there is no unit predicate for it. They wear the family's shape because that
+    // is the right shape for an invention of ours to wear, not because a binding was read.
     g.set(
         "UnitIsConnected",
         lua.create_function(|lua, token: Value| {
@@ -662,31 +812,19 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitIsConnected("unit")"#,
             )?);
-            Ok(if with_unit(lua, &token, false, |u| u.is_connected)? {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            unit_predicate(lua, &token, |u| u.is_connected)
         })?,
     )?;
     g.set(
         "UnitIsAFK",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.is_afk)? {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            unit_predicate(lua, &token, |u| u.is_afk)
         })?,
     )?;
     g.set(
         "UnitIsDND",
         lua.create_function(|lua, token: Option<String>| {
-            Ok(if with_unit(lua, &token, false, |u| u.is_dnd)? {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            unit_predicate(lua, &token, |u| u.is_dnd)
         })?,
     )?;
     // UnitIsPVP reads the same `pvp` field the unit tooltip's "PvP" line already does (one flag,
@@ -699,11 +837,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitIsPVP("unit")"#,
             )?);
-            Ok(if with_unit(lua, &token, false, |u| u.pvp)? {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            unit_predicate(lua, &token, |u| u.pvp)
         })?,
     )?;
     g.set(
@@ -714,11 +848,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitIsPVPFreeForAll("unit")"#,
             )?);
-            Ok(if with_unit(lua, &token, false, |u| u.is_pvp_ffa)? {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            unit_predicate(lua, &token, |u| u.is_pvp_ffa)
         })?,
     )?;
     // UnitFactionGroup(unit) → (englishGroup, localizedName), the pair the PvP icon law reads:
@@ -775,6 +905,18 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitRace("unit")"#,
             )?);
+            // The `"player"` arm is the RECORD, not the snapshot (decision 2263): `0x518269`
+            // reads `0x5abdd0` — `0xc27e80`, the char-enum row's race byte — and resolves it
+            // through `ChrRaces`, never reaching the unit resolver. See [`PlayerRecord`].
+            if let Some(pair) = player_record_arm(lua, &token, |r| r.race.clone()) {
+                return match pair {
+                    Some((loc, file)) => Ok((
+                        Value::String(lua.create_string(&loc)?),
+                        Value::String(lua.create_string(&file)?),
+                    )),
+                    None => Ok((Value::Nil, Value::Nil)),
+                };
+            }
             let pair = with_unit(lua, &token, None, |u| {
                 u.race.clone().zip(u.race_file.clone())
             })?;
@@ -795,6 +937,17 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitClass("unit")"#,
             )?);
+            // The `"player"` arm is the RECORD (decision 2263): `0x5183b9` → `0x5abde0`,
+            // `0xc27e81` through `ChrClasses`. Second return is the UPPERCASE token.
+            if let Some(pair) = player_record_arm(lua, &token, |r| r.class.clone()) {
+                return match pair {
+                    Some((loc, file)) => Ok((
+                        Value::String(lua.create_string(&loc)?),
+                        Value::String(lua.create_string(&file)?),
+                    )),
+                    None => Ok((Value::Nil, Value::Nil)),
+                };
+            }
             let pair = with_unit(lua, &token, None, |u| {
                 u.class.clone().zip(u.class_file.clone())
             })?;
@@ -838,12 +991,18 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 r#"Usage: UnitHasRelicSlot("unit")"#,
             )?);
             let has = with_unit(lua, &token, false, |u| u.has_relic_slot)?;
-            Ok(if has { Value::Integer(1) } else { Value::Nil })
+            Ok(flag(has))
         })?,
     )?;
 
-    // UnitSex(unit) → 2 male, 3 female (1 = neuter — no 1.12 unit feed produces it); nil when the
-    // unit is absent or the sex hasn't streamed (`0`), the API's "can't tell".
+    // UnitSex(unit) → 2 male, 3 female (1 = neuter — no 1.12 unit feed produces it).
+    //
+    // **The absent/unstreamed leg is the NUMBER 2, not nil** — `UnitSex 0x517f9f` pushes the
+    // constant double 2.0 (`push 0x40000000; push 0`), which wow-re's
+    // `unit-predicate-return-shape.md` §4 carves as the numeric-getter contrast to the predicate
+    // family's `1.0`/nil: the numeric getters in this same table answer a number on the
+    // unresolved leg, never nil. The shapes table agrees — this row is `(number)`, with no nil
+    // alternative anywhere (decision 2118).
     g.set(
         "UnitSex",
         lua.create_function(|lua, token: Value| {
@@ -852,12 +1011,15 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitSex("unit")"#,
             )?);
-            let sex = with_unit(lua, &token, 0u8, |u| u.sex)?;
-            Ok(if sex == 0 {
-                Value::Nil
-            } else {
-                Value::Integer(i64::from(sex))
-            })
+            // The `"player"` arm is the RECORD (decision 2263): `0x517ef9` → `0x5abdf0`,
+            // `0xc27e82`. **No bounds check anywhere on that path** — the byte indexes
+            // `fild [4*eax+0x808be4]` over `{2,3,1,6}` directly — so an unset record answers `2`
+            // ("male") in the reference too, which is what our `0` maps to below.
+            let sex = match player_record_arm(lua, &token, |r| r.sex) {
+                Some(sex) => sex,
+                None => with_unit(lua, &token, 0u8, |u| u.sex)?,
+            };
+            Ok(Value::Integer(i64::from(if sex == 0 { 2 } else { sex })))
         })?,
     )?;
 
@@ -1043,13 +1205,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsCharmed",
         lua.create_function(|lua, token: Option<String>| {
-            with_unit(lua, &token, Value::Nil, |u| {
-                if u.charmed {
-                    Value::Number(1.0)
-                } else {
-                    Value::Nil
-                }
-            })
+            unit_predicate(lua, &token, |u| u.charmed)
         })?,
     )?;
 
@@ -1157,11 +1313,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         "IsResting",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(if model.resting {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            Ok(flag(model.resting))
         })?,
     )?;
     // PartialPlayTime() / NoPlayTime() → 1/nil: the two anti-addiction play-time regimes, read
@@ -1174,22 +1326,14 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         "PartialPlayTime",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(if model.partial_play_time {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            Ok(flag(model.partial_play_time))
         })?,
     )?;
     g.set(
         "NoPlayTime",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(if model.no_play_time {
-                Value::Integer(1)
-            } else {
-                Value::Nil
-            })
+            Ok(flag(model.no_play_time))
         })?,
     )?;
     // GetBillingTimeRested() → the account's rested billing MINUTES, as one number, always
@@ -1411,12 +1555,11 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         "ClearTarget",
         lua.create_function(|lua, ()| {
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            if model.unit("target").is_some_and(|u| u.exists) {
+            let had = model.unit("target").is_some_and(|u| u.exists);
+            if had {
                 model.target_clear = true;
-                Ok(Value::Integer(1))
-            } else {
-                Ok(Value::Nil)
             }
+            Ok(flag(had))
         })?,
     )?;
 

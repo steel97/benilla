@@ -32,9 +32,11 @@ pub fn tuned_default_plugins(primary_window: Window) -> PluginGroupBuilder {
         // (`crate::shaders`, `benilla_app::shaders`, `benilla_assets::materials`) and addressed
         // `embedded://<crate>/shaders/…`, so nothing reaches for a file root at all and 1171's
         // engine/game line survives as the crate each shader is embedded from.
-        // Quiet wgpu/naga; our own crates stay at info.
+        // Quiet wgpu/naga; our own crates stay at info. The ring keeps the last lines of what
+        // stderr shows for the crash report (`log_ring`; decision 2266 §B2).
         .set(bevy::log::LogPlugin {
             filter: "wgpu=error,naga=warn".into(),
+            custom_layer: |_| Some(Box::new(crate::log_ring::LogRing)),
             ..default()
         })
         // Asset streaming is this client's load bottleneck: every M2/WMO/BLP read decompresses from
@@ -86,11 +88,11 @@ pub fn tuned_default_plugins(primary_window: Window) -> PluginGroupBuilder {
                 ..default()
             },
         })
-        // Sound is kira behind our own mixer seam (decision 0070); Bevy's AudioPlugin would only
-        // open a second, never-used OS output stream at startup. Off (0530). Its rodio/cpal stack
-        // still compiles in via bevy's default feature — trimming the feature set is a separate,
-        // wider call.
-        .disable::<bevy::audio::AudioPlugin>()
+        // Sound is kira behind our own mixer seam (decision 0070). Bevy's `AudioPlugin` used to be
+        // disabled here (0530) so it would not open a second, never-used OS output stream — but
+        // the crate behind it was still compiled and linked. Since 1932 `bevy_audio` is off at the
+        // feature level, so there is no plugin to disable and no rodio/cpal/vorbis stack in the
+        // binary; the feature list that keeps it out is in the workspace `Cargo.toml`.
         // The dead registrations (decision 1438): DefaultPlugins members whose only runtime
         // trace here was per-frame machinery for types nothing instantiates — every registered
         // asset/material type costs an `Assets<T>` event system in PostUpdate plus

@@ -1,9 +1,11 @@
 //! Rust-driven tests of the Lua host: the object model, layout+size reads, show/hide + event + tick
-//! firing (both RF-0025 conventions), the WoW stdlib (positional `format`, `strsplit`, `wipe`,
+//! firing (both RF-0025 conventions), the WoW stdlib (positional `format`, the aliases,
 //! `getglobal`), the sandbox holes, and an end-to-end extract in ZKey order.
 //!
 //! Split by subject; the shared `script()` fixture lives in [`common`].
 
+mod addon_argument_abi;
+mod addon_index_space;
 mod anchors;
 mod backdrop;
 mod button;
@@ -11,6 +13,7 @@ mod channel;
 mod common;
 mod cooldown;
 mod create_frame_template;
+mod dispatch_bench;
 mod end_to_end;
 mod events;
 mod font_object;
@@ -23,8 +26,12 @@ mod keyboard;
 mod layout_gate;
 mod measure;
 mod minimap;
+mod model_clock;
 mod modelframe;
 mod movable;
+mod name_targets;
+mod nameplate;
+mod numeric_shape_gate;
 mod object_model;
 mod reference_surface;
 mod region_map;
@@ -47,6 +54,8 @@ mod tooltip_spell;
 mod tooltip_unit;
 mod toplevel;
 mod visibility;
+mod widget_surface;
+mod worldframe;
 mod worldmap;
 
 /// **A bounded chunk reports instead of hanging** — the guard decision 1247's hang called for.
@@ -135,11 +144,7 @@ fn request_time_played_queues_an_ask_and_the_answer_arrives_as_an_event() {
     let mut s = crate::script::UiScript::new().unwrap();
 
     // The verb returns NOTHING — the answer is an event, never a return value.
-    assert_eq!(
-        s.eval::<i64>("return select('#', RequestTimePlayed())")
-            .unwrap(),
-        0
-    );
+    assert_eq!(s.arity("RequestTimePlayed()").unwrap(), 0);
     // …and that call queued one ask. A COUNT, not a payload: the packet is empty, so two asks in a
     // frame are two sends rather than one collapsed intent (the pvp queue's rule).
     s.run("RequestTimePlayed() RequestTimePlayed()").unwrap();

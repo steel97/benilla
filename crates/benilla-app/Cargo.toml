@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "The Bevy app as a library: everything but the build-id stamp, which lives in the `benilla` launcher shim so a commit dirties ~30 lines instead of this crate (decision 0993)"
 
+[lints]
+workspace = true
+
 [features]
 # **The dev/player seam** (decisions 0026 + 1173). Default-ON, so every ordinary `cargo run`,
 # capture, probe and gate builds exactly what it built before. `--no-default-features` compiles
@@ -60,6 +63,11 @@ half = "2"
 # macro plus a no-dependency runtime shim — it adds nothing to the graph at runtime, and it is the
 # crate everyone uses for this. `assets/ui` is OUR content (MIT/Apache), not Blizzard's.
 include_dir = "0.7"
+# The 1.12 chat filters are PCRE over shipped DBCs (decision 2077; `text_filter`): 2289 profanity
+# expressions and 28 spam ones, compiled once at startup and run over every chat line. `RegexSet` is
+# exactly the shape that needs — one automaton over the whole list for the "can anything match at
+# all" pass — and the crate is already in the tree transitively.
+regex = "1"
 # `getrusage` — whole-process CPU time (all threads), the perf probes' `cpu_ms`/`cpu_pct` metric
 # (`perf::process_cpu_secs`). Wall-clock fps is unusable as a regression instrument on a machine
 # running parallel sessions' builds; CPU-per-frame is, and it is also the number the Mac report
@@ -101,9 +109,11 @@ cosmic-text = "0.16"
 # `fontdb` in the graph.
 fontdb = "0.23"
 # kira renders the mix; the device it plays through is OURS (`sound::output`, decision 1857) —
-# kira's own cpal backend is not enabled, and cpal is out of the graph on our path with it: on
-# macOS it could neither report a lost default device nor rebuild on one, and it discarded the
-# IO-cycle timestamp the deadline meters need.
+# kira's own `cpal` backend is not enabled on any target. On macOS that took cpal out of the graph
+# entirely: it could neither report a lost default device nor rebuild on one, and it discarded the
+# IO-cycle timestamp the deadline meters need. Off macOS cpal is back (1920) but as OUR device
+# layer under the same backend, not as kira's — the ring, the render thread and the meters are the
+# same code on every platform.
 kira = { version = "0.12", default-features = false, features = ["mp3", "wav", "pcm", "adpcm"] }
 # The realtime-audio allocation tripwire (decision 1857): `assert_no_alloc(|| …)` around the output
 # IO callback and the render pass aborts a DEBUG build on any allocation inside them, so a
@@ -169,3 +179,21 @@ objc2-app-kit = { version = "0.2", features = [
     "NSEvent",
 ] }
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSGeometry"] }
+
+# Everywhere else: the same device layer over cpal (decision 1920, `sound::output::cpal`). 1857
+# owns the mix-ahead ring, the render thread and the meters on every platform; only the last
+# hop — find the default device, open a stream on it, hand back one buffer per cycle — is
+# platform code, and off macOS that hop is ALSA/PipeWire, WASAPI or the host's own API. cpal is
+# the layer that already speaks all of them; on macOS it is still not in the graph, because
+# there its defects (a no-op error callback on the default device, a pinned `DefaultOutput`
+# unit, the discarded IO-cycle timestamp) are exactly what 1857 went direct to escape. On an
+# unsupported target cpal compiles to its Null host, which reports no device — the same silent
+# posture the old `stub.rs` had, without a second file to rot.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+cpal = "0.17"
+
+# Windows: the journal's and the probes' CPU clocks (decision 2219, `perf::clock`) —
+# `GetProcessTimes`, `GetThreadTimes` and `GetSystemTimes`, the twins of the `getrusage`,
+# `clock_gettime` and `host_statistics64` arms. The version is one the graph already carries.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

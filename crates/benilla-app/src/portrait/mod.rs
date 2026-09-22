@@ -78,7 +78,10 @@ use crate::target::Selection;
 use benilla_assets::materials::WowModelMaterial;
 
 mod framing;
-pub(crate) use framing::{attachment_point, head_anchor, PortraitAnchors};
+pub(crate) use framing::{
+    attachment_point, glue_box_aspect, glue_canvas_bars, head_anchor, pane_projection,
+    PortraitAnchors, WowPortraitProjection,
+};
 use framing::{body_frame, frame, PORTRAIT_FOV};
 mod booth;
 /// The translucency twins ride the *preview* shapes as well as the booth ones — one type for both
@@ -97,8 +100,9 @@ pub(crate) use glue_booth::{
     PreviewBillboard, PreviewEffects, PreviewPart, PreviewRider, SelectLook, GLUE_SLOT,
 };
 mod light;
-use light::{material_variant, model_pane_light, studio_light, BoothLight};
-mod test_bake;
+pub(crate) use light::{material_variant, VariantLane};
+use light::{model_pane_light, studio_light, BoothLight};
+pub(crate) mod test_bake;
 
 /// The portrait slots we bake, each with its own render layer/camera: the player + target unit
 /// frames, `"pet"` (decision 0990's frame), and `"npc"` — the NPC an interaction window (gossip /
@@ -160,8 +164,9 @@ const STABLE_SLOT: &str = "stable";
 ///
 /// The names, and where each is declared: `CharacterModelFrame` (stock `PaperDollFrame.xml`),
 /// `PetModelFrame` (stock `PetPaperDollFrame.xml`), `PetStableModel` (stock `PetStable.xml`, the
-/// reference's own file since 1751), `DressUpModel` (stock `DressUpFrame.xml`'s name, still our
-/// file), and `InspectModelFrame` (stock `InspectPaperDollFrame.xml`, out of the LoadOnDemand
+/// reference's own file since 1751), `DressUpModel` (stock `DressUpFrame.xml`, 1969),
+/// `AuctionDressUpModel` (the auction addon's `Blizzard_AuctionDressUp.xml`, 1971), and
+/// `InspectModelFrame` (stock `InspectPaperDollFrame.xml`, out of the LoadOnDemand
 /// `Blizzard_InspectUI` — the reference's own since 1832).
 ///
 /// **Every name here is now the reference's.** This note used to carry a `BenillaInspectModelFrame`
@@ -169,12 +174,20 @@ const STABLE_SLOT: &str = "stable";
 /// take the name from. It is not packed — the `.pub` is only what the loose
 /// `Interface\AddOns\Blizzard_InspectUI\` folder holds, while the real `.xml` and `.lua` sit
 /// inside `patch.MPQ`, which the chain mounts. 1832 migrated the window and the prefix went with it.
-const MODEL_PANE_BOOTHS: [(&str, &str); 5] = [
+const MODEL_PANE_BOOTHS: [(&str, &str); 7] = [
     ("CharacterModelFrame", PAPERDOLL_SLOT),
+    // The tabard designer's pane (1977): a PlayerModel of the player — the paper doll's own
+    // bake, whose body wears the design under preview while the window is up.
+    ("TabardModel", PAPERDOLL_SLOT),
     ("PetModelFrame", PETDOLL_SLOT),
     ("InspectModelFrame", INSPECT_SLOT),
     ("PetStableModel", STABLE_SLOT),
     ("DressUpModel", dressup::DRESSUP_SLOT),
+    // The auction house's embedded dressing room (`Blizzard_AuctionDressUp.xml`, 1971) — a second
+    // `<DressUpModel>` sharing the one booth: the app keeps ONE dressing-room look (its
+    // `TryOn`/`Dress` intents are not per-widget), so the two panes show the same substitutions.
+    // A deliberate approximation, named: the reference's two widgets each clone their own model.
+    ("AuctionDressUpModel", dressup::DRESSUP_SLOT),
 ];
 
 /// The booth a named model pane samples, or `None` for a pane no window has claimed.
@@ -211,12 +224,35 @@ pub(super) const DRESSUP_LAYER: usize = GLUE_LAYER + 1;
 /// rule as [`GLUE_LAYER`]). This camera exists only while the warm pass runs
 /// ([`spawn_warm_booth`]); nothing but menagerie rigs ever rides its layer.
 pub(crate) const WARM_BOOTH_LAYER: usize = DRESSUP_LAYER + 1;
+/// pipe_warm's **orthographic twin camera**'s layer ([`crate::ui_models::spawn_warm_tile_cam`],
+/// decision 2262) — the next one past the twin booth's, same ladder rule. bevy_pbr keys a mesh
+/// pipeline on the view's projection CLASS, and the tile atlas's one camera is
+/// `Projection::Orthographic`: a THIRD class beside the world camera's Perspective and the twin
+/// booth's custom `WowPortraitProjection`. Like [`WARM_BOOTH_LAYER`] this camera exists only while
+/// the warm pass runs, and nothing but menagerie rigs ever rides its layer.
+pub(crate) const WARM_ORTHO_LAYER: usize = WARM_BOOTH_LAYER + 1;
 /// The **minimap interior composite**'s render layer (decision 1466) — the next one past the warm
 /// booth's. Not a portrait booth, but it is an offscreen camera with its own layer, and 0775's rule
 /// is that EVERY such layer is computed in this one ladder: the two booths that each worked out
 /// "the next layer past the paper doll's" in their own file landed on the same number, and the
 /// clash was silent in both rendering and the emitter→camera match.
-pub(crate) const MINIMAP_COMPOSITE_LAYER: usize = WARM_BOOTH_LAYER + 1;
+pub(crate) const MINIMAP_COMPOSITE_LAYER: usize = WARM_ORTHO_LAYER + 1;
+/// The UI model tiles' layer (`crate::ui_models`, decision 2008): every `<Model>` widget's M2
+/// renders into one atlas through one camera on this layer.
+pub(crate) const UI_MODELS_LAYER: usize = MINIMAP_COMPOSITE_LAYER + 1;
+/// The base of the **perspective model panes'** layer block (decision 2027). A `<Model>` framed
+/// by its file's own camera cannot share the tile atlas's one orthographic camera — it needs a
+/// camera of its own, rendering into its own cell of the same atlas through a viewport — and one
+/// camera per pane means one layer per pane, or every perspective camera would draw every other
+/// pane's model over its cell. The block runs `BASE + i` for `i < UI_MODEL_CAM_LAYERS` and sits at
+/// the TOP of the ladder, so it can be widened without colliding with anything above it.
+pub(crate) const UI_MODEL_CAM_LAYER_BASE: usize = UI_MODELS_LAYER + 1;
+/// How many perspective model panes can draw at once — the size of the layer block above and of
+/// the camera pool beside it. Each is a full render pass into the atlas, and a UI showing eight
+/// authored-camera 3-D scenes at once is already far past anything the reference's interface or
+/// the addon corpus does; a ninth pane holds its cell and draws nothing, the same degrade the
+/// atlas already makes for a tile that does not fit.
+pub(crate) const UI_MODEL_CAM_LAYERS: usize = 8;
 
 // The ladder must stay collision-free: a booth camera's layer is its identity for both rendering
 // and the emitter→camera match, and the failure above was silent in both.
@@ -233,7 +269,10 @@ const _: () = assert!(
         && INSPECT_LAYER != GLUE_LAYER
         && DRESSUP_LAYER > GLUE_LAYER
         && WARM_BOOTH_LAYER > DRESSUP_LAYER
-        && MINIMAP_COMPOSITE_LAYER > WARM_BOOTH_LAYER,
+        && WARM_ORTHO_LAYER > WARM_BOOTH_LAYER
+        && MINIMAP_COMPOSITE_LAYER > WARM_ORTHO_LAYER
+        && UI_MODELS_LAYER > MINIMAP_COMPOSITE_LAYER
+        && UI_MODEL_CAM_LAYER_BASE > UI_MODELS_LAYER,
     "booth render layers must be distinct — see GLUE_LAYER"
 );
 const _: () = assert!(
@@ -1020,12 +1059,15 @@ pub(crate) struct BoothPanes(pub(crate) HashMap<String, f32>);
 /// Both directions of the booth↔UI bridge in one system param: the bake a bound region **samples**
 /// ([`PortraitImages`]) and the pane geometry the extract **publishes** back ([`BoothPanes`]).
 ///
-/// They travel together because they are the same seam, and because `drive_script` had already
+/// They travel together because they are the same seam, and because the UI pass had already
 /// reached Bevy's 16-parameter ceiling — two more `Res`es there is one too many.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct BoothBridge<'w> {
     pub(crate) images: Res<'w, PortraitImages>,
     pub(crate) panes: ResMut<'w, BoothPanes>,
+    /// The file panes' half of the same seam (decision 2008): the `ModelPane` arm publishes a
+    /// tile request per pane and samples the tile's atlas cell back.
+    pub(crate) tiles: ResMut<'w, crate::ui_models::UiModelTiles>,
 }
 
 /// The group-facing inputs [`sync_portraits`] needs, in one param: who is in the party
@@ -1162,11 +1204,19 @@ pub(crate) struct BoothFraming<'w> {
 /// Owns the portrait bake pipeline: the [`PortraitImages`] bridge + the per-slot off-screen booths.
 pub(crate) struct PortraitPlugin;
 
+/// The body panes' half-rate switch's change callback (1444, 2303): a flag.
+pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut rate: ResMut<PaneRate>) {
+    if ev.is("boothHalfRate") {
+        rate.half = ev.flag();
+    }
+}
+
 impl Plugin for PortraitPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PortraitImages>()
             .init_resource::<PortraitBakes>()
             .init_resource::<PaneRate>()
+            .add_observer(on_cvar)
             .init_resource::<PaperDollBooth>()
             .init_resource::<InspectBooth>()
             .init_resource::<PetDollBooth>()
@@ -1252,10 +1302,15 @@ impl Plugin for PortraitPlugin {
 /// A fresh transparent render-target image of `size²`, usable as a camera target and sampled by the
 /// UI. Portrait slots pass [`PORTRAIT_SIZE`]; the paper doll passes [`PAPERDOLL_SIZE`].
 fn new_target_image(size: u32) -> Image {
+    new_target_image_sized(size, size)
+}
+
+/// [`new_target_image`] at any size — the UI model tiles' atlas (`crate::ui_models`).
+pub(crate) fn new_target_image_sized(width: u32, height: u32) -> Image {
     let mut image = Image::new_fill(
         Extent3d {
-            width: size,
-            height: size,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
@@ -1291,12 +1346,18 @@ fn new_target_image(size: u32) -> Image {
 /// booth — because the warm pass compiles the samples=1 twin of every model pipeline against
 /// exactly this shape behind the loading cover (decisions 0938/0958): a booth camera whose shape
 /// drifts from the warm booth's is a live pipeline stall on its first bake.
-fn booth_view_shape() -> impl Bundle {
+pub(crate) fn booth_view_shape() -> impl Bundle {
     (
         Camera3d::default(),
         bevy::render::view::Hdr,
         Tonemapping::None,
         Msaa::Off,
+        // No bevy light ever reaches a booth (its lighting is the material variant,
+        // `portrait::light`), so the per-view cluster assignment is dead work here exactly as
+        // it is on the world camera (`player::setup`): with the default config every booth view
+        // rebuilt its empty cluster grid each frame — 0.2 ms of the raid's main thread for
+        // nothing drawn by it.
+        bevy::light::cluster::ClusterConfig::None,
     )
 }
 
@@ -1343,7 +1404,6 @@ pub(crate) fn spawn_warm_booth(
 /// Startup: stand up one booth per slot — its image (registered in [`PortraitImages`]), a model-root
 /// entity, and a camera rendering only that slot's layer into the image (transparent, no bloom/MSAA,
 /// rendered before the world camera via a negative order).
-#[allow(clippy::too_many_arguments)]
 fn setup_booths(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
@@ -1639,7 +1699,6 @@ impl SnapKey {
     /// Build the key for `unit`'s pane this frame. `dress`/`rev` are the unit's own components
     /// (absent until its equipment first resolves, which is simply another value); `show` and
     /// `aspect` are the booth's.
-    #[allow(clippy::too_many_arguments)]
     fn build(
         unit: Entity,
         parts: &[&PortraitPart],
@@ -1850,7 +1909,6 @@ impl DressedLook<'_, '_> {
 /// [`PortraitPart`] children — into the booth whenever that look changes (new unit, gear swap,
 /// appearance refresh), re-framing the camera from the display's anchors. A live unit whose model
 /// hasn't attached yet shows the ref's 2D `TemporaryPortrait` stand-in instead (RE C5).
-#[allow(clippy::too_many_arguments)]
 fn sync_portraits(
     mut commands: Commands,
     mut booths: ResMut<Booths>,
@@ -2073,6 +2131,7 @@ fn sync_portraits(
                     // mirrored `PortraitPart` doesn't carry the batch's alpha loops.
                     alpha_anim: None,
                     twins: BoothTwins::default(),
+                    mat_anim: false,
                 })
                 .collect();
             let booth_riders: Vec<BoothRider> = riders
@@ -2192,7 +2251,6 @@ fn sync_portraits(
 /// pane showing, a change of dress, an explicit model event, a resize. Mirroring live put a bow
 /// drawn in combat straight onto the character sheet (`#bugs` B324); [`SnapKey`] carries the whole
 /// law and its byte provenance.
-#[allow(clippy::too_many_arguments)]
 fn sync_paperdoll(
     mut commands: Commands,
     mut booths: ResMut<Booths>,
@@ -2237,7 +2295,6 @@ fn sync_paperdoll(
 
 /// The inspect window's model pane (decision 0631 §4) — the paper doll's exact twin, pointed at
 /// whichever unit [`crate::ui_inspect`] resolved this frame instead of at the self player.
-#[allow(clippy::too_many_arguments)]
 fn sync_inspect_booth(
     mut commands: Commands,
     mut booths: ResMut<Booths>,
@@ -2281,7 +2338,6 @@ fn sync_inspect_booth(
 
 /// The pet paper doll's model pane (decision 1057) — the inspect pane's exact twin, pointed at the
 /// pet [`crate::ui_pet_doll`] resolved this frame.
-#[allow(clippy::too_many_arguments)]
 fn sync_petdoll_booth(
     mut commands: Commands,
     mut booths: ResMut<Booths>,
@@ -2410,7 +2466,6 @@ fn sync_stable_standin(
 /// subject entity. So this is [`sync_petdoll_booth`] with one `or` — which is the point of the
 /// stand-in: the summoned pet and the stabled pet reach the same bake through the same code, and so
 /// cannot drift apart in framing, lighting, animation or settle.
-#[allow(clippy::too_many_arguments)]
 fn sync_stable_booth(
     mut commands: Commands,
     mut booths: ResMut<Booths>,
@@ -2461,7 +2516,6 @@ fn sync_stable_booth(
 /// `unit` is a **subject**, not necessarily a world unit: a [`PortraitStandIn`] mirrors the same
 /// way and carries its own display id, which is how the stable pane draws a pet that has no object
 /// anywhere ([`StableBooth`]).
-#[allow(clippy::too_many_arguments)]
 fn sync_body_booth(
     palettes: &mut benilla_world::rig_palette::RigPalettes,
     slot: &str,
@@ -2591,6 +2645,7 @@ fn sync_body_booth(
                 // `None` — the same known gap as the glue preview's (decision 0807).
                 alpha_anim: None,
                 twins: BoothTwins::default(),
+                mat_anim: false,
             })
             .collect();
         let booth_riders: Vec<BoothRider> = riders
@@ -2784,7 +2839,6 @@ fn pipe_settle(compiling: bool, wake_drained: bool, held_for: f64) -> PipeSettle
 /// The pipeline warm pass is demand too (decision 0938): its menagerie duplicates rigs onto a
 /// booth layer so the booths' `Msaa::Off` pipeline twins compile behind the entry cover — which
 /// only works if the booth cameras render during the warm window.
-#[allow(clippy::too_many_arguments)] // a Bevy system: each param is one resource/query
 fn gate_booth_cameras(
     mut commands: Commands,
     mut booths: ResMut<Booths>,

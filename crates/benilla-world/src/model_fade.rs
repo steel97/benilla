@@ -130,19 +130,52 @@ pub fn fade_band(radius: f32) -> Option<(f32, f32)> {
 /// ([`FadeMaterials::material_for`]) — so an entity that streams in indoors ramps up already lit by
 /// its room instead of appearing under exterior light and snapping to the room's when it latches.
 ///
-/// Built general (`from`/`to`/`duration`) so the **despawn fade-out** (our stream-out look — the
-/// binary has no teardown fade, see [`DespawnFade`]) is a `{from: α, to: 0}` instance + a
-/// despawn-on-complete system — no new channel needed. The appear case is
-/// `{from: 0, to: 1, duration: 2 s}`. (Decision 0032; teardown fidelity corrected in 0067.)
+/// One channel, **two curves**, and that is the reference's shape rather than a generalisation of
+/// ours (decisions 2198/2203). Both ramps write this same per-instance alpha, but they are different
+/// functions armed by different subsystems: the appear ramp is `FadeTo 0x614f80` eased cubically by
+/// the object's own vtable slot 14, and the teardown ramp is the `SWModelFadeout` pump `0x672ef0`
+/// smoothstepping a *detached* model the object left behind. [`FadeCurve`] is which one; the
+/// teardown case is `{curve: Smoothstep, from: the live α, to: 0, duration: 2 s}` plus a
+/// despawn-on-complete system ([`DespawnFade`]), the appear case
+/// `{curve: Cubic, from: 0, to: 1, duration: 2 s}`. (Decision 0032; teardown fidelity corrected in
+/// 0067, its mechanism pinned in 2198 and its curve in 2203.)
 #[derive(Component, Clone)]
 pub struct RenderFade {
     /// `Time::elapsed_secs` when the fade was armed (the entity's first-visible moment).
     pub started: f32,
-    /// Fade length in seconds. Appear = [`APPEAR_FADE_SECS`].
+    /// Fade length in seconds. Both ramps are [`APPEAR_FADE_SECS`] in 1.12 — the appear `FadeTo`'s
+    /// `0x7d0` argument and the teardown pump's `age > 0x7d0` unlink are the same 2000 ms.
     pub duration: f32,
-    /// Cubic ramp endpoints. Appear `0 → 1`; despawn `α → 0`.
+    /// Ramp endpoints. Appear `0 → 1`; teardown `live α → 0` (where `from` is the pump's
+    /// `startAlpha`, which scales the ramp rather than lerping from it — see
+    /// [`teardown_fade_alpha`]).
     pub from: f32,
     pub to: f32,
+    /// Which of the reference's two ramps this is.
+    pub curve: FadeCurve,
+}
+
+/// Which of the reference's two render-alpha ramps a [`RenderFade`] runs. They are not
+/// parameterisations of one curve: the appear ease lives on the CGObject
+/// (`0x614a90`, `α = lerp(from, to, t³)`) and the teardown ease lives on the scene-node fadeout
+/// scheduler the object hands its model to on the way out (`0x672ef0`, `α = smoothstep(1 − t)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FadeCurve {
+    /// [`fade_alpha`] — the appear ramp.
+    #[default]
+    Cubic,
+    /// [`teardown_fade_alpha`] — the `SWModelFadeout` ramp.
+    Smoothstep,
+}
+
+impl RenderFade {
+    /// This fade's alpha at fractional age `t`, by its own curve.
+    pub fn alpha_at(&self, t: f32) -> f32 {
+        match self.curve {
+            FadeCurve::Cubic => fade_alpha(self.from, self.to, t),
+            FadeCurve::Smoothstep => teardown_fade_alpha(self.from, t),
+        }
+    }
 }
 
 /// The reference's appear-fade duration — `FadeTo(1.0, 2000 ms)` (`wow-5875-re` object-layer/`appear-fade`:
@@ -157,17 +190,45 @@ impl RenderFade {
             duration: APPEAR_FADE_SECS,
             from: 0.0,
             to: 1.0,
+            curve: FadeCurve::Cubic,
         }
     }
 }
 
 /// The reference's cubic-ease render-alpha: `α = lerp(from, to, clamp(t, 0, 1)³)` (`0x614a90`: `fld t;
-/// fmul t; fmul t`). `t` is the fractional fade age. Appear (0→1) accelerates up from invisible; a
-/// despawn (α→0) eases out.
+/// fmul t; fmul t`). `t` is the fractional fade age. This is the **appear** ramp, and only the
+/// appear ramp: the teardown runs a different function entirely ([`teardown_fade_alpha`]).
 pub fn fade_alpha(from: f32, to: f32, t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     from + (to - from) * t * t * t
 }
+
+/// The reference's **teardown** render-alpha — the `SWModelFadeout` pump `0x672ef0`
+/// (`doodad_despawn_fade`, wow-re models PRIMITIVE, diffed bit-exact against the x87), which is
+/// what drives a model handed to the scheduler `0x672df0` by the base OnDeactivate `0x6145e0`
+/// (decision 2203):
+///
+/// ```text
+/// t = clamp((1 − age_ms · 0.0005 [0x80c698]) · startAlpha, 0, 1)
+/// α = (3 − 2t) · t²                                  ; smoothstep
+/// ```
+///
+/// `t_frac` is the fractional fade age (`age_ms · 0.0005` at the reference's fixed 2 s window), so
+/// the ramp inside the smoothstep *descends*. `start_alpha` is the object's live transition alpha
+/// at the hand-off (`obj+0xf4`) — **scaling the ramp, not the output**, which is why this is not
+/// expressible as a `lerp` and gets its own function rather than a flag on [`fade_alpha`].
+///
+/// Against the appear curve reversed — what benilla ran before the mechanism was pinned — this is a
+/// visibly different shape: at the half-way mark `1 − t³` is still at 0.875 where this is at 0.5.
+pub fn teardown_fade_alpha(start_alpha: f32, t_frac: f32) -> f32 {
+    let t = ((1.0 - t_frac) * start_alpha).clamp(0.0, 1.0);
+    (3.0 - 2.0 * t) * t * t
+}
+
+/// The scheduler's own **skip gate** (`0x672df0` @ `0x672e21`, the float compare against
+/// `[0x8029d0]`): a model handed over at less than this alpha is unlinked on the spot
+/// (`0x671ac0`) instead of being faded — it had nothing left to show. Below it, benilla pops.
+pub const TEARDOWN_MIN_ALPHA: f32 = 0.01;
 
 /// One model instance's live **render alpha** — the reference's `CM2Model+0x19c`, and the single
 /// slot every fade in the client writes through (wow-re object-layer/`appear-fade` §"the alpha
@@ -299,10 +360,192 @@ pub fn model_render_alpha(
             fade_alpha(0.0, 1.0, (now - started) / APPEAR_FADE_SECS)
         }
     };
+    // The teardown's own curve (2203) — the same smoothstep the mesh channel runs, so an emitter's
+    // particles and a ribbon's strip thin out in step with the geometry they hang off rather than
+    // holding opaque while it feathers away.
     let despawn = despawn_started.map_or(1.0, |started| {
-        fade_alpha(1.0, 0.0, (now - started) / APPEAR_FADE_SECS)
+        teardown_fade_alpha(1.0, (now - started) / APPEAR_FADE_SECS)
     });
     (appear * despawn * self_fade * declared).clamp(0.0, 1.0)
+}
+
+/// **One streamed unit's live render alpha, asked of the unit** — the same product
+/// [`publish_model_alpha`] publishes as [`ModelAlpha`], answered on demand from the root's own
+/// presentation state.
+///
+/// [`ModelAlphas`] is the read side for a consumer that can wait for the publish: it looks up a
+/// number written in `PostUpdate` and composed down the [`ParentModel`] chain. This is the read
+/// side for a consumer that **cannot** — one that runs in `Update`, or on the very frame a unit's
+/// presentation begins, where the published component does not exist yet (`publish_model_alpha`
+/// inserts it through `Commands`). Both answer the same question from the same law
+/// ([`model_render_alpha`]); they differ only in where the inputs come from.
+///
+/// It exists because a consumer that reconstructs the answer for itself gets it wrong in the same
+/// way every time. The blob shadow gathered the live [`RenderFade`]s off a unit's *part* entities
+/// and read "no part is fading" as opaque — which is true of a settled unit and false of a
+/// **pending** one, whose parts are deliberately invisible and carry no `RenderFade` at all. The
+/// unit root is where the answer is unambiguous, because [`UnitAppearFade`] distinguishes the two
+/// states that a part-side walk cannot tell apart.
+#[derive(bevy::ecs::system::SystemParam)]
+#[allow(clippy::type_complexity)] // one query, the four facets of a unit's presentation
+pub struct UnitRenderAlpha<'w, 's> {
+    time: Res<'w, Time>,
+    viewer: Res<'w, crate::view::Viewer>,
+    units: Query<
+        'w,
+        's,
+        (
+            Option<&'static UnitAppearFade>,
+            Option<&'static DespawnFade>,
+            Option<&'static ModelFade>,
+            Has<crate::world_unit::ViewerUnit>,
+        ),
+    >,
+}
+
+impl UnitRenderAlpha<'_, '_> {
+    /// `unit`'s render alpha this frame. A unit with nothing in flight — and an entity this query
+    /// cannot read at all — is `1.0`, so a settled world costs one lookup and no arithmetic.
+    ///
+    /// The viewer's own body carries the zoom feather here exactly as the publisher applies it,
+    /// so a caller never folds it in itself.
+    pub fn get(&self, unit: Entity) -> f32 {
+        let Ok((appear, despawn, declared, is_self)) = self.units.get(unit) else {
+            return 1.0;
+        };
+        model_render_alpha(
+            self.time.elapsed_secs(),
+            appear.copied(),
+            despawn.and_then(DespawnFade::armed),
+            if is_self { self.viewer.self_fade } else { 1.0 },
+            declared.map_or(1.0, |d| d.0),
+        )
+    }
+}
+
+/// The door's own tests — the states a consumer that reconstructs this number gets wrong.
+#[cfg(test)]
+mod unit_render_alpha_tests {
+    use super::*;
+    use bevy::ecs::system::SystemState;
+
+    /// A world at `now`, holding one unit root built by `build`.
+    fn unit_at(now: f32, build: impl FnOnce(&mut bevy::ecs::world::EntityWorldMut)) -> f32 {
+        let mut world = World::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(std::time::Duration::from_secs_f32(now));
+        world.insert_resource(time);
+        world.insert_resource(crate::view::Viewer::default());
+        let mut unit = world.spawn_empty();
+        build(&mut unit);
+        let unit = unit.id();
+        let mut state = SystemState::<UnitRenderAlpha>::new(&mut world);
+        let alpha = state.get(&world).get(unit);
+        alpha
+    }
+
+    /// **The blob shadow's bug, as the door now answers it.** A streamed unit waiting on the
+    /// world to be shown carries `UnitAppearFade::Pending` and no live `RenderFade` anywhere in
+    /// its tree; a consumer that asks "is any part of this unit fading" hears no and draws itself
+    /// opaque over an invisible creature. Asking the ROOT distinguishes the two.
+    #[test]
+    fn a_pending_unit_is_zero_and_a_settled_one_is_opaque() {
+        assert_eq!(
+            unit_at(10.0, |u| {
+                u.insert(UnitAppearFade::Pending { since: 9.0 });
+            }),
+            0.0,
+            "pending: not shown yet, so nothing that rides this number may show either"
+        );
+        assert_eq!(
+            unit_at(11.0, |u| {
+                u.insert(UnitAppearFade::Live { started: 10.0 });
+            }),
+            fade_alpha(0.0, 1.0, 0.5),
+            "live: the same cubic the body's parts run"
+        );
+        assert_eq!(
+            unit_at(10.0, |_| {}),
+            1.0,
+            "nothing in flight: opaque, and no arithmetic paid for it"
+        );
+    }
+
+    /// The unarmed `DespawnFade` sentinel is the component's business, not each caller's — the
+    /// negative `started` a stream-out stamps before it arms would otherwise read as a fade that
+    /// began long ago and finished, i.e. a unit that vanishes the moment it is marked.
+    #[test]
+    fn an_unarmed_despawn_stamp_is_not_a_fade() {
+        assert_eq!(DespawnFade::default().armed(), None);
+        assert_eq!(DespawnFade { started: 4.0 }.armed(), Some(4.0));
+        assert_eq!(
+            unit_at(10.0, |u| {
+                u.insert(DespawnFade::default());
+            }),
+            1.0,
+            "marked but not armed: still fully there"
+        );
+        assert_eq!(
+            unit_at(11.0, |u| {
+                u.insert(DespawnFade { started: 10.0 });
+            }),
+            teardown_fade_alpha(1.0, 0.5),
+            "armed: the ramp down — the SWModelFadeout smoothstep, not the appear cubic reversed"
+        );
+    }
+
+    /// **The two ramps are different functions** (decision 2203), and this is the test that would
+    /// have caught benilla running one of them backwards in place of the other. The appear ease is
+    /// the CGObject's own (`0x614a90`, `t³`); the teardown ease is the scene-node fadeout
+    /// scheduler's (`0x672ef0`, `smoothstep(1 − t)`), and they agree only at the endpoints.
+    #[test]
+    fn the_teardown_curve_is_not_the_appear_curve_reversed() {
+        // Endpoints — the only place they may agree.
+        assert_eq!(teardown_fade_alpha(1.0, 0.0), 1.0, "opaque at the hand-off");
+        assert_eq!(teardown_fade_alpha(1.0, 1.0), 0.0, "gone at the window end");
+        // The middle, where the old curve was visibly wrong: 1 − 0.5³ = 0.875 against 0.5.
+        assert!((teardown_fade_alpha(1.0, 0.5) - 0.5).abs() < 1e-6);
+        assert!((fade_alpha(1.0, 0.0, 0.5) - 0.875).abs() < 1e-6);
+        // Monotone down over the window, and clamped past it (the pump unlinks at `age > 2000`,
+        // so nothing ever samples beyond 1.0 — but a late frame must not read as re-appearing).
+        let mut prev = f32::INFINITY;
+        for i in 0..=20 {
+            let a = teardown_fade_alpha(1.0, i as f32 / 20.0);
+            assert!(a <= prev + 1e-6, "monotone at t={i}");
+            prev = a;
+        }
+        assert_eq!(
+            teardown_fade_alpha(1.0, 2.0),
+            0.0,
+            "clamped past the window"
+        );
+
+        // `start_alpha` scales the RAMP, not the output — the reference multiplies it inside the
+        // clamp (`(1 − age·0.0005)·startAlpha`), which is why this is not a lerp from it.
+        assert!(
+            teardown_fade_alpha(0.25, 0.0) < 0.25,
+            "smoothstep(0.25) < 0.25"
+        );
+        assert_eq!(
+            teardown_fade_alpha(0.0, 0.0),
+            0.0,
+            "handed nothing, shows nothing"
+        );
+    }
+
+    /// An entity the query cannot read at all — a shadow whose owner was despawned this frame,
+    /// a booth part with no presentation — is opaque, never an accidental 0 that blinks the
+    /// thing out on its last frame.
+    #[test]
+    fn an_unreadable_owner_is_opaque() {
+        let mut world = World::new();
+        world.insert_resource(Time::<()>::default());
+        world.insert_resource(crate::view::Viewer::default());
+        let gone = world.spawn_empty().id();
+        world.despawn(gone);
+        let mut state = SystemState::<UnitRenderAlpha>::new(&mut world);
+        assert_eq!(state.get(&world).get(gone), 1.0);
+    }
 }
 
 /// Publish [`ModelAlpha`] on every streamed object each frame. Runs in `PostUpdate`, after every
@@ -322,18 +565,38 @@ pub(crate) fn publish_model_alpha(
             Option<&UnitAppearFade>,
             Option<&DespawnFade>,
             Has<crate::world_unit::ViewerUnit>,
-            Option<&ModelFade>,
+            Option<Ref<ModelFade>>,
             Option<&mut ModelAlpha>,
         ),
         With<crate::world_unit::WorldUnit>,
     >,
+    // A declaration that went away is a change the `Ref` cannot see: those units are due.
+    mut undeclared: RemovedComponents<ModelFade>,
+    // The appear ramp's RETIREMENT is a removal too — the frame it goes, the alpha must land
+    // on its final value, not hold the ramp's last sample (review 2026-09-04).
+    mut ramp_done: RemovedComponents<UnitAppearFade>,
 ) {
     let now = time.elapsed_secs();
+    let mut undeclared: bevy::platform::collections::HashSet<Entity> = undeclared.read().collect();
+    undeclared.extend(ramp_done.read());
     for (entity, appear, despawn, is_self, declared, current) in &mut units {
+        // With no ramp in flight and not the self body, the alpha is the declared fade alone —
+        // a published value that cannot have moved unless the declaration did. Every resident
+        // unit was recomputed and compared each frame (decision 1979's floor).
+        if appear.is_none()
+            && despawn.is_none()
+            && !is_self
+            && current.is_some()
+            && !declared.as_ref().is_some_and(|d| d.is_changed())
+            && !undeclared.contains(&entity)
+        {
+            continue;
+        }
+        let declared = declared.as_deref();
         let alpha = model_render_alpha(
             now,
             appear.copied(),
-            despawn.map(|d| d.started).filter(|s| *s >= 0.0),
+            despawn.and_then(DespawnFade::armed),
             if is_self { viewer.self_fade } else { 1.0 },
             // The game's declared fade — the aura ramp ticks it in Update (`apply_aura_alpha`)
             // and this runs PostUpdate, so it is fresh. `self_fade` above is the bare zoom
@@ -369,7 +632,9 @@ pub const SELF_FADE_HIDE: f32 = 0.00278;
 /// distance, `α = (1 − cos(π·D/F))/2` over `D = dist − nearclip ∈ (SELF_FADE_HIDE, window]`. Below
 /// [`SELF_FADE_HIDE`] above the near clip the model hard-hides (`0.0`); at/after `window` it's opaque
 /// (`1.0`). `nearclip` is the camera's near-plane distance — the fade completes exactly as the near
-/// plane would begin to slice the model, which is why the two are coupled (see `crate::view::CAM_NEAR`).
+/// plane would begin to slice the model, which is why the two are coupled — the caller passes the
+/// LIVE `nearclip` ([`crate::view::ViewDistance::nearclip`]), not a constant, so a player who moves
+/// the near plane moves the fade with it (2163).
 ///
 /// Unlike [`doodad_fade_alpha`] (horizontal *world* distance, size-bucketed) this is the *camera*
 /// distance to a single tracked object; both feed the same per-instance render-alpha channel.
@@ -426,7 +691,7 @@ pub fn apply_render_fade(
         // `A = instanceAlpha × colourAlpha × weight` (wow-re `m2-alpha-combine-cull.md`), and the
         // fade ramp IS this instance's alpha. Without this a unit appearing mid-Death would flash
         // its death-only geometry opaque for the length of the ramp.
-        let alpha = fade_alpha(fade.from, fade.to, t) * anim.map_or(1.0, |a| a.current);
+        let alpha = fade.alpha_at(t) * anim.map_or(1.0, |a| a.current);
         // `with_alpha` handles the `MeshTag == 0` opaque-sentinel — else a just-spawned object at
         // α 0 would flash fully opaque — and preserves the ground-shade byte, so a unit fading in
         // under MCSH shadow doesn't flash lit (the conventions live in `crate::mesh_tag`).
@@ -743,6 +1008,7 @@ impl PartFade {
                     duration: APPEAR_FADE_SECS,
                     from: 0.0,
                     to: 1.0,
+                    curve: FadeCurve::Cubic,
                 });
                 true
             }
@@ -750,11 +1016,25 @@ impl PartFade {
     }
 }
 
-/// Marks a streamed entity (the parent) that went out of range: instead of popping it out,
-/// [`apply_despawn_fade`] fades it out then despawns it. **Our** stream-out look, not a verified
-/// mechanism — the wow-re teardown RE found no fade-out in the binary (a *destroyed* object pops
-/// instantly, and the net bridge despawns it directly, bypassing this). `started < 0` ⇒ not yet
-/// armed/stamped.
+/// Marks a streamed entity (the parent) whose object has gone away — out of range, destroyed, or
+/// released from the despawn-animation pin: instead of popping it out, [`apply_despawn_fade`]
+/// fades it out and then despawns it. `started < 0` ⇒ not yet armed/stamped.
+///
+/// **This is the reference's teardown, one hop below where an earlier round looked** (decision
+/// 2198). The object-manager destroy `0x464920` — which `SMSG_DESTROY_OBJECT` (`0x4674a0`) and the
+/// `SMSG_UPDATE_OBJECT` OUT_OF_RANGE **destroy** `0x465ec0` both reach (`0x465f4f`/`0x465fa6`;
+/// 2198 cited `0x465fd0` for this, which is the type-4/5 *block* arm and genuinely is reached —
+/// it just unpacks the packed guids and discards every one. The destroy runs earlier, off the
+/// leading-block check `0x4651e1`) — invokes the object's vtable
+/// slot 1, whose base `0x6145e0` unbinds the scene handle and hands the model to the
+/// **`SWModelFadeout` scheduler `0x672df0`**: the model outlives the object and its alpha is
+/// ramped to zero by the per-frame pump `0x672ef0` (wow-re `models/models.md` §"Doodad despawn
+/// fade", `object-layer/scratch/w2d2-decomp.c` `FUN_006145e0`). So the object *is* freed on the
+/// spot — the paragraph this supersedes was right about that — and the thing you watch fade is
+/// its orphaned model. One arm covers both wire routes, which is why one component does here.
+///
+/// 0067 settled the *look* from the director's eyes while the mechanism was unpinned; the
+/// mechanism is the scheduler; the curve and window it uses are 2203's.
 #[derive(Component)]
 pub struct DespawnFade {
     pub(crate) started: f32,
@@ -763,6 +1043,17 @@ pub struct DespawnFade {
 impl Default for DespawnFade {
     fn default() -> Self {
         Self { started: -1.0 }
+    }
+}
+
+impl DespawnFade {
+    /// The instant this fade-out was armed, or `None` while the stamp is still the unarmed
+    /// sentinel — the shape [`model_render_alpha`] takes its `despawn_started` in.
+    ///
+    /// The sentinel is a negative `started`, and every caller that read the field had to know
+    /// that; asking here instead keeps the encoding inside the component that chose it.
+    pub fn armed(&self) -> Option<f32> {
+        (self.started >= 0.0).then_some(self.started)
     }
 }
 
@@ -785,8 +1076,12 @@ pub(crate) fn apply_despawn_fade(
     mut commands: Commands,
     mut q: Query<(Entity, &mut DespawnFade)>,
     children_of: Query<&Children>,
-    fm: Query<(), With<FadeMaterials>>,
-    cards: Query<(Entity, &crate::billboard::BillboardCard), With<FadeMaterials>>,
+    // The tag, not a bare `With` marker: the ramp starts from the alpha the part is SHOWING (the
+    // scheduler's `startAlpha` argument — [`arm_fade_out`]), and the tag is where that lives.
+    // `Option`, because a part that never had one is the shader's untagged-⇒-opaque sentinel, not
+    // a part that cannot fade — tying fadeability to the tag's presence would pop it instead.
+    fm: Query<Option<&MeshTag>, With<FadeMaterials>>,
+    cards: Query<(Entity, &crate::billboard::BillboardCard, Option<&MeshTag>), With<FadeMaterials>>,
 ) {
     let now = time.elapsed_secs();
     for (parent, mut df) in &mut q {
@@ -802,10 +1097,13 @@ pub(crate) fn apply_despawn_fade(
                 &mut any,
                 &mut walked,
             );
-            for (card, follow) in &cards {
+            for (card, follow, tag) in &cards {
                 if follow.follows().is_some_and(|a| walked.contains(&a)) {
-                    any = true;
-                    arm_fade_out(card, now, &mut commands);
+                    let start = start_alpha(tag);
+                    if start >= TEARDOWN_MIN_ALPHA {
+                        any = true;
+                        arm_fade_out(card, now, start, &mut commands);
+                    }
                 }
             }
             if any {
@@ -819,22 +1117,35 @@ pub(crate) fn apply_despawn_fade(
     }
 }
 
-/// Arm one fadeable entity's `{from: 1, to: 0}` ramp. No material is chosen here:
-/// [`apply_render_fade`] resolves it per frame from the part's live law (0755), so a
-/// bake-classified part fades out probe-lit — and keeps doing so if it re-classifies mid-ramp,
-/// which a pair latched at this instant could not express. `try_*`: a child (a held item
+/// Arm one fadeable entity's teardown ramp, **from the alpha it is actually showing**. The
+/// scheduler is handed `obj+0xf4`, the object's live transition alpha (wow-re, decision 2203), so a
+/// model torn down mid-appear-fade ramps down from where it stood — where a hardcoded `1.0` would
+/// snap it opaque first and then fade, a visible pop in the one case the fade exists to avoid.
+/// Ours lives in the part's `MeshTag`, which is the same channel the ramp is about to write.
+///
+/// No material is chosen here: [`apply_render_fade`] resolves it per frame from the part's live law
+/// (0755), so a bake-classified part fades out probe-lit — and keeps doing so if it re-classifies
+/// mid-ramp, which a pair latched at this instant could not express. `try_*`: a child (a held item
 /// mid-re-resolve, a gear swap) can be despawned by its own owner in the same frame — the
 /// lifetime contract in [`arm_appear_fade`].
-fn arm_fade_out(entity: Entity, now: f32, commands: &mut Commands) {
+fn arm_fade_out(entity: Entity, now: f32, start_alpha: f32, commands: &mut Commands) {
     commands
         .entity(entity)
         .try_insert(RenderFade {
             started: now,
             duration: APPEAR_FADE_SECS,
-            from: 1.0,
+            from: start_alpha,
             to: 0.0,
+            curve: FadeCurve::Smoothstep,
         })
         .try_remove::<PendingAppearFade>();
+}
+
+/// The alpha a part is showing, as the teardown ramp's `startAlpha`. No tag at all is the shader's
+/// untagged-⇒-opaque sentinel ([`crate::mesh_tag::alpha_of`] reads a zero payload as `1.0`), which
+/// is the same answer for the same reason.
+fn start_alpha(tag: Option<&MeshTag>) -> f32 {
+    tag.map_or(1.0, |t| crate::mesh_tag::alpha_of(t.0))
 }
 
 /// Depth-first helper for [`apply_despawn_fade`]: arm the fade-out on `entity` if it carries
@@ -842,20 +1153,25 @@ fn arm_fade_out(entity: Entity, now: f32, commands: &mut Commands) {
 /// itself but has fadeable meshes beneath it). Every entity visited — parts, joints, attach roots,
 /// billboard anchors alike — is recorded in `walked`, which the caller uses to recognise the
 /// world-root billboard cards that follow this model.
-#[allow(clippy::too_many_arguments)]
 fn arm_despawn_descendants(
     entity: Entity,
     now: f32,
     commands: &mut Commands,
     children_of: &Query<&Children>,
-    fm: &Query<(), With<FadeMaterials>>,
+    fm: &Query<Option<&MeshTag>, With<FadeMaterials>>,
     any: &mut bool,
     walked: &mut bevy::ecs::entity::EntityHashSet,
 ) {
     walked.insert(entity);
-    if fm.contains(entity) {
-        *any = true;
-        arm_fade_out(entity, now, commands);
+    // The scheduler's own skip gate (`0x672e21`): a part already showing nothing is not worth a
+    // ramp, and an object whose every part is under it has no fade at all — `any` stays false and
+    // the caller pops it, which is the reference unlinking at `0x671ac0`.
+    if let Ok(tag) = fm.get(entity) {
+        let start = start_alpha(tag);
+        if start >= TEARDOWN_MIN_ALPHA {
+            *any = true;
+            arm_fade_out(entity, now, start, commands);
+        }
     }
     if let Ok(children) = children_of.get(entity) {
         for &child in children {

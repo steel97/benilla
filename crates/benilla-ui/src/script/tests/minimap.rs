@@ -13,7 +13,7 @@ fn minimap_zoom_api_and_extract() {
     s.run(
         r#"
         m = CreateFrame("Minimap", "TestMinimap")
-        m:SetWidth(140); m:SetHeight(140); m:SetPoint("TOPRIGHT")
+        m:SetWidth(140); m:SetHeight(140); m:SetPoint("TOPRIGHT", 0, 0)
     "#,
     )
     .unwrap();
@@ -80,7 +80,7 @@ fn minimap_indoor_and_outdoor_zoom_indices_are_independent() {
     s.run(
         r#"
         m = CreateFrame("Minimap", "TestMinimap")
-        m:SetWidth(140); m:SetHeight(140); m:SetPoint("TOPRIGHT")
+        m:SetWidth(140); m:SetHeight(140); m:SetPoint("TOPRIGHT", 0, 0)
     "#,
     )
     .unwrap();
@@ -292,4 +292,28 @@ fn set_mask_texture_is_state_and_empty_restores_the_default() {
 
     // There is no getter in 1.12, and we do not invent one (decision 1189).
     assert!(s.eval::<bool>("return m.GetMaskTexture == nil").unwrap());
+}
+
+/// `frame_effective_alpha` — the host-side read behind a frame whose pixels the app draws (the
+/// stock `MiniMapPing` model, 1974): `None` while hidden, or hidden through a parent; the
+/// effective alpha while effectively visible.
+#[test]
+fn frame_effective_alpha_reads_the_shown_frames_alpha() {
+    let s = UiScript::new().unwrap();
+    s.run(
+        r#"p = CreateFrame("Frame", "PingParent")
+           f = CreateFrame("Model", "PingModel", p) f:SetAlpha(0.5) f:Hide()"#,
+    )
+    .unwrap();
+    assert_eq!(s.frame_effective_alpha("PingModel"), None, "hidden");
+    assert_eq!(s.frame_effective_alpha("NoSuchFrame"), None);
+    s.run("f:Show()").unwrap();
+    let a = s.frame_effective_alpha("PingModel").expect("shown");
+    assert!((a - 0.5).abs() < 1e-6, "the frame's alpha: {a}");
+    s.run("p:Hide()").unwrap();
+    assert_eq!(
+        s.frame_effective_alpha("PingModel"),
+        None,
+        "hidden through the parent"
+    );
 }

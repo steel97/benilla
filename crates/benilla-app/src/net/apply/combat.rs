@@ -3,12 +3,14 @@
 //! full-block synthesis. Each `pub(super)` fn here is exactly one arm's body; the match at the
 //! call site stays the dispatcher, one call per arm.
 
-use benilla_protocol::messages::AttackerState;
+use benilla_protocol::messages::{AttackSwingError, AttackerState};
 use bevy::prelude::*;
 
 use crate::creature_anim::{
     Engaged, RangedHold, SheathRequest, SwingFlush, SwingImpact, SwingMessage,
 };
+use crate::swing_refusal::SwingRefusalEdge;
+use crate::ui_action::{UiError, UiErrorKeys};
 use crate::ui_unit::CombatTextEvent;
 
 use super::super::{AiReactionMessage, GuidIndex, SelfGuid};
@@ -23,7 +25,10 @@ pub(super) fn attack_start(attacker: u64, victim: u64, commands: &mut Commands, 
         // Melee-start drops the `0x400` weapon-visual hold unconditionally (the client's
         // `0x60fc50` sibling clear) — a shooter that closes to melee leaves the drawn idle.
         // The LOCAL player's melee paths additionally run the full cancel funnel at send.
-        commands.entity(e).insert(Engaged).remove::<RangedHold>();
+        commands
+            .entity(e)
+            .insert(Engaged(victim))
+            .remove::<RangedHold>();
     }
 }
 
@@ -42,6 +47,39 @@ pub(super) fn attack_stop(
         // swing record flushes text-only and clears.
         flushes.write(SwingFlush(e));
     }
+}
+
+/// The server refused our melee swing (`SMSG_ATTACKSWING_NOTINRANGE`/`_BADFACING`/`_DEADTARGET`/
+/// `_CANT_ATTACK`) — forwarded verbatim to [`crate::swing_refusal`], which owns the latch, the 4 s
+/// repeat, and arm 4's silent StopAttack. Nothing is decided here: the arms differ only in what
+/// that module does with them, and it holds the write set for all three.
+pub(super) fn attack_swing_error(
+    error: AttackSwingError,
+    edges: &mut MessageWriter<SwingRefusalEdge>,
+) {
+    edges.write(SwingRefusalEdge::Refused(error));
+}
+
+/// `SMSG_CANCEL_COMBAT` — the server forced our attack to stop. The swing family's fourth arm,
+/// and the same act as `0x148`/`0x149`: the reference's handler `0x5e7dd0` is arm 4's body
+/// verbatim.
+pub(super) fn cancel_combat(edges: &mut MessageWriter<SwingRefusalEdge>) {
+    edges.write(SwingRefusalEdge::CombatCancelled);
+}
+
+/// `SMSG_FEIGN_DEATH_RESISTED` — the target shrugged off our Feign Death.
+///
+/// One red line and nothing else: the reference's handler `0x6e9800` is `push 0x1a5; call
+/// 0x496720`, a bare `DisplayError(421)` with no latch, no cooldown and no state — the opposite of
+/// its sibling above, and the reason the two do not share a path. Catalog row 421 is
+/// `ERR_FEIGN_DEATH_RESISTED`, whose 1.12 string is the single word "Resisted".
+///
+/// It lives beside the swing arms because vmangos sends it in the same breath as
+/// `SMSG_CANCEL_COMBAT` (`Objects/Unit.cpp:9445-9451`: a resisted feign death cancels the attack
+/// and says so), and finding one without the other is how this family stayed half-built.
+pub(super) fn feign_death_resisted(errors: &mut UiErrorKeys) {
+    debug!("net: feign death resisted");
+    errors.0.push(UiError::key("ERR_FEIGN_DEATH_RESISTED"));
 }
 
 /// A creature flared aggro or a stealth pre-aggro alert (`SMSG_AI_REACTION`).
@@ -71,7 +109,6 @@ pub(super) fn ai_reaction(
 /// the center combat text, which the client fires **synchronously at packet parse**
 /// (`0x6255b0 → 0x629d30 → 0x703f50`, one call stack — §5-verified, wow-re
 /// `combat-text-update-emission-law.md`; decision 0580's fold-back).
-#[allow(clippy::too_many_arguments)] // one dispatch arm's full writer set
 pub(super) fn attacker_state(
     mut s: AttackerState,
     index: &GuidIndex,
@@ -80,9 +117,19 @@ pub(super) fn attacker_state(
     impacts: &mut MessageWriter<SwingImpact>,
     center: &mut MessageWriter<CombatTextEvent>,
     sheaths: &mut MessageWriter<SheathRequest>,
+    edges: &mut MessageWriter<SwingRefusalEdge>,
+    stores: &Query<&mut crate::net::ObjectStore>,
     seq: u64,
 ) {
     let victim = index.0.get(&s.victim).copied();
+    // Arm 5's `0x6259b6 call 0x5ea800`, whose first act is the swing-refusal latch clear
+    // (`0x5ecdb0(0)`) — gated exactly as the reference gates it: the attacker IS the active player
+    // (`0x5fa6d0`, a guid compare) and the victim resolves as a streamed unit. Written from here
+    // rather than computed downstream because this is the only place holding both guids, and it
+    // keeps the clear in packet order with the refusals (`crate::swing_refusal`).
+    if self_guid.0 == Some(s.attacker) && victim.is_some() {
+        edges.write(SwingRefusalEdge::Landed);
+    }
     if benilla_assets::trace::enabled() {
         benilla_assets::trace::line(
             "fct",
@@ -124,6 +171,7 @@ pub(super) fn attacker_state(
         hit_info: s.hit_info,
         victim_state: s.victim_state,
         damage: s.damage,
+        displayed: s.displayed(),
         seq,
     };
     if let Some(&e) = index.0.get(&s.attacker) {
@@ -147,7 +195,13 @@ pub(super) fn attacker_state(
             attacker: e,
             ..swing
         });
-    } else if swing.victim.is_some() {
+    } else if swing.victim.is_some_and(|v| {
+        // The receive-time arm goes THROUGH the gated dispatcher — `0x625823 je 0x625a3e` takes
+        // the unresolved-attacker leg, which resolves the victim and calls `0x625a6d call
+        // 0x624530`, so the LOOTABLE front gate applies here exactly as it does to the tag path
+        // (`creature_anim::impact::lootable_victim`). It calls no consequence directly.
+        !stores.get(v).is_ok_and(|s| s.0.unit_lootable())
+    }) {
         // The client's SMSG-arm fallback: an attacker we can't resolve (out of range)
         // can't animate a swing — its victim feedback fires immediately and in FULL
         // (`0x625a6d`, the only receive-time victim dispatch). The PLACEHOLDER
@@ -156,6 +210,9 @@ pub(super) fn attacker_state(
             swing,
             text_only: false,
             natural: None,
+            // The receive-time arm: no tag fired, so the reference has no event point either —
+            // the consumer falls back to the victim, the only anchor the packet leaves us.
+            pos: None,
         });
     }
 }

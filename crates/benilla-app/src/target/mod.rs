@@ -22,12 +22,24 @@
 //!   Clicking empty ground / a non-unit, or pressing **Esc**, clears the target; the target's death
 //!   clears it too (in [`ring::update_ring`], where death is already read).
 //!
+//! **A unit the classifier refuses is not the mouseover at all** ([`hover::refuse_unselectable`]).
+//! `IsSelectable` (`UNIT_FIELD_FLAGS` bit 25 clear, or `UNIT_FIELD_CREATEDBY` == us) is tested by
+//! the hover grader `0x4828d0` at `0x482982`, and a false answer jumps straight to
+//! `0x482090(0,0)` + `ResetCursor 0x523d30` — the mouseover globals are cleared and the type
+//! dispatch that would have chosen a cursor never runs. It is the **same predicate** the selection
+//! commit runs (`0x60be60`, reached there through the `+0x58` thunk), not a second rule: no
+//! tooltip, no cursor, no brighten, no click. The pick itself reads no unit field — the flagged
+//! unit is a candidate and wins — which is why this is a grader and not a filter (wow-re
+//! `object-layer/scratch/not-selectable-mouse-refusal.md`; decision 2060).
+//!
 //! The mouseover/target "light-up" has two consumers: the per-model **emissive lift**
 //! ([`highlight`], the byte-verified additive term) and the V-plate's reaction-tinted **glow**
 //! (`crate::vplates`, drawn later off [`Hovered`] + [`Selection`]). The plate rect is itself part
 //! of the pick: hovering a plate makes its unit the mouseover *before* any world ray-test
-//! ([`hover::update_hover`] consults `crate::vplates::PlateRects` first — the reference's
-//! UI-blocks-world frame walk), so plates brighten the model and take clicks like the body does.
+//! ([`hover::update_hover`] reads `crate::vplates::PlateHover` first — the plate is real
+//! mouse-enabled UI since 2148/2159, so it takes the pointer and publishes the unit itself, the
+//! reference's own OnEnter arrangement), so plates brighten the model and take clicks like the
+//! body does ([`click::select_on_plate_click`]).
 //! The real pick's **world-occlusion clamp** is modelled ([`PickOcclusion`]): the reference's scene
 //! trace runs `CWorld::Intersect` first and the object pick only wins nearer than the world hit —
 //! a unit or GameObject behind a wall is not hoverable. Not yet modelled: the header-sphere
@@ -58,6 +70,20 @@ pub(crate) mod cursor_mode;
 mod flash;
 mod highlight;
 pub(crate) mod hover;
+/// The headless hover probe (2250) — see its header.
+mod hover_probe;
+
+/// The probe's aim for a window with no OS cursor — for the tooltip's cursor-seated arm and the
+/// UI mouse feed (2250; 2255 made it THIS frame's aim as the pick published it, rather than a
+/// second, independently recomputed one that disagreed with the pick on 34 sweep frames in 35).
+pub(crate) fn hover_probe_point() -> Option<bevy::math::Vec2> {
+    hover_probe::now()
+}
+
+/// Is the headless hover probe armed? (Gates its own log lines outside this module.)
+pub(crate) fn hover_probe_armed() -> bool {
+    hover_probe::armed()
+}
 pub(crate) mod lock;
 mod relations;
 mod reticle;
@@ -108,6 +134,8 @@ pub(crate) use by_name::{AssistRequest, TargetByNameRequest};
 // `duel_rung` is the diagnostic face of the same walk, for `/reaction` (decision 0637).
 pub(crate) use ring::{duel_rung, ring_reaction, ring_variant, Factions, RingVariant};
 
+pub(crate) use click::DeselectGuid;
+
 /// Our current target: the selected entity and its server guid, or `None`. Set the instant we click a
 /// unit (client-authoritative for the ring — the real client doesn't wait for the server), cleared on
 /// deselect or when the target streams out. The guid is what we send in `CMSG_SET_SELECTION` and, later,
@@ -149,6 +177,16 @@ pub(crate) struct Hovered {
     pub(crate) corpse: Option<Entity>,
     /// The hovered corpse's guid — `CMSG_LOOT` / `CMSG_RECLAIM_CORPSE` carry it.
     pub(crate) corpse_guid: Option<u64>,
+    /// **The pick won, and the grader threw it away** — [`hover::selectable_pick`], the
+    /// `IsSelectable` refusal at `0x482982`–`0x482987`. Both entity slots are empty, but
+    /// [`Self::distance`] still holds where the ray hit, because in the reference there is ONE
+    /// pick over all CGObjects: a non-selectable unit standing in front of a chest **wins** that
+    /// pick and is then discarded, so the chest behind it does not inherit the mouseover.
+    ///
+    /// Two readers, and no others: [`go_is_nearest`], and [`click::select_on_click`]'s
+    /// nothing-leg guard — a refused pick is an **object** hit, and the reference's object leg
+    /// clears no selection. Everything else sees an empty hover, which is the point.
+    pub(crate) refused: bool,
 }
 
 impl Hovered {
@@ -218,14 +256,30 @@ impl Default for PickOcclusion {
 ///
 /// Written by [`latch_press_pick`] at the head of the target chain, which runs **before**
 /// [`hover::update_hover`] can clear anything, so the values it copies are the pick as of the press.
+///
+/// **Both buttons read it** (decision 2230). 1122 built this for the left button and left
+/// [`click::act_on_right_click`] on the live hover, where it appeared to work only because the
+/// release frame re-picks at the restored cursor and — for a body click that moved nothing —
+/// lands back on the same unit. It is not the same pick: the plate case has no body under the
+/// cursor to re-find, so a right-click on a V-plate acted on nothing at all.
 #[derive(Resource, Default, Clone, Copy)]
 pub(crate) struct PressPick {
     pub(crate) hovered: Hovered,
     pub(crate) object: HoveredObject,
     pub(crate) occlusion: PickOcclusion,
-    /// The cursor's Attack classification at the press — the reference's new-target validation
-    /// (`0x5ecb70`), which likewise reads the pick the gesture started on, not a live one.
-    pub(crate) attack: bool,
+    /// The **context cursor as of the press** — the classification the whole right-click ladder
+    /// forks on (Attack/Speak/Loot/the GameObject arms) plus its `unable` range gray, and the
+    /// reference's new-target validation (`0x5ecb70`) likewise reads the pick the gesture started
+    /// on, not a live one. Latched whole rather than as the single Attack bit it used to be,
+    /// because every one of those forks is the same frozen pick's answer.
+    pub(crate) cursor: cursor_mode::WorldCursor,
+}
+
+impl PressPick {
+    /// Was the press an **Attack**-cursor press? `0x5ecb70`'s new-target validation.
+    pub(crate) fn attack(&self) -> bool {
+        self.cursor.kind == cursor_mode::CursorKind::Attack
+    }
 }
 
 /// Latch the frame's pick as a press begins — the [`PressPick`] writer.
@@ -257,7 +311,7 @@ pub(crate) fn latch_press_pick(
         hovered: *hovered,
         object: *object,
         occlusion: *occlusion,
-        attack: cursor.kind == cursor_mode::CursorKind::Attack,
+        cursor: *cursor,
     };
 }
 
@@ -273,9 +327,11 @@ pub(crate) fn latch_press_pick(
 /// before corpses could be picked — would have handed the click, the cursor, the tooltip and the
 /// highlight to any GameObject on screen the instant the ray landed on a body instead of a unit.
 pub(crate) fn go_is_nearest(character: &Hovered, go: &HoveredObject) -> bool {
-    match (character.any(), go.target) {
-        (Some(_), Some(_)) => go.distance < character.distance,
-        (None, Some(_)) => true,
+    // A **refused** character pick still occupies the pick (see [`Hovered::refused`]): it wins on
+    // distance exactly as a kept one would, and then nothing is hovered at all.
+    match (character.any().is_some() || character.refused, go.target) {
+        (true, Some(_)) => go.distance < character.distance,
+        (false, Some(_)) => true,
         _ => false,
     }
 }
@@ -315,13 +371,46 @@ impl Default for ClickConfig {
     }
 }
 
+/// **`assistAttack`** — the second, opt-in leg of `/assist` (1.12's *Assist Attack* checkbox).
+///
+/// `/assist` always does leg 1: read the basis unit's `UNIT_FIELD_TARGET` and select it
+/// (`CMSG_SET_SELECTION`). With this CVar non-zero the reference's shared tail runs a **second**
+/// leg — `0x489c02`/`0x489d02 call 0x5ecb70` `StartAttack(&guid)` — which stands you and sends
+/// `CMSG_ATTACKSWING`. So `/assist` stops meaning "select what my friend is fighting" and starts
+/// meaning "select it and open the swing".
+///
+/// Its record `[0xb4d8f8]` has exactly **three references image-wide**: the registration store and
+/// the two shared assist tails. `CanAssist 0x6066f0` is *not* on this path (verified negative over
+/// all 25 of its call sites).
+///
+/// **Registered default `"0"`, so nothing changes until a player asks for it.** That number cost
+/// wow-re a correction it records against itself: its first pass read `"3"` off the *next*
+/// registration's default (`minimapZoom`), the `mov ds:` adjacency trap.
+#[derive(Resource, Default)]
+pub(crate) struct AssistAttack(pub(crate) bool);
+
+/// The targeting rows' change callback (decision 2303): two flags.
+pub(crate) fn on_cvar(
+    ev: On<crate::cvars::CvarChanged>,
+    mut click: ResMut<ClickConfig>,
+    mut assist: ResMut<AssistAttack>,
+) {
+    match ev.key().as_str() {
+        "deselectonclick" => click.deselect_on_click = ev.flag(),
+        "assistattack" => assist.0 = ev.flag(),
+        _ => {}
+    }
+}
+
 /// Targeting: click-to-select + the ground selection ring.
 pub(crate) struct TargetPlugin;
 
 impl Plugin for TargetPlugin {
     fn build(&self, app: &mut App) {
+        app.add_observer(on_cvar);
         app.init_resource::<Selection>()
             .init_resource::<ClickConfig>()
+            .init_resource::<AssistAttack>()
             .init_resource::<Hovered>()
             .init_resource::<HoveredObject>()
             .init_resource::<PickOcclusion>()
@@ -333,6 +422,7 @@ impl Plugin for TargetPlugin {
             .add_message::<AttackNearestRequest>()
             .add_message::<TargetByNameRequest>()
             .add_message::<AssistRequest>()
+            .add_message::<click::DeselectGuid>()
             .add_systems(
                 Startup,
                 (
@@ -369,7 +459,9 @@ impl Plugin for TargetPlugin {
                     // range state — the ref's one CheckGroundPointInRange caller feeds both).
                     reticle::update_reticle,
                     click::world_right_click_payload,
-                    click::select_on_click,
+                    // A plate click replayed as the click it is (2148), then the select that
+                    // reads it. One element, chained: the outer chain is at Bevy's 20-tuple limit.
+                    (click::select_on_plate_click, click::select_on_click).chain(),
                     // AFTER the gated select (which holds while the mode is active): the commit
                     // may clear the mode, and the selection gate must have read it first. The two
                     // world legs are siblings, not a fallback chain — the pending spell's word
@@ -474,6 +566,20 @@ mod tests {
         assert!(!go_is_nearest(&corpse(true, 4.0), &obj(true, 10.0)));
         assert!(!go_is_nearest(&corpse(true, 5.0), &obj(true, 5.0)));
         assert!(go_is_nearest(&corpse(true, 10.0), &obj(true, 4.0)));
+        // A **refused** pick — a `NOT_SELECTABLE` unit the hover grader threw away
+        // (`hover::selectable_pick`; the predicate's own arms are pinned in
+        // `scan::tests::not_selectable_refuses_the_commit_and_keeps_the_old_target`) — holds the
+        // ground on distance exactly as a kept one does, and then nothing is hovered at all: the
+        // reference makes ONE pick over all CGObjects, so the flagged unit *wins* it and is
+        // discarded, and the chest standing behind it never inherits the mouseover.
+        let refused = |d: f32| Hovered {
+            refused: true,
+            distance: d,
+            ..Hovered::default()
+        };
+        assert!(!go_is_nearest(&refused(4.0), &obj(true, 10.0)));
+        assert!(!go_is_nearest(&refused(5.0), &obj(true, 5.0)));
+        assert!(go_is_nearest(&refused(10.0), &obj(true, 4.0)));
     }
 
     /// The latch survives the hover being cleared — which is the whole reason it exists.
@@ -505,7 +611,7 @@ mod tests {
             .press(MouseButton::Left);
         world.run_system(id).unwrap();
         assert_eq!(world.resource::<PressPick>().hovered.guid, Some(BOAR));
-        assert!(world.resource::<PressPick>().attack, "Attack rode along");
+        assert!(world.resource::<PressPick>().attack(), "Attack rode along");
 
         // The drag begins: the look session blanks the live hover, every frame, for as long as it
         // lasts. The latch must not follow it down.

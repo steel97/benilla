@@ -34,18 +34,23 @@ use benilla_protocol::messages::ObjectType;
 use benilla_ui::script::{power_token, ScriptValue, UiScript, UnitState, WornDisplay};
 
 use crate::names::NameCache;
-use crate::net::{Guid, NetCommands, ObjectStore, Reputations, SelfPlayer};
+use crate::net::{
+    FieldChanged, FieldEdges, Guid, NetCommands, ObjectStore, Reputations, SelfPlayer,
+};
 use crate::target::{ring_reaction, Factions, Selection};
-use crate::ui_chat::{ChatEvent, ChatEventKind, ChatLog};
 use crate::ui_script::{gate, UiInput};
 
-/// The feed pass — runs **after [`benilla_world::schedule::WorldStage::Net`]** (the feeds snapshot state
-/// the net apply writes; unordered, `apply_net_updates` could land BETWEEN two feeds, and a
-/// synchronous event fired by the later one then re-read the earlier one's pre-mutation push —
-/// the spellbook's cooldown pie stayed cold until a manual reopen, reproduced live 2026-07-31)
-/// and before [`UiInput`], so the snapshot + events it produces are in place when the VM ticks
-/// and dispatches this frame. A named set so the demo override ([`crate::ui_script`]) can order
-/// itself after it. Configured in [`UiUnitPlugin`] — the set's home.
+/// The unit-feed pass — the GATED sub-phase of [`crate::ui_script::UiFeed`], which carries the
+/// order: after [`benilla_world::schedule::WorldStage::Net`] and before [`UiInput`], so the
+/// snapshot + events it produces are in place when the VM ticks and dispatches this frame. That
+/// order was found here first (the feeds snapshot state the net apply writes; unordered,
+/// `apply_net_updates` could land BETWEEN two feeds, and a synchronous event fired by the later
+/// one then re-read the earlier one's pre-mutation push — the spellbook's cooldown pie stayed
+/// cold until a manual reopen, reproduced live 2026-07-31), and decision 2304 made it every
+/// feed's. What stays this set's own is the gate: every member either fires a login one-shot or
+/// latches a per-VM memo, so none may run before the in-game interface exists (1348). A named
+/// set so the demo override ([`crate::ui_script`]) can order itself after it. Configured in
+/// [`UiUnitPlugin`] — the set's home.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UnitFeed;
 
@@ -94,6 +99,85 @@ pub(crate) struct CombatTextEvent {
 
 /// The feed's change-tracking memory: what we last told the VM, plus one server-side log-once.
 ///
+/// **`PLAYER_LEAVING_WORLD` on a cross-map worldport** (decision 2235, corrected by 2238).
+///
+/// The reference fires event `0x111` at `0x490b48`, inside `0x490a80`. wow-re's census of both
+/// signal helpers puts the id at exactly one site image-wide — 336/336 ids resolved through
+/// `0x703e50`, 149/149 through `0x703f50`, and the encoding `b9 11 01 00 00` occurs once in the
+/// binary — so that is the whole of the FIRE, and it is what this doc used to conflate with the
+/// whole of the event.
+///
+/// **One fire site, three callers, and this system is one of them** (2238; wow-re `5ad31a12`).
+/// `0x490a80` is reached from the local player object's own destructor (`0x401bc0` → `0x467700`
+/// → `0x467800` → the per-object `[vtbl+0]` → `0x5dd500` → `0x5dd600` → `0x5dd72c` → `0x5dd543`)
+/// — **this system's occasion** — and also from `0x490c20` inside the shutdown tail `0x490bd0`,
+/// which is where an in-world `/reload`, a logout, a quit and a disconnect reach it, and from
+/// `0x5e9b5a`, vtable slot 1, on a DESTROY / OUT_OF_RANGE of the local player object.
+/// 2235 read `5ce96437`'s "three gates" as three gates on the event and its subject line as a
+/// census of the callers; neither is what they were. Two of those gates (`0x5dd71c`/`0x5dd721`/
+/// `0x5dd725` and `0x5dd539`/`0x5dd53e`/`0x5dd541`) sit in the destructor chain and gate only the
+/// caller below; `0x490a80`'s own only gate is the latch at `[0xb4b424]`.
+///
+/// **The tail's occasions are already ours**, and were years before this system existed:
+/// [`crate::ui_script::shutdown_ui_state`] fires `PLAYER_LEAVING_WORLD` then `PLAYER_LOGOUT` as
+/// the head of the same `0x490bd0` tail, from `end_ui_session` (logout, disconnect, and
+/// `run_pending_reload`'s `/reload`) and from `shutdown_on_exit` (quit). So the two producers are
+/// complements, not duplicates — a fact worth writing down precisely because nothing in either
+/// file said so, and a reader of this doc alone would take the tail's fire for a bug.
+///
+/// **Cross-map only *for this occasion*, and that falls out of the gate rather than being a rule
+/// on top of it.** The first gate (`0x5dd728`) admits only the local player's destructor, and a
+/// same-map teleport never destroys the object — including the >30 yd variant that forces a
+/// blocking terrain reload, which reloads tiles rather than `CGObject`s. So
+/// [`crate::net::WorldportMessage`] is the right edge and `needs_ack` is the right discriminator:
+/// the one worldport that does NOT need an ack is the initial-login map, where nothing is being
+/// left.
+///
+/// **Nothing shipped listens to it.** Zero of the 232 extracted reference interface files
+/// register `PLAYER_LEAVING_WORLD` (controls, same sweep: `PLAYER_ENTERING_WORLD` 22 files,
+/// `VARIABLES_LOADED` 7, `PLAYER_LOGIN` 1). This is an addon-facing event, which is exactly why
+/// it went missing here for so long — no stock window breaks without it, and only the corpus
+/// notices. It is also why this stays a bare fire and promises nothing more: in the reference the
+/// handler runs *during* teardown, after the three manager unlinks and ~35 of `0x490a80`'s 37
+/// teardown calls, so a real addon's handler already sees a substantially dismantled UI.
+///
+/// **What "dismantled" costs there is the opposite of what 2235 guessed** (2238; wow-re
+/// `20210d32`). The GUID hash's link is `obj+0x1c` and the destructor splices the object out
+/// (`0x467887 call 0x468680`) *before* `call [vtbl+0]`, so on THIS occasion — and only this one —
+/// a hash lookup misses. But `UnitName("player")` never asks the hash: `0x517020` short-circuits
+/// at `0x51707d` and answers from the cached character record `[0xc27d88]`, which has one writer
+/// (`CGlueMgr::EnterWorld`) and no clearer; `UnitRace`, `UnitClass` and `0x517ee0` take the same
+/// fast path. The binding that *does* go nil is `UnitExists("player")`, whose `0x515970` resolves
+/// through `0x468460` and takes `0x5159c9 je 0x515a39` → `0:0` on the miss. We reproduce none of
+/// that ordering and are not trying to: ours fires with the descriptor still present, so every
+/// unit binding answers. That is a divergence in our favour, recorded rather than closed —
+/// closing it would mean deliberately breaking `UnitExists` to match a teardown artifact no
+/// stock file observes.
+fn fire_leaving_world_on_worldport(
+    script: Option<NonSendMut<UiScript>>,
+    mut armed: ResMut<crate::ui_script::LeavingWorldArmed>,
+    mut ports: MessageReader<crate::net::WorldportMessage>,
+) {
+    // `needs_ack` false is the initial-login map (`player::wire_in`'s own split): an entry, not a
+    // departure. Read the whole iterator either way so the cursor never carries one over.
+    let leaving = ports.read().filter(|w| w.needs_ack).count() > 0;
+    if !leaving {
+        return;
+    }
+    // **The world latch, spent here** (2239): this producer and the shutdown tail are the
+    // reference's `0x5dd543` and `0x490c20`, two callers of one fire site, and `[0xb4b424]` is
+    // what keeps them from both claiming one departure. Spent even if the VM turns out to be
+    // absent below — the reference clears it at `0x490a8d`, ahead of the fire and of every
+    // teardown call after it, so a departure nobody could be told about is still a departure.
+    if !armed.spend() {
+        return;
+    }
+    let Some(mut script) = script else {
+        return;
+    };
+    script.fire_event("PLAYER_LEAVING_WORLD", Vec::new());
+}
+
 /// The VM half lives behind a [`crate::ui_script::VmMemo`], **inside the resource** — the same
 /// law 1290 wrote for `Local` memos, reached the way a `ResMut` system has to reach it: a memory
 /// about what THIS VM was told is unreadable against the next VM, so a `/reload` (1291) — which
@@ -128,11 +212,14 @@ struct UnitFeedMemo {
     /// The last `(PLAYER_XP, PLAYER_NEXT_LEVEL_XP)` pair pushed, for the `PLAYER_XP_UPDATE` trigger —
     /// the XP bar's feed is a player-global (like coinage), not a per-unit-token field.
     last_xp: Option<(u32, u32)>,
-    /// The last `(restState, restPool, PLAYER_FLAGS)` triple pushed, for the `UPDATE_EXHAUSTION`
-    /// and `PLAYER_UPDATE_RESTING` triggers — player-globals like the XP pair (decisions
-    /// 1082/1087). The whole flags dword, not just the resting bit: the client's `0x5ee990`
-    /// fires `PLAYER_UPDATE_RESTING` on any PLAYER_FLAGS delta. Pushed as one snapshot so
+    /// The last `(restState, restPool, PLAYER_FLAGS)` triple pushed, for the `UPDATE_EXHAUSTION`,
+    /// `PLAYER_UPDATE_RESTING` and `PLAYTIME_CHANGED` triggers — player-globals like the XP pair
+    /// (decisions 1082/1087/2078). Pushed as one snapshot so
     /// `GetRestState`/`GetXPExhaustion`/`IsResting` never read it half-updated.
+    ///
+    /// The whole flags dword is kept because the two flag events read **different bits of it**
+    /// (`0x20` and `0x1000|0x2000`), not because either fires on the word as a whole — 2078
+    /// corrected that, and the feed XORs against this to find which arm moved.
     last_rest: Option<(u8, u32, u32)>,
     /// Our avatar's last-seen `UNIT_FIELD_LEVEL`, for the `PLAYER_LEVEL_UP` trigger (decision
     /// 1094). `None` until first seen — the first sighting is the login descriptor, not a ding.
@@ -170,39 +257,65 @@ impl Plugin for UiUnitPlugin {
         app.configure_sets(
             Update,
             UnitFeed
-                .after(benilla_world::schedule::WorldStage::Net) // the set's own doc: the why
+                // A sub-phase of the feed phase, which carries the order (the set's own doc)…
+                .in_set(crate::ui_script::UiFeed)
                 // …and never before the in-game UI exists (1348). The whole SET, not just
                 // `feed_units`: every feed in it either fires a login one-shot or latches a
                 // per-VM memo, and both are lost forever against the boot VM. The window and
-                // the reference's own ordering: `ui_script::ingame_ui_pending`.
-                .run_if(bevy::ecs::schedule::common_conditions::not(
-                    crate::ui_script::ingame_ui_pending,
-                )),
+                // the reference's own ordering: `ui_script::ingame_ui_up`.
+                .run_if(crate::ui_script::ingame_ui_up),
         )
         .init_resource::<UnitFeedState>()
+        // [`feed_units`] shows catalog messages (the rest-state pair, the PvP toggle) through
+        // `ui_action::show_messages`, whose sink is the chat log and the message-sound queue.
+        // The queue belongs to the sound stack, which a UI-only harness does not stand up, and a
+        // missing `ResMut` is a system-validation panic — so this plugin declares it. `init` is a
+        // no-op when the sound plugin has already put it there.
+        .init_resource::<crate::sound::MessageSounds>()
         .add_message::<UnitCombatFeedback>()
         .add_message::<CombatTextEvent>()
+        // …and the worldport edge [`fire_leaving_world_on_worldport`] reads, for exactly the
+        // reason above: the message belongs to `crate::net`, which a UI-only harness does not
+        // stand up, and an unregistered `MessageReader` is a system-validation panic rather than
+        // an empty read. `add_message` is idempotent, so the net plugin declaring it too costs
+        // nothing. (1348's own `the_login_one_shots_wait_for_the_in_game_ui` is the harness that
+        // found this — it builds this plugin alone.)
+        .add_message::<crate::net::WorldportMessage>()
+        .add_message::<crate::net::FieldChanged>()
+        // The world latch (2239): this plugin owns one of its two producers, so it declares the
+        // resource as well as the message — same reason, and `init_resource` is idempotent
+        // against `UiScriptPlugin`'s own.
+        .init_resource::<crate::ui_script::LeavingWorldArmed>()
         .add_systems(
             Update,
             (
+                // FIRST in the chain, so a worldport's leaving edge precedes the entering edge
+                // the same port raises in `feed_units` once the new descriptor lands.
+                fire_leaving_world_on_worldport,
                 feed_units,
                 feed_unit_reach,
+                feed_player_control,
+                feed_farsight_focus,
                 melee_unit_combat,
                 fire_unit_combat,
                 fire_combat_text,
             )
                 .chain()
-                .in_set(UnitFeed)
-                .before(UiInput),
+                .in_set(UnitFeed),
         )
         .add_systems(Update, drain_pvp_toggles.after(UiInput))
         .add_systems(Update, drain_worn_display_toggles.after(UiInput))
         .add_systems(Update, drain_action_bar_toggles.after(UiInput))
         .add_systems(Update, feed_default_language.in_set(UnitFeed))
-        // `load_exhaustion_rows` pushes into the VM, so it runs per VM in `Update` (1290);
-        // `load_default_languages` only builds a Bevy resource and stays a one-shot.
-        .add_systems(Update, load_exhaustion_rows)
-        .add_systems(PostStartup, load_default_languages);
+        .add_systems(Update, feed_known_languages.in_set(UnitFeed))
+        // `load_exhaustion_rows` pushes into the VM, so it runs per VM in `Update` (1290), in
+        // the feed phase; `load_default_languages` only builds a Bevy resource and stays a
+        // one-shot.
+        .add_systems(
+            Update,
+            load_exhaustion_rows.in_set(crate::ui_script::UiFeed),
+        )
+        .add_systems(PostStartup, (load_default_languages, load_languages));
     }
 }
 
@@ -213,6 +326,120 @@ impl Plugin for UiUnitPlugin {
 pub(crate) struct DefaultLanguagesRes(pub(crate) benilla_formats::DefaultLanguages);
 
 /// Load `Languages.dbc` × `ChrRaces.dbc` once at startup ([`load_exhaustion_rows`]'s shape).
+/// `Languages.dbc` in row order — the walk behind `GetNumLaguages`/`GetLanguageByIndex`.
+#[derive(Resource)]
+pub(crate) struct LanguagesRes(pub(crate) benilla_formats::Languages);
+
+fn load_languages(mut commands: Commands, assets: Option<Res<benilla_assets::WorldAssets>>) {
+    let Some(assets) = assets else { return };
+    let loaded = {
+        use benilla_assets::LockRecover;
+        let mut chain = assets.chain.lock_recover();
+        benilla_formats::load_languages(&mut chain)
+    };
+    match loaded {
+        Ok(langs) => {
+            info!("ui_unit: {} Languages.dbc rows", langs.len());
+            commands.insert_resource(LanguagesRes(langs));
+        }
+        Err(e) => warn!("ui_unit: Languages.dbc unavailable — {e:#}"),
+    }
+}
+
+/// The languages this character **knows**, folded the reference's way and fed to the VM for
+/// `GetNumLaguages`/`GetLanguageByIndex` (wow-re `chat-language-scramble.md` §8, C6):
+///
+/// 1. `0x4b25b0` runs on spell add and stores `[languageId] = spellId` for a spell whose
+///    `Effect_1 == 39` — so the table holds only languages *this character's known spells*
+///    declare ([`benilla_formats::SpellCatalog::declared_language`], spell → language, never the
+///    other way round: five shipped language spells declare Common, and that anomaly is the
+///    reference's).
+/// 2. `GetNumLaguages` walks `Languages.dbc` rows and keeps those `0x5ec720` answers non-zero
+///    for: the language's spell resolves to a `SkillLine` (`0x6de040`, race/class, spell) that is
+///    present in the player's `PLAYER_SKILL_INFO` block. Presence, not value: a found line
+///    returns 1 whatever its value.
+///
+/// One knowingly-unreproduced detail: a later learn overwrites an earlier spell on the same
+/// language id in the reference's table. The known-spell set here is unordered, so when two
+/// known spells declare one language, either's skill line passes — unobservable on shipped data
+/// (every language skill a character holds is 300, and the only shared id is Common's).
+pub(crate) fn known_languages(
+    known: impl IntoIterator<Item = u32>,
+    spells: &benilla_formats::SpellCatalog,
+    skill_lines: Option<&benilla_formats::SkillLineCatalog>,
+    has_skill_line: impl Fn(u32) -> bool,
+    languages: &benilla_formats::Languages,
+) -> Vec<String> {
+    let mut declared: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+    for spell in known {
+        if let Some(lang) = spells.declared_language(spell) {
+            declared.entry(lang).or_default().push(spell);
+        }
+    }
+    languages
+        .names(0)
+        .filter(|(id, _)| {
+            declared.get(id).is_some_and(|spells| {
+                spells.iter().any(|&spell| {
+                    skill_lines
+                        .and_then(|sl| sl.spell_to_line(spell))
+                        .is_some_and(&has_skill_line)
+                })
+            })
+        })
+        .map(|(_, name)| name.to_string())
+        .collect()
+}
+
+fn feed_known_languages(
+    script: Option<NonSendMut<UiScript>>,
+    actions: Option<Res<crate::ui_action::PlayerActions>>,
+    spells: Option<Res<crate::ui_action::Spells>>,
+    skill_lines: Option<Res<crate::ui_spellbook::SkillLines>>,
+    languages: Option<Res<LanguagesRes>>,
+    self_q: Query<Ref<ObjectStore>, With<SelfPlayer>>,
+    mut pushed: Local<crate::ui_script::VmMemo<Option<Vec<String>>>>,
+) {
+    let Some(mut script) = script else {
+        return;
+    };
+    let (Some(actions), Some(spells), Some(languages)) = (actions, spells, languages) else {
+        return;
+    };
+    let pushed = pushed.get(&script);
+    let store = self_q.iter().next();
+    // A pure function of the spell book, the three catalogs and our descriptor — with all still
+    // and a push already made on this VM, the rebuild (a skill-slot scan per language, a
+    // `Vec<String>`) can only reproduce the memo.
+    let inputs_moved = store.as_ref().is_some_and(|s| s.is_changed())
+        || actions.is_changed()
+        || spells.is_changed()
+        || languages.is_changed()
+        || skill_lines.as_ref().is_some_and(|l| l.is_changed());
+    if pushed.is_some() && !inputs_moved {
+        return;
+    }
+    let store: Option<&ObjectStore> = store.as_deref();
+    let has_skill_line = |line: u32| {
+        store.is_some_and(|s| {
+            (0..benilla_protocol::messages::PLAYER_SKILL_SLOTS)
+                .filter_map(|i| s.0.player_skill(i))
+                .any(|slot| u32::from(slot.skill_id) == line)
+        })
+    };
+    let names = known_languages(
+        actions.spells.iter().copied(),
+        &spells.catalog,
+        skill_lines.as_deref().map(|s| &s.catalog),
+        has_skill_line,
+        &languages.0,
+    );
+    if pushed.as_ref() != Some(&names) {
+        script.set_known_languages(names.clone());
+        *pushed = Some(names);
+    }
+}
+
 fn load_default_languages(
     mut commands: Commands,
     assets: Option<Res<benilla_assets::WorldAssets>>,
@@ -231,6 +458,35 @@ fn load_default_languages(
         // Not fatal: the binding's contract already has an answer for "no table".
         Err(e) => warn!("ui_unit: default languages unavailable — {e:#}"),
     }
+}
+
+/// **The player's default language goes into the VM at its birth** (decision 2241, through the
+/// seam 2240 established) — because `GetDefaultLanguage()` is read *inside* the load burst, and
+/// until now the answer during that burst was `nil` and then a race.
+///
+/// Two readers, both stock: `ChatEdit_OnLoad` takes it at OnLoad (dead in 1.12, but it is the
+/// era's idiom), and `ChatFrame_OnEvent`'s `PLAYER_ENTERING_WORLD` arm stores it as
+/// `this.defaultLanguage`, which gates the `[Common]`/`[Orcish]` prefix on every readable chat
+/// line for the session. We fire `PLAYER_ENTERING_WORLD` from [`feed_units`] — an `Update` system
+/// in the same set as [`feed_default_language`], with no ordering between them — so whether that
+/// gate was seeded when the event arrived was Bevy's intra-set order to decide, per run.
+///
+/// The race comes from the **roster row** rather than the object store, because the avatar does not
+/// exist yet at this edge; it is the same value from the same login, and it is the row
+/// [`crate::ui_script::seat_from_roster`] builds the player seat from a few lines earlier in the
+/// same call. [`feed_default_language`] still runs and still owns the live answer — this only
+/// makes sure the burst does not read a nil.
+pub(crate) fn seed_default_language(world: &mut World, script: &mut UiScript) {
+    let (Some(langs), Some(roster)) = (
+        world.get_resource::<DefaultLanguagesRes>(),
+        world.get_resource::<crate::char_select::Roster>(),
+    ) else {
+        return;
+    };
+    let Some(row) = roster.pending_row() else {
+        return;
+    };
+    script.set_default_language(langs.0.name(u32::from(row.race), 0).map(str::to_string));
 }
 
 /// Push `GetDefaultLanguage()`'s one string, on change only.
@@ -482,6 +738,42 @@ pub(crate) fn race_faction_group(race: u8) -> Option<&'static str> {
     })
 }
 
+/// A unit's **PvP team digit** — `0x5efe00`'s tri-state: `0` Horde, `1` Alliance, `-1` no side.
+///
+/// **This is NOT [`faction_group`], and the difference is the whole of report B378.** The two read
+/// different sources and only agree while nothing has moved a unit off its racial faction:
+///
+/// * `UnitFactionGroup` (`0x516630`) reads the unit's LIVE `UNIT_FIELD_FACTIONTEMPLATE`
+///   (`0x5166b8 mov eax,[eax+0x110]` / `0x5166be mov eax,[eax+0x74]`, byte-read here) — so a
+///   vmangos GM, forced to template 35, genuinely has no side and the PvP flag icon genuinely
+///   hides. That is faithful.
+/// * The rank title's team digit (`0x5efe00`) reads the unit's **RACE** and walks
+///   `[obj+0x110]+0x78` → `ChrRaces.dbc` field 2 (FactionTemplate id) → `FactionTemplate.dbc`
+///   field 3 (factionGroupMask) → `& 4` ⇒ 0, else `& 2` ⇒ 1, else −1 — never the live template.
+///   A GM's race does not change, so the reference names his rank exactly as it always did.
+///
+/// We had the second wired to the first, which is why a Grand Marshal's Honor tab read `NONE` on
+/// a GM-flagged account while the 1.12 client on the same server read "Grand Marshal"
+/// (decision 2227). Every `0x5efe00` caller is race-derived: `GetPVPRankInfo`'s team
+/// (`0x51a9af`/`0x51a9c8`), `UnitPVPName`'s rank decoration (`0x5efe60`), the battlefield
+/// scoreboard's per-row side (`0x4aa200`, which inlines the same walk off the name-cache record).
+///
+/// The table is the shipped one, frozen: `ChrRaces.dbc` has **nine** rows in 5875 and race 9
+/// (Goblin, unplayable) shares Human's faction template 1, so it answers Alliance — not `None`,
+/// which is what a "playable races only" table would say.
+/// [`tests::race_pvp_team_matches_the_shipped_tables`] walks the real DBCs and pins every row.
+pub(crate) fn race_pvp_team(race: u8) -> i8 {
+    match race {
+        // factionGroupMask 3 = Player|Alliance → `& 4` clear, `& 2` set.
+        1 | 3 | 4 | 7 | 9 => 1,
+        // factionGroupMask 5 = Player|Horde → `& 4` set, tested first.
+        2 | 5 | 6 | 8 => 0,
+        // No `ChrRaces` row (a creature's race byte, or an unstreamed descriptor): the engine's
+        // bounds/NULL failure tail, `-1`. It formats into the key and matches no GlobalString.
+        _ => -1,
+    }
+}
+
 /// Resolve a UnitPopup unit token to the **player guid** it names — `"target"` through the
 /// selection iff it really is a player (the target frame's PLAYER menu), a `"partyN"` token through
 /// the roster (the party frame's PARTY menu). `"player"` (yourself) and any unresolved token answer
@@ -627,6 +919,57 @@ fn dist_sq(q: Vec3, p: Vec3) -> f64 {
     (dz * dz + dx * dx) + dy * dy
 }
 
+/// `PLAYER_CONTROL_LOST` / `PLAYER_CONTROL_GAINED` — `SMSG_CLIENT_CONTROL_UPDATE` naming the
+/// local player reaches `0x4958e0`, which writes the player-control flag and, **on a change**,
+/// fires LOST when the byte is zero and GAINED when it is not; the boot init is "in control"
+/// (wow-re `farsight-and-client-control.md` §5, `incoming-trade-request-law.md`). The flag is
+/// [`crate::player::Player::control_lost`], which `player::wire_in` writes from that packet; this
+/// fires the edge, and a fresh VM's memo is the boot value.
+fn feed_player_control(
+    script: Option<NonSendMut<UiScript>>,
+    player: Option<Res<crate::player::Player>>,
+    mut lost: Local<crate::ui_script::VmMemo<bool>>,
+) {
+    let (Some(mut script), Some(player)) = (script, player) else {
+        return;
+    };
+    let lost = lost.get(&script);
+    if *lost != player.control_lost {
+        *lost = player.control_lost;
+        // `HasFullControl`'s flag rides the same edge (1958).
+        script.set_player_control(!player.control_lost);
+        let event = if player.control_lost {
+            "PLAYER_CONTROL_LOST"
+        } else {
+            "PLAYER_CONTROL_GAINED"
+        };
+        script.fire_event(event, vec![]);
+    }
+}
+
+/// `PLAYER_FARSIGHT_FOCUS_CHANGED` — the `PLAYER_FARSIGHT` field-change callback (`0x5de0d0`)
+/// fires it on both of its legs, whether or not the new guid resolves to a streamed object
+/// (wow-re `farsight-and-client-control.md` §2). The edge is the FIELD's, so this diffs the
+/// descriptor value the camera's `publish_view_subject` reads, never the resolved pose.
+fn feed_farsight_focus(
+    script: Option<NonSendMut<UiScript>>,
+    self_q: Query<&ObjectStore, With<SelfPlayer>>,
+    mut focus: Local<crate::ui_script::VmMemo<Option<u64>>>,
+) {
+    let Some(mut script) = script else {
+        return;
+    };
+    let Some(store) = self_q.iter().next() else {
+        return;
+    };
+    let anchor = store.0.player_farsight();
+    let focus = focus.get(&script);
+    if *focus != anchor {
+        *focus = anchor;
+        script.fire_event("PLAYER_FARSIGHT_FOCUS_CHANGED", vec![]);
+    }
+}
+
 /// Feed the **unit reach map** — for every token that resolves to a live unit object, its squared
 /// distance from us, plus whether that unit passes inspect's own two non-distance refusals.
 ///
@@ -706,6 +1049,9 @@ pub(crate) struct UnitStores<'w, 's> {
     changed: Query<'w, 's, (), Changed<ObjectStore>>,
     /// Whose object left the manager — the other half of that gate, and cleared every run.
     removed: RemovedComponents<'w, 's, ObjectStore>,
+    /// The per-field edges this run (decision 2297) — [`fire_transitions`]' three mirror-diff
+    /// arms fire off these, per token naming the moved unit.
+    edges: MessageReader<'w, 's, FieldChanged>,
 }
 
 /// Build a unit snapshot from a streamed object's descriptor (decision 0061's `ObjectFields`) plus
@@ -768,6 +1114,11 @@ pub(crate) fn snapshot(
         // TYPEMASK_PLAYER restriction achieves there: a non-player has no PLAYER block at all, so
         // the field simply reads absent.
         group_leader: store.0.player_is_group_leader(),
+        // The raw `PLAYER_FLAGS` dword `PLAYER_FLAGS_CHANGED` fires on (decision 2078) — the
+        // `flags`/`UNIT_FLAGS` pattern one field over. Absent on a creature, which reads 0 and so
+        // can never produce a delta, exactly as the reference's TYPEID_PLAYER-scoped watcher
+        // cannot be registered against one.
+        player_flags: store.0.player_flags(),
         reaction,
         race: race.map(|(n, _)| n.to_string()),
         race_file: race.map(|(_, f)| f.to_string()),
@@ -796,6 +1147,18 @@ pub(crate) fn snapshot(
         // leg of the selection ring). Wider than `is_player` above: a pet or a charmed creature
         // sets it without being a player.
         player_controlled: store.0.unit_flags() & 0x8 != 0,
+        flags: store.0.unit_flags(),
+        // The raw `UNIT_DYNAMIC_FLAGS` dword the event of the same name fires on — the `flags`
+        // arm above, a hundred descriptor fields over. `tapped`/`tapped_by_player` up the struct
+        // are two of its bits; this is the whole word, because the reference's watch is a memcmp
+        // over the dword and not a bit test.
+        dynamic_flags: store.0.unit_dynamic_flags(),
+        owner: store
+            .0
+            .unit_summoned_by()
+            .or_else(|| store.0.unit_charmed_by())
+            .or_else(|| store.0.unit_created_by())
+            .unwrap_or(0),
         // `UnitAffectingCombat 0x517e10` — the SAME `UNIT_FIELD_FLAGS` word, bit 19
         // (`shr ecx,0x13; test cl,1`). One flag for every token: wow-re's whole-image census of
         // that idiom found the local-player readers reading this identical bit, so there is no
@@ -813,6 +1176,13 @@ pub(crate) fn snapshot(
         // pane's `UnitPVPRank("target")` can answer at all. A creature has no PLAYER block and
         // reads 0, the reference's own answer for one.
         pvp_rank: store.0.player_pvp_rank().unwrap_or(0),
+        // `0x5efe00`'s team digit — the second `%d` of `PVP_RANK_<rank>_<team>`. It sits here
+        // beside the rank byte for the same reason that one does (nothing but the descriptor is
+        // needed) and it reads the RACE, not `faction_group`: the engine walks the race through
+        // `ChrRaces`/`FactionTemplate` and never looks at the live `UNIT_FIELD_FACTIONTEMPLATE`
+        // this unit is carrying, so a GM-flagged player keeps his rank title while losing the PvP
+        // icon. See [`race_pvp_team`] and decision 2227 (report B378).
+        pvp_team: store.0.unit_race().map_or(-1, race_pvp_team),
         // `PLAYER_BYTES_3` byte 2 — the city-protector title, the same PUBLIC dword as the rank
         // byte above. `UnitPVPName` appends a `PVP_MEDAL<n>` line for a non-zero one; 0 is "no
         // medal", which is every character on this server (vmangos never writes the byte).
@@ -845,7 +1215,12 @@ pub(crate) fn enrich_unit(
     let Some(entry) = benilla_protocol::guid::entry(guid) else {
         return;
     };
-    if let Some(rec) = names.creature_record(entry) {
+    // The ask-once creature record — `CGUnit+0xb30`, filled from `SMSG_CREATURE_QUERY_RESPONSE`.
+    // `None` is the round trip before the answer lands, and it is a REAL state the plate is drawn
+    // in, not a "nothing is known yet" to render blank: the name reads `UNKNOWNOBJECT` there
+    // (decision 2040), and the lines below split on exactly what the record does or does not gate.
+    let rec = names.creature_record(entry);
+    if let Some(rec) = rec {
         state.subtitle = rec.subname.clone();
         state.creature_type_name = creature_type_word(rec.creature_type).map(str::to_string);
         // The client's one rank getter, both gates (`gated_rank`, decision 0782) — never `rec.rank`
@@ -854,25 +1229,31 @@ pub(crate) fn enrich_unit(
         state.rank = crate::names::gated_rank(Some(rec), Some(store));
         state.civilian = rec.civilian;
         state.racial_leader = rec.racial_leader;
-        // The faction-name line ("Stormwind", between level and PvP) — the unit builder's tail
-        // block, every gate transcribed: the record's HIDE_FACTION_TOOLTIP type flag (0x10, the
-        // `0x612610` gate), the template → Faction.dbc hop, the reputation-slot gate
-        // (rep_index ≥ 0), and the race/class slot walk with its hidden flag (0x4). The record
-        // gate also stands in for the bytes' "no creature info → pass": before the query
-        // answers we have no name line either, and the tooltip rebuilds when it lands.
-        if rec.type_flags & 0x10 == 0 {
-            state.faction_name = (|| {
-                let catalog = factions?.catalog();
-                let faction_id = catalog.template(store.0.unit_faction_template()?)?.faction;
-                let info = catalog.reputation_faction(faction_id)?;
-                let self_store = self_store?;
-                let race = self_store.0.unit_race().unwrap_or(0);
-                let class = self_store.0.unit_class().unwrap_or(0);
-                info.tooltip_shows_for(race, class)
-                    .then(|| catalog.faction_name(faction_id).map(str::to_string))
-                    .flatten()
-            })();
-        }
+    }
+    // The faction-name line ("Stormwind", between level and PvP) — the unit builder's tail block,
+    // every gate transcribed: the record's HIDE_FACTION_TOOLTIP type flag (0x10), the template →
+    // Faction.dbc hop, the reputation-slot gate (rep_index ≥ 0), and the race/class slot walk with
+    // its hidden flag (0x4).
+    //
+    // **Its entry gate is NOT the record.** `0x612610` reads `[unit+0xb30]` and returns 1 when
+    // there is none — that is how a PLAYER passes a gate whose only field lives in CreatureInfo,
+    // and a creature whose query has not answered takes the identical leg. So the line resolves
+    // off the DESCRIPTOR's `UNIT_FIELD_FACTIONTEMPLATE`, which is already streamed, and shows
+    // under a pending name exactly as it does under a known one. It was gated on the record here
+    // on the premise that "before the query answers we have no name line either" — the premise
+    // decision 2002 corrected, and 2040 with it.
+    if rec.is_none_or(|r| r.type_flags & crate::names::type_flags::NO_FACTION_TOOLTIP == 0) {
+        state.faction_name = (|| {
+            let catalog = factions?.catalog();
+            let faction_id = catalog.template(store.0.unit_faction_template()?)?.faction;
+            let info = catalog.reputation_faction(faction_id)?;
+            let self_store = self_store?;
+            let race = self_store.0.unit_race().unwrap_or(0);
+            let class = self_store.0.unit_class().unwrap_or(0);
+            info.tooltip_shows_for(race, class)
+                .then(|| catalog.faction_name(faction_id).map(str::to_string))
+                .flatten()
+        })();
     }
 }
 
@@ -946,28 +1327,27 @@ const PLAYER_FLAGS_RESTING: u32 = 0x20;
 const PLAYER_FLAGS_PARTIAL_PLAY_TIME: u32 = 0x1000;
 const PLAYER_FLAGS_NO_PLAY_TIME: u32 = 0x2000;
 
-/// The PvP-preference announcement rule (decision 0652): `(toast, verbose)` on a real change of the
-/// bit, `None` otherwise.
+/// The PvP-preference announcement rule (decision 0652): the `(toast, verbose)` **GlobalStrings
+/// keys** on a real change of the bit, `None` otherwise.
 ///
 /// `was: None` is first sight and stays silent — the reference's handler is driven by a
 /// *changed-bits* mask (`new ^ old`), so the descriptor that first carries the flag at login says
-/// nothing. The two texts are verbatim 1.12 `GlobalStrings.lua`: the `ERR_PVP_TOGGLE_*` toast
-/// (l.1788-1789) and the `PVP_TOGGLE_*_VERBOSE` chat sentence (l.3221-3222). Both are
-/// argument-free, so there is no format step.
+/// nothing.
+///
+/// **Keys, not sentences** (decision 2045), and the pair rides two different routes because the
+/// reference gives them two different natures. `ERR_PVP_TOGGLE_ON`/`_OFF` are message-catalog rows
+/// (437/438, `kind 1` — the yellow `UI_INFO_MESSAGE`), so the catalog names their surface;
+/// `PVP_TOGGLE_ON_VERBOSE`/`_OFF_VERBOSE` are **not** catalog rows at all, so there is no record to
+/// read a kind or a sound off and the chat surface is the handler's own — the `/ginfo` shape
+/// (`ui_guild::feed::ginfo_lines`, decision 2054). Both are argument-free, so there is no fill step.
 fn pvp_announcement(was: Option<bool>, now: bool) -> Option<(&'static str, &'static str)> {
     if was? == now {
         return None;
     }
     Some(if now {
-        (
-            "PvP combat toggled on",
-            "You are now flagged for PvP combat and will remain so until toggled off.",
-        )
+        ("ERR_PVP_TOGGLE_ON", "PVP_TOGGLE_ON_VERBOSE")
     } else {
-        (
-            "PvP combat toggled off",
-            "You will be unflagged for PvP combat after five minutes of non-PvP action in friendly territory.",
-        )
+        ("ERR_PVP_TOGGLE_OFF", "PVP_TOGGLE_OFF_VERBOSE")
     })
 }
 
@@ -976,18 +1356,19 @@ fn pvp_announcement(was: Option<bool>, now: bool) -> Option<(&'static str, &'sta
 /// dispatcher's `rep cmpsb` mirror diff at `0x4655bb`), through the hard-coded 3×2 pair table
 /// `0x80af50` — state 1 → `ERR_EXHAUSTION_RESTED`, state 2 → `ERR_EXHAUSTION_NORMAL`, state 0 →
 /// the table's deliberate no-message sentinel (id 0x1d1), states ≥ 3 gated off before the table
-/// (`cmp esi,3; jae`), so the beta tiers never speak even though their strings ship. The line is
-/// a plain yellow SYSTEM chat message (`CHAT_MSG_SYSTEM`) — never UIErrorsFrame, no sound.
-/// enUS literals like every app-side chat line (`level_up_lines`' shape); the keys above are the
-/// GlobalStrings homes. Entering rested also arms a one-shot tutorial popup (id 0x19) — the
-/// tutorial system isn't built, a named cut.
+/// (`cmp esi,3; jae`), so the beta tiers never speak even though their strings ship.
+///
+/// The table holds **message ids**, so the answer here is the row's key and the catalog decides the
+/// rest (decision 2045): rows 346/347 are `kind 0` — a plain SYSTEM chat line, never UIErrorsFrame
+/// — with no cue and `type_tag 0x44`, so no voice either. Entering rested also arms a one-shot
+/// tutorial popup (id 0x19) — the tutorial system isn't built, a named cut.
 fn rest_state_message(prev: u8, new: u8) -> Option<&'static str> {
     if prev == new {
         return None;
     }
     match new {
-        1 => Some("You feel rested."),
-        2 => Some("You feel normal."),
+        1 => Some("ERR_EXHAUSTION_RESTED"),
+        2 => Some("ERR_EXHAUSTION_NORMAL"),
         _ => None,
     }
 }
@@ -1050,12 +1431,16 @@ fn creature_type_word(t: u32) -> Option<&'static str> {
 }
 
 /// Diff a token's fresh snapshot against the last one pushed and fire the per-field Era events.
-/// `prev = None` (the token just appeared) treats every present field as a transition.
+/// `prev = None` (the token just appeared) treats every present field as a transition — except
+/// the three arms that are the reference's per-field watch bridge, which fire off `edges`, the
+/// descriptor edges this run (decision 2297): those fire per token naming a unit whose dword
+/// moved, and a unit's create moves nothing.
 pub(crate) fn fire_transitions(
     script: &mut UiScript,
     token: &str,
     prev: Option<&UnitState>,
     cur: &UnitState,
+    edges: &FieldEdges,
 ) {
     let tok = || ScriptValue::Str(token.to_string());
     let changed = |f: fn(&UnitState) -> u64| prev.is_none_or(|p| f(p) != f(cur));
@@ -1071,6 +1456,84 @@ pub(crate) fn fire_transitions(
     }
     if changed(|u| u64::from(u.power_type)) {
         script.fire_event("UNIT_DISPLAYPOWER", vec![tok()]);
+    }
+    // `UNIT_FLAGS` (id 40) — the per-field watch bridge (wow-re `unit-field-event-bridge.md`,
+    // VERIFIED): `0x51bbb0` registers one watch per named unit field, the notifier `0x465570`
+    // fires `0x51bd50` → `0x515e50` on any change of the dword's bytes, once per token mapping to
+    // the unit, `arg1` the token. The create leg runs no notify pass, so a unit's FIRST snapshot
+    // is not a transition here — unlike the fields above, whose first-appearance fire is this
+    // feed's own posture (1953, corrected in 1957). Since 2297 that is literally the trigger:
+    // the field edge for this unit's dword, which a create never emits, and which a retarget
+    // onto a unit with different flags does not emit either (the old `prev.is_some()` snapshot
+    // diff fired on that). The stock pet bar filters it for `"pet"`.
+    if edges.moved(cur.guid, benilla_protocol::field::FIELD_UNIT_FLAGS) {
+        script.fire_event("UNIT_FLAGS", vec![tok()]);
+    }
+    // `PLAYER_FLAGS_CHANGED` (id 407) — the `UNIT_FLAGS` arm above, one descriptor field over, and
+    // until decision 2078 one of the events a migrated stock window registered and nothing here
+    // produced. Byte-read out of `WoW.exe` at `0x5eea27`-`0x5eea3d`:
+    //
+    // ```
+    // 5eea27  8b 56 08 8b 02 89 45 f0 8b 4a 04 89 4d f4   ; [ebp-0x10] = this player's own GUID
+    // 5eea35  ba 97 01 00 00                              ; edx = 0x197 = 407
+    // 5eea3a  8d 4d f0
+    // 5eea3d  e8 0e 74 f2 ff                              ; call 0x515e50 — the token fan-out
+    // ```
+    //
+    // Three properties, each load-bearing and each verified rather than assumed:
+    //
+    // 1. **Unguarded.** No bit test stands between the XOR-diff at `0x5ee9b8` and this fire, so
+    //    *any* `PLAYER_FLAGS` bit moving announces itself — not just the ones this struct decodes.
+    //    That is why the trigger is the raw dword (`UnitState::player_flags`) and not a bool.
+    // 2. **Above the local-GUID gate** at `0x5eea93` (the ghost/resting/PvP/play-time arms below it
+    //    are self-only; this one is not) — and the trampoline `0x5e2850` resolves the changed
+    //    object by GUID under TYPEMASK_PLAYER, "any player, not the local one" (wow-re
+    //    `object-layer/ledger.tsv`). So a *stranger's* flags fire it, which is the whole reason the
+    //    stock target frame can listen.
+    // 3. **Once per unit token naming that GUID, `arg1` = the token, no `arg2`** — `0x515e50` walks
+    //    `0x515c50`'s token array and calls `0x703f50(id, "%s", token)` per entry (wow-re
+    //    `ui/scratch/unit-field-event-bridge.md` §2.2). That is exactly this function's own shape,
+    //    which is why the arm belongs here and not beside the self-only feeds below.
+    //
+    // **"Fires for any player" is not "reaches Lua", and the difference is free here.**
+    // `0x515e63 test eax,eax / 0x515e6a jle 0x515e8a` skips the fan-out loop entirely on a zero
+    // token count, so a remote player who is nobody's target, mouseover, party or raid member
+    // announces **nothing** to the VM — the handler still runs, and its helm/cloak arms above the
+    // gate still repaint them, but no event is signalled. This feed gets that for nothing by
+    // construction: it is only ever called *per token*, so a tokenless player is never reached
+    // (wow-re `object-layer/scratch/player-flags-delta-arms.md`, the 2078 correction round).
+    //
+    // Off the field edge for the same reason `UNIT_FLAGS` is: this is a mirror-diff watcher,
+    // and a unit's first snapshot is its CREATE, which runs no notify pass (1098 §4).
+    //
+    // **The sole 1.12 consumer is the target frame's PARTY-LEADER icon, not an AFK/DND badge** —
+    // `TargetFrame.lua:88-95` re-runs the `UnitIsPartyLeader("target")` show/hide, and bit `0x1` is
+    // that predicate's descriptor leg. Nothing in 1.12 FrameXML draws an AFK or DND badge on a unit
+    // frame, and build 5875 has no `UnitIsAFK`/`UnitIsDND` binding at all (wow-re
+    // `ui/scratch/unit-predicate-return-shape.md` §5, a zero-hit whole-image byte census); the
+    // `<AFK>`/`<DND>` the era shows are the chat line's `arg6` flag. This comment is here because
+    // the gap list said "the AFK/DND badge" for months and sent the first look at the wrong window.
+    if edges.moved(cur.guid, benilla_protocol::field::FIELD_PLAYER_FLAGS) {
+        script.fire_event("PLAYER_FLAGS_CHANGED", vec![tok()]);
+    }
+    // `UNIT_DYNAMIC_FLAGS` (id 137) — the third arm of the same bridge, and one benilla had
+    // **never fired at all**, which is a different failure from firing it wrong: an addon that
+    // registers it hears nothing, forever, and there is no error anywhere to say so.
+    //
+    // Nothing in 1.12 FrameXML registers it, which is exactly why no gate saw the hole — the
+    // producer gate's oracle is what a stock chain file listens for (`reference_ui::
+    // every_event_a_chain_file_registers_has_a_producer`), and no stock file listens for this one.
+    // The corpus does: `CT_UnitFrames/CT_TargetFrame.xml:200` and `TipBuddy/TipBuddy.lua:17`
+    // register it, and both are repaint wires for the tapped/grey-bar state — the same state
+    // `UnitIsTapped` publishes and that the `UNIT_FACTION` arm below repaints the stock frames on.
+    //
+    // Byte-verified, not inherited (see [`UnitState::dynamic_flags`]): the name-table slot for
+    // 137 resolves to `"UNIT_DYNAMIC_FLAGS"`, and the watch length is one dword, so the trigger
+    // is the RAW word and not the four bits this struct decodes. Off the field edge for the same
+    // reason the two arms above are — a unit's first snapshot is its CREATE, and the create
+    // block runs no notify pass.
+    if edges.moved(cur.guid, benilla_protocol::field::FIELD_UNIT_DYNAMIC_FLAGS) {
+        script.fire_event("UNIT_DYNAMIC_FLAGS", vec![tok()]);
     }
     // The POWER pair is named per resource in 1.12, not once with the token as arg2: the reference's
     // `UnitFrameManaBar_Initialize` registers `UNIT_MANA`/`UNIT_RAGE`/`UNIT_FOCUS`/`UNIT_ENERGY`/
@@ -1135,7 +1598,6 @@ pub(crate) fn fire_transitions(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn feed_units(
     script: Option<NonSendMut<UiScript>>,
     // `ChrClasses.dbc` field 16, the only thing `UnitHasRelicSlot` reads. Absent when the client
@@ -1153,12 +1615,14 @@ fn feed_units(
     index: Option<Res<crate::net::GuidIndex>>,
     mut stores: UnitStores,
     mut feed: ResMut<UnitFeedState>,
-    mut names: ResMut<NameCache>,
+    names: Res<NameCache>,
     commands: Res<NetCommands>,
     factions: Option<Res<Factions>>,
     reputations: Res<Reputations>,
     group: Res<crate::ui_party::GroupState>,
-    mut chat: ResMut<ChatLog>,
+    // The chat window AND the message-sound queue, because this feed shows catalog messages (the
+    // rest-state pair, the PvP toggle) and `show_messages` writes both on every line.
+    mut sink: crate::ui_action::MessageSink,
     // The guild-identity cache `GetGuildInfo(unit)` reads — `ResMut` because it is a LAZY cache
     // (decision 1257): a lookup that misses is what sends the `CMSG_GUILD_QUERY`, exactly as a
     // `NameCache::resolve` miss sends the name query above.
@@ -1191,6 +1655,7 @@ fn feed_units(
     // disjoint fields they are — through the `ResMut` deref they would alias.
     let feed = &mut *feed;
     let (memo, vm_reset) = feed.vm.get_reset(&script);
+    let edges = FieldEdges::collect(&mut stores.edges);
 
     // The gate (1439): every input the two snapshots and the edge diffs below read — any
     // descriptor change or DESPAWN (a removed store is invisible to `Changed`), the selection,
@@ -1203,6 +1668,11 @@ fn feed_units(
     let group_changed = group.is_changed();
     let reps_changed = reputations.is_changed();
     let factions_changed = factions.as_ref().is_some_and(|r| r.is_changed());
+    // The interaction NPC is an input of the `"npc"` snapshot below, and it moves on frames
+    // nothing else does: a vendor window opening or swapping to a second vendor changes no
+    // descriptor, no selection, no group. Without this term such a frame skipped the whole
+    // feed and the window's own `MERCHANT_SHOW` handler read the previous NPC (decision 2022).
+    let interact_changed = interact.as_ref().is_some_and(|r| r.is_changed());
     gate::trace(
         "feed_units",
         &[
@@ -1215,6 +1685,7 @@ fn feed_units(
             ("group", group_changed),
             ("reputations", reps_changed),
             ("factions", factions_changed),
+            ("interact", interact_changed),
         ],
     );
     let gate = gate::Gate::new(
@@ -1226,7 +1697,8 @@ fn feed_units(
             || stores_removed
             || group_changed
             || reps_changed
-            || factions_changed,
+            || factions_changed
+            || interact_changed,
     );
     stores.removed.clear();
     if gate.skip() {
@@ -1270,20 +1742,22 @@ fn feed_units(
     // being broken, which has now cost two separate sessions an investigation. So it is a BENCH
     // diagnostic, not UI: nothing appears on screen, exactly as in the reference.
     //
-    // The honor arc (1512) put a SECOND surface behind this same side: a rank's title is the
-    // GlobalString `PVP_RANK_<rank>_<team>`, and with no side there is no team digit, so
-    // `GetPVPRankInfo` answers nil and the Honor tab renders `NONE` at every rank — for a Grand
-    // Marshal. That reads exactly like an unbuilt pane, which is why it is named in the warning
-    // rather than left for the next investigation to rediscover.
+    // The honor arc (1512) was once listed here as a SECOND surface behind this same side, and
+    // it is not one: the rank title's team digit is `0x5efe00`, which reads the RACE through
+    // `ChrRaces`/`FactionTemplate` and never the live template, so a GM's Honor tab names his
+    // rank exactly as it always did (`race_pvp_team`, decision 2227 — the cause of report B378
+    // was that we had wired the two together, not the GM mode itself). What this warning still
+    // covers is every genuinely template-derived surface: `UnitFactionGroup` and the icons and
+    // comparisons built on it.
     if let Some(p) = &player {
         let sideless = p.faction_group.is_none();
         if sideless && !feed.warned_sideless {
             warn!(
                 "faction: our own template names no side (usually GM mode — vmangos forces \
-                 template 35, group mask 0). Faction-derived UI cannot resolve a side while this \
-                 holds: the PvP flag icon stays hidden however flagged you are, and the Honor tab's rank \
-                 title reads NONE at every rank (PVP_RANK_<rank>_<team> has no team digit). \
-                 `.gm off` restores both."
+                 template 35, group mask 0). Every UnitFactionGroup-derived surface loses its \
+                 side while this holds — the PvP flag icon stays hidden however flagged you are. \
+                 `.gm off` restores it. (The Honor tab's rank title is NOT one of these: its team \
+                 digit comes from your race, not your template.)"
             );
         }
         feed.warned_sideless = sideless;
@@ -1468,7 +1942,12 @@ fn feed_units(
             Some(s)
         });
     // "Absence IS data" again: closing an NPC window must clear the token, or the next window's
-    // first frame paints the last NPC's name.
+    // first frame paints the last NPC's name. **The memo is written here, not only read**: for
+    // its first eight days this diff compared against a row nothing ever inserted, so a `Some`
+    // re-pushed every frame and a `None` never cleared — `UnitExists("npc")` stayed true after
+    // the window closed, and the stale name was what the next window's first frame painted
+    // (decision 2022). No `fire_transitions` leg: the reference's watch bridge fires `UNIT_*`
+    // for the frames that draw a unit, and nothing draws `"npc"` as a unit frame.
     let npc_dirty = match (&npc, memo.last.get("npc")) {
         (Some(cur), Some(prev)) => cur != prev,
         (None, None) => false,
@@ -1477,6 +1956,14 @@ fn feed_units(
     if npc_dirty {
         gate.audit("feed_units", "the interaction-NPC snapshot");
         script.set_unit("npc", npc.clone());
+        match &npc {
+            Some(cur) => {
+                memo.last.insert("npc".to_string(), cur.clone());
+            }
+            None => {
+                memo.last.remove("npc");
+            }
+        }
     }
 
     // The XP bar's feed: push our own avatar's PLAYER_XP / PLAYER_NEXT_LEVEL_XP (both PRIVATE, only
@@ -1495,16 +1982,40 @@ fn feed_units(
         }
     }
 
-    // The rest feed (decisions 1082/1087): the `PLAYER_BYTES_2` rest-state byte, the
-    // `PLAYER_REST_STATE_EXPERIENCE` pool and PLAYER_FLAGS, pushed as one snapshot. Two watches,
-    // the byte-verified grain (wow-re rested-xp-bindings.md §5): `UPDATE_EXHAUSTION` on a
-    // state-or-pool change (the client installs a watcher on each — `0x5de4e0` on the byte,
-    // `0x5de4b0` on the pool field), `PLAYER_UPDATE_RESTING` on **any PLAYER_FLAGS delta**
-    // (`0x5ee990` fires it beside PLAYER_FLAGS_CHANGED without testing which bit moved — the
-    // resting bit is just its loudest consumer). Runs before the PLAYER_ENTERING_WORLD fire
-    // below, like the XP push: in the real client the descriptor always lands before that
-    // event, so the first paint reads real state — the model's byte-2 default (its doc) is the
-    // backstop, this ordering is the guarantee itself.
+    // The rest feed (decisions 1082/1087/2078): the `PLAYER_BYTES_2` rest-state byte, the
+    // `PLAYER_REST_STATE_EXPERIENCE` pool and PLAYER_FLAGS, pushed as one snapshot. Runs before
+    // the PLAYER_ENTERING_WORLD fire below, like the XP push: in the real client the descriptor
+    // always lands before that event, so the first paint reads real state — the model's byte-2
+    // default (its doc) is the backstop, this ordering is the guarantee itself.
+    //
+    // **The self-only arms below are each gated on their OWN bits**, which is `0x5ee990`'s actual
+    // shape and not what this comment said until 2078. Everything from `0x5eea93` down — where the
+    // handler compares the changed player's GUID against the local one — is self-only, and inside
+    // that region each arm carries its own `test`:
+    //
+    // ```
+    // 5eead0  f6 45 fc 20   test byte [ebp-4],0x20   ; the RESTING bit CHANGED?
+    // 5eead4  74 26         je   0x5eeafc            ;   no -> skip the whole arm
+    // 5eead6..5eeaed              tutorial popup 0x4b5390(0x1d), only if the bit is now SET
+    // 5eeaf2  b9 95 01 00 00 / e8 …  mov ecx,0x195 ; call 0x703e50   <- PLAYER_UPDATE_RESTING
+    // 5eeafc  ...
+    // 5eeaff  f6 c4 02      test ah,0x2              ; bit 0x200, the PvP-desired arm (0652)
+    // 5eeb65  f6 c4 30      test ah,0x30             ; bits 0x1000|0x2000, the play-time regimes
+    // 5eeb6f  e8 …          call 0x703e50 (ecx=0x212) <- PLAYTIME_CHANGED
+    // ```
+    //
+    // `0x5eeaf2` sits INSIDE the `0x20` arm (`0x5eeaf2 < 0x5eeafc`, the `je`'s target), so
+    // **PLAYER_UPDATE_RESTING fires only on the resting bit's own edge** — not, as wow-re's
+    // `rested-xp-bindings.md` §5 and its `0x5ee990` ledger row both say, "on every flags change,
+    // not only the resting bit". That claim is what this feed was built against, and it made every
+    // helm toggle, every leadership pass and every AFK flip announce a resting change to the UI.
+    // The note's "argless unconditionally" is true only of the *direction*: the inner
+    // `0x5eeae4 je` skips the tutorial popup, never the fire, so both edges of the bit fire it.
+    // A correction round is dispatched into wow-re; the bytes above are read straight out of
+    // `WoW.exe` (file offset 0x1eead0, PE imagebase 0x400000, .text RVA 0x1000 → raw 0x1000).
+    //
+    // `UPDATE_EXHAUSTION` is unchanged and was already right: two separate watchers, `0x5de4e0` on
+    // the rest-state byte and `0x5de4b0` on the pool field, neither of them this handler.
     if let Some((store, _)) = self_q.iter().next() {
         let rest = (
             store.0.player_rest_state().unwrap_or(0),
@@ -1517,8 +2028,8 @@ fn feed_units(
             memo.last_rest = Some(rest);
             script.set_rest_state(rest.0, rest.1, rest.2 & PLAYER_FLAGS_RESTING != 0);
             // The same descriptor word carries the two play-time bits, and they ride the same
-            // memo: `0x5ee990` fires PLAYER_FLAGS_CHANGED on ANY PLAYER_FLAGS delta without
-            // testing which bit moved, so one snapshot is the faithful granularity for all three.
+            // memo — the PUSH is one snapshot because the wire delivers one dword; only the
+            // EVENTS below split by bit.
             script.set_play_time(
                 rest.2 & PLAYER_FLAGS_PARTIAL_PLAY_TIME != 0,
                 rest.2 & PLAYER_FLAGS_NO_PLAY_TIME != 0,
@@ -1531,15 +2042,26 @@ fn feed_units(
             // which the real client's fresh-CREATE path never runs through the notify pass
             // (byte-verified: login is structurally silent). The pool watcher never messages.
             if let Some(p) = prev {
-                if let Some(text) = rest_state_message(p.0, rest.0) {
-                    chat.push_event(ChatEvent::text_only(
-                        ChatEventKind::System,
-                        text.to_string(),
-                    ));
-                }
+                let line = rest_state_message(p.0, rest.0)
+                    .and_then(|key| crate::ui_action::keyed_line(&script, key));
+                crate::ui_action::show_messages(&mut script, &mut sink, "ui_unit", line);
             }
-            if prev.map(|p| p.2) != Some(rest.2) {
-                script.fire_event("PLAYER_UPDATE_RESTING", vec![]);
+            // The two self-only flag events, each on its own bits' edge (`0x5eead0` and
+            // `0x5eeb65` above). `prev` None is the login descriptor and stays silent for both,
+            // the same fresh-CREATE reasoning the rest message carries — a mirror-diff watcher
+            // has nothing to diff against on a create.
+            if let Some(p) = prev {
+                let moved = p.2 ^ rest.2;
+                if moved & PLAYER_FLAGS_RESTING != 0 {
+                    script.fire_event("PLAYER_UPDATE_RESTING", vec![]);
+                }
+                // PLAYTIME_CHANGED (id 530) — `0x5eeb65 test ah,0x30`, argless, self-only. Stock
+                // `PlayerFrame.lua:23` registers it and `PlayerFrame_UpdatePlaytime` reads
+                // `PartialPlayTime()`/`NoPlayTime()`, both of which we already feed off this very
+                // snapshot; the event was the one missing half. Decision 2078.
+                if moved & (PLAYER_FLAGS_PARTIAL_PLAY_TIME | PLAYER_FLAGS_NO_PLAY_TIME) != 0 {
+                    script.fire_event("PLAYTIME_CHANGED", vec![]);
+                }
             }
         }
     }
@@ -1553,15 +2075,50 @@ fn feed_units(
     // Trigger PROVISIONAL (0578's pattern): fired off the descriptor diff, which lands in the
     // same update batch as the ding's XP fields, so consumers read a coherent picture. The
     // real client plausibly fires it from its `SMSG_LEVELUP_INFO` handler instead, with the
-    // packet's gain tuple as arg2+ — unpinned, and no 1.12 FrameXML consumer reads past arg1
-    // (`ReputationWatchBar_Update` takes arg1; the tick's handler takes none), so the extra
-    // args wait for a consumer.
+    // packet's gain tuple as arg2+.
+    //
+    // **THE ARGS ARE NOT OPTIONAL, AND THE CLAIM THAT USED TO STAND HERE WAS WRONG.** It said no
+    // 1.12 FrameXML consumer reads past arg1, citing `ReputationWatchBar_Update` (arg1) and the
+    // tick's handler (none). It missed the main one: `ChatFrame.lua:1283-1320` reads **arg1
+    // through arg9** — the level, the health and mana gains, the talent points, and the five stat
+    // gains, each printed as its own system line. The reference's own fire site says the same,
+    // `%d%d%d%d%d%d%d%d%d` (SignalEvent2). Two consumers were surveyed, the conclusion was drawn
+    // from two, and the third is the one that matters.
+    //
+    // We fire arg1 alone, so the stock ChatFrame's `if ( arg3 > 0 )` would compare nil with a
+    // number and raise — this blocks the ChatFrame window. The gains are on a packet we already
+    // parse (`SMSG_LEVELUP_INFO`, twelve u32) and already spend: `ui_chat/feed.rs` composes those
+    // very lines in Rust because the event could not carry them. Decision 1884 scopes plumbing
+    // the tuple here and retiring the Rust duplicate; this trigger is a descriptor diff and the
+    // gains arrive on the packet, so it is a join, not a one-liner.
     if let Some((store, _)) = self_q.iter().next() {
         if let Some(level) = store.0.unit_level() {
             let prev = memo.last_level.replace(level);
             if prev.is_some_and(|p| level != p) {
                 gate.audit("feed_units", "the level edge");
-                script.fire_event("PLAYER_LEVEL_UP", vec![ScriptValue::Int(i64::from(level))]);
+                // All nine, per the reference's own fire site (`%d%d%d%d%d%d%d%d%d`): level,
+                // health gain, mana gain, talent points, then the five stat gains in
+                // `SPELL_STAT0..4` order. Absent gains are ZEROS, not a shorter payload — a
+                // demotion really did gain nothing, and every consumer guards with `if ( argN > 0 )`
+                // so zero reads as "no line" while nil raises.
+                let (info, talent_points) = sink.chat.take_level_up_gains(level).unzip();
+                let gain = |f: fn(&benilla_protocol::messages::LevelUpInfo) -> u32| {
+                    ScriptValue::Int(i64::from(info.as_ref().map_or(0, f)))
+                };
+                script.fire_event(
+                    "PLAYER_LEVEL_UP",
+                    vec![
+                        ScriptValue::Int(i64::from(level)),
+                        gain(|l| l.health),
+                        gain(|l| l.powers[0]),
+                        ScriptValue::Int(i64::from(talent_points.unwrap_or(0))),
+                        gain(|l| l.stats[0]),
+                        gain(|l| l.stats[1]),
+                        gain(|l| l.stats[2]),
+                        gain(|l| l.stats[3]),
+                        gain(|l| l.stats[4]),
+                    ],
+                );
             }
         }
     }
@@ -1648,7 +2205,7 @@ fn feed_units(
                 let prev = memo.last.get(token);
                 if prev != Some(cur) {
                     gate.audit("feed_units", "a unit-token transition");
-                    fire_transitions(&mut script, token, prev, cur);
+                    fire_transitions(&mut script, token, prev, cur, &edges);
                     memo.last.insert(token.to_string(), cur.clone());
                 }
             }
@@ -1703,11 +2260,27 @@ fn feed_units(
         let desired = store.0.player_flags() & PLAYER_FLAGS_PVP_DESIRED != 0;
         if let Some((toast, verbose)) = pvp_announcement(memo.pvp_desired, desired) {
             gate.audit("feed_units", "the PvP-desired edge");
-            script.fire_event("UI_INFO_MESSAGE", vec![ScriptValue::Str(toast.to_string())]);
-            chat.push_event(ChatEvent::text_only(
-                ChatEventKind::System,
-                verbose.to_string(),
-            ));
+            // The toast is a catalog row, so its surface is read there; the verbose sentence is
+            // not one, so it is emitted `unkeyed` on the handler's own chat surface rather than
+            // pushed through `Shown::keyed`, whose unknown-key fallback would turn it RED (2054).
+            let lines = [
+                crate::ui_action::keyed_line(&script, toast),
+                script
+                    .lua()
+                    .globals()
+                    .get::<String>(verbose)
+                    .ok()
+                    .filter(|t| !t.is_empty())
+                    .map(|t| {
+                        crate::ui_action::Shown::unkeyed(benilla_ui::messages::MsgKind::Chat, t)
+                    }),
+            ];
+            crate::ui_action::show_messages(
+                &mut script,
+                &mut sink,
+                "ui_unit",
+                lines.into_iter().flatten(),
+            );
         }
         memo.pvp_desired = Some(desired);
     }
@@ -1773,6 +2346,89 @@ fn combo_edge(last: Option<(u8, u64)>, now: (u8, u64)) -> Option<bool> {
 mod tests {
     use super::*;
 
+    /// The DESCRIPTOR leg of the same answer: `snapshot` takes the team digit off
+    /// `UNIT_FIELD_BYTES_0` byte 0 and **never** off `UNIT_FIELD_FACTIONTEMPLATE`.
+    ///
+    /// The pane-level regression (`ui_script::honor_frame_tests::a_gm_flagged_player_…`) seats
+    /// `pvp_team` by hand, so it proves the key is built from the right field and not that the
+    /// right field is read. This is that half: a template-35 GM — the exact descriptor vmangos
+    /// gives one — still answers his race's side.
+    #[test]
+    fn the_team_digit_comes_off_the_race_byte_not_the_faction_template() {
+        use benilla_protocol::ObjectFields;
+        /// `UNIT_FIELD_FACTIONTEMPLATE` / `UNIT_FIELD_BYTES_0`, one dword apart — the reference's
+        /// own `[obj+0x110]+0x74` and `+0x78`.
+        const FACTIONTEMPLATE: u16 = 35;
+        const BYTES_0: u16 = 36;
+        /// vmangos's GM template: `FactionTemplate.dbc` group mask 0, friendly to everyone.
+        const GM_TEMPLATE: u32 = 35;
+
+        let team = |fields: &[(u16, u32)]| {
+            snapshot(
+                &ObjectStore(ObjectFields::from_pairs(fields)),
+                None,
+                0,
+                None,
+            )
+            .pvp_team
+        };
+        // Byte 0 of BYTES_0 is the race; the class in byte 1 must not disturb it.
+        let human_warrior = 1 | (1 << 8);
+        let scourge_mage = 5 | (8 << 8);
+        assert_eq!(team(&[(BYTES_0, human_warrior)]), 1, "Human → Alliance");
+        assert_eq!(team(&[(BYTES_0, scourge_mage)]), 0, "Scourge → Horde");
+        // **The report.** The sideless GM template sits right beside the race byte and is not
+        // consulted: the answer is the race's, unchanged.
+        assert_eq!(
+            team(&[(BYTES_0, human_warrior), (FACTIONTEMPLATE, GM_TEMPLATE)]),
+            1,
+            "a GM keeps his race's side (report B378)"
+        );
+        assert_eq!(
+            team(&[(BYTES_0, scourge_mage), (FACTIONTEMPLATE, GM_TEMPLATE)]),
+            0,
+            "…on both sides"
+        );
+        // A unit whose race byte has not streamed is the engine's bounds-failure −1, and a
+        // faction template alone cannot stand in for it.
+        assert_eq!(team(&[]), -1, "no race byte, no team digit");
+        assert_eq!(
+            team(&[(FACTIONTEMPLATE, 1)]),
+            -1,
+            "and a template is not one"
+        );
+    }
+
+    /// [`race_pvp_team`]'s frozen table against the **shipped tables it is a copy of** — the walk
+    /// the engine runs at `0x5efe00`, on the real `ChrRaces.dbc` and `FactionTemplate.dbc`.
+    ///
+    /// The table is hardcoded because it is nine constant rows of a 2006 file and threading a DBC
+    /// resource through every unit snapshot to read them would be pure ceremony. This is what
+    /// makes that safe: the file decides, and a row that ever disagrees — or a race the file has
+    /// and the table does not (race 9, Goblin, which shares Human's template and is **not** a
+    /// `None`) — fails here. Skips without client data.
+    #[test]
+    fn race_pvp_team_matches_the_shipped_tables() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        let want = benilla_formats::load_race_pvp_teams(&mut chain).expect("ChrRaces walk");
+        // The misparse guard: 5875 ships nine rows, not eight. An empty or truncated map would
+        // otherwise let this test pass by asserting nothing.
+        assert_eq!(want.len(), 9, "ChrRaces.dbc row count");
+        for (&race, &team) in &want {
+            assert_eq!(race_pvp_team(race), team, "race {race}");
+        }
+        // Both sides are actually represented — a walk that answered one digit for everything
+        // would satisfy the loop above and name every rank off one list.
+        assert!(want.values().any(|&t| t == 0), "some race is Horde");
+        assert!(want.values().any(|&t| t == 1), "some race is Alliance");
+        // Off the end of the file is the engine's bounds-failure tail, not a guess.
+        for race in [0u8, 10, 255] {
+            assert!(!want.contains_key(&race));
+            assert_eq!(race_pvp_team(race), -1, "race {race} has no ChrRaces row");
+        }
+    }
+
     /// **The tapped bit fires `UNIT_FACTION`, and without this the verbs are decorative.**
     ///
     /// `UnitIsTapped` answering correctly is only half of it. pfUI's grey-bar branch lives inside
@@ -1790,6 +2446,149 @@ mod tests {
     /// Bit `0x8` has **no** arm, in the reference or here — proven there by enumerating all 122
     /// instructions and 12 branches of the watcher. The negative half is asserted too, because
     /// "fire on both, it's cheaper" is the obvious wrong simplification.
+    /// `UNIT_FLAGS` rides the raw field: any change of `UNIT_FIELD_FLAGS` fires it with the
+    /// token, an unchanged field does not, and a unit's first snapshot is NOT a transition — the
+    /// reference's watch bridge has no watch to fire on the create leg (1953, corrected 1957).
+    #[test]
+    fn a_flags_change_fires_unit_flags_with_the_token() {
+        let fired = |prev: Option<UnitState>, cur: UnitState, edges: &FieldEdges| -> Vec<String> {
+            let mut s = UiScript::new().unwrap();
+            s.run(
+                r#"
+                SEEN = {}
+                local f = CreateFrame("Frame")
+                f:RegisterEvent("UNIT_FLAGS")
+                f:SetScript("OnEvent", function() table.insert(SEEN, event .. ":" .. arg1) end)
+            "#,
+            )
+            .unwrap();
+            fire_transitions(&mut s, "pet", prev.as_ref(), &cur, edges);
+            s.eval::<Vec<String>>("return SEEN").unwrap()
+        };
+        const PET: u64 = 0xF140_0000_0000_0001;
+        let base = UnitState {
+            exists: true,
+            has_object: true,
+            guid: PET,
+            flags: 0x8,
+            ..Default::default()
+        };
+        let moved = FieldEdges::of(&[(PET, benilla_protocol::field::FIELD_UNIT_FLAGS)]);
+        assert_eq!(
+            fired(
+                Some(base.clone()),
+                UnitState {
+                    flags: 0x8 | 0x0400_0000,
+                    ..base.clone()
+                },
+                &moved,
+            ),
+            vec!["UNIT_FLAGS:pet".to_string()]
+        );
+        assert_eq!(
+            fired(Some(base.clone()), base.clone(), &FieldEdges::default()),
+            Vec::<String>::new()
+        );
+        // The create block runs no notify pass: no edge, no event — whatever the snapshot says.
+        assert_eq!(
+            fired(None, base.clone(), &FieldEdges::default()),
+            Vec::<String>::new()
+        );
+        // …and the trigger is the UNIT'S edge, not the token's history: a token acquired on the
+        // very frame the field moved hears it (the reference fans out to whoever names the unit
+        // at notify time), and another unit's edge is not this one's.
+        assert_eq!(
+            fired(None, base.clone(), &moved),
+            vec!["UNIT_FLAGS:pet".to_string()]
+        );
+        assert_eq!(
+            fired(
+                Some(base.clone()),
+                base.clone(),
+                &FieldEdges::of(&[(PET + 1, benilla_protocol::field::FIELD_UNIT_FLAGS)]),
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The two edges on the player's own state (1953): the control flag's, which fires LOST on
+    /// the way down and GAINED on the way up and nothing while it holds (the boot value is "in
+    /// control"), and the far-sight field's, which fires on every change including the clear.
+    #[test]
+    fn the_control_and_far_sight_edges_fire_once_each_way() {
+        use bevy::prelude::*;
+        const FIELD_PLAYER_FARSIGHT: u16 = 712;
+        let mut app = App::new();
+        app.init_resource::<crate::player::Player>()
+            .add_systems(Update, (feed_player_control, feed_farsight_focus));
+        let script = UiScript::new().unwrap();
+        script
+            .run(
+                r#"
+                SEEN = {}
+                local f = CreateFrame("Frame")
+                f:RegisterEvent("PLAYER_CONTROL_LOST")
+                f:RegisterEvent("PLAYER_CONTROL_GAINED")
+                f:RegisterEvent("PLAYER_FARSIGHT_FOCUS_CHANGED")
+                f:SetScript("OnEvent", function() table.insert(SEEN, event) end)
+            "#,
+            )
+            .unwrap();
+        app.insert_non_send_resource(script);
+        let me = app
+            .world_mut()
+            .spawn((
+                SelfPlayer,
+                Guid(0x77),
+                ObjectStore(benilla_protocol::ObjectFields::default()),
+            ))
+            .id();
+        let seen = |app: &mut App| -> Vec<String> {
+            app.update();
+            let mut s = app.world_mut().non_send_resource_mut::<UiScript>();
+            s.resolve();
+            let out = s.eval::<Vec<String>>("return SEEN").unwrap();
+            s.run("SEEN = {}").unwrap();
+            out
+        };
+        assert_eq!(
+            seen(&mut app),
+            Vec::<String>::new(),
+            "in control, no far sight: quiet"
+        );
+        app.world_mut()
+            .resource_mut::<crate::player::Player>()
+            .control_lost = true;
+        assert_eq!(seen(&mut app), vec!["PLAYER_CONTROL_LOST".to_string()]);
+        assert_eq!(seen(&mut app), Vec::<String>::new(), "held, not repeated");
+        app.world_mut()
+            .resource_mut::<crate::player::Player>()
+            .control_lost = false;
+        assert_eq!(seen(&mut app), vec!["PLAYER_CONTROL_GAINED".to_string()]);
+
+        let set_farsight = |app: &mut App, guid: u64| {
+            app.world_mut().entity_mut(me).insert(ObjectStore(
+                benilla_protocol::ObjectFields::from_pairs(&[
+                    (FIELD_PLAYER_FARSIGHT, guid as u32),
+                    (FIELD_PLAYER_FARSIGHT + 1, (guid >> 32) as u32),
+                ]),
+            ));
+        };
+        set_farsight(&mut app, 0xf130_0000_0000_0042);
+        assert_eq!(
+            seen(&mut app),
+            vec!["PLAYER_FARSIGHT_FOCUS_CHANGED".to_string()],
+            "set — whether or not the guid resolves"
+        );
+        assert_eq!(seen(&mut app), Vec::<String>::new());
+        set_farsight(&mut app, 0);
+        assert_eq!(
+            seen(&mut app),
+            vec!["PLAYER_FARSIGHT_FOCUS_CHANGED".to_string()],
+            "cleared — the other leg"
+        );
+    }
+
     #[test]
     fn the_tapped_bit_fires_unit_faction_and_the_by_player_bit_fires_nothing() {
         let fired = |prev: UnitState, cur: UnitState| -> Vec<String> {
@@ -1803,7 +2602,7 @@ mod tests {
             "#,
             )
             .unwrap();
-            fire_transitions(&mut s, "target", Some(&prev), &cur);
+            fire_transitions(&mut s, "target", Some(&prev), &cur, &FieldEdges::default());
             s.eval::<Vec<String>>("return SEEN").unwrap()
         };
         let base = UnitState {
@@ -1853,6 +2652,264 @@ mod tests {
         );
         // Nothing moved: nothing fires. The control that stops this passing by firing always.
         assert!(fired(base.clone(), base.clone()).is_empty());
+    }
+
+    /// **`PLAYER_FLAGS_CHANGED` — the event a migrated stock window listened for and nothing
+    /// fired** (decision 2078), pinned on the three properties that make it what it is.
+    ///
+    /// The gap was invisible from both ends, which is 1819's shape exactly: `TargetFrame.lua`
+    /// registered the name and this feed never spoke it, so the target frame's party-leader icon
+    /// only ever refreshed on a re-target. The census that caught it
+    /// (`reference_ui::every_event_a_chain_file_registers_has_a_producer`) described it as "the
+    /// AFK/DND badge"; the handler at `TargetFrame.lua:88-95` is the LEADER icon, and 1.12 has no
+    /// AFK/DND badge on any unit frame — so the control below is a bit no `UnitState` field
+    /// decodes, proving the trigger is the raw dword and not the two bools next to it.
+    #[test]
+    fn player_flags_changed_fires_per_token_on_any_bit_and_never_on_first_sight() {
+        let fired = |prev: Option<UnitState>, cur: UnitState, edges: &FieldEdges| -> Vec<String> {
+            let mut s = UiScript::new().unwrap();
+            s.run(
+                r#"
+                SEEN = {}
+                local f = CreateFrame("Frame")
+                f:RegisterEvent("PLAYER_FLAGS_CHANGED")
+                f:SetScript("OnEvent", function() table.insert(SEEN, event .. ":" .. arg1) end)
+            "#,
+            )
+            .unwrap();
+            fire_transitions(&mut s, "target", prev.as_ref(), &cur, edges);
+            s.eval::<Vec<String>>("return SEEN").unwrap()
+        };
+        const THEM: u64 = 0x2a;
+        let base = UnitState {
+            exists: true,
+            has_object: true,
+            guid: THEM,
+            ..Default::default()
+        };
+        let with = |flags: u32| UnitState {
+            player_flags: flags,
+            group_leader: flags & 0x1 != 0,
+            ghost: flags & 0x10 != 0,
+            ..base.clone()
+        };
+        let moved = FieldEdges::of(&[(THEM, benilla_protocol::field::FIELD_PLAYER_FLAGS)]);
+        let still = FieldEdges::default();
+
+        // The 1.12 consumer's own bit: `PLAYER_FLAGS_GROUP_LEADER 0x1`, `UnitIsPartyLeader`'s
+        // descriptor leg — leadership passing to the player you are targeting.
+        assert_eq!(
+            fired(Some(with(0)), with(0x1), &moved),
+            vec!["PLAYER_FLAGS_CHANGED:target".to_string()],
+            "arg1 is the unit token, and there is no arg2 (0x515e50 -> 0x703f50(id, \"%s\", token))"
+        );
+        // …and back down. The reference tests the XOR-diff, not the new value.
+        assert_eq!(
+            fired(Some(with(0x1)), with(0), &moved),
+            vec!["PLAYER_FLAGS_CHANGED:target".to_string()]
+        );
+
+        // **The control that proves the trigger is the RAW DWORD.** `PLAYER_FLAGS_HIDE_HELM 0x400`
+        // is a bit no `UnitState` field decodes — the fire at `0x5eea35` carries no bit test, so
+        // it announces this exactly as loudly as the leader bit: the edge is the dword's, and the
+        // snapshot's decoded bools are never consulted.
+        assert_eq!(
+            fired(Some(with(0)), with(0x400), &moved),
+            vec!["PLAYER_FLAGS_CHANGED:target".to_string()],
+            "an undecoded bit still fires it — the handler tests no bit at all"
+        );
+
+        // First sight is the CREATE, and a CREATE runs no notify pass (1098 §4) — the same
+        // posture `UNIT_FLAGS` holds one field over: no edge, no event.
+        assert!(
+            fired(None, with(0x1), &still).is_empty(),
+            "a unit's first snapshot is its create, not a transition"
+        );
+        // The control that stops all of the above passing by firing always.
+        assert!(fired(Some(with(0x1)), with(0x1), &still).is_empty());
+    }
+
+    /// **`UNIT_DYNAMIC_FLAGS` — an event benilla had never fired at all** (decision 2140).
+    ///
+    /// Same bridge, same shape, the third of the three raw-dword arms: id 137 is the unit-window
+    /// index of descriptor field 143, the name-table slot for 137 has exactly one writer in the
+    /// image and it points at the string `"UNIT_DYNAMIC_FLAGS"`, and the watch length is 4 — one
+    /// dword — so the gate is a `repe cmpsb` over the whole word and **any** bit fires it.
+    ///
+    /// The control below is bit `0x2` (`UNIT_DYNFLAG_TRACK_UNIT`, Hunter's Mark), which no
+    /// `UnitState` field decodes: an arm driven off `tapped`/`tapped_by_player` passes every other
+    /// assertion here and fails that one.
+    #[test]
+    fn unit_dynamic_flags_fires_per_token_on_any_bit_and_never_on_first_sight() {
+        let fired = |prev: Option<UnitState>, cur: UnitState, edges: &FieldEdges| -> Vec<String> {
+            let mut s = UiScript::new().unwrap();
+            s.run(
+                r#"
+                SEEN = {}
+                local f = CreateFrame("Frame")
+                f:RegisterEvent("UNIT_DYNAMIC_FLAGS")
+                f:SetScript("OnEvent", function() table.insert(SEEN, event .. ":" .. arg1) end)
+            "#,
+            )
+            .unwrap();
+            fire_transitions(&mut s, "target", prev.as_ref(), &cur, edges);
+            s.eval::<Vec<String>>("return SEEN").unwrap()
+        };
+        const MOB: u64 = 0xF130_0000_0000_0007;
+        let moved = FieldEdges::of(&[(MOB, benilla_protocol::field::FIELD_UNIT_DYNAMIC_FLAGS)]);
+        let still = FieldEdges::default();
+        let with = |dyn_flags: u32| UnitState {
+            exists: true,
+            has_object: true,
+            guid: MOB,
+            dynamic_flags: dyn_flags,
+            tapped: dyn_flags & 0x4 != 0,
+            tapped_by_player: dyn_flags & 0x8 != 0,
+            ..Default::default()
+        };
+
+        // The bit the corpus registers this event for: `0x4` TAPPED, the grey-bar state
+        // (`CT_UnitFrames/CT_TargetFrame.xml:200`, `TipBuddy/TipBuddy.lua:17`).
+        assert_eq!(
+            fired(Some(with(0)), with(0x4), &moved),
+            vec!["UNIT_DYNAMIC_FLAGS:target".to_string()],
+            "arg1 is the unit token, and there is no arg2"
+        );
+        // The control that proves the trigger is the RAW DWORD: a bit this struct never decodes.
+        assert_eq!(
+            fired(Some(with(0)), with(0x2), &moved),
+            vec!["UNIT_DYNAMIC_FLAGS:target".to_string()],
+            "an undecoded bit still fires it — the watch is a memcmp over the dword"
+        );
+        // The create block runs no notify pass (1098 §4), like both arms beside it.
+        assert!(fired(None, with(0x4), &still).is_empty());
+        // And the control that stops the rest passing by firing always.
+        assert!(fired(Some(with(0x4)), with(0x4), &still).is_empty());
+    }
+
+    /// **The two SELF-ONLY arms of the same handler, each on its own bits** — the half that was
+    /// over-firing, and the half that was missing (decision 2078).
+    ///
+    /// `0x5ee990`'s local-GUID gate at `0x5eea93` divides it: `PLAYER_FLAGS_CHANGED` above (any
+    /// player), and below it three arms that each carry their own `test` against the XOR-diff.
+    /// benilla fired `PLAYER_UPDATE_RESTING` on *any* `PLAYER_FLAGS` delta, because wow-re's
+    /// `rested-xp-bindings.md` §5 says it does; `0x5eead0 f6 45 fc 20 / 74 26` says otherwise —
+    /// the `je`'s target is `0x5eeafc` and the fire is at `0x5eeaf2`, inside the arm.
+    #[test]
+    fn the_self_flag_events_each_fire_on_their_own_bits() {
+        use bevy::ecs::system::RunSystemOnce;
+        const FIELD_PLAYER_FLAGS: u16 = 190;
+
+        let mut app = App::new();
+        app.add_message::<FieldChanged>();
+        app.init_resource::<Selection>()
+            .init_resource::<UnitFeedState>()
+            .init_resource::<NameCache>()
+            .init_resource::<Reputations>()
+            .init_resource::<crate::ui_party::GroupState>()
+            .init_resource::<crate::ui_chat::ChatLog>()
+            // The feed's `MessageSink` is chat + sounds since the PvP/rest lines became message
+            // KEYS (decision 2080): the row a key names carries the cue, so the sink reads both.
+            .init_resource::<crate::sound::MessageSounds>()
+            .init_resource::<crate::ui_guild::GuildState>();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        app.insert_resource(NetCommands(tx));
+        let script = UiScript::new().unwrap();
+        script
+            .run(
+                r#"
+                SEEN = {}
+                local f = CreateFrame("Frame")
+                f:RegisterEvent("PLAYER_UPDATE_RESTING")
+                f:RegisterEvent("PLAYTIME_CHANGED")
+                f:RegisterEvent("UPDATE_EXHAUSTION")
+                f:SetScript("OnEvent", function() table.insert(SEEN, event) end)
+            "#,
+            )
+            .unwrap();
+        app.insert_non_send_resource(script);
+        let me = app
+            .world_mut()
+            .spawn((
+                SelfPlayer,
+                Guid(0x77),
+                ObjectStore(
+                    benilla_protocol::ObjectFields::from_pairs(&[])
+                        .into_created(benilla_protocol::messages::ObjectType::Player),
+                ),
+            ))
+            .id();
+
+        // Set PLAYER_FLAGS, run the feed, read back what fired.
+        let step = |app: &mut App, flags: u32| -> Vec<String> {
+            app.world_mut()
+                .entity_mut(me)
+                .get_mut::<ObjectStore>()
+                .unwrap()
+                .0
+                .merge(benilla_protocol::ObjectFields::from_pairs(&[(
+                    FIELD_PLAYER_FLAGS,
+                    flags,
+                )]));
+            app.world_mut().run_system_once(feed_units).unwrap();
+            let mut s = app.world_mut().non_send_resource_mut::<UiScript>();
+            s.resolve();
+            let out = s.eval::<Vec<String>>("return SEEN").unwrap();
+            s.run("SEEN = {}").unwrap();
+            out
+        };
+
+        // Login: the first rest snapshot seeds the memo and says nothing about the flags word.
+        // (`UPDATE_EXHAUSTION` is a different watcher — `0x5de4e0`/`0x5de4b0`, not this handler —
+        // and its first-sight fire is 1087's settled posture, so it is filtered, not asserted on.)
+        let flag_events = |v: Vec<String>| -> Vec<String> {
+            v.into_iter().filter(|e| e != "UPDATE_EXHAUSTION").collect()
+        };
+        assert!(
+            flag_events(step(&mut app, 0)).is_empty(),
+            "the login descriptor is a create: structurally silent (1098 §4)"
+        );
+
+        // **The regression.** `PLAYER_FLAGS_HIDE_HELM 0x400` moves and the resting bit does not —
+        // before 2078 this announced a resting change to every listener in the UI.
+        assert!(
+            flag_events(step(&mut app, 0x400)).is_empty(),
+            "a non-resting, non-playtime bit fires neither self event"
+        );
+        // The resting bit's own edge, both ways: `0x5eead0 test byte [ebp-4],0x20`.
+        assert_eq!(
+            flag_events(step(&mut app, 0x400 | PLAYER_FLAGS_RESTING)),
+            vec!["PLAYER_UPDATE_RESTING".to_string()]
+        );
+        assert_eq!(
+            flag_events(step(&mut app, 0x400)),
+            vec!["PLAYER_UPDATE_RESTING".to_string()],
+            "the fire is on the XOR-diff, so the clear edge fires it too"
+        );
+
+        // `PLAYTIME_CHANGED` — `0x5eeb65 test ah,0x30`, the two play-time regimes together.
+        assert_eq!(
+            flag_events(step(&mut app, 0x400 | PLAYER_FLAGS_PARTIAL_PLAY_TIME)),
+            vec!["PLAYTIME_CHANGED".to_string()]
+        );
+        assert_eq!(
+            flag_events(step(
+                &mut app,
+                0x400 | PLAYER_FLAGS_PARTIAL_PLAY_TIME | PLAYER_FLAGS_NO_PLAY_TIME
+            )),
+            vec!["PLAYTIME_CHANGED".to_string()],
+            "the second regime bit is the same arm, not a second event"
+        );
+
+        // Both arms at once, from one dword: the handler runs them in order and neither masks the
+        // other.
+        assert_eq!(
+            flag_events(step(&mut app, 0x400 | PLAYER_FLAGS_RESTING)),
+            vec![
+                "PLAYER_UPDATE_RESTING".to_string(),
+                "PLAYTIME_CHANGED".to_string()
+            ]
+        );
     }
 
     /// **Report B304 — Quiver's range indicator read Dead Zone on a far target.**
@@ -2137,9 +3194,106 @@ mod tests {
         assert_eq!(s.rank, 0, "an un-queried creature has no classification");
     }
 
+    /// **The faction-name line does not wait for the creature query** (decision 2040).
+    ///
+    /// Its entry gate `0x612610` reads `[unit+0xb30]` and **returns 1 when there is none** — the
+    /// leg a PLAYER takes through a gate whose only field lives in CreatureInfo, and the leg a
+    /// creature takes for the round trip before `SMSG_CREATURE_QUERY_RESPONSE` lands. Everything
+    /// the line itself needs is on the descriptor (`UNIT_FIELD_FACTIONTEMPLATE`) and already
+    /// streamed, so it shows under the pending `UNKNOWNOBJECT` title rather than arriving a round
+    /// trip after it. It was gated on the record here, on the premise that a pending creature had
+    /// no name line either — the premise decision 2002 corrected.
+    ///
+    /// The record still owns the line's ONE creature-side gate, `HIDE_FACTION_TOOLTIP` (type flag
+    /// `0x10`), which is why the answer landing can take the line away again — the reference's
+    /// own sequence, not a flicker of ours.
+    #[test]
+    fn the_faction_line_does_not_wait_for_the_creature_query() {
+        use benilla_protocol::messages::ObjectFields;
+
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        let catalog = benilla_formats::load_faction_catalog(&mut chain).expect("Faction.dbc");
+        let factions = crate::target::Factions::from_catalog(catalog);
+
+        /// `UNIT_FIELD_FACTIONTEMPLATE` / `UNIT_FIELD_BYTES_0` — absolute descriptor indices.
+        const FACTIONTEMPLATE: u16 = 35;
+        const BYTES_0: u16 = 36;
+        /// The local player the slot walk is matched against: race 1 (human), class 1 (warrior),
+        /// packed as `UNIT_FIELD_BYTES_0` bytes 0 and 1.
+        const HUMAN_WARRIOR: u32 = 1 | (1 << 8);
+        /// A creature entry the cache below is deliberately never told about.
+        const ENTRY: u32 = 299;
+        const GUID: u64 = (0xF130u64 << 48) | ((ENTRY as u64) << 24) | 0x7;
+
+        let me = ObjectStore(ObjectFields::from_pairs(&[(BYTES_0, HUMAN_WARRIOR)]));
+        // The first template id whose faction carries a reputation slot this character can see.
+        // Derived from the real DBC rather than guessed, so the test names no id it cannot justify.
+        let (template_id, expected) = (1u32..3000)
+            .find_map(|id| {
+                let f = factions.catalog().template(id)?.faction;
+                let info = factions.catalog().reputation_faction(f)?;
+                info.tooltip_shows_for(1, 1)
+                    .then(|| factions.catalog().faction_name(f))
+                    .flatten()
+                    .map(|n| (id, n.to_string()))
+            })
+            .expect("some faction template shows a tooltip line to a human warrior");
+        let store = ObjectStore(ObjectFields::from_pairs(&[(FACTIONTEMPLATE, template_id)]));
+
+        let line_for = |names: &NameCache| {
+            let mut state = UnitState::default();
+            enrich_unit(&mut state, GUID, names, &store, Some(&factions), Some(&me));
+            state
+        };
+
+        // The query is still in flight: no record, so no name, no subtitle and no rank — and the
+        // faction line all the same.
+        let pending = line_for(&NameCache::default());
+        assert_eq!(pending.name, None, "the name is the thing still in flight");
+        assert_eq!(pending.subtitle, None);
+        assert_eq!(
+            pending.faction_name.as_deref(),
+            Some(expected.as_str()),
+            "the faction line resolves off the descriptor alone"
+        );
+
+        let record = |type_flags: u32| crate::names::CreatureRecord {
+            name: "Stormwind Guard".into(),
+            subname: None,
+            creature_type: 7,
+            pet_family: 0,
+            rank: 0,
+            type_flags,
+            civilian: false,
+            racial_leader: false,
+            display_id: 0,
+        };
+        let mut answered = NameCache::default();
+        answered.insert_creature(ENTRY, Some(record(0)));
+        assert_eq!(
+            line_for(&answered).faction_name.as_deref(),
+            Some(expected.as_str()),
+            "the answer landing keeps the line it was already showing"
+        );
+
+        // The one creature-side gate the record does own.
+        let mut hidden = NameCache::default();
+        hidden.insert_creature(ENTRY, Some(record(0x10)));
+        assert_eq!(
+            line_for(&hidden).faction_name,
+            None,
+            "HIDE_FACTION_TOOLTIP takes the line away once the record says so"
+        );
+    }
+
     /// The PvP-preference announcement law (decision 0652), as the reference's changed-bits handler
-    /// runs it: silent on first sight, one pair per real edge, and the OFF text is the one that
-    /// explains the five-minute wait — the whole reason the toggle doesn't read as dead.
+    /// runs it: silent on first sight, one pair of KEYS per real edge.
+    ///
+    /// The assertion is on the identifiers, never the sentences (decision 2045) — an English
+    /// comparison passes exactly where two keys agree in enUS and diverge everywhere else. The
+    /// wording lives in the player's own `GlobalStrings.lua` and is checked against it by
+    /// [`the_pvp_and_rest_keys_resolve_in_the_real_global_strings`].
     #[test]
     fn pvp_announcement_speaks_only_on_an_edge() {
         assert_eq!(
@@ -2151,19 +3305,45 @@ mod tests {
         assert_eq!(pvp_announcement(Some(true), true), None, "no change");
         assert_eq!(pvp_announcement(Some(false), false), None, "no change");
 
-        let (toast, verbose) = pvp_announcement(Some(false), true).expect("turning it on speaks");
-        assert_eq!(toast, "PvP combat toggled on"); // GlobalStrings ERR_PVP_TOGGLE_ON
         assert_eq!(
-            verbose,
-            "You are now flagged for PvP combat and will remain so until toggled off."
+            pvp_announcement(Some(false), true),
+            Some(("ERR_PVP_TOGGLE_ON", "PVP_TOGGLE_ON_VERBOSE"))
         );
+        assert_eq!(
+            pvp_announcement(Some(true), false),
+            Some(("ERR_PVP_TOGGLE_OFF", "PVP_TOGGLE_OFF_VERBOSE"))
+        );
+    }
 
-        let (toast, verbose) = pvp_announcement(Some(true), false).expect("turning it off speaks");
-        assert_eq!(toast, "PvP combat toggled off"); // GlobalStrings ERR_PVP_TOGGLE_OFF
+    /// The four keys, against the player's REAL `GlobalStrings.lua` — the guard a key-based
+    /// assertion needs beside it, since a typo'd key degrades a real line to silence rather than
+    /// to a wrong sentence. Also pins the one thing the director would actually notice: the OFF
+    /// verbose sentence is the one that explains the five-minute wait, which is the whole reason
+    /// the toggle doesn't read as dead. Skips without client data.
+    #[test]
+    fn the_pvp_and_rest_keys_resolve_in_the_real_global_strings() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        let src = chain
+            .read_file("Interface\\FrameXML\\GlobalStrings.lua")
+            .expect("GlobalStrings.lua in the chain");
+        let s = UiScript::new().expect("VM");
+        s.run(&String::from_utf8_lossy(&src)).expect("runs clean");
+        let g = |key: &str| s.lua().globals().get::<String>(key).unwrap_or_default();
+
+        for (was, now) in [(false, true), (true, false)] {
+            let (toast, verbose) = pvp_announcement(Some(was), now).expect("an edge speaks");
+            assert!(!g(toast).is_empty(), "{toast} missing");
+            assert!(!g(verbose).is_empty(), "{verbose} missing");
+        }
         assert!(
-            verbose.contains("five minutes"),
-            "the OFF sentence is what tells the player the flag lingers: {verbose}"
+            g("PVP_TOGGLE_OFF_VERBOSE").contains("five minutes"),
+            "the OFF sentence is what tells the player the flag lingers"
         );
+        for state in [1u8, 2] {
+            let key = rest_state_message(0, state).expect("states 1 and 2 speak");
+            assert!(!g(key).is_empty(), "{key} missing");
+        }
     }
 
     /// The rest-state chat law (decision 1098, wow-re §§6-10): a message needs a real byte
@@ -2172,11 +3352,11 @@ mod tests {
     /// swallowed by the dispatcher's mirror diff.
     #[test]
     fn rest_state_message_speaks_only_on_a_real_transition() {
-        assert_eq!(rest_state_message(2, 1), Some("You feel rested."));
-        assert_eq!(rest_state_message(1, 2), Some("You feel normal."));
+        assert_eq!(rest_state_message(2, 1), Some("ERR_EXHAUSTION_RESTED"));
+        assert_eq!(rest_state_message(1, 2), Some("ERR_EXHAUSTION_NORMAL"));
         assert_eq!(
             rest_state_message(0, 1),
-            Some("You feel rested."),
+            Some("ERR_EXHAUSTION_RESTED"),
             "0→1 IS a transition"
         );
         assert_eq!(
@@ -2196,5 +3376,174 @@ mod tests {
             "beta tiers are gated off (cmp esi,3; jae)"
         );
         assert_eq!(rest_state_message(1, 5), None);
+    }
+
+    /// The `"npc"` token follows the interaction NPC on the frame it moves — including a frame
+    /// on which NOTHING else moves — and is cleared when the window closes (decision 2022). The
+    /// legs are the vendor-swap probe's first run, in order: a second vendor opened over an
+    /// open window kept the first vendor's snapshot (the dirty gate had no interact input), and
+    /// a closed window left `UnitExists("npc")` true (the memo row was never written). The
+    /// feed runs in a real `Update` schedule rather than `run_system_once`, because a fresh
+    /// system instance sees every resource as changed and would hold the gate open by itself.
+    #[test]
+    fn the_npc_token_follows_the_interaction_npc_and_clears_with_it() {
+        use crate::ui_session::InteractNpc;
+        use benilla_protocol::messages::ObjectFields;
+
+        const FIELD_UNIT_LEVEL: u16 = 34;
+        // Two `HIGHGUID_UNIT` guids (the high word decides the family — `guid::is_player`).
+        const BROG: u64 = 0xF130_0000_9700_0001;
+        const DOBBINS: u64 = 0xF130_0001_D100_0002;
+
+        let mut app = App::new();
+        app.init_resource::<UnitFeedState>()
+            .init_resource::<Selection>()
+            .init_resource::<NameCache>()
+            .init_resource::<Reputations>()
+            .init_resource::<crate::ui_party::GroupState>()
+            .init_resource::<crate::ui_chat::ChatLog>()
+            // `feed_units` shows catalog messages through `show_messages`, whose sink is the chat
+            // log AND the message-sound queue.
+            .init_resource::<crate::sound::MessageSounds>()
+            .init_resource::<crate::ui_guild::GuildState>()
+            .init_resource::<InteractNpc>();
+        app.add_message::<FieldChanged>();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        app.insert_resource(NetCommands(tx));
+        app.insert_non_send_resource(UiScript::new().unwrap());
+        app.add_systems(Update, feed_units);
+        // Two vendors, told apart by level alone — no name cache, no descriptor beyond it.
+        let mut vendor = |level: u32| {
+            app.world_mut()
+                .spawn(ObjectStore(ObjectFields::from_pairs(&[(
+                    FIELD_UNIT_LEVEL,
+                    level,
+                )])))
+                .id()
+        };
+        let brog = vendor(7);
+        let dobbins = vendor(9);
+        let eval = |app: &mut App, expr: &str| -> i64 {
+            app.world_mut()
+                .non_send_resource_mut::<UiScript>()
+                .eval::<i64>(expr)
+                .unwrap()
+        };
+        let exists = |app: &mut App| eval(app, r#"return UnitExists("npc") and 1 or 0"#) == 1;
+        let level = |app: &mut App| eval(app, r#"return UnitLevel("npc")"#);
+
+        // Nothing open: no token.
+        app.update();
+        assert!(!exists(&mut app), "no window open, yet UnitExists(\"npc\")");
+
+        // Brog's window opens.
+        *app.world_mut().resource_mut::<InteractNpc>() = InteractNpc(Some(brog), Some(BROG));
+        app.update();
+        assert_eq!(
+            level(&mut app),
+            7,
+            "the token names the vendor whose window opened"
+        );
+
+        // Dobbins' window opens OVER it: the interaction NPC is the only thing that moved this
+        // frame — no descriptor, no selection, no group — and the token must still follow.
+        *app.world_mut().resource_mut::<InteractNpc>() = InteractNpc(Some(dobbins), Some(DOBBINS));
+        app.update();
+        assert_eq!(
+            level(&mut app),
+            9,
+            "a second vendor over an open window swaps the token"
+        );
+
+        // Closed: absence is data.
+        *app.world_mut().resource_mut::<InteractNpc>() = InteractNpc::default();
+        app.update();
+        assert!(
+            !exists(&mut app),
+            "the window closed, yet UnitExists(\"npc\")"
+        );
+    }
+
+    /// **`PLAYER_LEAVING_WORLD` fires on a cross-map worldport, and only on one** (decision 2235).
+    ///
+    /// Measured live before this existed: an addon counting all three world events across a real
+    /// mapId 0 → 1 port read `enter=2 leave=0 login=1`. Two of those already matched the
+    /// reference — `PLAYER_ENTERING_WORLD` re-fires because the port destroys and re-creates the
+    /// descriptor, and `PLAYER_LOGIN` correctly does not, being armed only by a UI load. The
+    /// leaving half was simply never wired.
+    ///
+    /// The `needs_ack` split is the reference's own: `0x111` is fired from the local player
+    /// object's destructor, which a same-map teleport never reaches, and the one worldport that
+    /// owes no ack is the initial-login map — an arrival, with nothing behind it to leave.
+    #[test]
+    fn a_cross_map_worldport_fires_leaving_world_and_the_login_map_does_not() {
+        let mut app = App::new();
+        app.add_message::<crate::net::WorldportMessage>()
+            .init_resource::<crate::ui_script::LeavingWorldArmed>()
+            .add_systems(Update, fire_leaving_world_on_worldport);
+        app.insert_non_send_resource(UiScript::new().expect("VM"));
+        app.world_mut()
+            .non_send_resource::<UiScript>()
+            .run(
+                "Left = 0 \
+                 local f = CreateFrame(\"Frame\") \
+                 f:RegisterEvent(\"PLAYER_LEAVING_WORLD\") \
+                 f:SetScript(\"OnEvent\", function() Left = Left + 1 end)",
+            )
+            .expect("probe frame");
+        let left = |app: &mut App| -> i64 {
+            app.world_mut()
+                .non_send_resource_mut::<UiScript>()
+                .eval::<i64>("return Left")
+                .unwrap()
+        };
+        let port = |needs_ack: bool| crate::net::WorldportMessage {
+            map_id: 1,
+            position: [0.0; 3],
+            orientation: 0.0,
+            needs_ack,
+            transport_entry: None,
+        };
+
+        let arm = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<crate::ui_script::LeavingWorldArmed>()
+                .arm();
+        };
+
+        // A world began (2239's latch — the reference arms it from the local player's create).
+        arm(&mut app);
+        app.world_mut().write_message(port(false));
+        app.update();
+        assert_eq!(left(&mut app), 0, "the initial-login map is an arrival");
+
+        app.world_mut().write_message(port(true));
+        app.update();
+        assert_eq!(left(&mut app), 1, "a cross-map port leaves a world");
+
+        app.update();
+        assert_eq!(
+            left(&mut app),
+            1,
+            "once per port, not once per frame after it"
+        );
+
+        // **And once per WORLD, which is the latch's own law** (2239): the port above spent it,
+        // and nothing here re-armed — no new avatar was created. A second departure off the same
+        // world is the window a quit on the loading screen lands in, and the reference fires
+        // nothing there.
+        app.world_mut().write_message(port(true));
+        app.update();
+        assert_eq!(
+            left(&mut app),
+            1,
+            "a second departure with the latch spent fired again — [0xb4b424] is per world"
+        );
+
+        // Re-armed, as the new world's create does: the next departure is its own.
+        arm(&mut app);
+        app.world_mut().write_message(port(true));
+        app.update();
+        assert_eq!(left(&mut app), 2, "the next world's departure fires again");
     }
 }

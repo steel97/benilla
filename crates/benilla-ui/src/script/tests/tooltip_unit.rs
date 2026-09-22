@@ -1,10 +1,35 @@
 //! The engine unit tooltip builder (decision 0274 P3, law per 0276): the level-line composition
-//! (four templates, the rank words, "??", Corpse, "Race Class (Player)"), the flag lines
+//! (four `TOOLTIP_UNIT_LEVEL*` keys, the `ELITE`/`BOSS` rank table, "??", `CORPSE`, "Race Class"
+//! over `PLAYER` — all seeded here as marked stand-ins, see [`seed_level_strings`]), the flag lines
 //! (PvP white / Skinnable red / Civilian green), the world-mouseover drive (default anchor +
 //! `UPDATE_MOUSEOVER_UNIT` recolor + the fade arm on loss), and the health-bar watcher.
 
 use super::common::script;
 use crate::script::*;
+
+/// A stand-in string table for the level line — the four `TOOLTIP_UNIT_LEVEL*` templates and the
+/// three word slots that fill them, **deliberately not the shipped wording**. What these tests
+/// establish is *which key* each slot combination reaches and what fills it, never what the
+/// sentence says (decision 2045, "assert the identifier, not the sentence"), and here that is not
+/// a formality: `TOOLTIP_UNIT_LEVEL_CLASS`'s enUS "Level %s %s" is word-for-word
+/// `FRIENDS_LEVEL_TEMPLATE`, `UNIT_TYPE_LEVEL_TEMPLATE` and `CHARACTER_SELECT_INFO`, and the bare
+/// template's "Level %s" is also `ITEM_LEVEL`, `LEVEL_GAINED` and `UNIT_LEVEL_TEMPLATE`. An
+/// assertion on the English would pass on all seven.
+fn seed_level_strings(s: &mut UiScript) {
+    s.run(
+        r#"
+        TOOLTIP_UNIT_LEVEL            = "[LEVEL %s]"
+        TOOLTIP_UNIT_LEVEL_CLASS      = "[LEVEL_CLASS %s %s]"
+        TOOLTIP_UNIT_LEVEL_TYPE       = "[LEVEL_TYPE %s %s]"
+        TOOLTIP_UNIT_LEVEL_CLASS_TYPE = "[LEVEL_CLASS_TYPE %s %s %s]"
+        CORPSE = "[CORPSE]"
+        PLAYER = "[PLAYER]"
+        ELITE  = "[ELITE]"
+        BOSS   = "[BOSS]"
+    "#,
+    )
+    .unwrap();
+}
 
 fn wolf() -> UnitState {
     UnitState {
@@ -21,10 +46,11 @@ fn wolf() -> UnitState {
     }
 }
 
-/// The creature law: gold name, subtitle, "Level 10 Beast (Elite)", red Skinnable.
+/// The creature law: gold name, subtitle, the CLASS_TYPE level line, red Skinnable.
 #[test]
 fn creature_line_law() {
     let mut s = script();
+    seed_level_strings(&mut s);
     s.set_screen_size(800.0, 600.0);
     let mut u = wolf();
     u.subtitle = Some("Alpha".into());
@@ -35,13 +61,13 @@ fn creature_line_law() {
     });
     s.run(
         r#"
-        local a = CreateFrame("Button", "UF1"); a:SetPoint("CENTER", 0, 0); a:SetSize(10, 10)
+        local a = CreateFrame("Button", "UF1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
         local tt = CreateFrame("GameTooltip", "TT")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         assert(tt:SetUnit("target") == 1, "SetUnit returns 1 on a live unit")
         assert(TTTextLeft1:GetText() == "Timber Wolf")
         assert(TTTextLeft2:GetText() == "Alpha")
-        assert(TTTextLeft3:GetText() == "Level 10 Beast (Elite)", "got " .. TTTextLeft3:GetText())
+        assert(TTTextLeft3:GetText() == "[LEVEL_CLASS_TYPE 10 Beast [ELITE]]", "got " .. TTTextLeft3:GetText())
         assert(TTTextLeft4:GetText() == "Skinnable")
         -- A RECOGNISED token naming nothing answers nil...
         assert(tt:SetUnit("party4") == nil, "a recognised but absent unit answers nil")
@@ -56,6 +82,134 @@ fn creature_line_law() {
     assert!(s.take_errors().is_empty());
 }
 
+/// The snapshot the app pushes for a creature the client has only just seen: the DESCRIPTOR's
+/// fields are in (level, reaction, the skinnable flag) and everything the creature record carries
+/// — name, subtitle, type word, rank, civilian/leader — is still absent, because they all arrive
+/// together in the one `SMSG_CREATURE_QUERY_RESPONSE` that fills `CGUnit+0xb30`.
+fn unqueried_wolf() -> UnitState {
+    UnitState {
+        exists: true,
+        has_object: true,
+        name: None,
+        health: 30,
+        max_health: 50,
+        level: 10,
+        reaction: 2, // hostile
+        skinnable: true,
+        guid: 0xF130_0000_0000_0001,
+        ..Default::default()
+    }
+}
+
+/// **A name still in flight titles the plate `UNKNOWNOBJECT` — never an empty line** (decision
+/// 2040, closing 2002's residue).
+///
+/// The builder's name read is `CGUnit_C::GetUnitName 0x609210` (`0x52a187`), the same resolver
+/// `UnitName 0x517020` delegates to, and every one of its misses — a null `CGUnit+0xb30`
+/// (`0x609353 je 0x609324`) among them — ends at the same `FrameScript_GetText("UNKNOWNOBJECT")`
+/// tail. So the verb and the plate answer the same string for the same instant, and because the
+/// string is read out of the VM's `_G` it translates with `GlobalStrings.lua`.
+///
+/// The builder has NO counterpart to `UnitName`'s two nils: the `"player"` fast path is the
+/// *binding's* (`0x517083`, before any resolve), so a player whose name has not arrived titles
+/// `UNKNOWNOBJECT` too; and a token resolving to nothing never reaches a builder at all — the
+/// entry gate hands back no object, `SetUnit` answers nil and no plate is drawn.
+///
+/// Failure looks like the empty first line the residue named: `TextLeft1` reads `""`, the plate
+/// measures to a blank row, and the level line reads as the tooltip's title.
+#[test]
+fn a_pending_name_titles_unknownobject_and_the_answer_replaces_it() {
+    let mut s = script();
+    seed_level_strings(&mut s);
+    s.set_screen_size(800.0, 600.0);
+    s.set_unit("target", Some(unqueried_wolf()));
+    s.set_player_req_state(PlayerReqState {
+        level: 12,
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        UNKNOWNOBJECT = "Unknown"   -- GlobalStrings.lua:4444, enUS
+        local a = CreateFrame("Button", "UF1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
+        local tt = CreateFrame("GameTooltip", "TT")
+        tt:SetOwner(a, "ANCHOR_RIGHT")
+        assert(tt:SetUnit("target") == 1, "a resolved unit shows, name or no name")
+        assert(TTTextLeft1:GetText() == UNKNOWNOBJECT,
+               "the title is the GlobalString, got '" .. tostring(TTTextLeft1:GetText()) .. "'")
+        -- The record's other lines are absent with it: no subtitle, and the level line takes the
+        -- bare TOOLTIP_UNIT_LEVEL template because both the CLASS and TYPE slots are the record's.
+        assert(TTTextLeft2:GetText() == "[LEVEL 10]", "got " .. TTTextLeft2:GetText())
+        -- The descriptor's own lines are NOT the record's and show anyway.
+        assert(TTTextLeft3:GetText() == "Skinnable")
+    "#,
+    )
+    .unwrap();
+
+    // The query answers: the very next render replaces the placeholder with the real name and
+    // fills the record's lines. (Live, the hover feed re-drives this without the mouse moving —
+    // its rebuild key is the whole line-affecting snapshot, `ui_tooltip::lines_view`.)
+    let mut answered = unqueried_wolf();
+    answered.name = Some("Timber Wolf".into());
+    answered.subtitle = Some("Alpha".into());
+    answered.creature_type_name = Some("Beast".into());
+    answered.rank = 2;
+    s.set_unit("target", Some(answered));
+    s.run(
+        r#"
+        assert(TT:SetUnit("target") == 1)
+        assert(TTTextLeft1:GetText() == "Timber Wolf", "the answer replaced UNKNOWNOBJECT")
+        assert(TTTextLeft2:GetText() == "Alpha")
+        assert(TTTextLeft3:GetText() == "[LEVEL_CLASS_TYPE 10 Beast [ELITE]]", "got " .. TTTextLeft3:GetText())
+        assert(TTTextLeft4:GetText() == "Skinnable")
+    "#,
+    )
+    .unwrap();
+
+    // An EMPTY (or absent) global is the same miss as no global — `0x609324`'s own check, which
+    // falls to the binary's literal `0x860fa4`.
+    s.set_unit("target", Some(unqueried_wolf()));
+    s.run(
+        r#"
+        UNKNOWNOBJECT = ""
+        assert(TT:SetUnit("target") == 1)
+        assert(TTTextLeft1:GetText() == "Unknown Being", "got " .. TTTextLeft1:GetText())
+    "#,
+    )
+    .unwrap();
+
+    // The `"player"` fast path is the BINDING's, not the builder's: a player whose name-cache row
+    // has not answered titles the same placeholder, where `UnitName("player")` would push nil.
+    s.set_unit(
+        "player",
+        Some(UnitState {
+            exists: true,
+            has_object: true,
+            name: None,
+            level: 12,
+            is_player: true,
+            player_controlled: true,
+            guid: 0x0000_0000_0000_0007,
+            ..Default::default()
+        }),
+    );
+    s.run(
+        r#"
+        UNKNOWNOBJECT = "Unknown"
+        assert(UnitName("player") == nil, "the binding's own fast path still pushes nil (2002)")
+        assert(TT:SetUnit("player") == 1)
+        assert(TTTextLeft1:GetText() == UNKNOWNOBJECT,
+               "the builder has no player fast path, got " .. tostring(TTTextLeft1:GetText()))
+    "#,
+    )
+    .unwrap();
+
+    // The GUID-0 counterpart: a recognised token naming nothing resolves to no object, so no
+    // builder runs — nil, and no plate. (There is no third answer; the builder never sees it.)
+    s.run(r#"assert(TT:SetUnit("party4") == nil, "an absent unit draws no plate at all")"#)
+        .unwrap();
+    assert!(s.take_errors().is_empty());
+}
+
 /// The faction-name line sits between the level line and "PvP" (the builder-tail block the §2
 /// order omitted — the director's Marshal McBride reference: Level, Stormwind, PvP); the
 /// CIVILIAN line is the dishonorable-kill warning, whole gate (`0x612550`): PvP bit + civilian
@@ -64,6 +218,7 @@ fn creature_line_law() {
 #[test]
 fn faction_line_and_civilian_gate() {
     let mut s = script();
+    seed_level_strings(&mut s);
     s.set_screen_size(800.0, 600.0);
     s.set_player_req_state(PlayerReqState {
         level: 30,
@@ -86,11 +241,11 @@ fn faction_line_and_civilian_gate() {
     );
     s.run(
         r#"
-        local a = CreateFrame("Button", "UF9"); a:SetPoint("CENTER", 0, 0); a:SetSize(10, 10)
+        local a = CreateFrame("Button", "UF9"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
         local tt = CreateFrame("GameTooltip", "TT")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         tt:SetUnit("target")
-        assert(TTTextLeft2:GetText() == "Level 20", "friendly creature: no type word; got " .. TTTextLeft2:GetText())
+        assert(TTTextLeft2:GetText() == "[LEVEL 20]", "friendly creature: no type word; got " .. TTTextLeft2:GetText())
         assert(TTTextLeft3:GetText() == "Stormwind", "faction line before PvP; got " .. TTTextLeft3:GetText())
         assert(TTTextLeft4:GetText() == "PvP")
         assert(TTTextLeft5 == nil or TTTextLeft5:GetText() == nil, "friendly civilian shows NO Civilian line")
@@ -116,7 +271,7 @@ fn faction_line_and_civilian_gate() {
         r#"
         TT:SetOwner(UF9, "ANCHOR_RIGHT")
         TT:SetUnit("target")
-        assert(TTTextLeft2:GetText() == "Level 20 Humanoid", "got " .. TTTextLeft2:GetText())
+        assert(TTTextLeft2:GetText() == "[LEVEL_CLASS 20 Humanoid]", "got " .. TTTextLeft2:GetText())
         assert(TTTextLeft3:GetText() == "PvP")
         assert(TTTextLeft4:GetText() == "Civilian", "hostile+grey+pvp civilian warns; got " .. TTTextLeft4:GetText())
         assert(TTTextLeft5:GetText() == "Leader")
@@ -153,6 +308,7 @@ fn faction_line_and_civilian_gate() {
 #[test]
 fn level_line_variants() {
     let mut s = script();
+    seed_level_strings(&mut s);
     s.set_screen_size(800.0, 600.0);
     s.set_player_req_state(PlayerReqState {
         level: 60,
@@ -173,11 +329,11 @@ fn level_line_variants() {
     );
     s.run(
         r#"
-        local a = CreateFrame("Button", "UF2"); a:SetPoint("CENTER", 0, 0); a:SetSize(10, 10)
+        local a = CreateFrame("Button", "UF2"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
         local tt = CreateFrame("GameTooltip", "TT")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         tt:SetUnit("target")
-        assert(TTTextLeft2:GetText() == "Level 32 Human Rogue (Player)", "got " .. TTTextLeft2:GetText())
+        assert(TTTextLeft2:GetText() == "[LEVEL_CLASS_TYPE 32 Human Rogue [PLAYER]]", "got " .. TTTextLeft2:GetText())
         assert(TTTextLeft3:GetText() == "PvP")
     "#,
     )
@@ -199,7 +355,7 @@ fn level_line_variants() {
         r#"
         TT:SetOwner(UF2, "ANCHOR_RIGHT")
         TT:SetUnit("target")
-        assert(TTTextLeft2:GetText() == "Level 3 Corpse", "got " .. TTTextLeft2:GetText())
+        assert(TTTextLeft2:GetText() == "[LEVEL_CLASS 3 [CORPSE]]", "got " .. TTTextLeft2:GetText())
     "#,
     )
     .unwrap();
@@ -220,7 +376,7 @@ fn level_line_variants() {
         r#"
         TT:SetOwner(UF2, "ANCHOR_RIGHT")
         TT:SetUnit("target")
-        assert(TTTextLeft2:GetText() == "Level ?? Demon (Boss)", "got " .. TTTextLeft2:GetText())
+        assert(TTTextLeft2:GetText() == "[LEVEL_CLASS_TYPE ?? Demon [BOSS]]", "got " .. TTTextLeft2:GetText())
     "#,
     )
     .unwrap();
@@ -240,7 +396,7 @@ fn level_line_variants() {
     s.run(
         r#"
         TT:SetOwner(UF2, "ANCHOR_RIGHT"); TT:SetUnit("target")
-        assert(TTTextLeft2:GetText() == "Level ?? Beast", "hostile 10-up, got " .. TTTextLeft2:GetText())
+        assert(TTTextLeft2:GetText() == "[LEVEL_CLASS ?? Beast]", "hostile 10-up, got " .. TTTextLeft2:GetText())
     "#,
     )
     .unwrap();
@@ -249,7 +405,7 @@ fn level_line_variants() {
     s.run(
         r#"
         TT:SetOwner(UF2, "ANCHOR_RIGHT"); TT:SetUnit("target")
-        assert(TTTextLeft2:GetText() == "Level 70 Beast", "unfriendly 10-up, got " .. TTTextLeft2:GetText())
+        assert(TTTextLeft2:GetText() == "[LEVEL_CLASS 70 Beast]", "unfriendly 10-up, got " .. TTTextLeft2:GetText())
     "#,
     )
     .unwrap();
@@ -258,7 +414,7 @@ fn level_line_variants() {
     s.run(
         r#"
         TT:SetOwner(UF2, "ANCHOR_RIGHT"); TT:SetUnit("target")
-        assert(TTTextLeft2:GetText() == "Level 70 Orc Shaman (Player)", "hostile player, got " .. TTTextLeft2:GetText())
+        assert(TTTextLeft2:GetText() == "[LEVEL_CLASS_TYPE 70 Orc Shaman [PLAYER]]", "hostile player, got " .. TTTextLeft2:GetText())
     "#,
     )
     .unwrap();
@@ -294,7 +450,7 @@ fn world_hover_drive_and_health_watcher() {
             getglobal("GameTooltipTextLeft1"):SetTextColor(1, 0, 0)
         end)
         local bar = CreateFrame("StatusBar", "GameTooltipStatusBar", tt)
-        bar:SetPoint("TOPLEFT", tt, "BOTTOMLEFT", 2, -1); bar:SetSize(100, 8)
+        bar:SetPoint("TOPLEFT", tt, "BOTTOMLEFT", 2, -1); bar:SetWidth(100); bar:SetHeight(8)
     "#,
     )
     .unwrap();
@@ -356,7 +512,7 @@ fn minimap_blip_tooltip_shows_and_fades() {
     s.run(
         r#"
         local up = CreateFrame("Frame", "UIParent")
-        up:SetPoint("BOTTOMLEFT"); up:SetSize(800, 600)
+        up:SetPoint("BOTTOMLEFT", 0, 0); up:SetWidth(800); up:SetHeight(600)
     "#,
     )
     .unwrap();

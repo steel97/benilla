@@ -16,7 +16,8 @@
 /// report is written in ("250 % CPU at 59 fps" against 1.12.1's "100 % at 160"), so a probe that
 /// prints it can be compared against a reporter's number directly.
 ///
-/// Non-unix returns `None`: the probes print the field only where the platform answers.
+/// Unix answers through `getrusage`, Windows through `GetProcessTimes` (decision 2219);
+/// elsewhere `None`: the probes print the field only where the platform answers.
 pub(crate) fn process_cpu_secs() -> Option<f64> {
     #[cfg(unix)]
     {
@@ -29,6 +30,66 @@ pub(crate) fn process_cpu_secs() -> Option<f64> {
             }
             let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
             Some(secs(ru.ru_utime) + secs(ru.ru_stime))
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        // SAFETY: `GetProcessTimes` writes four fully-initialised `FILETIME`s into its out-params
+        // and reads nothing from them; zeroed is a valid starting value for two plain integers,
+        // and the pseudo-handle `GetCurrentProcess` returns is never closed.
+        unsafe {
+            let mut creation = std::mem::zeroed();
+            let mut exit = std::mem::zeroed();
+            let mut kernel = std::mem::zeroed();
+            let mut user = std::mem::zeroed();
+            if GetProcessTimes(
+                GetCurrentProcess(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            ) == 0
+            {
+                return None;
+            }
+            Some(filetime_secs(kernel) + filetime_secs(user))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// A `FILETIME` — 100-nanosecond ticks — as an integer, for the differences and sums the
+/// Windows arms take before converting.
+#[cfg(windows)]
+fn filetime_ticks(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)
+}
+
+/// A `FILETIME` as seconds.
+#[cfg(windows)]
+fn filetime_secs(t: windows_sys::Win32::Foundation::FILETIME) -> f64 {
+    filetime_ticks(t) as f64 * 1e-7
+}
+
+/// The process's page-fault counters so far — `(minor, major)` from `getrusage`. A minor fault
+/// is a page the kernel had to map or zero-fill on first touch: memory the allocator handed back
+/// to the OS and then asked for again. It is CPU time the process pays in the kernel with no
+/// syscall in any user stack — invisible to a sampler, visible to [`thread_cpu_table`]'s `sys`
+/// column. Per frame, it is the number that says whether that column is allocator churn.
+pub(crate) fn process_faults() -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        // SAFETY: as in `process_cpu_secs` — `getrusage` fills the out-param completely.
+        unsafe {
+            let mut ru: libc::rusage = std::mem::zeroed();
+            if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+                return None;
+            }
+            Some((ru.ru_minflt as u64, ru.ru_majflt as u64))
         }
     }
     #[cfg(not(unix))]
@@ -50,7 +111,9 @@ pub(crate) fn process_cpu_secs() -> Option<f64> {
 /// becomes "whichever worker happened to run this system", which is noise shaped like a
 /// measurement.
 ///
-/// Non-unix returns `None`, like its twin.
+/// Unix answers through `clock_gettime`, Windows through `GetThreadTimes` on the calling
+/// thread's pseudo-handle — the same "whichever thread calls" contract (decision 2219);
+/// elsewhere `None`, like its twin.
 pub(crate) fn main_thread_cpu_secs() -> Option<f64> {
     #[cfg(unix)]
     {
@@ -64,7 +127,30 @@ pub(crate) fn main_thread_cpu_secs() -> Option<f64> {
             Some(ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9)
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+        // SAFETY: as in `process_cpu_secs` — four out-params fully written, nothing read, and
+        // `GetCurrentThread` is a pseudo-handle valid on the thread that asked for it.
+        unsafe {
+            let mut creation = std::mem::zeroed();
+            let mut exit = std::mem::zeroed();
+            let mut kernel = std::mem::zeroed();
+            let mut user = std::mem::zeroed();
+            if GetThreadTimes(
+                GetCurrentThread(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            ) == 0
+            {
+                return None;
+            }
+            Some(filetime_secs(kernel) + filetime_secs(user))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }
@@ -93,7 +179,9 @@ pub(crate) fn main_thread_cpu_secs() -> Option<f64> {
 /// had not caught up with. Cross-checked against an independent out-of-process sampler over the
 /// same window — 44 % vs 44.5 % — so where the two disagree, this is the one that is right.
 ///
-/// Non-macOS returns `None`: the probes print the field only where the platform answers.
+/// macOS answers through `host_statistics64`, Windows through `GetSystemTimes` (decision 2219
+/// — its kernel time INCLUDES idle, so busy is kernel − idle + user); elsewhere `None`: the
+/// probes print the field only where the platform answers.
 ///
 /// The `deprecated` allow is `libc::mach_host_self`, whose deprecation note says "use the `mach2`
 /// crate instead". Checked, and it does not apply here: `mach2` 0.5.0 carries `mach_host_self` and
@@ -124,6 +212,107 @@ pub(crate) fn system_cpu_ticks() -> Option<(u64, u64)> {
             let idle = u64::from(info.cpu_ticks[libc::CPU_STATE_IDLE as usize]);
             Some((total - idle, total))
         }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::GetSystemTimes;
+        // SAFETY: `GetSystemTimes` writes three fully-initialised `FILETIME`s and reads nothing.
+        unsafe {
+            let mut idle = std::mem::zeroed();
+            let mut kernel = std::mem::zeroed();
+            let mut user = std::mem::zeroed();
+            if GetSystemTimes(&mut idle, &mut kernel, &mut user) == 0 {
+                return None;
+            }
+            // All three are summed across every processor, and kernel time includes idle.
+            let total = filetime_ticks(kernel) + filetime_ticks(user);
+            Some((total.saturating_sub(filetime_ticks(idle)), total))
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        None
+    }
+}
+
+/// CPU seconds consumed so far by **every thread of this process, by name** — the split of
+/// [`process_cpu_secs`] that says *which* thread a tax landed on. A frame's `cpu_ms` rose by
+/// ~1.8 ms under vsync with no system growing on a sampled profile and no thread spinning
+/// (decision 1947): the number that resolves that is per-thread CPU across a window, which
+/// no sampler reports and this call does.
+///
+/// macOS only (`task_threads` + `thread_info(THREAD_BASIC_INFO)`, names through
+/// `pthread_getname_np`); elsewhere `None`, like the twins above. Threads are keyed by their
+/// pthread identity so two snapshots subtract, user and system time apart — the vsync tax
+/// turned out to be the main thread's kernel time, which a user-mode sampler never sees; a
+/// thread without a name reports as `"?"`.
+/// Cost: one kernel round-trip per thread — tens of microseconds, taken twice per probe
+/// window, never per frame.
+pub(crate) fn thread_cpu_table() -> Option<Vec<(usize, String, f64, f64)>> {
+    // `libc` deprecates its mach port bindings in favour of a crate this module does not need
+    // for two symbols; both are libSystem's, the import every mach caller links.
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CStr;
+        let mut out = Vec::new();
+        // SAFETY: mach's own out-param protocol — `task_threads` hands back a kernel-allocated
+        // array of thread ports and its count, each port is inspected with a stack-allocated,
+        // count-checked `thread_basic_info`, and every port and the array are released after.
+        unsafe {
+            let task = mach_task_self_;
+            let mut list: libc::thread_act_array_t = std::ptr::null_mut();
+            let mut count: libc::mach_msg_type_number_t = 0;
+            if libc::task_threads(task, &mut list, &mut count) != libc::KERN_SUCCESS {
+                return None;
+            }
+            for i in 0..count as usize {
+                let port = *list.add(i);
+                let mut info: libc::thread_basic_info = std::mem::zeroed();
+                let mut n = libc::THREAD_BASIC_INFO_COUNT;
+                let kr = libc::thread_info(
+                    port,
+                    libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+                    (&mut info as *mut libc::thread_basic_info).cast(),
+                    &mut n,
+                );
+                if kr == libc::KERN_SUCCESS {
+                    let secs = |t: libc::time_value_t| {
+                        f64::from(t.seconds) + f64::from(t.microseconds) * 1e-6
+                    };
+                    let (user, system) = (secs(info.user_time), secs(info.system_time));
+                    let pthread = libc::pthread_from_mach_thread_np(port);
+                    let mut name = [0 as libc::c_char; 64];
+                    let label = if pthread != 0
+                        && libc::pthread_getname_np(pthread, name.as_mut_ptr(), name.len()) == 0
+                    {
+                        let s = CStr::from_ptr(name.as_ptr()).to_string_lossy();
+                        if s.is_empty() {
+                            "?".to_string()
+                        } else {
+                            s.into_owned()
+                        }
+                    } else {
+                        "?".to_string()
+                    };
+                    out.push((pthread as usize, label, user, system));
+                }
+                mach_port_deallocate(task, port);
+            }
+            libc::vm_deallocate(
+                task,
+                list as libc::vm_address_t,
+                (count as usize * std::mem::size_of::<libc::thread_act_t>()) as libc::vm_size_t,
+            );
+        }
+        Some(out)
     }
     #[cfg(not(target_os = "macos"))]
     {

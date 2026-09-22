@@ -12,7 +12,8 @@ use std::io::{self, Read};
 
 use crate::messages::update_object::power_display_scale;
 use crate::wire::{
-    read_cstring, read_f32_le, read_packed_guid, read_u16_le, read_u32_le, read_u64_le, read_u8,
+    capacity_hint, read_cstring, read_f32_le, read_packed_guid, read_u16_le, read_u32_le,
+    read_u64_le, read_u8,
 };
 
 /// The raid-assistant bit in [`GroupMemberEntry::flags`] / `SMSG_GROUP_LIST`'s own-flags byte —
@@ -95,7 +96,8 @@ pub(super) fn read_group_list(
     let group_type = read_u8(r)?;
     let own_flags = read_u8(r)?;
     let count = read_u32_le(r)?;
-    let mut members = Vec::with_capacity(count as usize);
+    // A raid is the widest list this carries: vmangos `MAX_RAID_SIZE` 40 (`Group/Group.h:50`).
+    let mut members = Vec::with_capacity(capacity_hint(count, 40));
     for _ in 0..count {
         members.push(GroupMemberEntry {
             name: read_cstring(r)?,
@@ -295,12 +297,14 @@ impl PartyMemberStatsInfo {
     /// [`power_display_scale`], exactly as the live-object leg divides. Without it an out-of-range
     /// warrior's rage bar reads ten times an in-range one's. Miss ⇒ `0`, the binding's own.
     pub fn shown_power(&self) -> u32 {
-        u32::from(self.cur_power.unwrap_or(0)) / power_display_scale(self.shown_power_type())
+        u32::from(self.cur_power.unwrap_or(0))
+            / power_display_scale(u32::from(self.shown_power_type()))
     }
 
     /// `UnitManaMax` on the record path (`0x5178af`), the same divide.
     pub fn shown_max_power(&self) -> u32 {
-        u32::from(self.max_power.unwrap_or(0)) / power_display_scale(self.shown_power_type())
+        u32::from(self.max_power.unwrap_or(0))
+            / power_display_scale(u32::from(self.shown_power_type()))
     }
 }
 
@@ -631,7 +635,7 @@ pub(super) fn read_raid_instance_info(r: &mut &[u8]) -> io::Result<Vec<RaidInsta
     // A cap before the allocation: `count` is attacker-controlled in the general case, and the
     // real client's own list is `MAX_RAID_INFOS`-bounded at the UI. 1024 is far above anything a
     // server can legitimately send and far below a memory problem.
-    let mut out = Vec::with_capacity((count as usize).min(1024));
+    let mut out = Vec::with_capacity(capacity_hint(count, 1024));
     for _ in 0..count {
         out.push(RaidInstanceEntry {
             map: read_u32_le(r)?,

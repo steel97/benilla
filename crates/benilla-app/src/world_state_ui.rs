@@ -1,5 +1,5 @@
 //! The always-up world-state readout (`WorldStateFrame`) — the app half behind
-//! `assets/ui/WorldStateFrame.xml` and benilla-ui's `script/worldstate.rs` bindings.
+//! stock `Interface\FrameXML\WorldStateFrame.xml` and benilla-ui's `script/worldstate.rs` bindings.
 //!
 //! This is report **B190**'s second half: the alliance↔horde progress UI. `WorldStateUI.dbc` says
 //! which world states are *displayed*, where, and with what label; [`crate::world_state`] holds
@@ -81,9 +81,7 @@ fn load_world_state_ui(mut commands: Commands, assets: Option<Res<WorldAssets>>)
 fn defense_channel_joined(channels: &crate::ui_chat::ChannelState) -> bool {
     const REQUIRED: u32 = chan::ZONE_DEP | chan::DEFENSE;
     channels
-        .joined
-        .iter()
-        .flatten()
+        .iter_names()
         .filter_map(|name| channels.channels.row_for_name(name))
         .any(|row| row.flags & REQUIRED == REQUIRED)
 }

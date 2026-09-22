@@ -78,7 +78,13 @@ impl Plugin for CloudsPlugin {
                     // After the submersion verdict: the surfacing edge (wet→dry) must fire the
                     // full rebuild the SAME frame the dome un-hides, or the first visible frame
                     // still shows the submerged-era tile.
-                    tick_clouds.after(crate::liquid::SubmersionVerdict),
+                    // …and on the READ side of the lighting resolve: the surfacing rebuild
+                    // below takes its density and palette from `WowLighting`, so an unordered
+                    // tick rebuilds the field from the atmosphere we just LEFT — the underwater
+                    // one, whose cloud density is 0.0 in Stranglethorn (B354, decision 2032).
+                    tick_clouds
+                        .after(crate::liquid::SubmersionVerdict)
+                        .in_set(crate::lighting::LightingConsumeSet),
                     // After the resolve: the dome and the painted skybox must agree WITHIN a frame,
                     // or one frame draws both (the ordering `crate::sky`'s gate already takes) —
                     // and after the submersion verdict, for the same one-frame-agreement reason.
@@ -99,7 +105,6 @@ impl Plugin for CloudsPlugin {
 /// incremental 32-row band scroll (or the frozen capture clock) — and re-upload the colored
 /// RGBA texels when they changed (the reference's per-regen `0x58ac70` upload of the `0x6cfb00`
 /// color buffer, Addendum A §3).
-#[allow(clippy::too_many_arguments)] // one Bevy system's full input set
 fn tick_clouds(
     mut cov: ResMut<CloudCoverage>,
     light: Res<WowLighting>,
@@ -130,10 +135,12 @@ fn tick_clouds(
         glow_dir: light.cloud_glow_dir,
         glow_track: light.cloud_glow_track,
     };
-    if surfaced && std::env::var_os("WOW_CLOUD_DUMP").is_some() {
+    static CLOUD_DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let cloud_dump = *CLOUD_DUMP.get_or_init(|| std::env::var_os("WOW_CLOUD_DUMP").is_some());
+    if surfaced && cloud_dump {
         eprintln!("[cloud] surfaced -> full rebuild (C {density:.3})");
     }
-    if std::env::var_os("WOW_CLOUD_DUMP").is_some() && cov.last_frame != Some(frame) {
+    if cloud_dump && cov.last_frame != Some(frame) {
         eprintln!(
             "[cloud] C {density:.3} sun {:?} slope {:?} gbase {:?} bcc {:.2} glow_dir {:?} track {:.2}",
             frame.sun, frame.slope, frame.gbase, frame.bcc, frame.glow_dir, frame.glow_track

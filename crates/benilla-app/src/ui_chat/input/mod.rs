@@ -13,73 +13,20 @@
 use bevy::prelude::*;
 
 mod parse;
-pub(super) use parse::{parse_enter_type_switch, parse_line, ParsedChat};
+#[cfg(test)]
+pub(super) use parse::lua_quoted_string;
+pub(super) use parse::{parse_line, ParsedChat};
 
 use crate::creature_anim::{move_flags, MovementState};
 use crate::net::{ClientCommand, NetCommands, SelfPlayer};
 use crate::target::Selection;
 
-/// Send `text` as the box's CURRENT type (`ChatEdit_SendText`): whisper/channel targets ride
-/// along; a sent whisper remembers its target (`ChatEdit_SetLastToldTarget`); a sticky type
-/// commits (`ChatEdit_OnEnterPressed`'s `stickyType = type`).
-fn send_current(state: &mut super::edit::ChatEditState, commands: &NetCommands, text: String) {
-    use super::edit::SendType;
-    if text.trim().is_empty() {
-        if state.chat_type.sticky() {
-            state.sticky = state.chat_type;
-        }
-        return;
-    }
-    let target = match state.chat_type {
-        SendType::Whisper => Some(state.tell_target.clone()),
-        SendType::Channel => Some(state.channel_target.clone()),
-        _ => None,
-    };
-    if state.chat_type == SendType::Whisper {
-        state.last_told = Some(state.tell_target.clone());
-    }
-    if state.chat_type.sticky() {
-        state.sticky = state.chat_type;
-    }
-    let cmd = ClientCommand::Chat {
-        kind: state.chat_type.wire(),
-        target,
-        text,
-    };
-    match commands.0.send(cmd) {
-        Ok(()) => {}
-        Err(_) => warn!("chat: not connected; line dropped"),
-    }
-}
-
-/// The canonical recallable form of a submitted line — the ref's `ChatEdit_AddHistory`
-/// (ChatFrame.lua 1916-1938: `SLASH_<type>1`, plus the whisper target / the channel number,
-/// then the typed text) — so a recalled line re-Entered reproduces the send even after the
-/// box's mode has moved on. A typed slash line recalls exactly as typed; that also stores
-/// command lines (`/join …`), which the ref never recalls — a deliberate, useful divergence
-/// (decision 0301).
-fn history_line(state: &super::edit::ChatEditState, msg: &str) -> String {
-    use super::edit::SendType;
-    if msg.starts_with('/') {
-        return msg.to_string();
-    }
-    match state.chat_type {
-        SendType::Whisper => format!("/w {} {}", state.tell_target, msg),
-        SendType::Channel => format!("/{} {}", state.channel_number, msg),
-        t => match t.canonical_slash() {
-            Some(a) => format!("/{a} {msg}"),
-            None => msg.to_string(), // the leader types: no 1.12 slash — recall raw
-        },
-    }
-}
-
-#[allow(clippy::too_many_arguments)] // a Bevy system's param list IS its dependency set
 /// The target half of the ref's `GetSlashCmdTarget` (ChatFrame.lua:650-658): a bare party
 /// command falls back to the current selection iff it's a PLAYER; anything else is `None` (the
 /// ref's silent no-op). The name is cache-resolved — a streamed player target is always cached.
 fn target_player_name(
     selection: &Selection,
-    names: &mut crate::names::NameCache,
+    names: &crate::names::NameCache,
     commands: &NetCommands,
 ) -> Option<String> {
     let guid = selection.guid?;
@@ -119,7 +66,6 @@ pub(super) fn emote_target(selection: &Selection, me: Option<Entity>) -> u64 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// The client-local diagnostics' inputs, as one [`SystemParam`] — [`drain_chat_input`] is at the
 /// 16-parameter ceiling, and a named struct beats a nested tuple nobody can read.
 ///
@@ -157,9 +103,6 @@ pub(super) struct ChatProbes<'w, 's> {
     /// "leader" on this wire is a guid. Here rather than as a 17th drain parameter for the
     /// reason this struct exists at all — the drain is at Bevy's 16-param ceiling.
     self_guid: Res<'w, crate::net::SelfGuid>,
-    /// The map `/partytest ping` stamps its synthetic ping with — a ping carries no map on the
-    /// wire either, so "the one we are standing on" is the client's answer in both paths.
-    map: Option<Res<'w, benilla_world::world_map::CurrentMap>>,
 }
 
 /// Everything the drain **queues into another subsystem's one setter** rather than applying itself,
@@ -173,7 +116,10 @@ pub(super) struct ChatProbes<'w, 's> {
 ///   [`crate::target`]'s shared resolver so they commit through the same SetSelection path a click
 ///   does. Chat never writes [`Selection`] itself.
 #[derive(bevy::ecs::system::SystemParam)]
-pub(super) struct ChatOut<'w> {
+pub(super) struct ChatOut<'w, 's> {
+    /// The console registry's lane: a `/console` line runs against the world at the next sync
+    /// point ([`crate::console::execute`]).
+    console: Commands<'w, 's>,
     stand: MessageWriter<'w, crate::player::StandStateRequest>,
     sheath: MessageWriter<'w, crate::creature_anim::SheathRequest>,
     target: MessageWriter<'w, crate::target::TargetByNameRequest>,
@@ -185,15 +131,81 @@ pub(super) struct ChatOut<'w> {
     /// same `seat` the wire arm calls, so the remote leg — the `partyN` token, the marker, the
     /// pin holding while you walk — is exercisable solo.
     ping: ResMut<'w, crate::minimap::MinimapPing>,
+    /// The red UIErrorsFrame line by GlobalStrings key — the emote-while-moving refusal is its one
+    /// tenant here (decision 1904). It rides this bundle rather than the system's own parameter
+    /// list because that list is at Bevy's arity limit; checked first against every other param,
+    /// since a resource reachable twice from one system is a `B0002` panic on the first live frame
+    /// (1903). Nothing else in this system touches `UiErrorKeys`.
+    ui_errors: ResMut<'w, crate::ui_action::UiErrorKeys>,
 }
 
 // One parameter per concern — the chat drain fans out to every command's consumer.
-#[allow(clippy::too_many_arguments)]
+/// The chat verbs the stock `ChatFrame.lua` slash handlers call once *they* have parsed the
+/// line — `DoEmote`, `RandomRoll`, `UninviteByName`, `ConsoleExec`, the channel verbs — drained
+/// from the VM into the same [`ParsedChat`] values our own parser produces, so one executor
+/// below serves both the reference's Lua and the lines it never sees.
+fn engine_verbs(
+    script: &mut benilla_ui::script::UiScript,
+    emotes: Option<&crate::sound::EmoteSounds>,
+) -> Vec<(String, ParsedChat)> {
+    let mut out = Vec::new();
+    for e in script.take_emote_requests() {
+        // The token is the `EmotesText.dbc` NAME (`EMOTE<i>_TOKEN`, "WAVE"), which is how the
+        // slash table resolved `/wave` before the Lua did the resolving.
+        match emotes.and_then(|c| c.text_id(&e.token)) {
+            Some(id) => out.push((String::new(), ParsedChat::TextEmote(id))),
+            None => warn!(
+                "chat: DoEmote({:?}): no EmotesText row for that token",
+                e.token
+            ),
+        }
+    }
+    for (min, max) in script.take_roll_requests() {
+        out.push((String::new(), ParsedChat::Random { min, max }));
+    }
+    for name in script.take_uninvite_requests() {
+        out.push((String::new(), ParsedChat::Uninvite { name: Some(name) }));
+    }
+    for line in script.take_console_lines() {
+        // `ConsoleExec` already wrote the valued CVar lines to the store; what reaches here is
+        // a console COMMAND — a name the engine's own command table owns rather than
+        // `CVar::Register`'s (`detailDoodadAlpha`: registrar `0x63f9e0`, so it never persists —
+        // 2012) — or a bare CVar name for the registry to print (2303).
+        out.push((line.clone(), ParsedChat::Console { line }));
+    }
+    for cmd in script.take_channel_commands() {
+        out.push((String::new(), ParsedChat::Channel(cmd)));
+    }
+    out
+}
+
+/// **A manual join or leave of `GuildRecruitment` turns the auto-join option off** — the
+/// reference's `0x49ed3d` (join) and `0x49ef8f` (leave), each `call 0x49ea70(0)` gated on the
+/// matched `ChatChannels.dbc` row carrying `flags & 0x20000` and on the caller's own flag, which
+/// the Lua bindings pass and the cascade's internal calls do not (wow-re
+/// `guild-recruitment-mode.md` §3; decision 2144). The player has taken manual control, and an
+/// option left checked would silently re-join or re-leave behind them.
+fn manual_join_or_leave(
+    channels: &super::edit::ChannelState,
+    script: &mut benilla_ui::script::UiScript,
+    wire_name: &str,
+) {
+    let guild_row = channels
+        .channels
+        .row_for_name(wire_name)
+        .is_some_and(|r| r.is_guild_recruitment());
+    if guild_row && script.reset_guild_recruitment_mode() {
+        info!("chat: manual {wire_name:?} — auto-join guild recruitment channel switched off");
+    }
+}
+
 pub(super) fn drain_chat_input(
     script: Option<NonSendMut<benilla_ui::script::UiScript>>,
     mut chat_log: ResMut<super::feed::ChatLog>,
-    mut state: ResMut<super::edit::ChatEditState>,
-    channels: Res<super::edit::ChannelState>,
+    // Mutable for one reason: an EXPLICIT leave clears the channel's `ZONECHANNELS` bit
+    // (decision 2120, the reference's `0x49f10a` inside leave-by-name `0x49ee70`). The zone
+    // walk's own LEAVE, one module over, deliberately does not.
+    mut channels: ResMut<super::edit::ChannelState>,
     commands: Res<NetCommands>,
     emotes: Option<Res<crate::sound::EmoteSounds>>,
     selection: Res<Selection>,
@@ -224,79 +236,70 @@ pub(super) fn drain_chat_input(
         guids,
         kinds,
         self_guid,
-        map,
     } = &probes;
     let Some(mut script) = script else {
         return;
     };
+    let mut queue = engine_verbs(&mut script, emotes.as_deref());
+    // What `take_chat_input` carries now is benilla's own commands, handed over by the
+    // `SlashCmdList` shim in ScriptLogFrame.xml once the reference's `ChatEdit_ParseText` has
+    // found no built-in for the line — the history line, the type switch and the send are the
+    // reference's Lua before the line ever reaches here (1948).
     for raw in script.take_chat_input() {
         let msg = raw.trim();
         if msg.is_empty() {
-            continue; // empty Enter = cancel (sticky already committed on prior sends)
+            continue;
         }
-        // Every non-blank submit becomes recallable (Up/Down) in its canonical form — the ref's
-        // `ChatEdit_AddHistory` slot. Plain lines canonicalize from the same state the send
-        // below uses, so this pre-branch placement equals the ref's post-parse one.
-        script.editbox_add_history("ChatFrameEditBox", &history_line(&state, msg));
-        // A plain line sends as the box's CURRENT type — the whole point of the edit machine
-        // (the v1 always-SAY default dies here).
+        // A line with no slash is SPEECH — which is also how a `.gm`-style server command
+        // travels (the server reads the dot off a SAY). That is the seam's contract
+        // (`UiScript::push_chat_input`): a typed line takes the stock `ChatEdit_SendText` →
+        // `SendChatMessage` route since 1948, and a probe's line, which never touched the edit
+        // box, must reach the wire the same way. The migration dropped this branch with the
+        // old edit-state sender, and every `WOW_PROBE_CHAT` rig — the crowd raid's forty
+        // `.partybot add`s, the probe shield's `.cheat god on` — went silent on the server.
         if !msg.starts_with('/') {
-            send_current(&mut state, &commands, msg.to_string());
-            continue;
-        }
-        // A slash line typed whole + Entered (never live-parsed — no trailing space): the type
-        // switch still applies on the send path (`ChatEdit_ParseText(send=1)` runs the same
-        // conversion first), then the remainder sends as the new type.
-        if let Some((switch, remainder)) = parse_enter_type_switch(&channels, msg) {
-            match switch {
-                super::edit::TypeSwitch::Plain(t) => state.chat_type = t,
-                super::edit::TypeSwitch::Whisper(target) => {
-                    state.chat_type = super::edit::SendType::Whisper;
-                    state.tell_target = target;
-                }
-                super::edit::TypeSwitch::Channel { name, number } => {
-                    state.chat_type = super::edit::SendType::Channel;
-                    state.channel_target = name;
-                    state.channel_number = number;
-                }
+            let cmd = ClientCommand::Chat {
+                kind: super::edit::SendType::Say.wire(),
+                target: None,
+                text: msg.to_string(),
+            };
+            if commands.0.send(cmd).is_err() {
+                warn!("chat: not connected; line dropped");
             }
-            state.header_dirty = true;
-            send_current(&mut state, &commands, remainder);
             continue;
         }
-        match parse_line(&table, msg) {
-            ParsedChat::Reply { text } => match state.last_tell.front().cloned() {
-                Some(target) => {
-                    state.chat_type = super::edit::SendType::Whisper;
-                    state.tell_target = target;
-                    state.header_dirty = true;
-                    send_current(&mut state, &commands, text);
-                }
-                None => {
-                    // ERR_NO_REPLY_TARGET (GlobalStrings:1748).
-                    chat_log.push_event(super::event::ChatEvent::text_only(
-                        super::event::ChatEventKind::System,
-                        "You have nobody to reply to yet.".to_string(),
-                    ));
-                }
-            },
+        queue.push((msg.to_string(), parse_line(&table, msg)));
+    }
+    for (msg, parsed) in queue {
+        let msg = msg.as_str();
+        match parsed {
+            // `/r` is `SLASH_REPLY`, one of the reference's own built-ins (`ChatEdit_ParseText`'s
+            // REPLY arm over the box's tell ring) — the line never reaches this queue.
+            ParsedChat::Reply { .. } => {}
+            // `/join` and `/leave` are stock built-ins (`SlashCmdList["JOIN"]`/`["LEAVE"]`, ref
+            // `ChatFrame.lua` l.778/l.803), so a typed line never reaches here — only a probe's,
+            // which skips the edit box. It takes the same handler, not a shortcut past it: the
+            // command-table arm used to send the token verbatim, and a probe's `/join General`
+            // created a CUSTOM channel called "General" on the server (decision 2144's live
+            // run D). The handlers resolve through `JoinChannelByName`/`LeaveChannelByName`,
+            // whose commands the `Channel` arm below drains next frame.
             ParsedChat::Join { name, password } => {
-                let _ = commands
-                    .0
-                    .send(ClientCommand::JoinChannel { name, password });
+                let body = format!(
+                    "SlashCmdList['JOIN']({:?})",
+                    format!("{name} {password}").trim_end()
+                );
+                if let Err(e) = script.run(&body) {
+                    warn!("ui_chat: {body}: {e}");
+                }
             }
             ParsedChat::Leave { name } => {
-                let _ = commands.0.send(ClientCommand::LeaveChannel { name });
+                let body = format!("SlashCmdList['LEAVE']({name:?})");
+                if let Err(e) = script.run(&body) {
+                    warn!("ui_chat: {body}: {e}");
+                }
             }
             ParsedChat::ChatList { name } => {
                 let _ = commands.0.send(ClientCommand::ChannelList { name });
-            }
-            ParsedChat::AfkDnd { kind, msg } => {
-                let _ = commands.0.send(ClientCommand::Chat {
-                    kind,
-                    target: None,
-                    text: msg,
-                });
             }
             ParsedChat::Random { min, max } => {
                 let _ = commands.0.send(ClientCommand::RandomRoll { min, max });
@@ -575,13 +578,15 @@ pub(super) fn drain_chat_input(
                 "off" => group.clear_session(),
                 // The raid grid's instrument (decision 1549) — 25 synthetic rows, us leading.
                 "raid" => {
-                    for line in crate::ui_party::synthetic_raid(&mut group, &mut names, self_guid.0)
-                    {
-                        chat_log.push_event(super::event::ChatEvent::text_only(
-                            super::event::ChatEventKind::System,
-                            line,
-                        ));
-                    }
+                    // Onto the same by-key queue the wire arm uses (2045/2054), so the instrument
+                    // shows the lines a real roster would — resolved from GlobalStrings, on the
+                    // surface each catalog row names, with its sound. An instrument that composed
+                    // its own text would be eyeballing something the game never prints.
+                    chat_out.ui_errors.0.extend(crate::ui_party::synthetic_raid(
+                        &mut group,
+                        &mut names,
+                        self_guid.0,
+                    ));
                 }
                 "invite" => group.pending_invite = Some("Partner".to_string()),
                 // A group member's ping, without the group member (decision 1596). 35 yd
@@ -594,9 +599,7 @@ pub(super) fn drain_chat_input(
                         let w = benilla_assets::coords::bevy_to_wow(tf.translation());
                         // +x is north, −y is east (0203's north-up mapping).
                         let at = (w[0] + 24.75, w[1] - 24.75);
-                        chat_out
-                            .ping
-                            .seat(at, map.as_ref().map_or(0, |m| m.0), 0xF001);
+                        chat_out.ping.seat(at, 0xF001);
                         format!(
                             "partytest: Alice pinged ({:.0}, {:.0}) — 35 yd NE, party1, 5 s",
                             at.0, at.1
@@ -622,12 +625,10 @@ pub(super) fn drain_chat_input(
                         let w = benilla_assets::coords::bevy_to_wow(tf.translation());
                         (w[0], w[1])
                     });
-                    for line in crate::ui_party::synthetic_roster(&mut group, player_xy) {
-                        chat_log.push_event(super::event::ChatEvent::text_only(
-                            super::event::ChatEventKind::System,
-                            line,
-                        ));
-                    }
+                    chat_out
+                        .ui_errors
+                        .0
+                        .extend(crate::ui_party::synthetic_roster(&mut group, player_xy));
                     if arg == "lead" {
                         // The leader-view variant: an unmatched leader guid resolves to
                         // leader_index 0 in the feed — "we lead" — so the leader-only popup
@@ -638,7 +639,7 @@ pub(super) fn drain_chat_input(
             },
             ParsedChat::Invite { name } => {
                 if let Some(name) =
-                    name.or_else(|| target_player_name(&selection, &mut names, &commands))
+                    name.or_else(|| target_player_name(&selection, &names, &commands))
                 {
                     let _ = commands.0.send(ClientCommand::GroupInvite { name });
                 }
@@ -651,14 +652,14 @@ pub(super) fn drain_chat_input(
             }
             ParsedChat::Uninvite { name } => {
                 if let Some(name) =
-                    name.or_else(|| target_player_name(&selection, &mut names, &commands))
+                    name.or_else(|| target_player_name(&selection, &names, &commands))
                 {
                     let _ = commands.0.send(ClientCommand::GroupUninvite { name });
                 }
             }
             ParsedChat::Promote { name } => {
                 if let Some(name) =
-                    name.or_else(|| target_player_name(&selection, &mut names, &commands))
+                    name.or_else(|| target_player_name(&selection, &names, &commands))
                 {
                     // The 1.12 wire form is a guid (CMSG_GROUP_SET_LEADER) — resolve against the
                     // roster; a miss answers with the server's own would-be error string
@@ -689,7 +690,7 @@ pub(super) fn drain_chat_input(
             // player gate, arbiter echo) instead of a second one here.
             ParsedChat::Duel { name } => {
                 if let Some(name) =
-                    name.or_else(|| target_player_name(&selection, &mut names, &commands))
+                    name.or_else(|| target_player_name(&selection, &names, &commands))
                 {
                     script.queue_duel_request(benilla_ui::script::DuelRequest::StartByName(name));
                 }
@@ -707,7 +708,7 @@ pub(super) fn drain_chat_input(
             // GetSlashCmdTarget(msg)` guard does.
             ParsedChat::Target { name } => {
                 if let Some(name) =
-                    name.or_else(|| target_player_name(&selection, &mut names, &commands))
+                    name.or_else(|| target_player_name(&selection, &names, &commands))
                 {
                     chat_out
                         .target
@@ -736,15 +737,6 @@ pub(super) fn drain_chat_input(
             // over the same binding the popup row calls, so it enters the same intent queue
             // (decision 0646 §3; the `/duel` reasoning above, verbatim).
             ParsedChat::Pvp => script.queue_pvp_toggle(),
-            // Run the reference's own slash body (see the variant's doc). The argument is a Lua
-            // string literal, so it is escaped: a `/who` filter legitimately contains quotes
-            // (`z-"Elwynn Forest"`), and a newline would end the statement.
-            ParsedChat::Social { verb, arg } => {
-                let lua = format!("{}(\"{}\")", verb.lua_fn(), parse::escape_lua_string(&arg));
-                if let Err(e) = script.run(&lua) {
-                    warn!("ui_chat(social): {e}");
-                }
-            }
             ParsedChat::Help => {
                 // An honest benilla summary (the ref's HELP_TEXT_LINE pages are a settings-era
                 // nicety; this stays useful and never stale-quotes them).
@@ -796,13 +788,33 @@ pub(super) fn drain_chat_input(
                 // A chat-only text emote (no Emotes.dbc row) has no EmoteFlags to test and no
                 // posture to set — it always sends.
                 let posture = emote_id.and_then(|id| emotes.as_deref()?.posture_state(id));
-                // GATE A (`CheckEmoteEligible` `0x47db40`): suppresses the anim AND the packet.
-                let eligible = match emotes.as_deref() {
+                // GATE A (`CheckEmoteEligible` `0x47db40`): suppresses the anim AND the packet —
+                // except its `0x4000` arm, which refuses out loud instead (decision 1904).
+                let gate = match emotes.as_deref() {
                     Some(e) => emote_id
                         .and_then(|id| e.emote_flags(id))
-                        .is_none_or(|f| emote_send_eligible(f, stand_state, swimming)),
-                    None => true,
+                        .map_or(EmoteGate::Send, |f| {
+                            emote_send_eligible(f, stand_state, swimming, flags)
+                        }),
+                    None => EmoteGate::Send,
                 };
+                // The `0x4000` arm's own half of the law, which lives in `DoEmote` (`0x5ef5d0`)
+                // and not in the eligibility check: the red line fires only while the caster is
+                // acting under its OWN control, so a feared or confused player emotes normally.
+                if gate == EmoteGate::Moving {
+                    let controlled = self_store
+                        .single()
+                        .is_ok_and(|s| crate::player::self_controlled(s.0.unit_flags()));
+                    if controlled {
+                        debug!("chat: emote {text_id} refused — moving (ERR_NOEMOTEWHILERUNNING)");
+                        chat_out
+                            .ui_errors
+                            .0
+                            .push(crate::ui_action::UiError::key("ERR_NOEMOTEWHILERUNNING"));
+                        continue;
+                    }
+                }
+                let eligible = gate != EmoteGate::Suppressed;
                 // GATE B (`0x5ef5f3`): asleep, only a POSTURE emote gets through — which is how
                 // `/stand` (and `/sit`) is the way out of `/sleep`, while a `/wave` in bed does
                 // nothing at all.
@@ -911,7 +923,14 @@ pub(super) fn drain_chat_input(
                     None => warn!("castvis: no selection and no self avatar — dropped"),
                 }
             }
-            ParsedChat::ChatTest => chattest_battery(&mut chat_log),
+            ParsedChat::ChatTest => chattest_battery(&mut chat_log, &|key: &str| {
+                script
+                    .lua()
+                    .globals()
+                    .get::<String>(key)
+                    .ok()
+                    .filter(|t| !t.is_empty())
+            }),
             // `/logout` (and `/camp`) is the reference's own `SlashCmdList["LOGOUT"]` → `Logout()`,
             // so it takes the SAME route the game menu's Logout button does (decision 0674): the
             // request queues on the script seam, `crate::ui_logout` sends it and narrates the
@@ -925,23 +944,26 @@ pub(super) fn drain_chat_input(
             ParsedChat::Quit => {
                 script.queue_session_request(benilla_ui::script::SessionRequest::Quit)
             }
-            // `/reload` and `/console reloadUI` — the same deferred rebuild `ReloadUI()` queues
-            // (decision 1291), through the same session seam as the exit verbs above.
+            // `/reload` — the same deferred rebuild `ReloadUI()` queues (decision 1291), through
+            // the same session seam as the exit verbs above.
             ParsedChat::ReloadUi => {
                 script.queue_session_request(benilla_ui::script::SessionRequest::ReloadUi)
             }
-            ParsedChat::ConsoleUnknown { cmd } => {
-                let text = if cmd.is_empty() {
-                    "console: no command given (this client implements: reloadUI)".to_string()
-                } else {
-                    format!(
-                        "console: '{cmd}' is not implemented (this client implements: reloadUI)"
-                    )
-                };
-                chat_log.push_event(super::event::ChatEvent::text_only(
-                    super::event::ChatEventKind::System,
-                    text,
-                ));
+            // A `/console` line for the command registry (decision 2303). Deferred to the world
+            // because a command's body is `fn(&mut World, &str)` — the reference's handlers run
+            // against the whole client too — and its lines land in the chat frame as system
+            // text, the seam `/console` output has always used.
+            ParsedChat::Console { line } => {
+                chat_out.console.queue(move |world: &mut World| {
+                    let lines = crate::console::execute(world, &line);
+                    let mut log = world.resource_mut::<super::feed::ChatLog>();
+                    for text in lines {
+                        log.push_event(super::event::ChatEvent::text_only(
+                            super::event::ChatEventKind::System,
+                            text,
+                        ));
+                    }
+                });
             }
             // The reference's own handler body, run in the VM (the 0668 posture) — `/trade`,
             // `/inspect`, the loot-method trio, and `/script`'s raw chunk.
@@ -956,6 +978,69 @@ pub(super) fn drain_chat_input(
                     ));
                 }
             }
+            ParsedChat::Channel(cmd) => {
+                use benilla_ui::script::ChannelCommand as C;
+                let cmd = match cmd {
+                    C::Join { name, password } => {
+                        manual_join_or_leave(&channels, &mut script, &name);
+                        ClientCommand::JoinChannel { name, password }
+                    }
+                    C::Leave { name } => {
+                        // `LeaveChannelByName` (`0x4a0000` → `0x49ee70`): the VM composed a
+                        // shortcut or passed a custom name; a number names a confirmed slot here
+                        // or the call is a no-op. The mask clear is this path's and no other's
+                        // (decisions 2120, 2144).
+                        let Some(name) = channels.leave_target(&name) else {
+                            continue;
+                        };
+                        manual_join_or_leave(&channels, &mut script, &name);
+                        channels.note_zone_channel_left(&name);
+                        ClientCommand::LeaveChannel { name }
+                    }
+                    C::List { name } => ClientCommand::ChannelList { name },
+                    // `ListChannels()` — the joined roster, numbered the way `/N` addresses it.
+                    C::ListAll => {
+                        let roster: Vec<String> = channels
+                            .joined
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, c)| {
+                                c.as_ref().map(|c| format!("{}. {}", i + 1, c.name))
+                            })
+                            .collect();
+                        let text = if roster.is_empty() {
+                            "You are not in any channels.".to_string()
+                        } else {
+                            format!("Channels: {}", roster.join(", "))
+                        };
+                        chat_log.push_event(super::event::ChatEvent::text_only(
+                            super::event::ChatEventKind::System,
+                            text,
+                        ));
+                        continue;
+                    }
+                    C::DisplayOwner { name } => ClientCommand::ChannelOwner { name },
+                    C::SetOwner { name, player } => ClientCommand::ChannelSetOwner { name, player },
+                    C::SetPassword { name, password } => {
+                        ClientCommand::ChannelPassword { name, password }
+                    }
+                    C::Ban { name, player } => ClientCommand::ChannelBan { name, player },
+                    C::Invite { name, player } => ClientCommand::ChannelInvite { name, player },
+                    C::Kick { name, player } => ClientCommand::ChannelKick { name, player },
+                    C::Moderator { name, player } => {
+                        ClientCommand::ChannelModerator { name, player }
+                    }
+                    C::Unmoderator { name, player } => {
+                        ClientCommand::ChannelUnmoderator { name, player }
+                    }
+                    C::Mute { name, player } => ClientCommand::ChannelMute { name, player },
+                    C::Unmute { name, player } => ClientCommand::ChannelUnmute { name, player },
+                    C::Unban { name, player } => ClientCommand::ChannelUnban { name, player },
+                    C::Moderate { name } => ClientCommand::ChannelModerate { name },
+                    C::ToggleAnnouncements { name } => ClientCommand::ChannelAnnouncements { name },
+                };
+                let _ = commands.0.send(cmd);
+            }
             ParsedChat::Unknown => {
                 // Before the help line: an ADDON may claim it (decision 1195). The reference
                 // resolves `SlashCmdList` in the same pass as its own commands; ours runs after
@@ -968,11 +1053,22 @@ pub(super) fn drain_chat_input(
                         continue;
                     }
                 }
-                // HELP_TEXT_SIMPLE (the ref's unknown-command reply, ChatEdit_ParseText l.2203).
-                chat_log.push_event(super::event::ChatEvent::text_only(
-                    super::event::ChatEventKind::System,
-                    "Type '/help' for a listing of a few commands.".to_string(),
-                ));
+                // HELP_TEXT_SIMPLE (the ref's unknown-command reply, ChatEdit_ParseText l.2203),
+                // read off the player's own table rather than re-typed here (decision 2045). It is
+                // no message-catalog row — the reference emits it from Lua straight into chat — so
+                // there is no surface or sound to look up, only the wording.
+                if let Some(text) = script
+                    .lua()
+                    .globals()
+                    .get::<String>("HELP_TEXT_SIMPLE")
+                    .ok()
+                    .filter(|t| !t.is_empty())
+                {
+                    chat_log.push_event(super::event::ChatEvent::text_only(
+                        super::event::ChatEventKind::System,
+                        text,
+                    ));
+                }
             }
         }
     }
@@ -981,7 +1077,7 @@ pub(super) fn drain_chat_input(
 /// `/chattest` (the 0288 instrument): one synthetic line of every renderable form through the
 /// real event pipeline — kinds, flags, the language header, channel prefixes, notices, and both
 /// link forms (item + player), so formats/colors/links verify in one screen.
-fn chattest_battery(log: &mut super::feed::ChatLog) {
+fn chattest_battery(log: &mut super::feed::ChatLog, get: &dyn Fn(&str) -> Option<String>) {
     use super::event::{ChatEvent, ChatEventKind as K};
     let player = |kind: K, text: &str, sender: &str| {
         let mut e = ChatEvent::text_only(kind, text.into());
@@ -1037,7 +1133,7 @@ fn chattest_battery(log: &mut super::feed::ChatLog) {
     for e in battery {
         log.push_event(e);
     }
-    combat_log_battery(log);
+    combat_log_battery(log, get);
     info!("chattest: battery queued");
 }
 
@@ -1053,7 +1149,7 @@ fn chattest_battery(log: &mut super::feed::ChatLog) {
 ///
 /// The chat TYPES are picked to show the block's spread rather than one row: your own melee and
 /// spells, your pet, a hostile player, and a creature hitting you (which is the one that is red).
-fn combat_log_battery(log: &mut super::feed::ChatLog) {
+fn combat_log_battery(log: &mut super::feed::ChatLog, get: &dyn Fn(&str) -> Option<String>) {
     use super::combat::{self, Family, Fills, PendingCombat, Variant};
     use super::event::ChatEventKind as K;
 
@@ -1315,12 +1411,18 @@ fn combat_log_battery(log: &mut super::feed::ChatLog) {
                 ..fills(250, None, None)
             },
         ),
+        // The failure reason is the ONE fill in this battery that is a reference string rather
+        // than a synthetic name: production puts a resolved GlobalString in this slot
+        // (`ui_action::feed`'s `CAST_FAIL_KEYS` lookup), so a battery that typed English here
+        // would read as the only untranslated line on a localized install. `ERR_OUT_OF_MANA` and
+        // not `OUT_OF_MANA` — the same enUS sentence, but the byte-verified NO_POWER pick table
+        // `0x8118dc` names the former (`ui_action::cast_fail`).
         line(
             K::SpellFailedLocalPlayer,
             combat::SPELLFAILCAST,
             Variant::SelfOther,
             Fills {
-                named: "Not enough mana".into(),
+                named: get("ERR_OUT_OF_MANA").unwrap_or_default(),
                 ..fills(0, None, None)
             },
         ),
@@ -1355,6 +1457,22 @@ fn combat_log_battery(log: &mut super::feed::ChatLog) {
 ///
 /// # The fifth flag, `0x4000` — NOT built, and the reason recorded here was WRONG
 ///
+/// What `CheckEmoteEligible 0x47db40` decides about one emote — three outcomes, not two, which is
+/// why this replaced a `bool` (decision 1904).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum EmoteGate {
+    /// Send it: packet, posture, animation.
+    Send,
+    /// **Silently** dropped — no packet, no animation, and no line. A seated `/bow` is this.
+    Suppressed,
+    /// The `0x4000` "requires standing still" arm tripped. The reference does NOT suppress here:
+    /// `CheckEmoteEligible` writes an out-param and `DoEmote` reads it at `0x5ef5d0`, raising
+    /// `ERR_NOEMOTEWHILERUNNING` and aborting **only when `IsSelfControlled 0x5fa550` is
+    /// non-zero** — so the toast fires for an ordinary moving player and a **feared** one emotes
+    /// away happily. That caster-state test is the caller's, exactly as it is the reference's.
+    Moving,
+}
+
 /// This doc used to say `0x4000` ("requires standing still") *"only sets an out param the client
 /// acts on while fear/confuse-controlled, which benilla doesn't model"*. A §5 trio carve of the
 /// neighbouring stand-state gate re-read the leg and **inverted that polarity**
@@ -1378,25 +1496,61 @@ fn combat_log_battery(log: &mut super::feed::ChatLog) {
 /// to do with B155 and could never have covered it (`super::super::tests::
 /// the_posture_emotes_carry_no_swim_suppression_flag` is the data half of that same negative). The
 /// posture path's water refusal lives in [`crate::player::state`]'s `stand_state_refused`.
-pub(super) fn emote_send_eligible(emote_flags: u32, stand_state: u8, swimming: bool) -> bool {
+pub(super) fn emote_send_eligible(
+    emote_flags: u32,
+    stand_state: u8,
+    swimming: bool,
+    move_flags: u32,
+) -> EmoteGate {
     // `0x0400`: unconditional suppress (client `0x47db58`).
     if emote_flags & 0x0400 != 0 {
-        return false;
+        return EmoteGate::Suppressed;
     }
     // `0x0001` + non-zero stand-state: "requires STAND" (client `0x47db65`..`0x47db74`).
     if emote_flags & 0x0001 != 0 && stand_state != 0 {
-        return false;
+        return EmoteGate::Suppressed;
     }
     // `0x0080` while swimming (client `0x47db76`..`0x47db7d`).
     if emote_flags & 0x0080 != 0 && swimming {
-        return false;
+        return EmoteGate::Suppressed;
     }
     // `0x0200` ABSENT at SLEEP(3)/DEAD(7): the bit means "allowed while asleep/dead" (client
     // `0x47db8e`..`0x47db9f`).
     if emote_flags & 0x0200 == 0 && matches!(stand_state, 3 | 7) {
-        return false;
+        return EmoteGate::Suppressed;
     }
-    true
+    // `0x4000` "requires standing still" (client `0x47dbab`), tested against the live CMovement
+    // word at `0x47dbb3` — the reference's own `0x20ff`, which is exactly
+    // [`crate::creature_anim::move_flags::INTEGRATED`]: the four direction bits, the two turn
+    // bits, the two pitch bits and FALLING. Pointedly **not** SWIMMING.
+    //
+    // This arm does not suppress: it writes `*out = 1`, and DoEmote turns that into a red line
+    // (or not) on a caster-state test the caller owns — see [`EmoteGate::Moving`].
+    if emote_flags & 0x4000 != 0 && move_flags & crate::creature_anim::move_flags::INTEGRATED != 0 {
+        return EmoteGate::Moving;
+    }
+    EmoteGate::Send
+}
+
+/// `PLAYER_FLAGS_DND` (`0x4`) off our own live descriptor — the DND arm's state test.
+///
+/// **Live, not mirrored, and that asymmetry is the reference's** (wow-re
+/// `afk-dnd-command-law.md` §8): the AFK path keeps an optimistic global and the DND path keeps
+/// nothing, so a second `/dnd` typed before the server's `PLAYER_FLAGS` update lands still reads
+/// DND clear and re-marks, where a second `/afk` in the same window clears. Do not "fix" this into
+/// a symmetric pair.
+fn is_dnd(self_q: &Query<&crate::net::ObjectStore, With<crate::net::SelfPlayer>>) -> bool {
+    self_q
+        .iter()
+        .next()
+        .is_some_and(|s| s.0.player_flags() & 0x4 != 0)
+}
+
+/// `autoClearAFK` — registered default `"1"` (`0x5e24d4 push 0x82e748`). Its reader tests
+/// `[cvar+0x28]` for non-zero (`0x5eb84b`), and with the CVar OFF the clear is a **total** no-op:
+/// no echo, no mirror write, no packet.
+fn auto_clear_afk(cvars: &crate::cvars::Cvars) -> bool {
+    cvars.flag("autoClearAFK").unwrap_or(true)
 }
 
 /// Turn an addon's `SendChatMessage` calls into sends (decision 1199).
@@ -1411,6 +1565,13 @@ pub(super) fn drain_addon_chat_sends(
     script: Option<NonSendMut<benilla_ui::script::UiScript>>,
     commands: Res<NetCommands>,
     mut chat_log: ResMut<super::feed::ChatLog>,
+    mut tutorials: Option<MessageWriter<crate::tutorial::TutorialEvent>>,
+    // The optimistic AFK mirror (`[0xb6e5cc]`) the `/afk` toggle reads and writes — 2088.
+    mut mirror: ResMut<super::away::AfkMirror>,
+    // `autoClearAFK`, whose registered default is `"1"` — the gate on the implicit clear.
+    cvars: Res<crate::cvars::Cvars>,
+    // Our own descriptor, for the DND arm's LIVE `PLAYER_FLAGS & 0x4` read (DND has no mirror).
+    self_q: Query<&crate::net::ObjectStore, With<crate::net::SelfPlayer>>,
 ) {
     let Some(mut script) = script else {
         return;
@@ -1427,10 +1588,70 @@ pub(super) fn drain_addon_chat_sends(
             ));
             continue;
         };
+        // `SendChatMessage`'s acknowledge (`0x49f5fc`, 1976): the twelve social wire types —
+        // party, raid, guild, officer, whisper, channel, AFK/DND, raid leader/warning, the two
+        // battleground types — say, yell and emote are not among them.
+        if !matches!(
+            kind,
+            super::edit::SendType::Say | super::edit::SendType::Yell | super::edit::SendType::Emote
+        ) {
+            if let Some(t) = tutorials.as_mut() {
+                t.write(crate::tutorial::TutorialEvent::Acknowledge {
+                    id: crate::tutorial::id::CHATTING,
+                });
+            }
+        }
+        // ── The away commands, and the implicit clear every other send carries (2088) ────────
+        //
+        // `SendChatMessage 0x49f1e0` is not a uniform dispatcher: AFK and DND each carry their own
+        // arm ahead of the generic send, and EVERY other type first clears a standing AFK. The
+        // whole law — the four `CHAT_MSG_SYSTEM` lines, the client-side default substitution, the
+        // optimistic mirror — is `super::away`, off wow-re's `afk-dnd-command-law.md` §12 table.
+        let strings = |key: &str| crate::ui_chat::combat::global_string(&script, key);
+        let wire = kind.wire();
+        let text = match wire {
+            crate::net::ChatKind::Afk => {
+                let out = super::away::afk_line(&send.text, *mirror, &strings);
+                if let Some(line) = out.line {
+                    super::away::push_system(&mut chat_log, line);
+                }
+                if let Some(v) = out.mirror {
+                    mirror.0 = v;
+                }
+                out.body
+            }
+            crate::net::ChatKind::Dnd => {
+                // The live descriptor bit, not a mirror: DND has none (§8), which is what makes a
+                // repeated `/dnd` re-mark where a repeated `/afk` clears.
+                let out = super::away::dnd_line(&send.text, is_dnd(&self_q), &strings);
+                if let Some(line) = out.line {
+                    super::away::push_system(&mut chat_log, line);
+                }
+                out.body
+            }
+            // Any other type: clear a standing AFK first (`0x49f3d6` skips only type `0x14`), then
+            // send the line's own packet. `/dnd` is type `0x15`, so it takes this path too — which
+            // is why the reference prints THREE lines for a typed `/afk` then `/dnd`.
+            _ => {
+                if let Some(line) =
+                    super::away::auto_clear_line(*mirror, auto_clear_afk(&cvars), &strings)
+                {
+                    super::away::push_system(&mut chat_log, line);
+                    mirror.0 = 0;
+                    // The empty `0x14` that tells the server, alongside the message's own packet.
+                    let _ = commands.0.send(ClientCommand::Chat {
+                        kind: crate::net::ChatKind::Afk,
+                        target: None,
+                        text: String::new(),
+                    });
+                }
+                send.text
+            }
+        };
         let cmd = ClientCommand::Chat {
-            kind: kind.wire(),
+            kind: wire,
             target: send.target,
-            text: send.text,
+            text,
         };
         if commands.0.send(cmd).is_err() {
             warn!("chat: not connected; addon line dropped");

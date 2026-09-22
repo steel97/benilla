@@ -39,6 +39,15 @@ pub struct SpellDisplay {
     /// [`Self::cooldown_on_event`] (bit 25), and the aura-bar display filter
     /// [`Self::hidden_from_aura_bar`] (`0x80`).
     pub attributes: u32,
+    /// **`School`** (column 1, `SpellRec+0x4`) — the spell's magic school as an INDEX, not a mask.
+    /// The crowd-control exemption's school arm shifts it (`1 << School`) before testing it against
+    /// an immunity effect's `EffectMiscValue`, which is a mask (decision 1946).
+    pub school: u32,
+    /// **`Mechanic`** (column 5, `SpellRec+0x14`) — the `SpellMechanic.dbc` id for the spell as a
+    /// whole. Read by the crowd-control ladder twice over: the mechanic-immunity arm compares it,
+    /// and it is the fallback value the scanner reports when a blocking aura's own
+    /// `EffectMechanic` is 0 — which is what names the `0x8d` "Can't do that while %s" line.
+    pub mechanic: u32,
     /// `AttributesEx` (column 7, `SpellRec+0x1c`) — only bit `0x10000000` is consumed
     /// ([`Self::hidden_from_aura_bar`]'s `SPELL_ATTR_EX_NO_AURA_ICON` half).
     pub attributes_ex: u32,
@@ -47,9 +56,43 @@ pub struct SpellDisplay {
     /// gate [`Self::form_refusal`]; the stance-bar admission bits (`0x2`/`0x10`) are read raw by
     /// `benilla::ui_shapeshift`.
     pub attributes_ex2: u32,
-    /// `AttributesEx3` (column 9, `SpellRec+0x24`) — only bit `0x8000` is consumed
-    /// ([`Self::melee_white_damage`]).
+    /// `AttributesEx3` (column 9, `SpellRec+0x24`) — bit `0x8000` is consumed
+    /// ([`Self::melee_white_damage`]), and bits `0x400` / `0x1000000` are the equipped-item
+    /// search's **hand restriction** (main-hand-only / off-hand-only), which is where
+    /// `0x5f0c50`'s slot mask comes from (decision 1903).
     pub attributes_ex3: u32,
+    /// **`SpellFamilyName`** (column 160, `SpellRec+0x280`) — which class's talent tree may modify
+    /// this spell. `0` on 18243 of the 22357 shipped rows (creature and world spells); the rest
+    /// carry a `SpellFamilyNames` value, which for a player spell is its own class's.
+    ///
+    /// The first two of `GetSpellModifiers 0x6e6b30`'s three conjunct gates read it and nothing
+    /// else: `!= 0` (`6e6b38`), then `== [0xcecaac]`, the local player's own class family
+    /// (`6e6b46` — [`crate::ChrClasses::spell_family`]). A spell that fails either takes no
+    /// modifier at all, which is how a mage's talent stays off a warrior's ability and off every
+    /// item/creature spell in the file. wow-re `system/spell/scratch/spellmod-table-law.md` §5.1.
+    pub spell_family: u32,
+    /// **`SpellFamilyFlags`** (columns 161/162, `SpellRec+0x284`/`+0x288`) — the 64-bit bit-set
+    /// naming which of its family's modifier rows this spell subscribes to, low dword first.
+    ///
+    /// `GetSpellModifiers` walks **all 64 bits** with no early break and SUMS one cell per set bit
+    /// out of each table (`6e6b72`–`6e6ba6`), so a multi-bit spell accumulates several — and the
+    /// high dword is genuinely live rather than unused width: measured on the shipped 5875 file,
+    /// 1794 rows set exactly one bit, **322 set more than one**, and the highest bit index in the
+    /// whole table is **35**. Frostbolt 116 sets 5/19/20/30, Cleanse 4987 sets 12 **and 33** (it
+    /// needs both dwords), Cure Poison 526 sets 35 alone.
+    pub spell_family_flags: u64,
+    /// **`PreventionType`** (column 165, `SpellRec+0x294`) — which crowd-control flag refuses this
+    /// spell **locally**, before any packet: `1` = silence, `2` = pacify, `0` = neither. The
+    /// client's CC validator `0x6094f0` (called from `TryCast 0x6e4b60`, bailing at `0x6e4f42`)
+    /// reads it per spell — so `UNIT_FLAG_SILENCED` does **not** stop everything, only the rows
+    /// that declare `1`. The STUNNED arm above it carries no such gate and refuses every spell.
+    ///
+    /// **Column pinned twice** (decision 1903): the byte offset `0x294 / 4 = 165` on a 173-field,
+    /// 692-byte record, and the shipped data itself — its neighbour 164 is `DmgClass` and takes
+    /// four values where this takes three, which **Auto Shot (75)** separates decisively at
+    /// `DmgClass = 3` (RANGED) with `PreventionType = 2`. Fireball 133 → 1, Heroic Strike 78 → 2,
+    /// Attack 6603 → 0.
+    pub prevention_type: u32,
     /// **`modalNextSpell`** (`Spell.dbc` column 38, `SpellRec + 0x98`) — the spell this one makes
     /// the client cast **by itself**, one server round-trip later, with no user input and no addon.
     /// `0` for all but 57 of the 22357 shipped rows.
@@ -174,6 +217,12 @@ pub struct SpellDisplay {
     /// enum the cast-arm's switch adjusts the flag_word by (and the usable walk's
     /// CanAttack/CanAssist fork inside the TargetAuraState leg keys on: 6 = enemy, 21 = friend).
     pub implicit_target_a1: u32,
+    /// `EffectImplicitTargetA[3]` (columns 82–84, [`COL_IMPLICIT_TARGET_A1`]) and
+    /// `EffectImplicitTargetB[3]` (columns 85–87, [`COL_IMPLICIT_TARGET_B1`]) — every effect's
+    /// implicit-target pair, the input of [`Self::is_harmful`] (the client's hostility classifier
+    /// walks all three slots, A then B). Slot 0 of A is also [`Self::implicit_target_a1`].
+    pub effect_implicit_target_a: [u32; 3],
+    pub effect_implicit_target_b: [u32; 3],
     /// `Stances` (column 11) — forms the spell is *explicitly* castable in, `1 << (form-1)` each
     /// (the form gate [`Self::usable_in_form`]). 0 = no form requirement of its own.
     pub stances: u32,
@@ -254,6 +303,10 @@ pub struct SpellDisplay {
     /// `SpellAuraDefines` aura-type enum; `0` = not an apply-aura effect. Slot 0 is also read via
     /// [`Self::shapeshift_form`]'s derivation.
     pub effect_apply_aura: [u32; 3],
+    /// **`EffectMechanic[0..2]`** (columns 79–81, `SpellRec+0x13c`) — the per-effect
+    /// `SpellMechanic.dbc` id. The mechanic-immunity arm accepts a match against *either* this or
+    /// [`Self::mechanic`], and the scanner prefers this one when naming the blocking mechanic.
+    pub effect_mechanic: [u32; 3],
     /// `EffectRadiusIndex[3]` (column 88, module docs) — each effect's `SpellRadius.dbc` row (not
     /// loaded by this crate yet); `0` = no radius (a single-target effect).
     pub effect_radius_index: [u32; 3],
@@ -298,10 +351,15 @@ impl Default for SpellDisplay {
             visual: 0,
             speed: 0.0,
             attributes: 0,
+            school: 0,
+            mechanic: 0,
             attributes_ex: 0,
             attributes_ex2: 0,
             modal_next_spell: 0,
             attributes_ex3: 0,
+            spell_family: 0,
+            spell_family_flags: 0,
+            prevention_type: 0,
             passive: false,
             cast_ui: 0,
             effects: [0, 0, 0],
@@ -353,6 +411,9 @@ impl Default for SpellDisplay {
             effect_real_points_per_level: [0.0; 3],
             effect_amplitude: [0; 3],
             effect_apply_aura: [0; 3],
+            effect_implicit_target_a: [0; 3],
+            effect_implicit_target_b: [0; 3],
+            effect_mechanic: [0; 3],
             effect_radius_index: [0; 3],
             effect_chain_targets: [0; 3],
             effect_multiple_value: [0.0; 3],
@@ -426,6 +487,31 @@ impl SpellDisplay {
     /// Byte-verified in wow-re (`SpellRec+0x20&0x20 || +0x18&0x2` — the test every ranged trigger
     /// runs: the `SMSG_SPELL_START` stance/ammo sites `0x6e78b6`/`0x6e78f3` and the local cast-send
     /// site `0x6e5930`).
+    /// The client's spell-hostility classifier `Spell_C::GetSpellVisualState` (`0x6ea280`),
+    /// reduced to its `== 2` answer — **"this spell targets enemies"** — which is the gate on the
+    /// victim's **wound flinch after a spell impact** (the instant-hit loop `0x6e8bf0` @
+    /// `0x6e8c7b`, and the reflect impact `0x6e8cb0` @ `0x6e8cf1`; decision 2058). Byte-read
+    /// 2026-09-07 off `WoW.exe`: `Targets & 0x100` (the ally flag) ⇒ 1, never harmful; else
+    /// `Targets & 0x80` (the enemy flag) ⇒ 2; else, for each of the three effects, A then B, an
+    /// implicit target in the byte tables `0x6ea338` / `0x6ea378` (identical) marked `0` ⇒ 2 —
+    /// the set is `{2, 6, 15, 16, 24, 28, 53, 54}`, exactly the ids the modern enum names
+    /// `*_ENEMY` (nearby enemy, target enemy, the two enemy areas, the two enemy cones, the enemy
+    /// dest, the channeled enemy area). The function's remaining passes decide 1 (helpful) vs 0
+    /// and can never yield 2, so this predicate is the whole `== 2` truth.
+    pub fn is_harmful(&self) -> bool {
+        const ENEMY_TARGETS: [u32; 8] = [2, 6, 15, 16, 24, 28, 53, 54];
+        if self.targets & 0x100 != 0 {
+            return false;
+        }
+        if self.targets & 0x80 != 0 {
+            return true;
+        }
+        (0..3).any(|i| {
+            ENEMY_TARGETS.contains(&self.effect_implicit_target_a[i])
+                || ENEMY_TARGETS.contains(&self.effect_implicit_target_b[i])
+        })
+    }
+
     pub fn ranged_attack(&self) -> bool {
         self.attributes_ex2 & ATTR_EX2_AUTO_REPEAT != 0 || self.attributes & ATTR_RANGED != 0
     }
@@ -503,6 +589,37 @@ impl SpellDisplay {
         self.attributes_ex3 & ATTR_EX3_NO_CASTING_BAR_TEXT != 0
     }
 
+    /// `AttributesEx3 & 0x2000` — **this spell shows no channel bar at all**
+    /// ([`ATTR_EX3_NO_CHANNEL_BAR`]). The channel handler `0x6e7550` tests it before it composes
+    /// anything (`0x6e7595 test ch,0x20` → `jne` the return), so `SPELLCAST_CHANNEL_START` never
+    /// fires and the frame is never shown.
+    ///
+    /// A **different** suppression from [`Self::no_casting_bar_text`]'s and a total one: that bit
+    /// blanks the cast bar's *label* and still draws the bar; this one removes the event. The two
+    /// live one nibble apart in the same column and are easy to conflate — the channel path never
+    /// reads bit 2 at all (`0x6e7a2d` is the only bit-2 test on `SpellRec+0x24` image-wide, wow-re
+    /// `wave-cast.md`'s twice-run census).
+    ///
+    /// Both shipped rows are 24322/24323 "Blood Siphon", the Hakkar encounter's drain.
+    pub fn no_channel_bar(&self) -> bool {
+        self.attributes_ex3 & ATTR_EX3_NO_CHANNEL_BAR != 0
+    }
+
+    /// `AttributesEx & 0x2000_0000` — **the channel bar prints this spell's own name**
+    /// ([`ATTR_EX_CHANNEL_BAR_OWN_NAME`]); cleared, it prints the GlobalStrings word `CHANNELING`.
+    /// `0x6e759a test DWORD PTR [SpellRec+0x1c],0x20000000` — set takes `Name[locale]`
+    /// (`0x6e75a9`), clear takes `FrameScript_GetText(0x870dd0 = "CHANNELING")` (`0x6e75bc`).
+    ///
+    /// This is the whole of the channel bar's naming law, and it is the reverse default of the
+    /// cast bar's: a cast bar names its spell unless told not to, a channel bar says "Channeling"
+    /// unless told to name it. Nine of the 323 channeled rows in the shipped 5875 file opt in —
+    /// the four Fishing ranks, Cannibalize, Dream Vision, Using Control Console and the two
+    /// (suppressed) Blood Siphons. Blizzard, Arcane Missiles, Mind Flay, Drain Life/Soul/Mana,
+    /// Rain of Fire, Hurricane, Tranquility, Evocation and First Aid all read the generic word.
+    pub fn channel_bar_own_name(&self) -> bool {
+        self.attributes_ex & ATTR_EX_CHANNEL_BAR_OWN_NAME != 0
+    }
+
     /// The ranged-shot cooldown pad's gate (`0x6e2b60` at `0x6e2c2c`–`0x6e2c47`, byte-verified —
     /// wow-re `ranged-cooldown-sweep.md`): on the caster's own SPELL_GO self-insert, a
     /// `Attributes & 0x2` spell WITHOUT `AttributesEx2 & 0x20000`
@@ -573,6 +690,18 @@ impl SpellDisplay {
                 self.effects[0],
                 SPELL_EFFECT_TRADE_SKILL | SPELL_EFFECT_ATTACK
             )
+    }
+
+    /// The spell **tooltip's** range gate — the two attribute tests the builder runs BEFORE it
+    /// ever calls `GetMinMaxRange 0x6e3480` (`0x52e9a5`: `Attributes & 0x404`, the on-next-swing
+    /// pair; `0x52e9b2`: `AttributesEx3 & 0x40000000`), each jumping straight past the cell.
+    /// The third absence case is not an attribute — it is a resolved `max <= 0`, which is what
+    /// the 11 777 self-only rows produce and is by far the dominant one (wow-re
+    /// `tooltip-globalstring-key-resolves.md` §A3, VERIFIED).
+    ///
+    /// So a Heroic Strike or a Backstab shows **no range cell at all** — not a melee wording.
+    pub fn tooltip_omits_range_line(&self) -> bool {
+        self.on_next_swing() || self.attributes_ex3 & 0x4000_0000 != 0
     }
 
     /// The cooldown getter's HEAD exclusion (`GetCooldownInfo 0x6e13e0` @ `6e1439`/`6e1442`,
@@ -778,6 +907,129 @@ impl SpellDisplay {
             None
         }
     }
+    /// The spell's name with its rank subtext appended **the way the client composes it** —
+    /// `"%s (%s)"` (the literal at `0x8468b0`, read out of the reference image) when [`Self::rank`]
+    /// is a non-empty string, and the bare name when it is not.
+    ///
+    /// Two surfaces build this string and both reach the same literal, so it is one method rather
+    /// than a copy each: the trainer window's prerequisite-ability list
+    /// (`GetTrainerServiceAbilityReq`, wow-re `system/ui/scratch/trainer-requirement.md`) and the
+    /// learn announcement's argText (`0x4b2963`'s empty-subtext test, then either
+    /// `0x4b2982 call 0x64a7f0` — `SStrPrintf(buf, 0x200, "%s (%s)", name, subtext)` — or
+    /// `0x4b29a0 call 0x64a5a0`, the plain copy). The format is a property of the spell record,
+    /// so it belongs with the record.
+    pub fn ranked_name(&self) -> String {
+        match self.rank.as_deref() {
+            Some(rank) if !rank.is_empty() => format!("{} ({})", self.name, rank),
+            _ => self.name.clone(),
+        }
+    }
+
+    /// **Which line the client prints in chat when this spell is learned**, or `None` for one it
+    /// learns silently (decision 2243).
+    ///
+    /// The announcement is the tail of the spell-added registrar `0x4b25b0` — the same function
+    /// whose head sets the known-spell bit and whose gates [`Self::in_spellbook`] models — and it
+    /// runs only when the registrar's `edx` flag is set. That flag is **not** an "announce" flag,
+    /// though this is the leg benilla uses it for: at `0x4b2b4f` it gates the book re-sort +
+    /// `SPELLS_CHANGED`, `LEARNED_SPELL_IN_TAB` and tutorial trigger 40 atomically with the chat
+    /// line, which is why the login drain fires one batched `0x4b2fd0(1,0)` rather than one per
+    /// spell. It is the **live-mutation** flag; decision 2246 names the legs still unbuilt. That flag is the whole
+    /// reason logging in is silent while a trainer purchase is not: the `SMSG_INITIAL_SPELLS`
+    /// drain replays the book through `AddSpell` with it **clear** (`0x5deaa4 push 0x1;
+    /// 0x5deaa6 push 0x0` — arg3 is the flag `AddSpell` forwards as `edx` at `0x5e9c5c`), while
+    /// `SMSG_LEARNED_SPELL`'s handler passes `1` (`0x5e61c0` -> `AddSpell(id, slot, 1, 1)`) and
+    /// `SMSG_SUPERCEDED_SPELL`'s reaches the registrar through the supersede pair `0x4b2f50`,
+    /// which hardcodes `mov edx,0x1` at `0x4b2f61`. **So a rank-up announces too** — and the
+    /// unlearn half of that same pair (`0x4b2c50`) contains no `DisplayError` call at all, which
+    /// is why a rank-up prints one line and not two, and why `SMSG_REMOVED_SPELL` prints nothing.
+    ///
+    /// The three-way itself is `0x4b2909`, reading `Attributes` (`SpellRec+0x18`) and nothing
+    /// else:
+    ///
+    /// ```text
+    /// 0x4b290f  test al,al / js  <out>      ; 0x80 DO_NOT_DISPLAY -> no line at all
+    /// 0x4b2917  test al,0x20 / je <below>   ; 0x20 IS_TRADESKILL  -> id 0x39 ERR_LEARN_RECIPE_S
+    /// 0x4b294a  and eax,0x10                ; 0x10 ABILITY
+    /// 0x4b29a9  setne al / add eax,0x37     ; -> 0x37 ERR_LEARN_SPELL_S or 0x38 ERR_LEARN_ABILITY_S
+    /// ```
+    ///
+    /// The recipe arm pushes the **bare** name (`0x4b292c`, `SpellRec+0x1e0`) and returns from the
+    /// function outright; the other two push [`Self::ranked_name`]. Every one of the three ids is
+    /// a `MsgKind::Chat` row carrying chat type `10` (`CHAT_MSG_SYSTEM`) in the message catalog,
+    /// so all three are chat lines, never `UIErrorsFrame` toasts.
+    ///
+    /// Note what the block does **not** read: the spell's power type, its school, its class, and
+    /// its `SPELL_ATTR_PASSIVE` bit are all irrelevant — a passive is announced like anything
+    /// else unless it also carries `DO_NOT_DISPLAY`, which in the shipped data it usually does.
+    /// Whether the client announces **unlearning** this spell — *"You have unlearned %s."*
+    /// (`ERR_SPELL_UNLEARNED_S`, message id `0x14a`), with the bare localized name and no rank
+    /// (decision 2246).
+    ///
+    /// A **different** gate set from [`Self::learn_announcement`]'s, in a different function, and
+    /// not guessable from it — which is how decision 2243 came to claim, with a byte citation,
+    /// that the reference never prints an unlearn line at all. It does. The claim came from
+    /// bounding `RemoveSpell 0x5e9fe0` at the `ret 0x8` at `0x5ea28f`; that `ret` is a *block*
+    /// end, and `0x5ea292` is a live branch target past it — the function really runs to
+    /// `0x5ea2ba`, and the announce is in the part 2243 never read.
+    ///
+    /// Four gates, all silent, taken in the binary's order:
+    ///
+    /// ```text
+    /// 0x5ea03a  sete cl                      ; announce := (suppress == 0)  — the caller's arg
+    /// 0x5ea03d  test al,0x20 / je 0x5ea172   ; IS_TRADESKILL falls into the container path,
+    /// 0x5ea170  xor ecx,ecx                  ;   whose join ZEROES the flag -> silent
+    /// 0x5ea17a  jle 0x5ea292                 ; castUI > 0 takes the castUI-container walk and
+    ///                                        ;   rejoins at 0x5ea245 -> silent (0x5ea292 has
+    ///                                        ;   exactly ONE entry, this one)
+    /// 0x5ea29b  js 0x5ea248                  ; DO_NOT_DISPLAY -> silent
+    /// 0x5ea2ab  push 0x14a / call 0x496720   ; else the line, with SpellRec+0x1e0 (name only)
+    /// ```
+    ///
+    /// `suppress` is the caller's, not the record's, so it is not modelled here: benilla's only
+    /// producer is `SMSG_REMOVED_SPELL` (`0x5e43e3`, `suppress = 0`), and the rank-up path that
+    /// passes `1` (`0x5e6392`) does not reach this function on our side at all.
+    ///
+    /// Note `castUI` gates the *unlearn* line and **not** the learn line — the learn block tests
+    /// it only afterwards, at `0x4b29bf`, to decide the book slot. A spell with `castUI > 0`
+    /// therefore announces when it is learned and says nothing when it is taken away. That
+    /// asymmetry is the reference's, not an oversight here.
+    pub fn announces_unlearn(&self) -> bool {
+        self.attributes & SPELL_ATTR_IS_TRADESKILL == 0
+            && self.cast_ui == 0
+            && self.attributes & ATTR_DO_NOT_DISPLAY == 0
+    }
+
+    pub fn learn_announcement(&self) -> Option<LearnAnnouncement> {
+        if self.attributes & ATTR_DO_NOT_DISPLAY != 0 {
+            return None;
+        }
+        if self.attributes & SPELL_ATTR_IS_TRADESKILL != 0 {
+            return Some(LearnAnnouncement::Recipe);
+        }
+        Some(if self.attributes & ATTR_ABILITY != 0 {
+            LearnAnnouncement::Ability
+        } else {
+            LearnAnnouncement::Spell
+        })
+    }
+}
+
+/// A [`SpellDisplay::learn_announcement`] verdict — which of the three `ERR_LEARN_*` chat lines
+/// the client prints when the spell is learned. The key each one names, and whether the argText
+/// carries the rank, is the caller's to map (`benilla::net::apply::spells`): the ids live in the
+/// message catalog, which is a UI-layer table, not a `Spell.dbc` fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LearnAnnouncement {
+    /// Message id `0x37` — `ERR_LEARN_SPELL_S`, "You have learned a new spell: %s."
+    Spell,
+    /// Message id `0x38` — `ERR_LEARN_ABILITY_S`, "You have learned a new ability: %s."
+    /// (`Attributes & 0x10`, `SPELL_ATTR_ABILITY`.)
+    Ability,
+    /// Message id `0x39` — `ERR_LEARN_RECIPE_S`, "You have learned how to create a new item: %s."
+    /// (`Attributes & 0x20`, `SPELL_ATTR_IS_TRADESKILL`.) Its argText is the **bare** name: the
+    /// reference's recipe arm never reaches the rank-subtext composer.
+    Recipe,
 }
 
 /// A [`SpellDisplay::form_refusal`] verdict — which cast-fail reason `0x612480` writes.
@@ -798,5 +1050,138 @@ impl FormRefusal {
             FormRefusal::NotShapeshift => 0x3d,
             FormRefusal::OnlyShapeshift => 0x56,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `0x6ea280 == 2` predicate on synthetic rows: the two `Targets` flags outrank the
+    /// implicit-target walk (ally wins over everything, enemy wins next), and the walk reads all
+    /// three effects' A and B slots against the byte tables' enemy set.
+    #[test]
+    fn is_harmful_follows_the_client_classifier() {
+        let mut d = SpellDisplay::default();
+        assert!(!d.is_harmful(), "an empty row targets nobody");
+        d.targets = 0x80;
+        assert!(d.is_harmful(), "the enemy target flag alone is harmful");
+        d.targets = 0x80 | 0x100;
+        assert!(!d.is_harmful(), "the ally flag wins over the enemy flag");
+        d.targets = 0;
+        d.effect_implicit_target_a = [6, 0, 0];
+        assert!(d.is_harmful(), "TARGET_UNIT_TARGET_ENEMY in slot 0");
+        d.effect_implicit_target_a = [21, 0, 0];
+        assert!(!d.is_harmful(), "a single-friend target is not harmful");
+        d.effect_implicit_target_b = [0, 16, 0];
+        assert!(d.is_harmful(), "an enemy area in a B slot counts too");
+        d.effect_implicit_target_b = [0, 0, 0];
+        d.effect_implicit_target_a = [22, 0, 54];
+        assert!(d.is_harmful(), "the enemy cone in the third effect");
+        d.targets = 0x100;
+        assert!(!d.is_harmful(), "the ally flag short-circuits the walk");
+    }
+
+    /// The learn announcement's three-way at `0x4b2909`, read off `Attributes` alone — and its
+    /// one silent case. The bit order is the binary's: `DO_NOT_DISPLAY` is tested first and wins
+    /// over a row that also declares `IS_TRADESKILL`, which in turn wins over `ABILITY`.
+    #[test]
+    fn learn_announcement_reads_the_three_attribute_bits_in_the_clients_order() {
+        let mut d = SpellDisplay::default();
+        assert_eq!(
+            d.learn_announcement(),
+            Some(LearnAnnouncement::Spell),
+            "a plain row is a spell — Fireball 133 carries Attributes 0x10000"
+        );
+        d.attributes = 0x10;
+        assert_eq!(
+            d.learn_announcement(),
+            Some(LearnAnnouncement::Ability),
+            "SPELL_ATTR_ABILITY picks the ability wording"
+        );
+        d.attributes = 0x20;
+        assert_eq!(
+            d.learn_announcement(),
+            Some(LearnAnnouncement::Recipe),
+            "SPELL_ATTR_IS_TRADESKILL diverts to the recipe line"
+        );
+        d.attributes = 0x20 | 0x10;
+        assert_eq!(
+            d.learn_announcement(),
+            Some(LearnAnnouncement::Recipe),
+            "the tradeskill branch is taken before the ability bit is ever read"
+        );
+        d.attributes = 0x80;
+        assert_eq!(
+            d.learn_announcement(),
+            None,
+            "SPELL_ATTR_DO_NOT_DISPLAY is announced silently — every language and proficiency"
+        );
+        d.attributes = 0x80 | 0x20;
+        assert_eq!(
+            d.learn_announcement(),
+            None,
+            "…and the sign test at 0x4b290f runs before the tradeskill test at 0x4b2917"
+        );
+        d.attributes = 0x40;
+        assert_eq!(
+            d.learn_announcement(),
+            Some(LearnAnnouncement::Spell),
+            "PASSIVE is not read by the block at all — only DO_NOT_DISPLAY silences a spell"
+        );
+    }
+
+    /// The unlearn line's four gates (`0x5e9fe0`'s block at `0x5ea292`) — a different set from
+    /// the learn block's, in a different function. `castUI` is the one that is easy to miss: it
+    /// silences the unlearn and does nothing to the learn.
+    #[test]
+    fn announces_unlearn_is_not_the_mirror_of_the_learn_gates() {
+        let mut d = SpellDisplay::default();
+        assert!(d.announces_unlearn(), "a plain row says it");
+        d.attributes = 0x10;
+        assert!(
+            d.announces_unlearn(),
+            "ABILITY is a learn-wording bit and nothing to this path"
+        );
+        d.attributes = 0x40;
+        assert!(d.announces_unlearn(), "PASSIVE is not read here either");
+        d.attributes = 0x20;
+        assert!(
+            !d.announces_unlearn(),
+            "IS_TRADESKILL: 0x5ea170 zeroes the flag"
+        );
+        d.attributes = 0x80;
+        assert!(!d.announces_unlearn(), "DO_NOT_DISPLAY: 0x5ea29b");
+        d.attributes = 0;
+        d.cast_ui = 1;
+        assert!(
+            !d.announces_unlearn(),
+            "castUI > 0 never reaches 0x5ea292 — its single entry is 0x5ea17a jle"
+        );
+        assert_eq!(
+            d.learn_announcement(),
+            Some(LearnAnnouncement::Spell),
+            "…while the SAME row still announces its learn: castUI is read after the message"
+        );
+    }
+
+    /// `"%s (%s)"` (`0x8468b0`) versus the bare copy, keyed on the rank subtext being a non-empty
+    /// string — the reference tests the first BYTE of the subtext (`0x4b2963 cmp BYTE PTR [eax],0x0`),
+    /// so a present-but-empty column is the bare name, not `"Name ()"`.
+    #[test]
+    fn ranked_name_appends_the_subtext_only_when_there_is_one() {
+        let mut d = SpellDisplay {
+            name: "Fireball".to_string(),
+            ..SpellDisplay::default()
+        };
+        assert_eq!(d.ranked_name(), "Fireball", "no subtext, no parentheses");
+        d.rank = Some(String::new());
+        assert_eq!(
+            d.ranked_name(),
+            "Fireball",
+            "an empty subtext is no subtext"
+        );
+        d.rank = Some("Rank 2".to_string());
+        assert_eq!(d.ranked_name(), "Fireball (Rank 2)");
     }
 }

@@ -42,13 +42,13 @@ fn board_and_dialog() -> UiScript {
         r#"
         Board = CreateFrame("Frame", "Board")
         Board:SetPoint("BOTTOMLEFT", 100, 100)
-        Board:SetSize(300, 300)
+        Board:SetWidth(300); Board:SetHeight(300)
         Board:SetFrameLevel(5)
         Board:CreateTexture(nil, "ARTWORK"):SetTexture("Board.blp")
 
         Dialog = CreateFrame("Frame", "Dialog")
         Dialog:SetPoint("BOTTOMLEFT", 200, 200)   -- overlaps Board's top-right quadrant
-        Dialog:SetSize(300, 300)
+        Dialog:SetWidth(300); Dialog:SetHeight(300)
         Dialog:CreateTexture(nil, "ARTWORK"):SetTexture("Dialog.blp")
         Dialog:Hide()
         "#,
@@ -93,9 +93,9 @@ fn the_flag_round_trips_and_defaults_off() {
 ///
 /// `enableKeyboard` used to be warned here on the same principle — implementing one clause is not
 /// a licence to go quiet about the other. It now lands on a real `EnableKeyboard`, so the warning
-/// is gone and this asserts the flag instead. What is still NOT built is key *delivery*, which the
-/// method's own doc states; the flag and the delivery are separable in the reference too
-/// (`frame-key-script-delivery.md` §3.2).
+/// is gone and this asserts the flag instead. Key *delivery* reads the same flag
+/// (`script::keyboard`'s walk, 1319); the flag and a handler stay separable in the reference too
+/// (`frame-key-script-delivery.md` §3.2), which is why this asserts the flag alone.
 #[test]
 fn the_xml_toplevel_and_enable_keyboard_attributes_both_reach_their_methods() {
     let s = script();
@@ -200,7 +200,7 @@ fn the_trigger_is_the_effective_visibility_transition_not_the_show_call() {
         r#"
         Holder = CreateFrame("Frame", "Holder")
         Holder:SetPoint("BOTTOMLEFT", 200, 200)
-        Holder:SetSize(300, 300)
+        Holder:SetWidth(300); Holder:SetHeight(300)
         Holder:Hide()
         Dialog:SetParent(Holder)
         Dialog:SetToplevel(true)
@@ -239,7 +239,7 @@ fn a_raise_on_a_frame_that_overlaps_nothing_is_a_total_no_op() {
         r#"
         Dialog:ClearAllPoints()
         Dialog:SetPoint("BOTTOMLEFT", 600, 450)   -- clear of Board's (100,100)-(400,400)
-        Dialog:SetSize(100, 100)
+        Dialog:SetWidth(100); Dialog:SetHeight(100)
         Dialog:SetToplevel(true)
         Dialog:Show()
         "#,
@@ -311,20 +311,20 @@ fn a_raise_can_never_lift_a_frame_out_of_its_stratum() {
         r#"
         Med = CreateFrame("Frame", "Med")
         Med:SetPoint("BOTTOMLEFT", 100, 100)
-        Med:SetSize(300, 300)
+        Med:SetWidth(300); Med:SetHeight(300)
         Med:CreateTexture(nil, "ARTWORK"):SetTexture("Med.blp")
 
         LowOther = CreateFrame("Frame", "LowOther")
         LowOther:SetFrameStrata("LOW")
         LowOther:SetPoint("BOTTOMLEFT", 100, 100)
-        LowOther:SetSize(300, 300)
+        LowOther:SetWidth(300); LowOther:SetHeight(300)
         LowOther:SetFrameLevel(4)
         LowOther:CreateTexture(nil, "ARTWORK"):SetTexture("LowOther.blp")
 
         LowTop = CreateFrame("Frame", "LowTop")
         LowTop:SetFrameStrata("LOW")
         LowTop:SetPoint("BOTTOMLEFT", 150, 150)
-        LowTop:SetSize(300, 300)
+        LowTop:SetWidth(300); LowTop:SetHeight(300)
         LowTop:SetToplevel(true)
         LowTop:CreateTexture(nil, "ARTWORK"):SetTexture("LowTop.blp")
         LowTop:Hide()
@@ -408,11 +408,11 @@ fn compaction_bounds_the_raise_across_repeated_shows() {
         r#"
         A = CreateFrame("Frame", "A")
         A:SetPoint("BOTTOMLEFT", 100, 100)
-        A:SetSize(300, 300)
+        A:SetWidth(300); A:SetHeight(300)
         A:SetToplevel(true)
         B = CreateFrame("Frame", "B")
         B:SetPoint("BOTTOMLEFT", 200, 200)
-        B:SetSize(300, 300)
+        B:SetWidth(300); B:SetHeight(300)
         B:SetToplevel(true)
         "#,
     )
@@ -451,7 +451,7 @@ fn lua_raise_acts_on_the_nearest_toplevel_ancestor_and_is_silent_without_one() {
         Kid = CreateFrame("Frame", "Kid", Dialog)
         Loose = CreateFrame("Frame", "Loose")
         Loose:SetPoint("BOTTOMLEFT", 200, 200)
-        Loose:SetSize(300, 300)
+        Loose:SetWidth(300); Loose:SetHeight(300)
         "#,
     )
     .unwrap();
@@ -575,7 +575,7 @@ fn pressing_a_child_of_a_toplevel_window_raises_the_window() {
         Dialog:Show()
         Knob = CreateFrame("Frame", "Knob", Dialog)
         Knob:SetPoint("CENTER", Dialog, "CENTER")
-        Knob:SetSize(40, 40)
+        Knob:SetWidth(40); Knob:SetHeight(40)
         Knob:EnableMouse(true)
         Board:SetFrameLevel(9)
         Dialog:SetFrameLevel(0)
@@ -643,12 +643,12 @@ fn a_chorded_press_raises_the_held_frame_not_the_one_under_the_cursor() {
         -- gate is occlusion, so a frame overlapping nothing would decline whatever we press.
         Other = CreateFrame("Frame", "Other")
         Other:SetPoint("BOTTOMLEFT", 500, 100)
-        Other:SetSize(200, 200)
+        Other:SetWidth(200); Other:SetHeight(200)
         Other:EnableMouse(true)
         Other:SetToplevel(true)
         Tile = CreateFrame("Frame", "Tile")
         Tile:SetPoint("BOTTOMLEFT", 660, 260)     -- clips Other's far corner only
-        Tile:SetSize(60, 60)
+        Tile:SetWidth(60); Tile:SetHeight(60)
         Tile:SetFrameLevel(9)
 
         Board:SetFrameLevel(9)
@@ -688,4 +688,142 @@ fn a_chorded_press_raises_the_held_frame_not_the_one_under_the_cursor() {
     );
     s.mouse_button(ox, oy, "LeftButton", false);
     assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// **A window raised while part of it is hidden must keep its own children level with each other**
+/// — the compaction may not split a sibling pair (director's report 2026-09-08, decision 2104).
+///
+/// This is Gatherer 1.0.0's Report window, built the way its XML builds it and reduced to the four
+/// frames that matter:
+///
+/// - `Win` — `toplevel`, `frameStrata="DIALOG"`, born hidden, at level 1 (what `SetParent` gives a
+///   child of a level-0 `UIParent`).
+/// - `Close` — a Button declared inside `Win`'s `<Frames>`, so level 2, and visible with `Win`.
+/// - `Body` — a `<Frame parent="Win" hidden="true" enableMouse="true">` covering the whole window
+///   (`GathererInfo_ReportFrame`, 640×370 centred on a 640×390 dialog), also level 2, but HIDDEN
+///   when `Win` is shown. The addon shows it one line later.
+/// - `Other` — the already-open Options window it overlaps, which is what arms the occlusion gate.
+///
+/// The sequence is the addon's: `Win:Show()` (whose raise runs while `Body` is still hidden), then
+/// `Body:Show()`. `Close` and `Body` are siblings under one parent, so their levels are equal by
+/// construction and **must stay equal** — the reference's hit sweep then gives the tie to the
+/// earlier-linked frame, which is `Close`, and the Close button works.
+///
+/// What went wrong: the compaction renumbered `Close` (visible, in the bucket) and not `Body`
+/// (hidden, in no bucket), then the raise's propagate pushed the same delta into both — so the one
+/// level the compaction squeezed out of `Close` and not out of `Body` became a permanent inversion.
+/// `Body` is mouse-enabled and covers the window, so it swallowed every click and hover the Close
+/// button should have had: the button showed no highlight and could not be pressed.
+#[test]
+fn a_raise_with_a_hidden_child_keeps_the_windows_own_siblings_level() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        -- The window already on screen that `Win` has to raise over.
+        Other = CreateFrame("Frame", "Other")
+        Other:SetFrameStrata("DIALOG")
+        Other:SetFrameLevel(1)
+        Other:SetPoint("BOTTOMLEFT", 50, 50)
+        Other:SetWidth(400); Other:SetHeight(400)
+        Other:EnableMouse(true)
+        Other:SetToplevel(true)
+        OtherKid = CreateFrame("Frame", "OtherKid", Other)   -- level 2
+
+        Win = CreateFrame("Frame", "Win")
+        Win:SetFrameStrata("DIALOG")
+        Win:SetFrameLevel(1)
+        Win:SetPoint("BOTTOMLEFT", 200, 100)
+        Win:SetWidth(400); Win:SetHeight(400)
+        Win:EnableMouse(true)
+        Win:SetToplevel(true)
+
+        Close = CreateFrame("Button", "Close", Win)          -- level 2, visible with Win
+        Close:SetPoint("BOTTOMRIGHT", Win, "BOTTOMRIGHT", -15, 15)
+        Close:SetWidth(100); Close:SetHeight(21)
+        Close:EnableMouse(true)
+        Close:SetScript("OnEnter", function(self) hovered = self:GetName() end)
+        Close:SetScript("OnClick", function(self) clicked = self:GetName() end)
+
+        Body = CreateFrame("Frame", "Body", Win)             -- level 2, covers the whole window
+        Body:SetAllPoints(Win)
+        Body:EnableMouse(true)
+        Body:SetScript("OnEnter", function(self) hovered = self:GetName() end)
+        Body:Hide()
+
+        Win:Hide()
+        "#,
+    )
+    .unwrap();
+    s.resolve();
+
+    // The addon's own two lines: show the window (the raise fires here, with `Body` still hidden),
+    // then show the sub-frame for the selected tab.
+    s.run("Win:Show()").unwrap();
+    s.run("Body:Show()").unwrap();
+    s.resolve();
+
+    assert!(
+        level(&mut s, "Win") > level(&mut s, "Other"),
+        "the window that was just shown is in front: Win={} Other={}",
+        level(&mut s, "Win"),
+        level(&mut s, "Other")
+    );
+
+    // THE SYMPTOM FIRST, through the engine's own pointer path: the Close button takes its own
+    // click and its own hover. Asserted before the arithmetic below so a regression reports what
+    // the director would see, not the number behind it.
+    let (cx, cy) = centre(&s, "Close");
+    assert_eq!(
+        s.hit_test_name(cx, cy).as_deref(),
+        Some("Close"),
+        "the click at the Close button's centre lands on the Close button"
+    );
+    s.mouse_move(cx, cy);
+    assert_eq!(
+        s.eval::<String>("return tostring(hovered)").unwrap(),
+        "Close",
+        "and so does the hover — the highlight is the reference's OnEnter"
+    );
+    s.mouse_button(cx, cy, "LeftButton", true);
+    s.mouse_button(cx, cy, "LeftButton", false);
+    assert_eq!(
+        s.eval::<String>("return tostring(clicked)").unwrap(),
+        "Close"
+    );
+
+    // …and the number behind it.
+    assert_eq!(
+        level(&mut s, "Close"),
+        level(&mut s, "Body"),
+        "two children of one parent are level with each other — the raise's compaction may not \
+         split them just because one of them was hidden when it ran"
+    );
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// **A script level change carries no children** (decision 2189): the Lua binding `0x774560`
+/// calls `set_frame_level 0x76a4f0` with `propagate=0` — only the raise shifts a subtree. Stock
+/// FrameXML is written against it (`BonusActionButtonTemplate` raises the button and then its
+/// cooldown by hand), and carrying the children put the bonus bar's sweep over an addon's
+/// cooldown count.
+#[test]
+fn a_script_level_change_leaves_the_children_where_they_were() {
+    let mut s = script();
+    s.run(
+        r#"
+        Parent = CreateFrame("Frame", "Parent")
+        Child = CreateFrame("Frame", "Child", Parent)
+        Grandchild = CreateFrame("Frame", "Grandchild", Child)
+        "#,
+    )
+    .unwrap();
+    let (child, grandchild) = (level(&mut s, "Child"), level(&mut s, "Grandchild"));
+    s.run("Parent:SetFrameLevel(7)").unwrap();
+    assert_eq!(level(&mut s, "Parent"), 7);
+    assert_eq!(
+        (level(&mut s, "Child"), level(&mut s, "Grandchild")),
+        (child, grandchild),
+        "the children keep their absolute levels"
+    );
 }

@@ -351,7 +351,7 @@ fn charter_tooltip_lines(script: &UiScript, pos: Option<(i64, u32)>) -> Vec<Stri
         local a = getglobal("BenillaProbeTipAnchor")
         if not a then
             a = CreateFrame("Button", "BenillaProbeTipAnchor")
-            a:SetPoint("CENTER", 0, 0); a:SetSize(10, 10)
+            a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
         end
         GameTooltip:SetOwner(a, "ANCHOR_RIGHT")
         GameTooltip:SetBagItem({bag}, {slot})
@@ -453,13 +453,12 @@ fn probe_guild_name(prefix: &str) -> String {
     format!("{prefix} {secs:08}")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn charter_probe(
     time: ProbeClock,
     mut probe: ResMut<CharterProbe>,
     gossip: Res<GossipState>,
     registrar: Res<GuildRegistrarState>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     script: Option<NonSendMut<UiScript>>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     player: Res<Player>,

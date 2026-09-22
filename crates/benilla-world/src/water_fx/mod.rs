@@ -318,7 +318,6 @@ fn build_patch(
 
 /// Classify + gate + emit for one unit this frame (the driver `0x5fa760`, once per unit per
 /// frame; emission paced by the unit's shared cooldown cell).
-#[allow(clippy::too_many_arguments)]
 fn drive_unit(
     foam_state: &mut UnitFoam,
     alloc: &mut dyn FnMut(FoamRecord),
@@ -413,7 +412,6 @@ fn drive_unit(
 
 /// Per frame: run the driver for the avatar (its real movement flags — the reference's own
 /// selection bits) and for every streamed unit (the velocity/yaw proxy), emitting pool records.
-#[allow(clippy::too_many_arguments)] // the emitter's real input set; the index ride-along tipped it
 fn emit_water_foam(
     time: Res<Time>,
     materials: Option<Res<FoamAssets>>,
@@ -616,8 +614,10 @@ fn push_water_foam(
                 // mesh, or bevy's sorted-phase batcher claims the item and rewrites its
                 // `batch_range` (gpu_preprocessing.rs keys purely on `item.main_entity()`) —
                 // the Goldshire-teleport crash. The chunk still keys the record grouping above.
+                no_depth_test: false,
                 main_entity: Entity::PLACEHOLDER,
                 light: None,
+                clip: None,
             },
         );
     }

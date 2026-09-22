@@ -8,8 +8,8 @@ use super::{
     container, craft, cursor, death, duel, follow, gossip, guild, inspect, item_text, loot,
     loot_roll, macros, mail, merchant, party, petition, pvp, quest, quest_log, reputation, session,
     simplehtml, skills, slider, social, spellbook, stable, taxi, trade, tradeskill, trainer,
-    weapon_enchant, ActionSlot, AuraState, FontObject, ItemTemplateView, PlayerReqState,
-    RegionData, ScriptValue, SoundRequest, UnitState,
+    weapon_enchant, ActionSlot, AuraState, FontObject, ItemTemplateView, MusicRequest,
+    PlayerReqState, RegionData, ScriptValue, SoundRequest, UnitState,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -22,6 +22,41 @@ pub type TextureProbe = Box<dyn Fn(&str) -> bool>;
 /// The host's texture **texel-size** oracle — see [`Model::texture_size_probe`].
 pub type TextureSizeProbe = Box<dyn Fn(&str) -> Option<(u32, u32)>>;
 
+/// The host's font-path resolvability oracle — see [`Model::font_probe`].
+pub type FontProbe = Box<dyn Fn(&str) -> bool>;
+
+/// A map from a minted object id to its handle, indexed directly: ids are dense (`next_id`
+/// counts from 1), and every scripted method call on a frame or region starts with this lookup
+/// — a few hundred a frame from the stock `OnUpdate` sweep alone (decision 1979's UI tick), so
+/// the hash a `HashMap` paid per call was the wrong price for a one-word index.
+#[derive(Debug, Clone)]
+pub(crate) struct IdMap<T>(Vec<Option<T>>);
+
+impl<T> Default for IdMap<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<T: Copy> IdMap<T> {
+    pub(crate) fn get(&self, id: &u32) -> Option<&T> {
+        self.0.get(*id as usize).and_then(Option::as_ref)
+    }
+    pub(crate) fn contains_key(&self, id: &u32) -> bool {
+        self.get(id).is_some()
+    }
+    pub(crate) fn insert(&mut self, id: u32, v: T) -> Option<T> {
+        let i = id as usize;
+        if self.0.len() <= i {
+            self.0.resize(i + 1, None);
+        }
+        self.0[i].replace(v)
+    }
+    pub(crate) fn remove(&mut self, id: &u32) -> Option<T> {
+        self.0.get_mut(*id as usize).and_then(Option::take)
+    }
+}
+
 /// The Rust-side model behind the Lua VM — the arena, the layout inputs + resolved rects, the
 /// id↔handle bijection, region visuals, and the event/script registrations. Held in `lua.app_data`
 /// (interior-mutable) so callbacks reach it; contains **no** mlua handles (the MAXCSTACK discipline).
@@ -29,8 +64,23 @@ pub(crate) struct Model {
     /// Every discovered addon, in load order — the AddOn API's registry, filled by the host at
     /// world entry ([`super::UiScript::register_addons`]). See [`super::addon`].
     pub(crate) addons: Vec<super::addon::AddOnInfo>,
+    /// **The Lua index space** — positions into [`Self::addons`], `## Title`-sorted and
+    /// hidden-filtered (decision 2175). NOT the registry: the reference keeps two structures and
+    /// they are different permutations of different sets (wow-re
+    /// `system/ui/scratch/addon-registry-scan-and-order.md` §7).
+    pub(crate) addon_index: Vec<usize>,
+    /// The lowercased names `SMSG_ADDON_INFO` marked `status = 2`, or **`None` when no reply has
+    /// arrived this session** — and `None` is why [`Self::addon_index`] can be legitimately empty
+    /// (decision 2175). `[0xbe1b90]` is zeroed by the registry reset `0x51fad1` and written
+    /// nowhere but the reply's own rebuild, so `GetNumAddOns()` really is 0 until the server
+    /// answers.
+    pub(crate) addon_info_hidden: Option<Vec<String>>,
     /// The AddOns folder, so `LoadAddOn` can read an addon's files from inside a Lua binding.
     pub(crate) addons_root: Option<std::path::PathBuf>,
+    /// The host's reader for a chain-sourced addon's files (`AddOnInfo::chain`), by
+    /// chain-internal path — `None` in a VM with no chain behind it, where such an addon
+    /// answers `MISSING`.
+    pub(crate) addons_chain_reader: Option<super::addon::SharedChainReader>,
     /// The host's font engine ([`super::UiScript::set_text_measurer`]) — what lets a metric read
     /// answer inside the Lua call that asked, instead of a frame later. `None` in every VM without
     /// a font atlas, which is the measure round-trip's own world and behaves exactly as it did.
@@ -56,6 +106,20 @@ pub(crate) struct Model {
     /// `None` in an engine-less VM (tests, the addon harness), where a zero-size texture keeps the
     /// rect it always had — there is no art to measure without a backend.
     pub(crate) texture_size_probe: Option<TextureSizeProbe>,
+    /// The host's font-path oracle ([`super::UiScript::set_font_probe`]): does this font reference
+    /// load — patch chain or loose addon folder? What lets `SetFont`'s path form answer the
+    /// reference's **1 | nil**, whose nil is a *load failure* and not an argument error (wow-re
+    /// `system/ui/ui.md`: `0x79f345`/`0x79f361`, originating at `0x5c1ae0` under the `0x44d040`
+    /// font-factory cache) — `!OmniCC/main.lua:41`'s `if not Font:SetFont(saved, size) then
+    /// revert end` is exactly that probe.
+    ///
+    /// **`None` answers 1 for a non-empty path, which is where this differs from
+    /// [`Self::texture_probe`]** (decision 2103). A VM with no font backend has no font store to
+    /// fail against, so nil there would report a load failure that never happened — and it would
+    /// send `!OmniCC` down its revert branch in every harness run. The texture probe could take
+    /// the opposite default because nil was already what its engine-less callers observed; here 1
+    /// is.
+    pub(crate) font_probe: Option<FontProbe>,
     /// Where per-addon saved variables live: the account-scoped folder, then this character's.
     /// Both are directories holding one `<Addon>.lua` per declaring addon.
     pub(crate) addons_saved_account: Option<std::path::PathBuf>,
@@ -72,6 +136,17 @@ pub(crate) struct Model {
     /// the same kind of thing — VM-global registries the loader fills.
     pub(crate) framexml_templates:
         std::cell::RefCell<std::collections::HashMap<String, crate::framexml::Element>>,
+    /// **`FrameXML_Debug`'s flag** — the loader's own trace-severity switch (decision 2160).
+    ///
+    /// `0x488440` is a get-or-set over the single global `[0xceea30]`, which boots at 0 and is
+    /// read at six sites image-wide: the binding itself and five inside the XML loader, each
+    /// gating a severity-0 trace line behind `flag > 0` (`0x6ee298 jle` — **greater than**, not
+    /// non-zero, which is why this is signed). The one site walked to the bytes is
+    /// `Instantiate 0x6ee280`, whose gated line is `0x871154 "-- Creating %s named %s"`.
+    ///
+    /// Here rather than on `UiScript` for `framexml_templates`' reason: the loader runs from a
+    /// bare `&Lua`, and so does the binding that writes this.
+    pub(crate) framexml_debug: std::cell::Cell<i32>,
     /// The FrameXML **font-element registry** (a separate namespace — a font inherits a font,
     /// never a frame template), persisted for the same cross-file reason.
     pub(crate) framexml_fonts:
@@ -79,7 +154,7 @@ pub(crate) struct Model {
     /// The frame arena (create/destroy + show/hide/strata/level/scale/alpha propagation).
     pub(crate) arena: WidgetArena,
     /// Per-frame layout input (anchors/size/scale). Every live frame has one (created at
-    /// `CreateFrame`); `SetPoint`/`SetSize`/… mutate it; `resolve` runs the graph over them.
+    /// `CreateFrame`); `SetPoint`/`SetWidth`/… mutate it; `resolve` runs the graph over them.
     pub(crate) layout_inputs: HashMap<FrameHandle, LayoutInput>,
     /// The last [`UiScript::resolve`] result: each resolvable frame's rect. Empty until `resolve`.
     pub(crate) resolved: HashMap<FrameHandle, Rect>,
@@ -261,9 +336,9 @@ pub(crate) struct Model {
 
     /// Monotonic id source (starts at 1; `0` is [`SCREEN`]).
     pub(crate) next_id: u32,
-    pub(crate) id_to_frame: HashMap<u32, FrameHandle>,
+    pub(crate) id_to_frame: IdMap<FrameHandle>,
     pub(crate) frame_to_id: HashMap<FrameHandle, u32>,
-    pub(crate) id_to_region: HashMap<u32, RegionHandle>,
+    pub(crate) id_to_region: IdMap<RegionHandle>,
     pub(crate) region_to_id: HashMap<RegionHandle, u32>,
     /// Region name → layout id — the region twin of the arena's frame-name publish (same
     /// non-overwriting first-wins rule). `SetPoint`'s string `relativeTo` resolves through frames
@@ -288,6 +363,19 @@ pub(crate) struct Model {
     /// resolve at a 3,988-frame roster, which made it the biggest phase left in the preamble
     /// (decision 1634's `[layout-pre] watched=`).
     pub(crate) on_size_changed_frames: Vec<FrameHandle>,
+    /// The frames carrying an `OnUpdateModel` script — the list the tick fires at the top of
+    /// every paint of a visible model pane (`0x76d1a0`'s first act; decision 2007). Same one
+    /// writer as the two lists above.
+    pub(crate) on_update_model_frames: Vec<FrameHandle>,
+    /// What the engine knows about each model **file** a pane has named — the sequences and
+    /// bounds a pane's clock needs ([`crate::widget::ModelFileFacts`]), handed over by the host
+    /// once the asset is resident, keyed by [`crate::widget::model_key`]. The reference reads
+    /// these off the loaded `MD20`; this engine parses no M2, so the facts arrive from the app's
+    /// loader through `UiScript::set_model_facts`.
+    pub(crate) model_facts: HashMap<String, std::sync::Arc<crate::widget::ModelFileFacts>>,
+    /// Model files a pane named that no facts have arrived for yet — drained by the host
+    /// (`UiScript::model_facts_wanted`) to load them. Deduplicated on push.
+    pub(crate) model_facts_wanted: Vec<String>,
     /// Edit boxes whose text changed and whose `OnTextChanged` has **not fired yet** — the
     /// reference's `textChanged` dirty bit (`[E+0x31c]` bit 0), which `SetText`/`Insert` raise and
     /// only the dirty-word drain `0x77d3e0` clears (decision 1831).
@@ -308,6 +396,20 @@ pub(crate) struct Model {
     pub(crate) event_to_frames: HashMap<String, Vec<FrameHandle>>,
     /// `frame → its registered events` (for UnregisterEvent / cleanup).
     pub(crate) frame_events: HashMap<FrameHandle, HashSet<String>>,
+    /// The frames registered for **every** event (`RegisterAllEvents`), in registration order —
+    /// the same ordered-Vec-never-a-set discipline as [`Self::event_to_frames`], and dispatched
+    /// after it for the same reason: a frame that asks for all events asks *after* the frames
+    /// already listening for a given one, so it takes the tail of that event's list.
+    ///
+    /// **A flag rather than an expansion.** 1.12's event ids run to `0x225` = 549
+    /// (`FrameScript_InitEvents`), so writing the frame into every per-event list on registration
+    /// would mean 549 vector pushes per call and 549 scans per `UnregisterAllEvents` — and would
+    /// also invent a name list this engine has no business owning (ours registers by string, and
+    /// an event the server sends that no name list knows about would be silently excluded).
+    /// `UnregisterAllEvents` empties this alongside the per-event registrations, which is the half
+    /// AceEvent-2.0 depends on: it calls `frame:UnregisterAllEvents()` and then re-registers each
+    /// individual event it still wants.
+    pub(crate) all_event_frames: Vec<FrameHandle>,
 
     /// The EditBox that currently owns keyboard focus — the engine's twin of the client's
     /// class-owned focus global `DAT_00cf4dc8` (`CSimpleEditBox* E`, 0 = none; RF-0082 §1). A focused
@@ -427,7 +529,7 @@ pub(crate) struct Model {
     pub(crate) target_nearest_friend_requests: Vec<bool>,
     /// `(name, exactMatch)` pairs `TargetByName` queued since the app's last
     /// [`UiScript::take_target_by_name_requests`] drain — the by-NAME twin of
-    /// [`Self::target_requests`], which takes unit tokens. The app runs the shared by-name
+    /// `Self::target_requests`, which takes unit tokens. The app runs the shared by-name
     /// resolver (`crate::target::by_name`, decision 0886) and commits the selection ([`unit`]).
     pub(crate) target_by_name_requests: Vec<(String, bool)>,
     /// Set when `ClearTarget()` fired with a live target — the ESC chain's LAST leg
@@ -454,6 +556,8 @@ pub(crate) struct Model {
     /// Party/loot intents (`AcceptGroup`/`InviteToParty`/`SetLootMethod`/…) queued since the
     /// app's last [`super::UiScript::take_party_requests`] drain — the outbound seam ([`party`]).
     pub(crate) party_requests: Vec<party::PartyRequest>,
+    /// The ready-check deadline and the unanswered flags the timeout tick reads (decision 1989).
+    pub(crate) ready_check: party::ReadyCheckState,
     /// The saved raid lockouts the Raid tab's info panel reads (decision 1549), pushed by the app
     /// from `SMSG_RAID_INSTANCE_INFO`. Its own field rather than a [`party::PartyState`] member
     /// because it arrives on its own packet and survives every roster change.
@@ -477,6 +581,12 @@ pub(crate) struct Model {
     /// Social intents (`AddFriend`/`RemoveFriend`/`SendWho`/…) queued since the app's last
     /// [`super::UiScript::take_social_requests`] drain — the outbound seam ([`social`]).
     pub(crate) social_requests: Vec<social::SocialRequest>,
+    /// The client's three LFG slot words (`[0xbc70a0]`) and its comment (`[0xbc6e98]`, a
+    /// 0x80-byte buffer), the BSS `SetLookingForGroup` writes and `GetLookingForGroup` reads
+    /// back — never the server's (wow-re `lfg-set-get-law.md`, 1961). The slots are always zero
+    /// in the reference: see [`social`].
+    pub(crate) lfg_slots: [u32; 3],
+    pub(crate) lfg_comment: String,
     /// The guild snapshot the app pushes (roster, ranks, MOTD, info text — decision 1257):
     /// `GetNumGuildMembers`/`GetGuildRosterInfo`/`GuildControlGetRankFlags`/… read it
     /// ([`guild`]). Already display-resolved and already sorted + filtered, because the sort
@@ -517,6 +627,48 @@ pub(crate) struct Model {
     /// [`super::UiScript::take_chat_window_changes`] drain — the persist cue. A set, so a slider
     /// drag costs one entry however many steps it took.
     pub(crate) chat_window_changes: HashSet<usize>,
+    /// The chat-type colour registry (`0xb4e518`): 94 fixed entries + 10 `CHANNELn` extras
+    /// (`chat_types`). Seeded from the compiled defaults; the app overlays `chat-cache.txt`'s
+    /// `COLORS` block through [`super::UiScript::set_chat_colors`].
+    pub(crate) chat_colors: Vec<super::chat_types::ChatTypeColor>,
+    /// A Lua-side colour write landed — [`super::UiScript::take_chat_color_changes`].
+    pub(crate) chat_colors_changed: bool,
+    /// The languages this character knows, `Languages.dbc` row order
+    /// ([`super::UiScript::set_known_languages`]).
+    pub(crate) known_languages: Vec<String>,
+    /// The zone-channel rows for the current zone ([`super::UiScript::set_zone_channel_catalog`]).
+    pub(crate) zone_channel_catalog: Vec<super::channel::ZoneChannelRow>,
+    /// Channel verbs since the last [`super::UiScript::take_channel_commands`] drain.
+    pub(crate) channel_commands: Vec<super::channel::ChannelCommand>,
+    /// **The guild-recruitment auto-join latch** — the reference's int global `[0x843608]`, which
+    /// `GetGuildRecruitmentMode` returns and `SetGuildRecruitmentMode` writes (decision 2115).
+    ///
+    /// `0` = STANDARD, `1` = AUTO, and those two words are literally what the per-character chat
+    /// cache stores it as (`OPTION_GUILD_RECRUITMENT_CHANNEL STANDARD|AUTO`; wow-re
+    /// `system/ui/scratch/chat-cache-grammar.md` — the reader maps `STANDARD` to 0 and anything
+    /// else, `AUTO` included, to 1). It boots at **1**: every one of the 33 `chat-cache.txt` files
+    /// the reference client itself wrote in this repo's install says `AUTO`, on characters that
+    /// never opened the option.
+    pub(crate) guild_recruitment_mode: u8,
+    /// A `SetGuildRecruitmentMode(1)` since the last drain — `0x49ea70`'s tail-jump into the
+    /// cascade `0x49ea90`, which the app runs (decision 2144). Keyed on the *new value alone*, not
+    /// on a change: the reference's store is unconditional and the jump reads only `ecx == 1`.
+    pub(crate) guild_recruitment_cascade: bool,
+    /// Whether Lua has moved [`Self::guild_recruitment_mode`] since the last drain — the chat
+    /// cache's dirty signal, the peer of `chat_window_changes`.
+    pub(crate) guild_recruitment_changed: bool,
+    /// `DoEmote` calls since the last drain.
+    pub(crate) emote_requests: Vec<super::chat_misc::EmoteRequest>,
+    /// `RandomRoll` calls since the last drain.
+    pub(crate) roll_requests: Vec<(u32, u32)>,
+    /// `UninviteByName` calls since the last drain.
+    pub(crate) uninvite_requests: Vec<String>,
+    /// `ConsoleExec` lines that were not CVar writes.
+    pub(crate) console_lines: Vec<String>,
+    /// `LoggingChat` / `LoggingCombat` — the two flags and their change cue.
+    pub(crate) logging_chat: bool,
+    pub(crate) logging_combat: bool,
+    pub(crate) logging_changed: bool,
     /// Whether a **user-placed** frame's geometry moved since the app's last
     /// [`super::UiScript::take_user_placed_change`] drain — the layout cache's persist cue
     /// ([`super::layout_cache`]). One bit rather than a set of handles, because the file is
@@ -604,6 +756,12 @@ pub(crate) struct Model {
     /// [`UiScript::take_sounds`] drain — the outbound Lua→app intent seam ([`sound`]).
     pub(crate) sound_queue: Vec<SoundRequest>,
 
+    /// `PlayMusic`/`StopMusic` intents queued since the app's last
+    /// [`UiScript::take_music`] drain — the same seam, a different *slot*: these drive the music
+    /// stream the reference gives the Lua caller (`[0xb06ccc]`), not the kit player ([`sound`]).
+    /// Order-bearing, so a start and a stop in one frame settle the slot the way they were called.
+    pub(crate) music_queue: Vec<MusicRequest>,
+
     /// **The UI-load sound-suppression depth** — `[0xb05fa0]` in the reference, a counted scope
     /// with exactly three references image-wide: `0x458f50` (`inc`), `0x458f60` (`dec`), and one
     /// reader at `0x458046`, inside `PlaySoundByName 0x458030`. The whole-UI load `0x48fbf0`
@@ -637,6 +795,9 @@ pub(crate) struct Model {
     /// `(registered name, new value)` per Lua `SetCVar` since the app's last
     /// [`super::UiScript::take_cvar_changes`] drain — the knob-sync + config-dirty cue.
     pub(crate) cvar_changes: Vec<(String, String)>,
+    /// `(name, default)` per addon `RegisterCVar` that created a slot, since the host's last
+    /// [`super::UiScript::take_cvar_registrations`] drain (decision 2303).
+    pub(crate) cvar_registrations: Vec<(String, String)>,
     /// Unknown CVar names already warned about (warn-once, the era-atlas-miss posture).
     pub(crate) cvars_warned: HashSet<String>,
 
@@ -651,6 +812,29 @@ pub(crate) struct Model {
     /// until the host pushes it — a VM with no device behind it (every extract test) offers no
     /// formats rather than inventing some.
     pub(crate) multisample_formats: Vec<super::cvars::MultisampleFormat>,
+
+    /// The screen resolutions the Video options window's dropdown offers, ascending — pushed by
+    /// the host ([`super::UiScript::set_screen_resolutions`]) from the display this client is on,
+    /// and read by `GetScreenResolutions` / `GetCurrentResolution` / `SetScreenResolution`.
+    ///
+    /// Empty until the host pushes it. A VM with no window behind it (every extract test) offers
+    /// none rather than inventing a ladder, and the reference's own consumer walks it zero times.
+    pub(crate) screen_resolutions: Vec<super::cvars::ScreenResolution>,
+    /// **Where in that list the client actually is** — the index `GetCurrentResolution` answers,
+    /// 0-based here and reported 1-based, which is the form `CT_Viewport.lua:105` indexes the
+    /// `GetScreenResolutions` varargs with (`arg[GetCurrentResolution()]`).
+    ///
+    /// Held as an index rather than a size so the two can never disagree: the host guarantees the
+    /// live size is IN the list when it pushes, which is what makes that addon's read total.
+    /// `None` while the list is empty.
+    pub(crate) current_resolution: Option<usize>,
+    /// What this run's device and presentation path really offer, behind `GetVideoCaps` — pushed
+    /// by the host, which is the only side holding a `RenderAdapter`.
+    pub(crate) video_caps: super::cvars::VideoCaps,
+    /// `RestartGx()` calls queued since the host last drained them — the video window's
+    /// "apply the staged settings now" button, counted like [`Self::screenshot_asks`] because the
+    /// request carries no payload.
+    pub(crate) restart_gx_asks: u32,
 
     /// The globals `RegisterForSave` declared, in registration order — the saved-variables set the
     /// host writes out at logout/exit and re-executes at load (decision 1128, [`super::saved`]).
@@ -762,6 +946,64 @@ pub(crate) struct Model {
     /// from OnUpdate and hides itself when it goes false; the binder question's twin, and the same
     /// range gate stands behind both (decision 1580).
     pub(crate) talent_master_pending: bool,
+    // ── The dialog engine's verbs (decision 1963; wow-re `staticpopup-dialog-bindings.md`) ──
+    /// `ConfirmPetUnlearn()` calls since the app's last drain — the pet trainer's twin of
+    /// [`Self::talent_wipe_confirms`]; the app holds the latched trainer and the money gate.
+    pub(crate) pet_unlearn_confirms: u32,
+    /// Whether the pet trainer's question is pending AND the trainer is in reach — what
+    /// `CheckPetUntrainerDist()` answers, pushed by the app each frame.
+    pub(crate) pet_untrainer_pending: bool,
+    /// `GetInstanceBootTimeRemaining()`'s answer in whole seconds, 0 when idle — the app derives
+    /// it from the `SMSG_RAID_GROUP_ONLY` deadline each frame.
+    pub(crate) instance_boot_secs: u32,
+    /// Whether a battleground spirit healer is the cached current-area healer (a non-zero
+    /// `[0xb4e330/334]`), and the seconds to its next wave (`[0xb4e338]`), both the app's.
+    pub(crate) area_spirit_healer_cached: bool,
+    pub(crate) area_spirit_secs: u32,
+    /// `AcceptAreaSpiritHeal()` calls since the last drain (each one `CMSG_AREA_SPIRIT_HEALER_QUEUE`
+    /// with the cached healer — the app holds the guid).
+    pub(crate) area_spirit_accepts: u32,
+    /// `AcceptBattlefieldPort(index, accept)` calls: the 1-based slot and the normalised answer.
+    pub(crate) battlefield_port_requests: Vec<(u8, bool)>,
+    /// The battleground scoreboard (1972): the pushed rows, the faction filter, the sorted order.
+    pub(crate) battlefield_board: super::battlefield_score::ScoreBoard,
+    /// `GetBattlefieldInstanceRunTime()`'s answer, pushed each frame by the app's clock.
+    pub(crate) battlefield_run_time_ms: u32,
+    /// `RequestBattlefieldScoreData()` calls since the last drain.
+    pub(crate) battlefield_score_requests: u32,
+    /// `LeaveBattlefield()` calls that passed the "ended" gate since the last drain.
+    pub(crate) battlefield_leave_requests: u32,
+    /// The battleground instance list and its scalars (1974), as the app last pushed them.
+    pub(crate) battlefield_list: super::battlefield_queue::BattlefieldListView,
+    /// `[0xb6eba0]` — the selected instance id (a VALUE; `SetSelectedBattlefield` writes it).
+    pub(crate) battlefield_selected: u32,
+    /// The three queue slots (1974), pushed each frame with their clock-shaped values reduced.
+    pub(crate) battlefield_slots: Vec<super::battlefield_queue::BattlefieldQueueSlot>,
+    /// `GetBattlefieldInstanceExpiration()`'s answer, pushed each frame.
+    pub(crate) battlefield_instance_expiration_ms: u32,
+    /// `JoinBattlefield` calls since the last drain: `(instance id, as group)`.
+    pub(crate) battlefield_join_requests: Vec<(u32, bool)>,
+    /// `ShowBattlefieldList` calls that passed their gates: the queued slot's map id.
+    pub(crate) battlefield_list_requests: Vec<u32>,
+    /// The battleground teammates' map positions as the app resolved them (1980), the flag
+    /// carrier, the active map's icon scale, and `RequestBattlefieldPositions()` calls.
+    pub(crate) battlefield_positions: Vec<super::battlefield_positions::BattlefieldPositionView>,
+    pub(crate) battlefield_flag: Option<super::battlefield_positions::BattlefieldFlagView>,
+    pub(crate) battlefield_icon_scale: f32,
+    pub(crate) battlefield_position_requests: u32,
+    /// `CancelMeetingStoneRequest()` calls since the last drain — the app gates on leadership.
+    pub(crate) meeting_stone_cancels: u32,
+    /// The meeting stone's queued area (`[0xb72038]`) and cached status text (`[0xb7203c]`), as the
+    /// app last pushed them (1974).
+    pub(crate) meeting_stone_area: u32,
+    pub(crate) meeting_stone_status_text: Option<String>,
+    /// The tutorial system's acknowledged bank, as the app last pushed it (1976); `None` before
+    /// `SMSG_TUTORIAL_FLAGS` — `TutorialsEnabled()`'s only input.
+    pub(crate) tutorial_bank: Option<Vec<u8>>,
+    /// `FlagTutorial(n)` calls since the last drain (0-based, in range).
+    pub(crate) tutorial_flag_requests: Vec<u32>,
+    pub(crate) tutorial_clears: u32,
+    pub(crate) tutorial_resets: u32,
 
     /// The stance/shapeshift bar's form list (bar order) the app pushes — the
     /// `GetNumShapeshiftForms`/`GetShapeshiftFormInfo` family reads it ([`super::shapeshift`]).
@@ -783,6 +1025,14 @@ pub(crate) struct Model {
     pub(crate) pet_autocast_toggles: Vec<u32>,
     /// `PetStopAttack()` calls queued — a count, since the verb takes no argument.
     pub(crate) pet_stop_attacks: u32,
+    /// The pet one-shot orders (`PetAttack`, `PetFollow`, `PetWait`, the three modes), each the
+    /// packed slot word the bar's own command or reaction slot would carry — the app's drain
+    /// presses them exactly as a slot (1958).
+    pub(crate) pet_orders: Vec<u32>,
+    /// `HasFullControl`'s flag — the reference's `[0xb4b3e4]`, written by
+    /// `SMSG_CLIENT_CONTROL_UPDATE` naming the local player and read as "if zero, refuse" by
+    /// every cast, item and cursor gate (wow-re `control-loss-and-restore.md`). Boot value 1.
+    pub(crate) player_control: bool,
     /// Pet bar writes queued by the drag ([`cursor::pet`], decision 1010) — **one entry per
     /// `CMSG_PET_SET_ACTION`**, each holding the one or two `(0-based position, packed word)` pairs
     /// that send names. The nesting is the point: the server tells the one-pair form from the
@@ -862,6 +1112,18 @@ pub(crate) struct Model {
     /// stack) — the popup-confirmed destroy (decision 0216 §3), drained by the app into
     /// `CMSG_DESTROYITEM`.
     pub(crate) container_destroys: Vec<(i64, u32, u32)>,
+    /// **The armed gift wrap** — the `(bag, slot)` of a piece of wrapping paper whose right-click
+    /// took the reference's begin-wrap arm (`0x5edea0`: lock the paper, cursor mode 2, no packet).
+    /// `None` = nothing armed, which is nearly always. Decision 1934.
+    ///
+    /// Deliberately **not** a [`cursor::CursorPayload`]: the reference writes no payload global at
+    /// all here, only the displayed-cursor mode, so `CursorHasItem()` stays nil and none of the
+    /// thirteen stock `CursorHasItem()` gates open. Making it a payload would silently open every
+    /// one of them — the same trap decision 1677's mode-5 note names for the vendor cursor.
+    pub(crate) pending_wrap: Option<container::PendingWrap>,
+    /// `(giftBag, giftSlot, itemBag, itemSlot)` quads a completed wrap queued, drained by the app
+    /// into `CMSG_WRAP_ITEM`. The paper's pair leads, as the wire does.
+    pub(crate) container_wraps: Vec<(i64, u32, i64, u32)>,
     /// The Lua-set **displayed-cursor override** (`ShowContainerSellCursor`/`ShowMerchantSellCursor`/
     /// `ShowBuybackSellCursor`/`ShowInspectCursor` set it, `ResetCursor` clears it; [`container`] +
     /// [`merchant`]) — the single "displayed mode" the real client keeps at `0xbe2c2c`, restored to
@@ -960,11 +1222,16 @@ pub(crate) struct Model {
     pub(crate) bank_close: bool,
 
     /// The open trainer's service snapshot the app pushes (`None` = no trainer open), the
-    /// `BuyTrainerService` intents it drains, the engine-held 1-based selection (0 = none), and
-    /// whether `CloseTrainer` was called — the trainer seam ([`trainer`], decision 0237).
+    /// `BuyTrainerService` intents it drains, the engine-held selection, and whether `CloseTrainer`
+    /// was called — the trainer seam ([`trainer`], decision 0237).
+    ///
+    /// The selection is the selected service's **spell id**, not its row number. A row number is a
+    /// coordinate in a list that three independent things move under it — the state filter, a
+    /// collapse, and a re-list — and `GetTrainerSelectionIndex` answering with a stale-but-in-range
+    /// one is what left the detail pane describing a spell that had already left the window.
     pub(crate) trainer: Option<trainer::TrainerState>,
     pub(crate) trainer_buys: Vec<u32>,
-    pub(crate) trainer_selection: u32,
+    pub(crate) trainer_selection: Option<u32>,
     pub(crate) trainer_close: bool,
     /// The three state filters (available / unavailable / used) — the real client hides filtered
     /// service rows itself ([`trainer`]); all shown by default. A state filter hides *services*, never
@@ -1106,6 +1373,10 @@ pub(crate) struct Model {
     /// The Send tab's attached bag item (a cursor drop, decision 0216) — carried until the send
     /// fires; the app resolves its `(bag, slot)` to the wire item guid then.
     pub(crate) mail_send_item: Option<cursor::CursorItem>,
+    /// The usable stationery list the app pushes, in the picker's order (1970).
+    pub(crate) mail_stationeries: Vec<mail::StationeryView>,
+    /// `SelectStationery`'s stored `Stationery.dbc` id — 0 = none, which silences `SendMail`.
+    pub(crate) mail_stationery: u32,
     /// `HasNewMail()` — login-scoped (survives the mailbox window closing, unlike [`Self::mail`]
     /// above): the app's `MSG_QUERY_NEXT_MAIL_TIME`/`SMSG_RECEIVED_MAIL`-fed countdown reduced to
     /// one flag (decision 0544 P3, wow-re §5 `mail-interaction.md`). The reference minimap icon
@@ -1122,6 +1393,8 @@ pub(crate) struct Model {
     /// throttle, pushed separately from the snapshot because the Search button polls it every
     /// frame and it would otherwise churn the snapshot's diff.
     pub(crate) auction: Option<auction::AuctionState>,
+    /// The Browse tab's class tree, login-scoped (`set_auction_item_classes`, 1971).
+    pub(crate) auction_item_classes: Vec<auction::AuctionCategory>,
     pub(crate) auction_selected: [u32; 3],
     pub(crate) auction_can_query: bool,
     pub(crate) auction_query: Option<auction::AuctionQuery>,
@@ -1147,6 +1420,9 @@ pub(crate) struct Model {
     pub(crate) trade_accept: bool,
     pub(crate) trade_unaccept: bool,
     pub(crate) trade_close: bool,
+    /// `BeginTrade()` / `CancelTrade()` since the last drain (decision 1963).
+    pub(crate) trade_begin: bool,
+    pub(crate) trade_cancel: bool,
     pub(crate) trade_set_money: Option<u32>,
     /// Cursor-drop placements onto our trade slots: `(trade_id 1-based, bag, slot)` → the app resolves
     /// `(bag, slot)` → wire position → `CMSG_SET_TRADE_ITEM`. `trade_clear_items` are the 1-based ids
@@ -1339,14 +1615,19 @@ pub(crate) struct Model {
     pub(crate) inspect_notifies: Vec<String>,
     /// `ClearInspectPlayer` was called — drained by the app, which drops its inspect target.
     pub(crate) inspect_clear: bool,
-    /// The inspect model pane's bake yaw — the last of the benilla-named pane scalars beside
-    /// [`Self::dressup_yaw`]. A migrated window's pane carries its own facing in `ModelState`
-    /// (`UiScript::model_pane_facing`, decision 1751); these two remain because their windows are
-    /// The dressing room's queued intents (decision 1060) — `BenillaDressUpModel_Dress/TryOn/Close`,
-    /// drained by the app in order (see [`super::dressup`] on why order matters).
+    /// The dressing room's queued intents (decision 1060) — the `DressUpModel` widget's
+    /// `SetUnit`/`Dress`/`Undress`/`TryOn`, drained by the app in order (see [`super::dressup`] on
+    /// why order matters). The pane's yaw is its own `ModelState` facing, like every migrated
+    /// window's (`UiScript::model_pane_facing`, 1751/1969).
     pub(crate) dressup_intents: Vec<super::dressup::DressUpIntent>,
-    /// The dressing-room pane's bake yaw, the fourth of those scalars.
-    pub(crate) dressup_yaw: f32,
+    /// The tabard designer (1977): each `TabardModel`'s five values, the last seeded/cycled five
+    /// (the app's body preview), the host facts, and the queued intents.
+    pub(crate) tabard_designs: HashMap<crate::widget::FrameHandle, [i32; 5]>,
+    pub(crate) tabard_preview: Option<[i32; 5]>,
+    pub(crate) tabard_host: super::tabard::TabardHost,
+    pub(crate) tabard_intents: Vec<super::tabard::TabardIntent>,
+    /// The WorldFrame type's one-shot registry record (1984): `true` once the first is made.
+    pub(crate) world_frame_made: bool,
     /// Unit token (lowercase) → what the app resolved about it this frame, for **every** token
     /// that named a **live unit object**, creature as readily as player — the input to both
     /// verified range predicates (`CanInspect`, `CheckInteractDistance`). An absent token is one
@@ -1397,6 +1678,11 @@ pub(crate) struct Model {
     /// The world-map seam ([`worldmap`](super::worldmap)): the pushed catalog/feed + the
     /// engine-owned selection.
     pub(crate) worldmap: super::worldmap::WorldMapState,
+    /// The V-key nameplate pool — engine-owned `Button` widgets under the `WorldFrame`, grown on
+    /// demand and never shrunk, in creation order (decision 2148). Lives here rather than on
+    /// [`super::UiScript`] because it IS model state: the plates are arena frames, and an addon
+    /// walking `WorldFrame:GetChildren()` reaches them like any other.
+    pub(crate) nameplates: super::nameplate::NamePlates,
     /// The always-up world-state readout's rows ([`worldstate`](super::worldstate)), already
     /// gated and resolved app-side.
     pub(crate) worldstate: super::worldstate::WorldStateUiState,
@@ -1418,13 +1704,16 @@ pub(crate) struct Model {
     /// the app's minimap geometry lives in; the app applies the 0582 seam scale on the way in,
     /// and getting that wrong is decision 1596's first root cause).
     pub(crate) minimap_ping_request: Option<(f32, f32)>,
-    /// The live minimap ping's **normalized** offsets from the widget centre (fractions of the
-    /// widget side, x right / y up — the `MINIMAP_PING` event's arg2/arg3 space), republished
-    /// by the app every frame a ping is live and cleared when the ping ends. Behind
-    /// `Minimap:GetPingPosition()`. There is exactly one ping, so it lives here rather than on
-    /// each Minimap widget's [`KindState`](crate::widget::KindState) — one write, one read,
-    /// no arena walk (decision 1596).
-    pub(crate) minimap_ping: Option<(f32, f32)>,
+    /// The minimap ping's **normalized** offsets from the widget centre (fractions of the widget
+    /// side, x right / y up — the `MINIMAP_PING` event's arg2/arg3 space), republished by the app
+    /// every frame from the stored world point against the player's live position. Behind
+    /// `Minimap:GetPingPosition()`, which answers **two numbers always** — the reference
+    /// recomputes them per call from a pair of statics nothing ever clears (wow-re
+    /// `minimap-ping-law.md`), and the stock `Minimap_OnUpdate` multiplies the answer without a
+    /// nil test for the whole of its 5 s timer (1974; 1596's nil answer stood until then). There
+    /// is exactly one ping, so it lives here rather than on each Minimap widget's
+    /// [`KindState`](crate::widget::KindState) — one write, one read, no arena walk.
+    pub(crate) minimap_ping: (f32, f32),
     /// The realm this session is on, behind `GetRealmName()` (decision 1195). `""` until the app
     /// pushes one — the glue screen's own answer, and never `nil`, because the corpus idiom is
     /// `db[GetRealmName()] = …` at file scope and a nil index errors one call deeper.
@@ -1446,6 +1735,26 @@ pub(crate) struct Model {
     /// payload, so two calls in a frame are two captures.
     pub(crate) screenshot_asks: u32,
     pub(crate) realm_name: String,
+    /// **The local player record — `0xc27d80`, ours** (decisions 2261 and 2263).
+    ///
+    /// The bytes, the four verbs that read it and why `UnitLevel` is not among them are on
+    /// [`super::PlayerRecord`] itself; what belongs here is the *lifetime*, because that is what
+    /// this field's position in the `Model` decides.
+    ///
+    /// **Two writers, and the asymmetry between them is the mechanism.** The world-entry UI load
+    /// seeds it from the roster row of the pick in flight — our copy of the same char-enum record
+    /// — beside [`Self::realm_name`] and before the addon walk (1195's slot, 1230's source); and
+    /// [`super::UiScript::set_unit`] keeps it in step for any `"player"` push that **carries** the
+    /// field. A push that does not carry it leaves it standing. So the record can be corrected but
+    /// never blanked, which is the reference's never-cleared property expressed where it can be
+    /// relied on — and decision 2260 is why that matters: a name-cache miss for our own guid
+    /// reached Lua as a nameless player snapshot and took KLHThreatMeter down with it.
+    ///
+    /// Our VM is rebuilt per login (1290) where the reference's record simply persists, so each new
+    /// VM is told once. That is the whole of the difference, and it is unobservable: the four verbs
+    /// do not exist between logins either — they live only in the in-game table `0x850438`, which
+    /// `UI_Init` installs and the teardown nils, and `GlueScript_RegisterBindings 0x46abb0` skips.
+    pub(crate) player_record: super::PlayerRecord,
     /// The hearthstone bind location's NAME, behind `GetBindLocation()` — the app resolves the
     /// `SMSG_BINDPOINTUPDATE` area id through the same AreaTable catalog the hearthstone's `$z`
     /// token already uses, and pushes the resolved string here.
@@ -1495,6 +1804,18 @@ pub(crate) struct Model {
 }
 
 impl Model {
+    /// The detail pane of the row `SelectQuestLogEntry` currently names — resolved HERE, per call,
+    /// never baked into the pushed snapshot (decision 2247). The reference's detail bindings read
+    /// the selection variable and peek the quest cache inside the same call, so a select-then-read
+    /// pair within one frame answers about the row just selected; the app's push only supplies the
+    /// per-row data those reads land on. `None` for no selection, an out-of-range one, or a header.
+    pub(crate) fn selected_quest_detail(&self) -> Option<&quest_log::QuestLogDetail> {
+        let index = usize::try_from(self.quest_log_selection.checked_sub(1)?).ok()?;
+        self.quest_log.entries.get(index)?.detail.as_ref()
+    }
+}
+
+impl Model {
     /// A unit token's snapshot, **case-folded the way the client folds it**.
     ///
     /// 1.12's resolver `0x515970` compares each of its literals with `SStrCmpI` → `_strnicmp`,
@@ -1531,6 +1852,35 @@ impl Model {
         self.errors.push(msg);
     }
 
+    /// **Record one non-fatal warning — the channel's one door** (decision 2135). Both halves:
+    /// the host's per-frame `warnings` drain (a `warn!` line in the terminal, for whoever is
+    /// running the client), and the retained diagnostic log, which is the only copy a player or an
+    /// instrument can read after the frame that produced it.
+    ///
+    /// Before this there was only the first half, and it was a dead end: `take_warnings` empties
+    /// every frame, so a warning existed for the length of one terminal line and then nowhere at
+    /// all. The messages it carries are the failures that never announce themselves — a dropped
+    /// `inherits=`, an unresolved anchor, an unregistered CVar — which is precisely the class the
+    /// diagnostic log was built for.
+    ///
+    /// Its sibling is [`Self::warn_host_only`], for the one message already retained under a
+    /// truer kind.
+    pub(crate) fn record_warning(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.diagnostics
+            .record(super::diagnostics::DiagnosticKind::Warning, &msg);
+        self.warnings.push(msg);
+    }
+
+    /// The host channel **alone** — for a message that is already retained under a kind that says
+    /// more than `Warning` does. Exactly one caller: `LoadAddOn`'s failure line, which
+    /// `record_load_failure` has already filed as a [`Load`](super::diagnostics::DiagnosticKind)
+    /// row ("the addon isn't running", which is the fact worth keeping) and which still wants its
+    /// terminal line. Retaining it twice would put the same sentence in the log under two kinds.
+    pub(crate) fn warn_host_only(&mut self, msg: String) {
+        self.warnings.push(msg);
+    }
+
     pub(crate) fn unit(&self, token: &str) -> Option<&UnitState> {
         if token.bytes().any(|b| b.is_ascii_uppercase()) {
             self.units_by_lower.get(&token.to_ascii_lowercase())
@@ -1542,13 +1892,18 @@ impl Model {
     pub(crate) fn new() -> Model {
         Model {
             addons: Vec::new(),
+            addon_index: Vec::new(),
+            addon_info_hidden: None,
             addons_root: None,
+            addons_chain_reader: None,
             measurer: None,
             texture_probe: None,
             texture_size_probe: None,
+            font_probe: None,
             addons_saved_account: None,
             addons_saved_character: None,
             framexml_templates: Default::default(),
+            framexml_debug: Default::default(),
             framexml_fonts: Default::default(),
             arena: WidgetArena::new(),
             layout_inputs: HashMap::new(),
@@ -1576,17 +1931,21 @@ impl Model {
             font_objects_by_lower: HashMap::new(),
             region_resolved: HashMap::new(),
             next_id: 1,
-            id_to_frame: HashMap::new(),
+            id_to_frame: IdMap::default(),
             frame_to_id: HashMap::new(),
-            id_to_region: HashMap::new(),
+            id_to_region: IdMap::default(),
             region_to_id: HashMap::new(),
             region_names: HashMap::new(),
             scripts: HashMap::new(),
             on_update_frames: Vec::new(),
             on_size_changed_frames: Vec::new(),
+            on_update_model_frames: Vec::new(),
+            model_facts: HashMap::new(),
+            model_facts_wanted: Vec::new(),
             dirty_editboxes: Vec::new(),
             event_to_frames: HashMap::new(),
             frame_events: HashMap::new(),
+            all_event_frames: Vec::new(),
             focused_editbox: None,
             mouseover: None,
             hover_repick: false,
@@ -1613,6 +1972,7 @@ impl Model {
             joined_channels: Vec::new(),
             party: party::PartyState::default(),
             party_requests: Vec::new(),
+            ready_check: party::ReadyCheckState::default(),
             saved_instances: Vec::new(),
             raid_selection: 0,
             instance_type: None,
@@ -1620,6 +1980,8 @@ impl Model {
             reset_instance_asks: 0,
             social: social::SocialState::default(),
             social_requests: Vec::new(),
+            lfg_slots: [0; 3],
+            lfg_comment: String::new(),
             guild: guild::GuildState::default(),
             guild_control: guild::GuildRankEdit::default(),
             guild_requests: Vec::new(),
@@ -1631,6 +1993,21 @@ impl Model {
             // seven (`ChatWindowLook::stock`): 1 and 2 are the dock, 3..7 are undocked.
             chat_window_looks: std::array::from_fn(chat_window::ChatWindowLook::stock),
             chat_window_changes: HashSet::new(),
+            chat_colors: super::chat_types::seed(),
+            chat_colors_changed: false,
+            known_languages: Vec::new(),
+            zone_channel_catalog: Vec::new(),
+            channel_commands: Vec::new(),
+            guild_recruitment_mode: 1,
+            guild_recruitment_cascade: false,
+            guild_recruitment_changed: false,
+            emote_requests: Vec::new(),
+            roll_requests: Vec::new(),
+            uninvite_requests: Vec::new(),
+            console_lines: Vec::new(),
+            logging_chat: false,
+            logging_combat: false,
+            logging_changed: false,
             user_placed_changed: false,
             default_language: None,
             duel_requests: Vec::new(),
@@ -1648,12 +2025,18 @@ impl Model {
             action_bar_toggles: None,
             action_bar_toggle_sends: Vec::new(),
             sound_queue: Vec::new(),
+            music_queue: Vec::new(),
             sound_suppression: 0,
             cvars: HashMap::new(),
             cvars_saved_base: HashMap::new(),
             cvar_changes: Vec::new(),
+            cvar_registrations: Vec::new(),
             cvars_warned: HashSet::new(),
             multisample_formats: Vec::new(),
+            screen_resolutions: Vec::new(),
+            current_resolution: None,
+            video_caps: super::cvars::VideoCaps::default(),
+            restart_gx_asks: 0,
             saved_names: Vec::new(),
             keybinds: super::keybind::KeybindState::default(),
             actions: HashMap::new(),
@@ -1680,12 +2063,42 @@ impl Model {
             talent_learns: Vec::new(),
             talent_wipe_confirms: 0,
             talent_master_pending: false,
+            pet_unlearn_confirms: 0,
+            pet_untrainer_pending: false,
+            instance_boot_secs: 0,
+            area_spirit_healer_cached: false,
+            area_spirit_secs: 0,
+            area_spirit_accepts: 0,
+            battlefield_port_requests: Vec::new(),
+            battlefield_board: Default::default(),
+            battlefield_run_time_ms: 0,
+            battlefield_score_requests: 0,
+            battlefield_leave_requests: 0,
+            battlefield_list: Default::default(),
+            battlefield_selected: 0,
+            battlefield_slots: Vec::new(),
+            battlefield_instance_expiration_ms: 0,
+            battlefield_join_requests: Vec::new(),
+            battlefield_list_requests: Vec::new(),
+            battlefield_positions: Vec::new(),
+            battlefield_flag: None,
+            battlefield_icon_scale: 1.0,
+            battlefield_position_requests: 0,
+            meeting_stone_cancels: 0,
+            meeting_stone_area: 0,
+            meeting_stone_status_text: None,
+            tutorial_bank: None,
+            tutorial_flag_requests: Vec::new(),
+            tutorial_clears: 0,
+            tutorial_resets: 0,
             shapeshift_forms: Vec::new(),
             shapeshift_casts: Vec::new(),
             pet_bar: super::pet::PetBarState::default(),
             pet_actions_pressed: Vec::new(),
             pet_autocast_toggles: Vec::new(),
             pet_stop_attacks: 0,
+            pet_orders: Vec::new(),
+            player_control: true,
             pet_set_actions: Vec::new(),
             pet_abandons: 0,
             pet_dismisses: 0,
@@ -1704,6 +2117,8 @@ impl Model {
             item_picks: Vec::new(),
             enchant_confirms: Vec::new(),
             container_destroys: Vec::new(),
+            pending_wrap: None,
+            container_wraps: Vec::new(),
             ui_cursor: None,
             ui_cursor_dirty: false,
             container_autoequips: Vec::new(),
@@ -1732,7 +2147,7 @@ impl Model {
             bank_close: false,
             trainer: None,
             trainer_buys: Vec::new(),
-            trainer_selection: 0,
+            trainer_selection: None,
             trainer_close: false,
             trainer_filter: [true; 3],
             trainer_collapsed: HashSet::new(),
@@ -1780,8 +2195,11 @@ impl Model {
             mail_send_money: 0,
             mail_send_cod: 0,
             mail_send_item: None,
+            mail_stationeries: Vec::new(),
+            mail_stationery: 0,
             has_new_mail: false,
             auction: None,
+            auction_item_classes: Vec::new(),
             auction_selected: [0; 3],
             auction_can_query: true,
             auction_query: None,
@@ -1798,6 +2216,8 @@ impl Model {
             trade_accept: false,
             trade_unaccept: false,
             trade_close: false,
+            trade_begin: false,
+            trade_cancel: false,
             trade_set_money: None,
             trade_set_items: Vec::new(),
             trade_clear_items: Vec::new(),
@@ -1824,16 +2244,18 @@ impl Model {
             quest_log_watched: Vec::new(),
             server_unix_time: None,
             worldmap: super::worldmap::WorldMapState::default(),
+            nameplates: super::nameplate::NamePlates::default(),
             worldstate: super::worldstate::WorldStateUiState::default(),
             pending_events: Vec::new(),
             cursor_pos: (0.0, 0.0),
             minimap_ping_request: None,
-            minimap_ping: None,
+            minimap_ping: (0.0, 0.0),
             chat_sends: Vec::new(),
             addon_sends: Vec::new(),
             played_time_asks: 0,
             screenshot_asks: 0,
             realm_name: String::new(),
+            player_record: super::PlayerRecord::default(),
             bind_location: String::new(),
             gm_ticket_categories: Vec::new(),
             gm_ticket_intents: Vec::new(),
@@ -1877,7 +2299,11 @@ impl Model {
             inspect_notifies: Vec::new(),
             inspect_clear: false,
             dressup_intents: Vec::new(),
-            dressup_yaw: 0.0,
+            tabard_designs: HashMap::new(),
+            tabard_preview: None,
+            tabard_host: Default::default(),
+            tabard_intents: Vec::new(),
+            world_frame_made: false,
             unit_reach: HashMap::new(),
             chat_input: Vec::new(),
             skills: skills::SkillsState::default(),
@@ -1964,6 +2390,67 @@ impl Model {
         match self.frame_to_id.get(&h) {
             Some(&id) => self.touch_layout_node(id),
             None => self.touch_layout(),
+        }
+    }
+
+    /// A **REPARENT** that names its nodes: `SetParent` moved the effective scale of every frame
+    /// in the subtree rooted at `root`, and moved nothing else the layout graph is made of
+    /// (decision 2314, extending 1388).
+    ///
+    /// ## Why a reparent is a value-only write here
+    ///
+    /// `LayoutInput.scale` is the only layout input a reparent touches: the arena recomputes the
+    /// subtree's `effective_scale` and the derive syncs it per frame. Nothing else moves —
+    /// **an anchor's target is an id resolved at `SetPoint` time** ([`super::object::anchor_args::
+    /// resolve_rel_target`]), not a live "my parent" link, so no edge is retargeted; no node is
+    /// born or dies, so the roster is unchanged; and visibility, strata and level are not layout
+    /// inputs at all (the derive walks liveness, not `effective_visible`). A region carries no
+    /// scale of its own — it reads its owner frame's — so naming the frames is enough: the dirty
+    /// closure pulls the regions that read them.
+    ///
+    /// ## Why it is worth naming a whole subtree
+    ///
+    /// `SetParent` used to take [`Self::touch_layout`], on the reading that a reparent is
+    /// human-rate. **It is not.** A pooled widget's recycle is a reparent, and an addon's map-note
+    /// pool recycles hundreds per redraw: with the director's addon set, every quest-log change
+    /// cost two frames of ~160 ms, of which `WOW_LAYOUT_PROF` attributed **128 ms to 58 full
+    /// graph derivations** — 5,267 frames and 16,124 anchored regions walked and hashed, ~3.2 ms
+    /// each, and `WOW_LAYOUT_DERIVE_TRACE` put all fourteen sampled give-ups on this one call.
+    /// A subtree is a handful of nodes; the roster is twenty thousand.
+    ///
+    /// Falls back to the conservative touch the moment a node of the subtree is not a node of the
+    /// cached graph — [`Self::touch_layout_frame`]'s own rule, and the same "worst case is a
+    /// derivation" safety every precise touch has.
+    pub(crate) fn touch_layout_reparent(&mut self, root: FrameHandle) {
+        // The walk first, then the writing: `touch_layout_frame` takes `&mut self` and the arena
+        // walk holds `&self`.
+        let mut subtree = vec![root];
+        let mut at = 0;
+        while at < subtree.len() {
+            let h = subtree[at];
+            at += 1;
+            if let Some(f) = self.arena.frame(h) {
+                subtree.extend(f.children.iter().copied());
+            }
+        }
+        // **The write itself, not only its name.** `LayoutInput.scale` was synced from the arena
+        // inside [`super::UiScript::resolve_layout`]'s DERIVATION — so a pass that skips the
+        // derivation never learned the new scale, and a named-but-unwritten node is the one shape
+        // that ships a stale rect. `WOW_LAYOUT_VERIFY` caught exactly that on the first run of
+        // `setparent::a_reparent_under_a_scale_change_moves_the_childs_rect`; naming is a claim
+        // about what moved, and this is what makes the claim true.
+        let Model {
+            arena,
+            layout_inputs,
+            ..
+        } = self;
+        for &h in &subtree {
+            if let Some(f) = arena.frame(h) {
+                layout_inputs.entry(h).or_default().scale = f.effective_scale;
+            }
+        }
+        for h in subtree {
+            self.touch_layout_frame(h);
         }
     }
 

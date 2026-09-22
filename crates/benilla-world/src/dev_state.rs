@@ -29,6 +29,51 @@ pub fn deterministic_run() -> bool {
     std::env::var("WOW_CAPTURE").is_ok()
 }
 
+/// How many frames each still-frame input has read as changed since startup — `[camera
+/// transform, DebugState, ViewDistance, ExteriorWindows, CameraInteriorClaim, any
+/// WmoPortalInstance, any InheritedVisibility]`. The still-frame skips (decision 1979: the
+/// visibility walk, billboards, emitter gates, doodad hosts) engage only when all of these are
+/// still; an input rewritten every frame silently disarms every one of them, and `FPS_PROBE`'s
+/// `noisy=` prints these as per-window deltas so that input is named. The two population
+/// terms are the visibility walk's own last two (`new_portals`, `owner_flips`): they were
+/// added the day the walk's `portals` term read 300 of 300 on a parked city frame for a
+/// latch written through `Mut` — a gate the five resource counters could not see.
+pub static STILL_INPUTS_CHANGED: [std::sync::atomic::AtomicU32; 7] = [
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+];
+
+/// `Last`: count this frame's changed still-frame inputs into [`STILL_INPUTS_CHANGED`].
+pub(crate) fn count_still_inputs(
+    cam: Query<Ref<GlobalTransform>, With<crate::view::WorldCamera>>,
+    debug: Res<DebugState>,
+    view: Res<crate::view::ViewDistance>,
+    windows: Res<crate::wmo_portal::ExteriorWindows>,
+    claim: Res<crate::wmo_portal::CameraInteriorClaim>,
+    portals: Query<(), Changed<crate::wmo_portal::WmoPortalInstance>>,
+    flips: Query<(), Changed<InheritedVisibility>>,
+) {
+    let changed = [
+        cam.iter().any(|t| t.is_changed()),
+        debug.is_changed(),
+        view.is_changed(),
+        windows.is_changed(),
+        claim.is_changed(),
+        !portals.is_empty(),
+        !flips.is_empty(),
+    ];
+    for (slot, c) in STILL_INPUTS_CHANGED.iter().zip(changed) {
+        if c {
+            slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// Root debug state. One resource, grouped into per-subsystem sections. Defaults: panel hidden
 /// (`open: false`), each section its own `Default` (so this derives cleanly).
 #[derive(Resource)]

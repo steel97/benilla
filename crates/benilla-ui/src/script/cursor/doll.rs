@@ -7,6 +7,7 @@
 
 use mlua::Lua;
 
+use crate::script::binding_abi::flag;
 use crate::script::container::ContainerMove;
 use crate::script::Model;
 
@@ -133,7 +134,9 @@ pub(super) fn pickup_inventory_item(model: &mut Model, id: u32) -> bool {
             | CursorPayload::PetAction(_)
             // Mode 10 (decision 1677) — a stabled pet refuses a bag/doll slot exactly as the
             // spell/action family does, and stays on the cursor for the stable window to take.
-            | CursorPayload::StablePet(_)),
+            | CursorPayload::StablePet(_)
+            // Mode 2 (1962) — coins have no slot to land in; a money frame's DropFunc takes them.
+            | CursorPayload::Money(_)),
         ) => {
             model.cursor = Some(other);
             false
@@ -269,7 +272,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "IsInventoryItemLocked",
         lua.create_function(|lua, id: u32| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(is_inventory_item_locked(&model, id))
+            Ok(flag(is_inventory_item_locked(&model, id)))
         })?,
     )?;
 
@@ -286,6 +289,7 @@ mod tests {
     fn doll_slots() -> crate::script::InventorySlots {
         let mut slots: crate::script::InventorySlots = Default::default();
         slots[1] = Some(InvSlotView {
+            duration_ms: None,
             already_bound: false,
             bar_placeable: true,
             durability: None,
@@ -303,6 +307,7 @@ mod tests {
             enchants: Vec::new(),
         });
         slots[11] = Some(InvSlotView {
+            duration_ms: None,
             already_bound: false,
             bar_placeable: true,
             durability: None,
@@ -320,6 +325,7 @@ mod tests {
             enchants: Vec::new(),
         });
         slots[19] = Some(InvSlotView {
+            duration_ms: None,
             already_bound: false,
             bar_placeable: true,
             durability: None,
@@ -344,6 +350,7 @@ mod tests {
         slots.insert(
             1,
             ContainerSlot {
+                duration_ms: None,
                 petition: None,
                 already_bound: false,
                 bar_placeable: true,
@@ -487,6 +494,7 @@ mod tests {
         });
         // An equipped bag in Bag0Slot (id 20): its equip_slots is the four bag slots.
         slots[20] = Some(InvSlotView {
+            duration_ms: None,
             already_bound: false,
             bar_placeable: true,
             durability: None,
@@ -526,6 +534,7 @@ mod tests {
         slots.insert(
             3,
             ContainerSlot {
+                duration_ms: None,
                 petition: None,
                 already_bound: false,
                 bar_placeable: true,

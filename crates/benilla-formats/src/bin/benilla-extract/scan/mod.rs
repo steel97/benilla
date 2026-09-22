@@ -8,7 +8,9 @@
 //! - [`lighting`] — what lights a model: the WMO prop lanes, M2 light blocks, terrain shadow.
 //! - [`geometry`] — what geometry a model draws: billboards, geosets, flat ground quads.
 //! - [`material`] — how a batch is textured and blended: blend modes, UV wrap, env stages,
-//!   the batches whose UV/tint loop differs between sequence slots.
+//!   the batches whose UV/tint loop differs between sequence slots, and what the spell-effect
+//!   (`fxuvscan`) and unit/GameObject/held-item (`entityuvscan`) corpora's animated texture
+//!   transforms render for a consumer that runs none of them.
 //! - [`particles`] — particle and ribbon emitters, and the features the corpus authors.
 //! - [`skeleton`] — the bone tree and the attachment table that addresses it.
 //! - [`sequence`] — which sequence an arm plays, what breaks when it is the wrong one, and
@@ -31,12 +33,16 @@ mod world;
 
 pub use geometry::{animboundscan, bbfacescan, bbscan, geosetscan, groundscan, normalscan};
 pub use lighting::{darkpropscan, m2lightscan, shadeat};
-pub use material::{alphascan, blendscan, envmapscan, texmodescan, uvslotscan, uvwrapscan};
+pub use material::{
+    alphascan, blendscan, entityuvscan, envmapscan, fxuvscan, texmodescan, uvslotscan, uvwrapscan,
+};
 pub use particles::{
     cellscan, fxordercensus, partcensus, partscan, partslotscan, ribbonscan, shardcensus,
 };
-pub use sequence::{fxlifescan, goanimscan, idleslotscan, seqclockscan, soundeventscan};
-pub use skeleton::{attachscan, bonescan};
+pub use sequence::{
+    fxlifescan, goanimscan, goslotscan, idleslotscan, seqclockscan, soundeventscan,
+};
+pub use skeleton::{attachscan, bonescan, eventmarkerscan};
 pub use world::{doodadscan, placescan, skyboxscan, wmodoodads};
 
 /// Every `.m2` in the chain, in listfile order, narrowed to a path `prefix` when one is given.
@@ -70,7 +76,7 @@ pub(crate) fn m2_names(chain: &mut Chain, prefix: Option<&str>) -> Result<Vec<St
 /// spell it inline had drifted into spelling it *differently* (one guarded a stem shorter than
 /// four characters, the other did not, so a hypothetical `123.wmo` was a root to one and a group
 /// to the other).
-fn wmo_roots(chain: &mut Chain, prefix: Option<&str>) -> Result<Vec<String>> {
+pub(crate) fn wmo_roots(chain: &mut Chain, prefix: Option<&str>) -> Result<Vec<String>> {
     let pfx = prefix.map(|p| p.to_ascii_lowercase().replace('/', "\\"));
     Ok(chain
         .list()

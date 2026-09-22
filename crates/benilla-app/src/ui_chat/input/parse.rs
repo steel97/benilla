@@ -8,7 +8,6 @@
 //! No aliases live here: which strings reach which arm is [`super::super::commands`]'s table,
 //! built from the shipped `GlobalStrings.lua`.
 
-use crate::net::ChatKind;
 use crate::ui_chat::commands::{Command, DevCmd, SlashCommands, SlashIndex};
 
 /// Escape a player-typed string for embedding in a Lua double-quoted literal: backslashes and
@@ -27,32 +26,10 @@ pub(in crate::ui_chat) fn escape_lua_string(s: &str) -> String {
         .collect()
 }
 
-/// Which social slash command was typed — the selector for the Lua body it runs
-/// ([`ParsedChat::Social`], decision 0668).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::ui_chat) enum SocialVerb {
-    /// `/who [filter]` — SLASH_WHO 1-2.
-    Who,
-    /// `/friends [name]` (aliases `/friend`) — SLASH_FRIENDS 1-4.
-    Friends,
-    /// `/removefriend <name>` (alias `/remfriend`) — SLASH_REMOVEFRIEND 1-4.
-    RemoveFriend,
-    /// `/ignore [name]` — SLASH_IGNORE 1-2. Toggles: an ignored name is un-ignored.
-    Ignore,
-    /// `/unignore [name]` — SLASH_UNIGNORE 1-2.
-    Unignore,
-}
-
-impl SocialVerb {
-    /// The Lua function in `FriendsFrame.xml` holding this verb's reference body.
-    pub(in crate::ui_chat) fn lua_fn(self) -> &'static str {
-        match self {
-            Self::Who => "BenillaSlashWho",
-            Self::Friends => "BenillaSlashFriends",
-            Self::RemoveFriend => "BenillaSlashRemoveFriend",
-            Self::Ignore => "BenillaSlashIgnore",
-            Self::Unignore => "BenillaSlashUnignore",
-        }
+/// A social slash line as the reference runs it: `SlashCmdList["<KEY>"](<arg>)` (1959).
+fn social_body(key: &str, args: &str) -> ParsedChat {
+    ParsedChat::Lua {
+        body: format!("SlashCmdList[\"{key}\"](\"{}\")", escape_lua_string(args)),
     }
 }
 
@@ -61,7 +38,8 @@ impl SocialVerb {
 /// resource or a network channel.
 #[derive(Debug, Clone, PartialEq)]
 pub(in crate::ui_chat) enum ParsedChat {
-    /// `/r [text]` — reply to the last received tell ([`crate::ui_chat::edit::ChatEditState::last_tell`]).
+    /// `/r [text]` — reply to the last received tell (the tell ring is the stock `ChatEdit_*`
+    /// Lua's since 1948 — see [`crate::ui_chat::edit`]).
     Reply { text: String },
     /// `/join <name> [password]` (aliases /channel /chan — SLASH_JOIN).
     Join { name: String, password: String },
@@ -69,8 +47,6 @@ pub(in crate::ui_chat) enum ParsedChat {
     Leave { name: String },
     /// `/chatlist <name>` (aliases /chatwho /chatinfo) — the member roster ask.
     ChatList { name: String },
-    /// `/afk [msg]` / `/dnd [msg]` — the away toggles (CHAT_MSG_AFK/DND sends).
-    AfkDnd { kind: ChatKind, msg: String },
     /// `/random [min] [max]` (aliases /rand /rnd /roll): bare = 1-100, one number = 1-N.
     Random { min: u32, max: u32 },
     /// `/played` — CMSG_PLAYED_TIME.
@@ -98,6 +74,10 @@ pub(in crate::ui_chat) enum ParsedChat {
     /// A `/name` line that resolved in `EmotesText` (`/wave` → text id 101) — sent as
     /// `CMSG_TEXT_EMOTE` targeted at the current selection.
     TextEmote(u32),
+    /// A channel verb the stock `ChatFrame.lua` handler already parsed and the VM queued
+    /// (`JoinChannelByName`, `ChannelKick`, … — `benilla_ui::script::ChannelCommand`). Never
+    /// produced by [`parse_line`]; it enters the executor from the engine's queue.
+    Channel(benilla_ui::script::ChannelCommand),
     /// The `/castvis` **dev instrument** (decision 0099 phase 2): synthesize a cast edge locally
     /// — the exact [`crate::creature_anim::CastEvent`] the wire would produce — on the selection
     /// (else self), no server round-trip. Runtime-available like every current instrument
@@ -152,13 +132,6 @@ pub(in crate::ui_chat) enum ParsedChat {
     /// `/pvp` — `TogglePVP()` (decision 0646 §3). Takes no argument: the binding has no state
     /// form, and the server reads the toggle from our current preference.
     Pvp,
-    /// The social verbs (decision 0668) — `/who`, `/friends`, `/removefriend`, `/ignore`,
-    /// `/unignore`. Each carries the raw argument (`/who`'s is a whole filter string, not a
-    /// name), and each runs the reference's OWN `SlashCmdList` body, transcribed into
-    /// `FriendsFrame.xml` as `BenillaSlash*`: those bodies do more than send (a bare `/who`
-    /// opens the panel and fills its edit box, a bare `/ignore` opens the ignore list), and
-    /// keeping them in the FrameXML is what stops that behaviour being re-derived here.
-    Social { verb: SocialVerb, arg: String },
     /// `/partytest [lead|raid|invite|mark|ping|off]` — the party-frame dev instrument (decision 0434, the
     /// `/chattest` pattern): a synthetic roster through the real apply path (`lead` = the same
     /// roster with US leading, for the leader-only popup rows), a fake pending invite for the
@@ -190,15 +163,17 @@ pub(in crate::ui_chat) enum ParsedChat {
     /// straight out of the shipped `GlobalStrings.lua` (decision 0983). Resolved in the drain,
     /// which holds the VM, so the text can never go stale against the install.
     MacroHelp,
-    /// `/reload`, `/console reloadUI`, or `ReloadUI()` typed through `/script` — tear the UI
-    /// session down and build a new one without leaving the world (decision 1291). Queued on the
-    /// session seam like [`ParsedChat::Logout`]; [`crate::ui_script::run_pending_reload`] runs it
-    /// at the top of the next frame.
+    /// `/reload`, or `ReloadUI()` typed through `/script` — tear the UI session down and build a
+    /// new one without leaving the world (decision 1291). Queued on the session seam like
+    /// [`ParsedChat::Logout`]; [`crate::ui_script::run_pending_reload`] runs it at the top of
+    /// the next frame. (`/console reloadUI` reaches the same request through the command
+    /// registry's `reloadUI`.)
     ReloadUi,
-    /// A `/console` command that is not `reloadUI` — the engine console this client does not
-    /// have. Answered with a system line naming what was asked, because a claimed alias that
-    /// silently drops its argument reads as a hang.
-    ConsoleUnknown { cmd: String },
+    /// A `/console` line the engine's CVar store did not consume — a command name, or a bare
+    /// CVar name to print — for the command registry ([`crate::console::execute`], decision
+    /// 2303): the reference's `ConsoleCommand` table, which every subsystem registers into and
+    /// which answers an unknown line by saying so.
+    Console { line: String },
     /// A slash line matching neither a chat command nor an `EmotesText` name — dropped.
     Unknown,
 }
@@ -253,6 +228,48 @@ pub(in crate::ui_chat) fn parse_line(table: &SlashCommands, line: &str) -> Parse
     }
 }
 
+/// `s` as a Lua **short** string literal, escaped — the only quoting 1.12's lexer can read for
+/// arbitrary text (decision 2136).
+///
+/// This used to build a long-bracket literal and step its `=` level past anything the payload
+/// could close early: `[=[a]]b]=]`. That works on a Lua 5.1-family lexer and **is a syntax error
+/// on the 1.12 client**, whose lexer has no long-string levels at all — `read_long_string
+/// 0x700010` routes `=` to its default arm as ordinary content, the `[` arm at `0x6ff771` makes
+/// exactly one comparison (`cmp eax,0x5b`), and a `[=` therefore leaves the lexer holding the
+/// single-character token `[`, which `prefixexp 0x6fde40` refuses with ``unexpected symbol near
+/// `['`` (wow-5875-re `lua-dialect.md` §9.2, verified and executed).
+///
+/// 2101 removed the three 5.1 grammar additions the corpus probes and left the levelled long
+/// bracket standing, on a measurement of **zero occurrences** across FrameXML, GlueXML,
+/// Blizzard's addons, the director's own folder and the 219-addon corpus. That measurement was
+/// right and incomplete in one specific way: it scanned Lua *trees*, and this is Lua *generated
+/// by Rust at runtime*, which no source scan could see and the fork's parser cannot reject at
+/// compile time either. It is the one live producer of a construct the reference cannot parse,
+/// and it fires whenever a `/console` argument contains `]]`.
+///
+/// Escaping is what 5.0 leaves: `\` and `"` are self-escaped, the three whitespace controls take
+/// their named forms, and every other control byte takes a **three-digit** `\ddd` — padded so a
+/// following digit cannot be swallowed into the escape.
+pub(in crate::ui_chat) fn lua_quoted_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\{:03}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// The per-command argument grammar. Each arm is the reference handler's own body reduced to what
 /// it does with `msg` — the aliases that reach it are the table's business, never this function's.
 fn slash_command(index: SlashIndex, args: &str) -> ParsedChat {
@@ -286,14 +303,17 @@ fn slash_command(index: SlashIndex, args: &str) -> ParsedChat {
             // The bare joined-channel listing is P6's (it needs the list).
             None => ParsedChat::Unknown,
         },
-        S::ChatAfk => ParsedChat::AfkDnd {
-            kind: ChatKind::Afk,
-            msg: args.to_string(),
-        },
-        S::ChatDnd => ParsedChat::AfkDnd {
-            kind: ChatKind::Dnd,
-            msg: args.to_string(),
-        },
+        // **The reference's own bodies, not a second implementation** (2088). These used to build
+        // a bare `ClientCommand::Chat` — which was right until the away law landed, and would now
+        // be a SECOND `/afk` that sends the packet with no echo, no default substitution and no
+        // mirror write. The stock parser claims a typed `/afk` before this table ever sees it, so
+        // the only lines still arriving here are the ones that never touched the edit box (a
+        // `WOW_PROBE_CHAT` rig's), and routing them through `SlashCmdList` funnels them into the
+        // same `SendChatMessage` seam the player's own keystrokes take — one implementation, and
+        // the probe exercises the real path rather than a shadow of it. Same posture, and the same
+        // reasoning, as the social verbs below.
+        S::ChatAfk => social_body("CHAT_AFK", args),
+        S::ChatDnd => social_body("CHAT_DND", args),
         S::Random => {
             let mut nums = args
                 .split_whitespace()
@@ -337,28 +357,15 @@ fn slash_command(index: SlashIndex, args: &str) -> ParsedChat {
         },
         S::DuelCancel => ParsedChat::Forfeit,
         S::Pvp => ParsedChat::Pvp,
-        // The social verbs (decision 0668). The argument is passed WHOLE: `/who`'s is a filter
-        // expression (`z-"Elwynn Forest" 1-10`), not a name.
-        S::Who => ParsedChat::Social {
-            verb: SocialVerb::Who,
-            arg: args.to_string(),
-        },
-        S::Friends => ParsedChat::Social {
-            verb: SocialVerb::Friends,
-            arg: args.to_string(),
-        },
-        S::RemoveFriend => ParsedChat::Social {
-            verb: SocialVerb::RemoveFriend,
-            arg: args.to_string(),
-        },
-        S::Ignore => ParsedChat::Social {
-            verb: SocialVerb::Ignore,
-            arg: args.to_string(),
-        },
-        S::Unignore => ParsedChat::Social {
-            verb: SocialVerb::Unignore,
-            arg: args.to_string(),
-        },
+        // The social verbs (decision 0668): the reference's own `SlashCmdList` bodies, which the
+        // stock ChatFrame.lua carries since 1948 — and whose parser claims these lines before
+        // they ever reach here, so these rows are the shape kept for the day the arm is pruned
+        // (1948's follow-on). The argument is passed WHOLE: `/who`'s is a filter expression.
+        S::Who => social_body("WHO", args),
+        S::Friends => social_body("FRIENDS", args),
+        S::RemoveFriend => social_body("REMOVEFRIEND", args),
+        S::Ignore => social_body("IGNORE", args),
+        S::Unignore => social_body("UNIGNORE", args),
         // The one-line reference bodies over globals benilla already implements (decision 0881,
         // the 0668 posture): `InitiateTrade("target")`, `InspectUnit("target")`,
         // `SetLootMethod(...)`, `RunScript(msg)`. Running the reference's own call keeps the
@@ -422,11 +429,18 @@ fn slash_command(index: SlashIndex, args: &str) -> ParsedChat {
                 "BenillaScriptLog_Toggle()".into()
             },
         },
-        S::Console => match args.split_whitespace().next() {
-            Some(cmd) if cmd.eq_ignore_ascii_case("reloadui") => ParsedChat::ReloadUi,
-            _ => ParsedChat::ConsoleUnknown {
-                cmd: args.to_string(),
-            },
+        // `/console <line>` — the stock ChatFrame.lua's handler is one line, `ConsoleExec(msg)`,
+        // and a TYPED `/console` never reaches this arm: the reference's `ChatEdit_ParseText`
+        // finds its own `SlashCmdList["CONSOLE"]` first (1948). What does reach it is a line
+        // that skipped the edit box — a `WOW_PROBE_CHAT` rig, or a chain whose ChatFrame.lua
+        // lacks the handler — and 0637's contract is that a probe line is "what the director
+        // would type". So this forwards to the same verb the stock handler calls: a registered
+        // CVar name writes the CVar (`fpsJournal 1`, 2008), and `reloadUI` or anything else
+        // comes back through `engine_verbs` exactly as it does from the Lua route. (Before 2008
+        // this arm knew `reloadui` and answered everything else "not implemented" — which is
+        // what a probe's `/console fpsJournal 1` got, while the same line typed worked.)
+        S::Console => ParsedChat::Lua {
+            body: format!("ConsoleExec({})", lua_quoted_string(args)),
         },
         // `/script` = the ref's `RunScript(msg)`: the typed text IS the chunk, un-escaped.
         S::Script => {
@@ -477,44 +491,4 @@ fn dev_command(dev: DevCmd, args: &str) -> ParsedChat {
             name: slash_target_name(args),
         },
     }
-}
-
-/// The Enter-path type switch (`ChatEdit_ParseText(send=1)` runs the same conversion the live
-/// parse does, but without the live parse's trailing-space requirement — "/g hi" + Enter
-/// converts and sends in one stroke; "/g" alone converts and commits the sticky).
-pub(in crate::ui_chat) fn parse_enter_type_switch(
-    channels: &crate::ui_chat::edit::ChannelState,
-    text: &str,
-) -> Option<(crate::ui_chat::edit::TypeSwitch, String)> {
-    use crate::ui_chat::edit::{SendType, TypeSwitch};
-    let rest = text.strip_prefix('/')?;
-    let (cmd, args) = rest.split_once(' ').unwrap_or((rest, ""));
-    let lower = cmd.to_ascii_lowercase();
-    // `/2 hi` and `/c world hi` convert-and-send on the enter path too.
-    if let Some(switch) = crate::ui_chat::edit::channel_switch(channels, &lower, args) {
-        return Some(switch);
-    }
-    if ["w", "whisper", "t", "tell", "send"].contains(&lower.as_str()) {
-        let (target, remainder) = args.split_once(' ').unwrap_or((args, ""));
-        if target.is_empty() || target.starts_with('|') || remainder.trim().is_empty() {
-            return None; // needs a name AND a message on the enter path
-        }
-        return Some((
-            TypeSwitch::Whisper(target.to_string()),
-            remainder.to_string(),
-        ));
-    }
-    let t = match lower.as_str() {
-        "s" | "say" => SendType::Say,
-        "y" | "yell" | "sh" | "shout" => SendType::Yell,
-        "e" | "em" | "emote" | "me" => SendType::Emote,
-        "p" | "party" => SendType::Party,
-        "raid" | "ra" | "rsay" => SendType::Raid,
-        "rw" => SendType::RaidWarning,
-        "g" | "gc" | "gu" | "guild" => SendType::Guild,
-        "o" | "osay" => SendType::Officer,
-        "bg" | "battleground" => SendType::Battleground,
-        _ => return None,
-    };
-    Some((TypeSwitch::Plain(t), args.to_string()))
 }

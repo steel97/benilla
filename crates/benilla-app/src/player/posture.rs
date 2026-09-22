@@ -17,7 +17,6 @@ use super::{move_trace, state, BodyQuery, ClientCommand, NetCommands, Player, St
 /// Run this frame's stand-state decision and the sheath toggle, and return the **committed**
 /// stand state — the local commit overlaid on the server's echoed byte, which is what the body
 /// pose and the sheath guard both read (decision 0080c).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn update(
     player: &mut Player,
     body: &BodyQuery,
@@ -166,7 +165,13 @@ pub(super) fn update(
                 // melee → ranged → stowed, gated on what is actually worn — never a
                 // two-state flip. `None` = the ref makes no call at all (nothing equipped).
                 let w = wielded.copied().unwrap_or_default();
-                let worn = (w.main.is_some() || w.off.is_some(), w.ranged.is_some());
+                // `0x5eb5f0`/`0x600`/`0x610` are `GetWeapon(slot, 0)` (1863): a disarmed hand
+                // is not "worn" to the cycle, so the press walks past melee — and with nothing
+                // else equipped makes no call at all, exactly like the ref's unarmed branch.
+                let worn = (
+                    w.armed_main().is_some() || w.armed_off().is_some(),
+                    w.ranged.is_some(),
+                );
                 let next =
                     crate::creature_anim::toggle_sheath_next(drv.sheath_state().unwrap_or(0), worn);
                 if let Some(state) = next {

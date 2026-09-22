@@ -22,8 +22,10 @@
 //! continuation** alone. The C dispatcher `0x4c2790(slot, flag)` takes the row only on `flag == 0`,
 //! which no Lua binding reaches — the row click is the C `CLootButton`'s own behaviour — while
 //! `LootSlot 0x4c2e70` passes `flag = 1`, whose arm refuses every slot but the one a bind confirm
-//! is pending for. benilla has no `CLootButton`, so the click arm is `BenillaTakeLootSlot(slot)`
-//! and `LootSlot` keeps the reference's meaning exactly.
+//! is pending for. benilla builds that widget — [`crate::widget::FrameKind::LootButton`], decision
+//! 1799 — so the row click's take runs where the reference runs it, in `script::button`'s click
+//! path under the same no-modifier gate; `BenillaTakeLootSlot` is the Lua-reachable entry to the
+//! same queue, and `LootSlot` keeps the reference's meaning exactly.
 //!
 //! The **coin pile is a synthesized client-side row** (first in the list when the loot carries gold):
 //! `LootSlotIsCoin` is true for it, its `item` text is the formatted money amount, and `LootSlot(1)`
@@ -43,6 +45,7 @@
 
 use mlua::{Lua, MultiValue, Table, Value};
 
+use super::binding_abi::flag;
 use super::Model;
 
 /// `CLootButton`'s own Lua method table (`0x847ce4`) — see [`crate::widget::FrameKind::LootButton`].
@@ -328,14 +331,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // IsFishingLoot() → whether the open loot came from fishing (false when none is open).
+    // IsFishingLoot() → 1/nil, whether the open loot came from fishing (nil when none is open).
     // `LootFrame_OnShow` keys the reel-in sound + the fishing portrait overlay on it
     // (`LootFrame.lua:137-140`; decision 1086).
     g.set(
         "IsFishingLoot",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(model.loot.as_ref().is_some_and(|l| l.fishing))
+            Ok(flag(model.loot.as_ref().is_some_and(|l| l.fishing)))
         })?,
     )?;
 

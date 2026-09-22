@@ -48,7 +48,14 @@ impl Plugin for ProbeTaxiPlugin {
                 load_expectations.after(benilla_assets::AssetSet::Open),
             )
             .add_systems(Update, taxi_probe)
-            .add_systems(PreUpdate, hold_w_post_land.after(bevy::input::InputSystems));
+            .add_systems(
+                PreUpdate,
+                // After the loading cover's input swallow as well as winit's input pass — see
+                // `probes::act::ProbeKeyPlugin` for why a synthetic press orders past it.
+                hold_w_post_land
+                    .after(bevy::input::InputSystems)
+                    .after(crate::loading_screen::CoverInput),
+            );
     }
 }
 
@@ -138,7 +145,7 @@ fn load_expectations(mut probe: ResMut<TaxiProbe>, world_assets: Option<Res<Worl
 }
 
 // One Bevy system's full input set (the crossing-probe shape) + its self query tuple.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 fn taxi_probe(
     time: ProbeClock,
     mut probe: ResMut<TaxiProbe>,

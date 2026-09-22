@@ -22,8 +22,6 @@
 
 use benilla_ui::script::{GuildState, ScriptValue, UiScript, UnitState};
 
-use super::test_ui::load_ui_strict as load_xml;
-
 /// The guild engine API, stood in for in Lua (see the module header).
 ///
 /// One mutable table, `BenillaGuildFixture`, is the whole model; every getter reads it and every
@@ -203,25 +201,7 @@ fn setup() -> UiScript {
             ..UnitState::default()
         }),
     );
-    load_xml(&s, "Fonts.xml");
-    load_xml(&s, "BasicControls.xml");
-    load_xml(&s, "MoneyFrame.xml");
-    load_xml(&s, "UiPanels.xml");
-    load_xml(&s, "GameTooltip.xml");
-    load_xml(&s, "Interface\\FrameXML\\UIDropDownMenu.xml");
-    load_xml(&s, "UnitPopup.xml");
-    load_xml(&s, "ScrollTemplates.xml");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
-    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
-    load_xml(&s, "FriendsFrame.xml");
-    // The social window's fourth tab lives in its own file, and it is part of THIS window's
-    // manifest slice now: `BENILLA_FRIENDS_SUBFRAMES` names "RaidFrame", and both
-    // `FriendsFrame_ShowSubFrame` and `FriendsFrame_OnHide` resolve every name in that list
-    // through `getglobal` and call `:Hide()` on it. The reference's list names it too and never
-    // guards, because there RaidFrame.xml is FrameXML and always loaded — so the guard belongs in
-    // the harness's load order, not in shipped Lua defending against a state the client cannot be
-    // in (decision 1549).
-    load_xml(&s, "RaidFrame.xml");
+    super::test_ui::load_social_ui(&mut s);
     s
 }
 
@@ -1256,9 +1236,10 @@ fn removing_a_member_names_them_in_the_confirm() {
 /// 5.0→5.1 vararg swap.** The one place the window and the engine are coupled by *arity* rather
 /// than by a name.
 ///
-/// The reference walks the 5.0 vararg table with `for i = 1, arg.n`; ours walks
-/// `for i = 1, select("#", ...)`. The two agree only while every one of the thirteen returns is
-/// actually pushed — and with no rank loaded, ALL THIRTEEN ARE NIL (era booleans are `1`/`nil`).
+/// The reference walks the 5.0 vararg table with `for i = 1, arg.n`, and that stock file is the
+/// one this window loads, so the checkbox loop's bound *is* whatever the binding pushed. The two
+/// agree only while every one of the thirteen returns is actually pushed — and with no rank
+/// loaded, ALL THIRTEEN ARE NIL (era booleans are `1`/`nil`).
 /// A binding that returned "as many values as are true" would look identical at every other
 /// assertion in this file, load without an error, and leave checkboxes stale from the last rank.
 /// So this one deliberately does NOT install the fixture: it asks the real `script::guild`.
@@ -1267,8 +1248,7 @@ fn the_rank_flags_binding_answers_thirteen_values_even_when_all_are_nil() {
     let _data = benilla_formats::wow_data_or_skip!();
     let s = UiScript::new().unwrap();
     assert_eq!(
-        s.eval::<i64>("return select(\"#\", GuildControlGetRankFlags())")
-            .unwrap(),
+        s.arity("GuildControlGetRankFlags()").unwrap(),
         13,
         "an unloaded buffer is all-nil, and every one of the thirteen must still be pushed — \
          `GuildControlCheckboxUpdate` drives checkbox i off argument i and nothing else"
@@ -1276,9 +1256,12 @@ fn the_rank_flags_binding_answers_thirteen_values_even_when_all_are_nil() {
     // …and each of them is nil, not `false`: the era boolean law, which `SetChecked` reads.
     assert_eq!(
         s.eval::<i64>(
-            "local n = 0 \
-             for i = 1, 13 do if select(i, GuildControlGetRankFlags()) ~= nil then n = n + 1 end end \
-             return n"
+            "local function count(...) \
+                 local n = 0 \
+                 for i = 1, 13 do if arg[i] ~= nil then n = n + 1 end end \
+                 return n \
+             end \
+             return count(GuildControlGetRankFlags())"
         )
         .unwrap(),
         0
@@ -1372,16 +1355,14 @@ fn the_roster_binding_answers_ten_values_and_the_tenth_is_status() {
     let _data = benilla_formats::wow_data_or_skip!();
     let s = UiScript::new().unwrap();
     assert_eq!(
-        s.eval::<i64>("return select(\"#\", GetGuildRosterInfo(1))")
-            .unwrap(),
+        s.arity("GetGuildRosterInfo(1)").unwrap(),
         10,
         "an out-of-range index still pushes all ten — the reference calls this with \
          GetGuildRosterSelection(), which is 0 whenever nothing is selected, on every \
          GuildStatus_Update pass before it ever checks `> 0`"
     );
     assert_eq!(
-        s.eval::<i64>("return select(\"#\", GetGuildRosterInfo(0))")
-            .unwrap(),
+        s.arity("GetGuildRosterInfo(0)").unwrap(),
         10,
         "…including index 0, the nothing-selected case the reference passes unguarded"
     );
@@ -1422,11 +1403,13 @@ fn every_list_in_the_window_takes_the_mouse_wheel() {
     let _data = benilla_formats::wow_data_or_skip!();
     let s = setup();
     open(&s);
+    // The reference's wheel lives on each list's FauxScrollFrameTemplate scroll frame, not on
+    // the pane (1959).
     for frame in [
-        "FriendsListFrame",
-        "IgnoreListFrame",
-        "WhoFrame",
-        "GuildFrame",
+        "FriendsFrameFriendsScrollFrame",
+        "FriendsFrameIgnoreScrollFrame",
+        "WhoListScrollFrame",
+        "GuildListScrollFrame",
     ] {
         assert!(
             s.eval::<bool>(&format!(

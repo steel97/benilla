@@ -24,23 +24,29 @@ const DOUBLE_CLICK_SECS: f32 = 0.4;
 /// back/escape (return to the login screen — decision 0539, retiring 0465 §6's exit-the-client
 /// collapse), arrow-key cycling. Inert while the delete dialog is up (it owns the keyboard and
 /// sits over the buttons).
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 pub(super) fn select_input(
     buttons: Query<(Entity, &SelectAction)>,
     clicks: Res<crate::glue::GlueClicks>,
     keys: Res<ButtonInput<KeyCode>>,
     mut roster: ResMut<Roster>,
+    mut realms: ResMut<crate::realm_select::Realms>,
     pick: Res<CharPick>,
     mut dialog: ResMut<DeleteDialog>,
     mut panel: ResMut<super::addons::AddonsPanel>,
+    choice: Res<crate::net::RealmChoice>,
     mut next: ResMut<NextState<ClientState>>,
     mut sounds: MessageWriter<GlueSound>,
     mut intent: ResMut<crate::login::LoginIntent>,
+    glue_dialog: Res<crate::glue::dialog::GlueDialog>,
     time: Res<Time>,
     mut last_click: Local<Option<(usize, f32)>>,
 ) {
-    // A modal owns the input while it is up — the delete confirm, or the AddOns list.
-    if dialog.open || panel.open {
+    // A modal owns the input while it is up — the delete confirm, the AddOns list, the realm
+    // list (which stands over this screen rather than replacing it), or the shared glue dialog
+    // (a refused character login is said in that one, and its Okay must not double as this
+    // screen's Enter World / Escape).
+    if dialog.open || panel.open || realms.shown || glue_dialog.is_open() {
         return;
     }
     let now = time.elapsed_secs();
@@ -58,13 +64,15 @@ pub(super) fn select_input(
                 // within the window is the double-click → enter world.
                 let double =
                     last_click.is_some_and(|(row, at)| row == i && now - at < DOUBLE_CLICK_SECS);
-                let was = roster.selected();
                 *last_click = Some((i, now));
-                // The ref selects on **every** click, the row you were already on included — which
-                // is what re-squares the facing (`Roster::select_seq`). Only the double still
-                // needs the "already selected" test.
-                roster.select(Some(i));
-                if was == Some(i) && double {
+                // Selecting is gated on the row actually CHANGING — the ref's own
+                // `CharacterSelectButton_OnClick` is that gate and nothing else, so the row you
+                // are already on is not re-selected and keeps the facing you dragged into it
+                // (`Roster::click_row`, decision 2194).
+                roster.click_row(i);
+                // `OnDoubleClick` runs the same gated select and then enters the world
+                // unconditionally — it does not re-test what was selected before.
+                if double {
                     enter_world = true;
                 }
             }
@@ -98,6 +106,16 @@ pub(super) fn select_input(
                 panel.open_for(realm, chars);
             }
             SelectAction::Back => back_to_login = true,
+            // The reference's `CHANGE_REALM`: raise the realm list **over** this screen. Nothing
+            // is torn down and nothing is disconnected — the character park serves the list in
+            // place and only leaves when a realm is picked, so Cancel puts the player back here
+            // with the session they never left. The pending pick still has to go, or the fresh
+            // roster on the OTHER realm would be auto-answered with a guid from this one.
+            SelectAction::ChangeRealm => {
+                sounds.write(GlueSound("gsLoginChangeRealmOK"));
+                roster.pending_pick = None;
+                crate::realm_select::open_over_char_select(&mut realms, &choice);
+            }
             _ => {}
         }
     }

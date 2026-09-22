@@ -22,7 +22,7 @@
 
 use std::io::{self, Read};
 
-use crate::wire::{read_u16_le, read_u32_le, read_u64_le, read_u8};
+use crate::wire::{capacity_hint, read_u16_le, read_u32_le, read_u64_le, read_u8, Vector3d};
 
 /// Pet action-bar slots (vmangos `MAX_UNIT_ACTION_BAR_INDEX` = `ACTION_BAR_INDEX_END(10) -
 /// ACTION_BAR_INDEX_START(0)`, `Objects/UnitDefines.h:781-787`); the client's own
@@ -286,7 +286,8 @@ pub(super) fn read_pet_spells(r: &mut &[u8]) -> io::Result<PetSpells> {
     }
 
     let spell_count = read_u8(r)?;
-    let mut spells = Vec::with_capacity(spell_count as usize);
+    // A `u8` count with no tighter server bound (`Player.cpp:17471`, `uint8 addlist`).
+    let mut spells = Vec::with_capacity(capacity_hint(spell_count, usize::from(u8::MAX)));
     for _ in 0..spell_count {
         spells.push(read_u32_le(r)?.into());
     }
@@ -321,16 +322,19 @@ pub(super) fn read_pet_spells(r: &mut &[u8]) -> io::Result<PetSpells> {
 /// discriminator is exact, not a heuristic — and the day vmangos is fixed, this keeps working.
 fn read_cooldown_block(r: &mut &[u8]) -> io::Result<Vec<PetSpellCooldown>> {
     let count = usize::from(read_u8(r)?);
-    if count == 0 {
-        // vmangos leaves its count's high byte behind; the client's form leaves nothing. Either
-        // way there is nothing to read, and trailing slack is not an error.
-        return Ok(Vec::new());
-    }
+    // The discriminator holds at `count == 0` too: vmangos's lone leftover is its `u16` count's
+    // high byte, the client's form leaves nothing. The byte is consumed rather than left behind
+    // so an empty block is not a tail for the decode-length check to announce (decision 2265
+    // §B1); either way nothing else is read and no entry is invented.
     let vmangos = r.len() == 1 + 14 * count;
     if vmangos {
         let _high_byte = read_u8(r)?;
     }
-    let mut cooldowns = Vec::with_capacity(count);
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    // `count` came off a `u8` (above); no tighter bound exists on either producer.
+    let mut cooldowns = Vec::with_capacity(capacity_hint(count, usize::from(u8::MAX)));
     for _ in 0..count {
         let spell_id = if vmangos {
             read_u32_le(r)?
@@ -373,6 +377,72 @@ pub(super) fn read_pet_mode(r: &mut impl Read) -> io::Result<PetMode> {
 /// ("Your pet has no path to that location", …).
 pub(super) fn read_pet_action_feedback(r: &mut impl Read) -> io::Result<u8> {
     read_u8(r)
+}
+
+/// Read `SMSG_PET_TAME_FAILURE` (VERIFIED vmangos `PetTameFailure::AppendBodyTo`,
+/// `Server/Packets/Pet.cpp:122-125`): one reason byte. [`pet_tame_failure_key`] is what the
+/// reference does with it.
+pub(super) fn read_pet_tame_failure(r: &mut impl Read) -> io::Result<u8> {
+    read_u8(r)
+}
+
+/// The `SMSG_PET_TAME_FAILURE` reason -> the `GlobalStrings.lua` key whose text fills
+/// `ERR_TAME_FAILED`'s lone `%s` — the reference's jump table at `0x6e6ac0`, read out of the
+/// image dword for dword.
+///
+/// `0x6e6a20` computes `reason - 1` and bounds it at `0xa`, so **`1..=11` index the table and
+/// everything else takes the default arm** `0x6e6a87` -> `PETTAME_UNKNOWNERROR`. That default is
+/// reachable in play: vmangos's own enum has a twelfth value (`PETTAME_UNKNOWNERROR = 12`) which
+/// falls out of range and lands on it, arriving at the same string by the other road.
+///
+/// The eleven pairs are byte-identical to vmangos's `PetTameFailureReason`
+/// (`src/game/SharedDefines.h:1707`) — the two ends agree without either having been fitted to
+/// the other.
+pub fn pet_tame_failure_key(reason: u8) -> &'static str {
+    match reason {
+        1 => "PETTAME_INVALIDCREATURE",
+        2 => "PETTAME_TOOMANY",
+        3 => "PETTAME_CREATUREALREADYOWNED",
+        4 => "PETTAME_NOTTAMEABLE",
+        5 => "PETTAME_ANOTHERSUMMONACTIVE",
+        6 => "PETTAME_UNITSCANTTAME",
+        7 => "PETTAME_NOPETAVAILABLE",
+        8 => "PETTAME_INTERNALERROR",
+        9 => "PETTAME_TOOHIGHLEVEL",
+        10 => "PETTAME_DEAD",
+        11 => "PETTAME_NOTDEAD",
+        _ => "PETTAME_UNKNOWNERROR",
+    }
+}
+
+/// `SMSG_PET_ACTION_SOUND`'s selector: the pet acknowledging an **order** (vmangos
+/// `PET_TALK_SPECIAL_SPELL`, sent when a pet bar spell press is accepted —
+/// `PetHandler.cpp:523`, `PetAI.cpp:336`).
+pub const PET_TALK_ORDER: u32 = 0;
+/// `SMSG_PET_ACTION_SOUND`'s selector: the pet **attacking** (vmangos `PET_TALK_ATTACK`, sent
+/// from `Unit.cpp:8941` when an attack order is taken).
+pub const PET_TALK_ATTACK: u32 = 1;
+
+/// Read `SMSG_PET_ACTION_SOUND` (VERIFIED vmangos `PetActionSound::AppendBodyTo`,
+/// `Server/Packets/Pet.cpp:96-100`, and the reference's own reader at `0x6040ca`/`0x6040db`):
+/// `u64 petGuid` then the `u32` talk selector.
+///
+/// The selector is NOT a `SoundEntries` id — it is [`PET_TALK_ORDER`] / [`PET_TALK_ATTACK`], and
+/// the sound comes off the pet's own `CreatureSoundData` row. Worth saying because the opcode's
+/// name invites the other reading, and a two-value selector and a kit id are indistinguishable
+/// on the wire.
+pub(super) fn read_pet_action_sound(r: &mut impl Read) -> io::Result<(u64, u32)> {
+    Ok((read_u64_le(r)?, read_u32_le(r)?))
+}
+
+/// Read `SMSG_PET_DISMISS_SOUND` — `u32 creatureModelDataId` then `f32` x/y/z.
+///
+/// VERIFIED off **the reference's own reader**, which is the only authority there is: `0x604140`
+/// takes one `0x418e30` (u32) then three `0x419130` (f32) in that order, and vmangos has no
+/// sender to cross-check against. The `+1.0` the handler adds to `z` afterwards is a *play*
+/// detail, not a wire one, so it is not applied here.
+pub(super) fn read_pet_dismiss_sound(r: &mut impl Read) -> io::Result<(u32, Vector3d)> {
+    Ok((read_u32_le(r)?, Vector3d::read(r)?))
 }
 
 /// Read `SMSG_PET_CAST_FAILED` (VERIFIED vmangos `PetCastFailed::AppendBodyTo`,
@@ -631,11 +701,19 @@ mod tests {
     }
 
     /// A pet with no cooldowns at all: the client's form ends the packet, vmangos's leaves its
-    /// count's high byte behind. Neither is an error and neither invents an entry.
+    /// count's high byte behind. Neither is an error and neither invents an entry — and the
+    /// high byte is consumed, so neither leaves a tail.
     #[test]
     fn an_empty_cooldown_block_reads_either_way() {
-        assert!(read_cooldown_block(&mut &[0u8][..]).unwrap().is_empty());
-        assert!(read_cooldown_block(&mut &[0u8, 0][..]).unwrap().is_empty());
+        let mut client = &[0u8][..];
+        assert!(read_cooldown_block(&mut client).unwrap().is_empty());
+        assert!(client.is_empty());
+        let mut vmangos = &[0u8, 0][..];
+        assert!(read_cooldown_block(&mut vmangos).unwrap().is_empty());
+        assert!(
+            vmangos.is_empty(),
+            "vmangos's count high byte is consumed, not left as a tail"
+        );
     }
 
     /// The teardown: an 8-byte body of zero guid ⇒ a default value whose `pet_guid` is 0. This is
@@ -764,4 +842,28 @@ mod tests {
         assert!(!odd.is_spell());
         assert!(odd.kind() != PET_ACT_COMMAND && odd.kind() != PET_ACT_REACTION);
     }
+}
+
+/// `SMSG_PET_UNLEARN_CONFIRM` (VERIFIED at the bytes, wow-re `staticpopup-dialog-bindings.md`
+/// §9, arm `0x5e4a26`): the pet trainer's guid and what unlearning costs, in copper — the
+/// reference latches both and fires `CONFIRM_PET_UNLEARN(cost)`. Decision 1963.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PetUnlearnConfirm {
+    pub trainer: u64,
+    pub cost: u32,
+}
+
+/// Parse `SMSG_PET_UNLEARN_CONFIRM`: `u64 trainerGuid`, `u32 costCopper`.
+pub(super) fn read_pet_unlearn_confirm(
+    r: &mut impl std::io::Read,
+) -> std::io::Result<PetUnlearnConfirm> {
+    Ok(PetUnlearnConfirm {
+        trainer: crate::wire::read_u64_le(r)?,
+        cost: crate::wire::read_u32_le(r)?,
+    })
+}
+
+/// Body of `CMSG_PET_UNLEARN` (VERIFIED, §9 `0x5dfba0`'s confirm arm): the latched trainer guid.
+pub fn pet_unlearn(trainer: u64) -> Vec<u8> {
+    trainer.to_le_bytes().to_vec()
 }

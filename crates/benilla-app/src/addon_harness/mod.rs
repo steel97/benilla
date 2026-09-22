@@ -8,7 +8,9 @@
 //!
 //! ## One VM per addon, deliberately
 //!
-//! Every addon is surveyed in a **fresh** [`UiScript`] with our own FrameXML loaded underneath it.
+//! Every addon is surveyed in a **fresh** [`UiScript`] with the whole in-game interface loaded
+//! underneath it — the stock 1.12 FrameXML off the player's chain plus the few files still ours
+//! (1751), exactly what a live session seats.
 //! That costs a full UI load per addon and buys the only property that makes the report readable:
 //! one addon's failure cannot be another's. Loading them all into one VM means the first addon to
 //! leave a global in a bad state gets blamed for the next twenty, and the distribution 1188 asks
@@ -82,6 +84,9 @@ mod probe_tests;
 pub mod render;
 #[cfg(test)]
 mod render_tests;
+/// The control for this module's one-VM-per-addon bound — the whole folder in ONE VM, the way a
+/// real client runs it. Its header says what it can and cannot answer.
+pub mod together;
 /// The use column — *does the thing it drew survive being **touched**?* Its own module for the
 /// same two reasons `render` is; its header is the design, the bounds and the four-deep history
 /// that made it necessary.
@@ -105,7 +110,19 @@ pub struct AddonReport {
     /// `## Interface`, as written. 1.12 is `11200`; the corpus is full of older values, and we
     /// deliberately do not refuse them (decision 1191 §6).
     pub interface: Vec<u32>,
-    /// Did every file in its manifest load without an error?
+    /// **Did anything in its manifest RAISE, fail to parse, or drop a frame?**
+    ///
+    /// Not "did every entry resolve" — that is [`Self::absent_own_files`] and
+    /// [`Self::absent_foreign_files`], and it is a different question because the reference
+    /// answers it differently: a manifest line naming no file is `"Couldn't open %s"` in
+    /// FrameXML.log and the walk carries straight on (wow-re
+    /// `ui/scratch/xml-toc-path-resolution.md` §4, VERIFIED). An addon shipping an incomplete zip
+    /// *works* on a real client, so counting it here made the survey say the opposite of the truth
+    /// about 24 addons — FuBar itself among them, on two locale files it does not ship.
+    ///
+    /// **[`Self::errors`] is unchanged and still carries those rows verbatim** (1213), so every
+    /// number in every past record is still readable off it; what changed, deliberately and with
+    /// decision 2155 behind it, is which of them this flag counts. The report prints both.
     pub loaded: bool,
     /// Load errors, verbatim, tagged by file.
     pub errors: Vec<String>,
@@ -162,9 +179,11 @@ pub struct AddonReport {
     /// Same static caveat, plus one of its own: `inherits=` spans two namespaces — a `<FontString
     /// inherits="GameFontNormal">` names a FONT — so a name registered as either is resolved.
     pub missing_inherits: Vec<String>,
-    /// Errors raised **after** the files loaded, while the session start was driven —
-    /// `ADDON_LOADED` → `VARIABLES_LOADED` → `PLAYER_LOGIN` → `PLAYER_ENTERING_WORLD`, then a few
-    /// ticks to drain `OnUpdate` and anything scheduled.
+    /// Errors raised **after** this addon's own files loaded, while the session start was driven —
+    /// its own `ADDON_LOADED` → `VARIABLES_LOADED` → `PLAYER_LOGIN` → `PLAYER_ENTERING_WORLD`,
+    /// then a few ticks to drain `OnUpdate` and anything scheduled. Every DEPENDENCY's
+    /// `ADDON_LOADED` is already behind this point: each fires beside its own addon's files, where
+    /// `0x51f5ad` fires it ([`load_dependencies`], 2166).
     ///
     /// **This is the survey's answer to its own oldest blind spot.** Every number beside it is
     /// load-time, and this arc has now written the same sentence into four decision records —
@@ -293,6 +312,28 @@ pub struct AddonReport {
     /// different question, and redefining an existing number would make every past run
     /// incomparable.
     pub probe_errors: Vec<String>,
+    /// **Warnings raised while this addon loaded and ran** — the engine's own non-fatal channel
+    /// (decision 2135), which nothing in this survey could see until it had one.
+    ///
+    /// A warning is the class of failure that *does not announce itself*: an `inherits=` argument
+    /// that was not a template name and got dropped, a `SetPoint` whose `relativeTo` did not
+    /// resolve and silently re-anchored, a `SetCVar` on a name nothing registered, a saved
+    /// variable that would not serialise, a loader note about a template of the wrong kind.
+    /// Nothing raises, so `errors`, `session_errors` and `probe_errors` are all blind to it, and
+    /// the addon scores a clean pass while doing the wrong thing. That is exactly the shape
+    /// `render` was added for — and this reaches the cases `render` cannot, because a warning
+    /// usually fires long before anything would have been drawn.
+    ///
+    /// A NEW column, never folded into another (1213's rule, again).
+    ///
+    /// **Read off the retained diagnostic log by `seq`, not off the per-frame drain**, so it
+    /// carries the host's loader warnings (which are recorded with their `<file>` prefix and never
+    /// touch the drain) as well as the engine's. One consequence of the log's dedupe is worth
+    /// stating: a warning whose exact text the FrameXML underneath already produced collapses onto
+    /// that older row and does not appear here. The corpus's warnings name the addon's own frames
+    /// and files, so this is rare rather than theoretical — but it means the column, like every
+    /// other one here, is a floor.
+    pub warnings: Vec<String>,
     /// **What it actually PUT ON SCREEN** — see [`render`], whose header is the design.
     ///
     /// The column every other one here was blind to. `loaded`, `session_errors` and `probe_errors`
@@ -356,7 +397,11 @@ fn corpus(
         .filter_map(|e| e.file_name().to_str().map(str::to_owned))
         .filter(|n| manifest_path(root, n).is_some())
         .collect();
-    names.sort();
+    // **The live walk's order, not a second opinion.** This used to be a bare `names.sort()`,
+    // a private copy of the ordering `ui_script::addons` decides — so the instrument could
+    // measure a walk the client does not perform. It calls the one definition now, which is what
+    // makes a `--together` row about shared-library provenance mean anything.
+    crate::ui_script::addons::sort_by_directory_order(&mut names);
 
     let installed: BTreeSet<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
 
@@ -505,9 +550,13 @@ fn survey_one(
     script.set_instruction_budget(ADDON_INSTRUCTION_BUDGET);
     script.set_screen_size(1024.0, 768.0);
     // Before anything runs: the AddOn API must answer for the whole installed set, not for nothing.
-    // `None` roots because a survey must never read or write the director's real saved variables
-    // (the same reason `drive_session_start` is not `finish_ui_load` — 1213 §4).
-    script.register_addons(registry.to_vec(), None, None, None);
+    // The **saved-variable** roots are `None` — a survey must never read or write the director's
+    // real ones (the same reason `drive_session_start` is not `finish_ui_load`, 1213 §4). The
+    // ADDONS root is not one of those and is passed in full (decision 2102): without it every
+    // `LoadAddOn("<a folder addon>")` answered `MISSING`, which is a state the real client cannot
+    // produce and is exactly the 1193/1212 fault one level up — `/msbt`'s
+    // `UIParentLoadAddOn("MikScrollingBattleTextOptions")` is the shape it hides.
+    script.register_addons(registry.to_vec(), Some(root.to_path_buf()), None, None);
     seat_a_session(&mut script);
     let _ = crate::ui_script::load_default_ui(&script);
     // The addon's DEPENDENCIES, first and recursively — `AddOn_Load 0x51f240`'s own first two
@@ -519,15 +568,16 @@ fn survey_one(
     //
     // Loaded BEFORE `globals_of` below, so a name a dependency provides does not also count as a
     // missing global — the same double-count the FrameXML-underneath decision avoided.
-    let mut dep_order: Vec<String> = Vec::new();
+    let mut dep_loads: Vec<LoadedDep> = Vec::new();
     load_dependencies(
-        &script,
+        &mut script,
         root,
         &toc,
         installed,
         &mut BTreeSet::new(),
-        &mut dep_order,
+        &mut dep_loads,
     );
+    let dep_order: Vec<String> = dep_loads.into_iter().map(|d| d.name).collect();
     let known = globals_of(&script);
     // The METHODS the dependency chain defines, gathered from the same folders whose files were
     // just loaded above. `known` covers their globals because the VM actually ran them; a method
@@ -543,15 +593,43 @@ fn survey_one(
     // Taken here, after the dependency chain, so a library's frames are not charged to its
     // consumer — the same rule `load_dependencies` applies to errors.
     let baseline = RenderBaseline::of(&script);
+    // THE WARNING MARK, taken at the same seam and for the same reason: everything the FrameXML
+    // underneath and this addon's dependency chain warned about is already behind us, so what
+    // follows is this addon's (decision 2135). `seq` is monotonic and never reused, which is what
+    // makes a high-water mark a valid cut of a log that also evicts and dedupes.
+    let warn_mark = script.diagnostics().last().map_or(0, |d| d.seq);
 
-    let (errors, absent) = load_addon_files(&script, root, name, &toc);
+    let files = load_addon_files(&script, root, name, &toc);
+    // The registry has to agree with the VM about what has loaded: the live walk stamps each
+    // addon at `0x51f5ad`'s position (`ui_script::addons`'s `mark_addon_loaded`, just before
+    // `ADDON_LOADED`), and without it here `IsAddOnLoaded` answered nil for an addon whose files
+    // had just run — and a LoadOnDemand dependent of it got `DEP_NOT_DEMAND_LOADED` rather than
+    // loading (decision 2102). The dependency chain stamped itself as it loaded, each one beside
+    // its own `ADDON_LOADED` (`load_dependencies`, 2166); only the surveyed addon is left.
+    script.mark_addon_loaded(name);
     let wants = missing_calls(root, name, &toc, &known, &dep_methods);
     // AFTER the addon's files: a template it declares in its OWN XML is registered by then, so it
     // is not missing. The check asks the VM's live registry, not a name list.
     let missing_templates = missing_templates(&script, root, name, &toc);
     let missing_inherits = missing_inherits(&script, root, name, &toc);
-    let session_errors = drive_session_start(&mut script, name, &dep_order);
+    let session_errors = drive_session_start(&mut script, name, installed);
     let probe_errors = drive_ui_probe(&mut script);
+    // Everything filed since the mark, warnings only — the errors have their own columns and are
+    // retained under their own kinds.
+    let warnings: Vec<String> = script
+        .diagnostics()
+        .into_iter()
+        .filter(|d| {
+            d.seq > warn_mark && d.kind == benilla_ui::script::diagnostics::DiagnosticKind::Warning
+        })
+        .map(|d| {
+            if d.count > 1 {
+                format!("{} (x{})", d.message, d.count)
+            } else {
+                d.message
+            }
+        })
+        .collect();
     // AFTER the UI probe and BEFORE the method oracle, and both halves of that are load-bearing.
     // After, because the probe leaves the addon fully driven — and this pass re-OPENS what the
     // probe's second toggle closed, which is why it is a separate probe rather than a read at the
@@ -590,10 +668,10 @@ fn survey_one(
     AddonReport {
         name: name.to_string(),
         interface: toc.interface_versions(),
-        loaded: errors.is_empty(),
-        errors,
-        absent_own_files: absent.own,
-        absent_foreign_files: absent.foreign,
+        loaded: !files.raised,
+        errors: files.errors,
+        absent_own_files: files.absent.own,
+        absent_foreign_files: files.absent.foreign,
         missing_globals: wants.missing_globals,
         missing_deps,
         missing_templates,
@@ -605,6 +683,7 @@ fn survey_one(
         ambiguous_methods,
         session_errors,
         probe_errors,
+        warnings,
         render,
         used,
     }
@@ -875,6 +954,11 @@ fn only_on(have: &[String], probes: &[String]) -> String {
 /// `PLAYER_LOGIN`; `PLAYER_ENTERING_WORLD` follows in the cascade. Then a few ticks, because a
 /// great deal of addon code runs from `OnUpdate` or from something scheduled on the first one.
 ///
+/// **Only the surveyed addon's `ADDON_LOADED` is fired here** (2166). The client fires each one
+/// inside that addon's own `AddOn_Load` (`0x51f5ad`), not in a batch afterwards, so every
+/// dependency's event has already happened in [`load_dependencies`] — before the surveyed addon's
+/// first line ran, which is what the real client presents to it.
+///
 /// **Deliberately not `ui_script::finish_ui_load`**, which is the production path: that also runs
 /// `load_saved_variables`, which reads the machine's real `BENILLA_HOME`. A survey must not depend
 /// on — or write to — the director's own saved variables, so the events are fired directly.
@@ -884,10 +968,17 @@ fn only_on(have: &[String], probes: &[String]) -> String {
 /// second reaches the common `ScheduleEvent(..., 0)`/`(..., 0.05)` shapes and Ace's own one-second
 /// `AceEvent_FullyInitialized` timer; it does not reach a ten-second self-heal, and that
 /// under-report is stated rather than hidden.
-fn drive_session_start(script: &mut UiScript, name: &str, deps: &[String]) -> Vec<String> {
-    // **Every addon in the VM gets its OWN `ADDON_LOADED`, in load order** — the client fires one
-    // per loaded addon with that addon's folder in `arg1`, and a dependency's initialiser is
-    // almost always gated on exactly that:
+fn drive_session_start(
+    script: &mut UiScript,
+    name: &str,
+    installed: &BTreeSet<String>,
+) -> Vec<String> {
+    // **The dependencies' `ADDON_LOADED`s are already behind us** — each fired beside its own
+    // addon's files, at `0x51f5ad`'s position, inside `load_dependencies` (2166). What is left of
+    // the client's session start is the SURVEYED addon's own event and the three that follow it
+    // once every addon has loaded: `VARIABLES_LOADED`, `PLAYER_LOGIN`, `PLAYER_ENTERING_WORLD`.
+    //
+    // A dependency's initialiser is almost always gated on its own name arriving in `arg1`:
     //
     //     -- Atlas.lua:326
     //     if (event == "ADDON_LOADED" and arg1 == "Atlas") then Atlas_Init(); end
@@ -895,34 +986,22 @@ fn drive_session_start(script: &mut UiScript, name: &str, deps: &[String]) -> Ve
     // `Atlas_Init` is what assigns `AtlasOptions` (l.199). Firing only the SURVEYED addon's name
     // meant that guard never passed for a dependency, so `FuBar_AtlasFu` met an Atlas that had
     // loaded its files and never initialised — and died at `AtlasButton.lua:30` on a nil
-    // `AtlasOptions`, a fault the survey then recorded against FuBar_AtlasFu. The state the real
-    // client presents was never reachable.
+    // `AtlasOptions`, a fault the survey then recorded against FuBar_AtlasFu. That was fixed by
+    // firing every dependency's event here; 2166 moved each one to where the client fires it.
     //
-    // Fired BEFORE the error mark, deliberately: a dependency's own handler raising is the
-    // dependency's row, not its consumers'. That is this module's stated rule for load errors
-    // (`load_dependencies`) and there is no reason session errors should differ — charging it here
-    // would count one library's fault once per addon that embeds it, which is the whole reason
-    // one-VM-per-addon exists.
-    //
-    // **Attribution is by the RAISING CHUNK now, not by which event window the raise fell in**
-    // (decision 1226 — recorded when this was still window-based, fixed here). The window proxy
+    // **Attribution is by the RAISING CHUNK, not by which event window the raise fell in**
+    // (decision 1226 — recorded when this was still window-based, fixed since). The window proxy
     // broke on the shape it was written for: AceAddon drains its ENTIRE `nextAddon` queue on any
     // `ADDON_LOADED` it sees (`AceAddon-2.0.lua:104-105`) and calls each consumer's
-    // `OnInitialize` there (`:230`). So the SURVEYED addon's own code runs inside a DEPENDENCY's
-    // window, and firing deps outside the mark charged those raises to nobody — the whole
-    // FuBar/Ace family was silently OVER-reported as surviving. `Region:SetParent` landing made
-    // FuBar_FuXPFu flip `ok -> fail` and that looked like a regression; it was this.
+    // `OnInitialize` there (`:230`). So the SURVEYED addon's own code can run inside a
+    // DEPENDENCY's window, and a mark that only covered its own window charged those raises to
+    // nobody — the whole FuBar/Ace family was silently OVER-reported as surviving.
     //
-    // Every `ADDON_LOADED` fires inside the mark now, and the dependency exemption is applied
-    // afterwards by asking WHOSE FILE raised. Chunk names have been truthful since 1217
-    // (`@Interface\AddOns\<Folder>\<File>`), which is what makes the honest key available at all.
+    // The mark opens BEFORE the surveyed addon's own event for exactly that reason, and the
+    // dependency exemption is applied afterwards by asking WHOSE FILE raised. Chunk names have
+    // been truthful since 1217 (`@Interface\AddOns\<Folder>\<File>`), which is what makes the
+    // honest key available at all.
     let before = script.errors().len();
-    for dep in deps {
-        script.fire_event(
-            "ADDON_LOADED",
-            vec![benilla_ui::script::ScriptValue::Str(dep.clone())],
-        );
-    }
     script.fire_event(
         "ADDON_LOADED",
         vec![benilla_ui::script::ScriptValue::Str(name.to_string())],
@@ -936,34 +1015,91 @@ fn drive_session_start(script: &mut UiScript, name: &str, deps: &[String]) -> Ve
     let raised = script.errors().split_off(before);
     raised
         .into_iter()
-        .filter(|e| !raised_inside_a_dependencys_own_file(e, name, deps))
+        .filter(|e| !raised_inside_another_addons_own_file(e, name, installed))
         .collect()
 }
 
-/// Does this raise belong to a DEPENDENCY's file rather than the surveyed addon's?
+/// Does this raise belong to **another installed addon's** file rather than the surveyed addon's?
 ///
-/// The rule `load_dependencies` already states for load errors, now enforceable for session errors
-/// too: *a library that fails is its own row; blaming its consumers would count one fault once per
-/// addon that embeds it.* Only the FIRST line is consulted — that is the raise site; the frames
-/// below it are the call path, and a consumer calling into a library that then raises is still the
-/// library's fault, exactly as it is at load time.
+/// The rule `load_dependencies` already states for load errors, enforceable for session errors
+/// since 1226: *a library that fails is its own row; blaming its consumers would count one fault
+/// once per addon that embeds it.* Only the FIRST line is consulted — that is the raise site; the
+/// frames below it are the call path, and a consumer calling into a library that then raises is
+/// still the library's fault, exactly as it is at load time.
 ///
-/// **Conservative on purpose.** A chunk that names no addon folder at all — our own FrameXML, an
-/// `[string "Frame:OnEvent"]` handler — is KEPT, because the surveyed addon is what drove it. Only
-/// a chunk that positively names one of this addon's own dependencies is dropped. Getting that
-/// backwards would swing the column the other way, and the whole point of 1226 is that a proxy
-/// which errs silently in one direction is how the number drifted in the first place.
-fn raised_inside_a_dependencys_own_file(err: &str, name: &str, deps: &[String]) -> bool {
-    let Some(first) = err.lines().next() else {
+/// **The exemption was "a DECLARED DEPENDENCY's file" and that was too narrow** (decision 2107).
+/// Once the harness's VMs got a real AddOns root, `LoadAddOn` began doing what it does in a real
+/// session, and the corpus's largest family drives it deliberately: `FuBar.lua:1034`'s
+/// `LoadLoadOnDemandPlugins` demand-loads **every** installed `FuBar_*` plugin the moment any one
+/// of them seats. So surveying `FuBar_MoneyFu` runs fifty *siblings*' file scope, and
+/// `FuBar_BattlegroundFu`'s embedded `Glory-2.0` raises `Glory-2.0 requires Deformat-2.0` —
+/// a library `FuBar_BattlegroundFu` does not ship and that a dozen of its siblings do, which is
+/// this module's own stated one-VM-per-addon limitation and not a gap of ours. It is not
+/// `FuBar_MoneyFu`'s row either: it is `FuBar_BattlegroundFu`'s, where the survey already counts it
+/// once. **49 of the corpus's 219 addons were failing on somebody else's file.**
+///
+/// A demand-loaded sibling is the same category as a declared dependency — code the surveyed addon
+/// did not write — so the test is now "an installed addon that is not this one", which subsumes
+/// `deps` (every dependency is installed) and adds the siblings.
+///
+/// **Conservative on purpose, unchanged.** A chunk that names no addon folder at all — our own
+/// FrameXML, an `[string "Frame:OnEvent"]` handler — is KEPT, because the surveyed addon is what
+/// drove it. And the surveyed addon's own folder is tested FIRST, so a raise inside its own
+/// `Libs\Ace\…` is never handed to an installed addon that happens to be called `Ace`.
+fn raised_inside_another_addons_own_file(
+    err: &str,
+    name: &str,
+    installed: &BTreeSet<String>,
+) -> bool {
+    let Some(first) = err.lines().next().map(str::to_ascii_lowercase) else {
         return false;
     };
-    // The surveyed addon's own folder always wins, even when a dependency's name is a substring of
-    // a path inside it.
-    if first.contains(&format!("\\{name}\\")) || first.starts_with(&format!("{name}\\")) {
+    let owns = |line: &str, folder: &str| {
+        line.contains(&format!("\\{folder}\\"))
+            || line.contains(&format!("{folder}/"))
+            || line.starts_with(&format!("{folder}\\"))
+    };
+    let mine = name.to_ascii_lowercase();
+    // The surveyed addon's own folder always wins, even when another addon's name is a substring
+    // of a path inside it.
+    if owns(&first, &mine) {
         return false;
     }
-    deps.iter()
-        .any(|d| first.contains(&format!("\\{d}\\")) || first.starts_with(&format!("{d}\\")))
+    if installed.iter().any(|d| owns(&first, d)) {
+        return true;
+    }
+    raised_inside_a_demand_load(err, &mine)
+}
+
+/// The raise site names **no file at all** — did it happen inside a `LoadAddOn` this addon made?
+///
+/// An inline `<OnEvent>`/`<OnLoad>` body is compiled under the FRAME's name
+/// (`[string "AuctioneerFrame:OnEvent"]`), not the file's, so the folder test above cannot see
+/// whose code it is — and 1226's conservative half then KEEPS it, charged to whoever drove it.
+/// That is right for a handler the surveyed addon's own events reached, and wrong for one reached
+/// through a demand load, which is somebody else's addon loading its own frames.
+///
+/// The traceback says which. `Stubby.lua:581`'s `inspectAddOn` calls `LoadAddOn` on every addon it
+/// finds, Auctioneer's `AuctioneerFrame:OnEvent` raises inside that call, and the frame between
+/// them is `[C]: in function 'LoadAddOn'`. So: walk the traceback from the raise site down, and if
+/// a `LoadAddOn` frame comes **before** any frame naming the surveyed addon's own folder, the code
+/// that raised belongs to the addon being loaded. It cost six addons their row — Stubby and the
+/// five that pull it in — for one raise in Auctioneer, which has its own row already.
+///
+/// **The false negative, stated:** the surveyed addon's OWN inline handler, fired by an event that
+/// happened to be dispatched inside a demand load it made, is exempted too. That is the same
+/// direction the dependency exemption has always erred in, and the alternative — charging every
+/// addon that calls `LoadAddOn` for its neighbours' code — is what this replaces.
+fn raised_inside_a_demand_load(err: &str, mine: &str) -> bool {
+    for line in err.lines().skip(1).map(str::to_ascii_lowercase) {
+        if line.contains(&format!("\\{mine}\\")) || line.contains(&format!("{mine}/")) {
+            return false; // our own frame is above the boundary: our raise
+        }
+        if line.contains("in function 'loadaddon'") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Invoke the reference's own UI entry points, so an addon's OVERRIDES actually execute.
@@ -1074,12 +1210,12 @@ fn drive_ui_probe(script: &mut UiScript) -> Vec<String> {
 /// own row in this survey; blaming its consumers would count one fault N times, which is the
 /// mistake the one-VM-per-addon rule exists to prevent.
 fn load_dependencies(
-    script: &UiScript,
+    script: &mut UiScript,
     root: &Path,
     toc: &Toc,
     installed: &BTreeSet<String>,
     seen: &mut BTreeSet<String>,
-    loaded: &mut Vec<String>,
+    loaded: &mut Vec<LoadedDep>,
 ) {
     // OPTIONAL first, then required — the reference's own order, and the half this walk was
     // missing. The doc above has claimed since 1193 that the two are "folded together"; only
@@ -1106,11 +1242,47 @@ fn load_dependencies(
             continue;
         };
         load_dependencies(script, root, &dep_toc, installed, seen, loaded);
-        let _ = load_addon_files(script, root, dep, &dep_toc);
-        // Recorded AFTER its own files, and after its own dependencies — the order the client
-        // fires `ADDON_LOADED` in, which is the order `drive_session_start` replays.
-        loaded.push(dep.to_string());
+        let files = load_addon_files(script, root, dep, &dep_toc);
+        // **`ADDON_LOADED` fires HERE, at the reference's own position** — not later, with every
+        // other one, which is what this harness did until 2166. `AddOn_Load 0x51f240` emits, per
+        // addon: its dependencies → its own `.toc` files (`0x51f3fa`) → `Bindings.xml` → the two
+        // SavedVariables chunks → **`ADDON_LOADED` (event 429) at `0x51f5ad`** — and only then
+        // returns to load the next addon. So a dependency's event lands BEFORE its dependent's
+        // first line runs, and the loaded flag is set before the event (`[rec+0x18]=1` at
+        // `0x51f313`, the loop preamble) so a handler asking `IsAddOnLoaded` gets the truth.
+        //
+        // Deferring them all to `drive_session_start` put the corpus's largest family in a state
+        // the client never produces. AceAddon-2.0 drains its **whole** `nextAddon` queue on the
+        // first `ADDON_LOADED` it sees, whoever it names (`AceAddon-2.0.lua:104-105`), and calls
+        // each consumer's `OnInitialize` there (`:230`) — so with the events deferred, every Ace2
+        // addon in the VM initialised under its FIRST DEPENDENCY's name, after every file in the
+        // chain had already run. ~87 corpus addons are Ace2.
+        //
+        // Fired OUTSIDE the surveyed addon's error mark, deliberately and for the same reason the
+        // dependency's load errors are: a library that raises in its own initialiser is its own
+        // row in this survey, where it is the surveyed addon and this same event fires inside the
+        // mark. Charging it here would count one fault once per addon that embeds the library.
+        script.mark_addon_loaded(dep);
+        script.fire_event(
+            "ADDON_LOADED",
+            vec![benilla_ui::script::ScriptValue::Str(dep.to_string())],
+        );
+        loaded.push(LoadedDep {
+            name: dep.to_string(),
+            files,
+        });
     }
+}
+
+/// One dependency the walk pulled in, and what its own files did.
+///
+/// The name alone was enough while every consumer only wanted the load ORDER. The shared-VM
+/// control ([`together`]) wants the failures too, and it cannot recover them any other way: a
+/// library folder loads exactly once in that VM, under whichever dependent reached it first, so
+/// it never gets a turn of its own to be measured in.
+struct LoadedDep {
+    name: String,
+    files: FileLoad,
 }
 
 /// Template names the addon passes to `CreateFrame` that the VM cannot resolve.
@@ -1121,7 +1293,7 @@ fn load_dependencies(
 ///
 /// **A string literal in the fourth argument, OR a local bound to one in the same file.** The
 /// literal-only form was the honest under-report this doc used to name — and then a decision was
-/// made on the number it produced. `assets/ui/ItemButtonTemplate.xml` declined to build
+/// made on the number it produced. `Interface\FrameXML\ItemButtonTemplate.xml` declined to build
 /// `ItemButtonTemplate` citing "the harness's template demand ranks it at zero on both axes"; the
 /// zero was real, and pfUI wanted `ContainerFrameItemButtonTemplate` (which inherits it) the whole
 /// time, through
@@ -1307,10 +1479,11 @@ fn missing_inherits(script: &UiScript, root: &Path, name: &str, toc: &Toc) -> Ve
 /// tree hanging off them. An addon's real Lua often hangs off its XML rather than its `.toc`, the
 /// same trap the 1.12 corpus set in decision 1190.
 fn source_files(root: &Path, name: &str, toc: &Toc) -> Vec<String> {
+    let base = addon_base(name);
     let mut pending: Vec<String> = toc
         .files
         .iter()
-        .map(|f| benilla_ui::loader::join_ref(name, f))
+        .map(|f| benilla_ui::loader::join_ref(&base, f))
         .collect();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
@@ -1332,8 +1505,10 @@ fn source_files(root: &Path, name: &str, toc: &Toc) -> Vec<String> {
 /// The FrameXML digest of the interface this survey loaded (`crate::ui_script::framexml_digest`).
 ///
 /// **Print it beside every number.** A survey run is only comparable to another survey run that
-/// loaded the same interface, and in a dev build `assets/ui` is read from the source tree — so an
-/// edit by anything sharing the checkout moves the headline with no rebuild and no announcement.
+/// loaded the same interface, and in a dev build the manifest and the files still ours are read
+/// from the source tree — so an edit by anything sharing the checkout moves the headline with no
+/// rebuild and no announcement. A chain entry contributes its name only (its bytes are the
+/// player's install), so migrating a window changes the digest and playing does not.
 pub fn framexml_digest() -> String {
     crate::ui_script::framexml_digest()
 }
@@ -1441,6 +1616,39 @@ fn seat_a_session(script: &mut UiScript) {
     // any, so `GetCVar` answered nil for every name the client actually ships. Same class as the
     // empty addon registry: a state the real client cannot be in.
     script.register_cvars(crate::cvars::registered_pairs());
+    // **A session runs on a DISPLAY, and until 2177 this one ran on none.** The host pushes the
+    // offered resolutions and the live one (`crate::video::publish_display_modes`); a VM with no
+    // window behind it gets an empty list, `GetScreenResolutions()` returns nothing and
+    // `GetCurrentResolution()` answers 0 — a state the real client cannot be in, and exactly the
+    // 1193/1212 fault this whole function exists to close. `CT_Viewport` is what found it: it
+    // reads its own screen size as `arg[GetCurrentResolution()]` at load and then indexes
+    // `CT_Viewport.screenRes` from an event handler, so an empty list turned "the verb is missing"
+    // into a nil-index two lines later — a moved symptom that would have read as a gap of ours.
+    //
+    // One mode, and it is the one this survey already tells the interface it is running at
+    // (`set_screen_size(1024, 768)` above): a display that offers exactly what the client is using.
+    // Anything richer would be numbers invented for an instrument.
+    script.set_screen_resolutions(
+        vec![benilla_ui::script::ScreenResolution {
+            width: 1024,
+            height: 768,
+        }],
+        Some(benilla_ui::script::ScreenResolution {
+            width: 1024,
+            height: 768,
+        }),
+    );
+    // What this run's device offers, as `crate::cvars` pushes it in the app — same values, because
+    // six of the seven are properties of this client rather than of the adapter.
+    script.set_video_caps(benilla_ui::script::VideoCaps {
+        anisotropic: true,
+        pixel_shaders: true,
+        vertex_shaders: true,
+        trilinear: true,
+        triple_buffering: false,
+        max_anisotropy: *benilla_assets::ANISO_RANGE.end(),
+        hardware_cursor: true,
+    });
     script.set_realm_name("Harness");
     // THE BIND POINT. `GetBindLocation()` answered `""` in every VM, and a logged-in character with
     // no hearth location is not a state one is in — the server sends `SMSG_BINDPOINTUPDATE` at
@@ -1472,6 +1680,10 @@ fn seat_a_session(script: &mut UiScript) {
             // `realm .. " - " .. faction` at file scope, so a nil faction is 24 addons stopping on
             // `attempt to concatenate local 'faction'`. Every playable race has a side.
             faction_group: Some("Alliance".into()),
+            // `0x5efe00`'s team digit for Human (race 1) — the rank-title key's second `%d`.
+            // Seated beside the faction group because they are different questions
+            // (`ui_unit::race_pvp_team`), not because they agree here.
+            pvp_team: crate::ui_unit::race_pvp_team(1),
             ..Default::default()
         }),
     );
@@ -1600,7 +1812,6 @@ fn seat_a_session(script: &mut UiScript) {
         script.set_quest_log(QuestLogState {
             entries: vec![header, in_progress, done],
             num_quests: 2,
-            detail: None,
         });
     }
 
@@ -1677,6 +1888,122 @@ fn seat_a_session(script: &mut UiScript) {
             spell_slot(772, "Rend", Some("Rank 1")),
         ],
     });
+
+    // ── THE TWO LOGIN-SCOPED CATALOGUES (2167) ─────────────────────────────────────────────
+    //
+    // Both of these are answered by the client with **no session behind them at all** — they are
+    // DBC reads, live from the moment the VM exists — so a VM that answers them empty is in a
+    // state the reference cannot be in, exactly like the nil faction group and the empty CVar
+    // table above. Both are read off the PLAYER'S OWN CHAIN, never shipped: we seat the
+    // structure, the install supplies the words (`ui_auction`'s own rule).
+    //
+    // **The auction class tree.** `GetAuctionItemClasses()` is `ItemClass.dbc` in the browse
+    // menu's order (1971), and the stock `AuctionFrameBrowse_OnLoad` reads it at the addon's
+    // LOAD. `Auctioneer`'s `AucCore.lua:105` is
+    //
+    //     local classes = pack(GetAuctionItemClasses());
+    //     local bidBasedCategories = {[classes[1]]=true, ..., [classes[10]]=true}
+    //
+    // — ten subscripts into a list that answered nothing, so `AucCore.lua:106` died on
+    // `table index is nil` and took `BeanCounter`, `Informant`, `Enchantrix` and `FonzAppraiser`
+    // with it. Five corpus addons read the tree; four of them at file scope.
+    // **The `SMSG_ADDON_INFO` reply, hiding nothing** (2175) — the same class of state correction
+    // as the two catalogues below and the empty spellbook above. The Lua index space
+    // (`GetNumAddOns`, and the index form of every AddOn verb) is built only when the server
+    // answers, and a surveyed VM is an IN-WORLD VM: the reference cannot be in the world without
+    // having had that reply. A survey that left it unanswered would measure a client whose
+    // `GetNumAddOns()` is 0, which is what AceAddon and AceLibrary scan.
+    //
+    // Empty, not the twelve: the corpus registry holds no `## Secure:` addon, so a real server
+    // would have nothing to hide here.
+    script.note_addon_info_reply(&[]);
+    script.set_auction_item_classes(auction_item_classes());
+
+    // **The talent tree.** `GetTalentInfo(tab, i)` answers off `Talent.dbc` × `TalentTab.dbc`;
+    // ten corpus addons read it, and `KLHThreatMeter` reads it by POSITION at file scope
+    // (`KTM_Data.lua:376`, `_, _, _, _, rank = GetTalentInfo(info[1], info[2])`) and then does
+    // `-rank` arithmetic on the answer (`KTM_My.lua:721`). An unseated tree is nil, not zero.
+    //
+    // **Zero ranks, the full unspent pool** — a character who has just reached 60 and not spent a
+    // point. Deliberately, and for 1209's reason: a specific build would put arbitrary constants
+    // into every threat and damage calculation in the corpus, and a row nobody can attribute is
+    // worse than a row that is merely quiet. Rank 0 is a NUMBER, which is the whole difference
+    // this seat makes. 51 points is `level - 9` at 60, and the class is the seated warrior's.
+    if let Some(state) = talent_snapshot(script) {
+        script.set_talents(state);
+    }
+}
+
+/// The reference's own auction browse tree, read once off the player's chain.
+///
+/// The same builder the live client feeds from (`ui_auction::categories`) over the same two DBCs,
+/// so the survey cannot drift from the window: a second copy of the ten-class set would be a
+/// second thing to keep right. Empty with no install, in which case the survey simply measures a
+/// worse VM and says so through [`seated_with_global_strings`].
+fn auction_item_classes() -> Vec<benilla_ui::script::AuctionCategory> {
+    use std::sync::OnceLock;
+    static TREE: OnceLock<Vec<benilla_ui::script::AuctionCategory>> = OnceLock::new();
+    TREE.get_or_init(|| {
+        let Some(data) = benilla_formats::wow_data() else {
+            return Vec::new();
+        };
+        let Ok(mut chain) = benilla_formats::open_chain(&data) else {
+            return Vec::new();
+        };
+        let classes = benilla_formats::load_item_classes(&mut chain)
+            .ok()
+            .map(crate::ui_items::ItemClasses);
+        let subclasses = benilla_formats::load_item_sub_classes(&mut chain)
+            .ok()
+            .map(crate::ui_items::ItemSubClasses);
+        crate::ui_auction::categories(classes.as_ref(), subclasses.as_ref())
+    })
+    .clone()
+}
+
+/// The seated character's talent pages, built by the live client's own `build_pages`.
+///
+/// The catalogues are read once per process (they are two DBC loads plus `Spell.dbc`, and the
+/// survey stands up 219 VMs); the PAGES are built per VM, because the red requirement lines are
+/// filled from that VM's own `GlobalStrings.lua` — the same rule the live feed follows (2045).
+/// `None` with no install.
+fn talent_snapshot(script: &UiScript) -> Option<benilla_ui::script::TalentUiState> {
+    use std::sync::OnceLock;
+    #[allow(clippy::type_complexity)]
+    static DBCS: OnceLock<
+        Option<(
+            benilla_formats::TalentCatalog,
+            benilla_formats::SpellCatalog,
+        )>,
+    > = OnceLock::new();
+    let (talents, spells) = DBCS
+        .get_or_init(|| {
+            let data = benilla_formats::wow_data()?;
+            let mut chain = benilla_formats::open_chain(&data).ok()?;
+            let talents = benilla_formats::load_talent_catalog(&mut chain).ok()?;
+            let spells = benilla_formats::load_spell_catalog(&mut chain).ok()?;
+            Some((talents, spells))
+        })
+        .as_ref()?;
+    let get = |key: &str| {
+        script
+            .lua()
+            .globals()
+            .get::<String>(key)
+            .ok()
+            .filter(|t| !t.is_empty())
+    };
+    // Human (`ChrRaces.dbc` 1) warrior (`ChrClasses.dbc` 1) — the character `seat_a_session`
+    // seats above, so the pages are the ones that character's talent window would show.
+    Some(crate::ui_talent::build_pages(
+        talents,
+        &BTreeSet::new(),
+        spells,
+        1,
+        1,
+        (51, 0),
+        &get,
+    ))
 }
 
 /// One seated equipment slot — full durability, so no alert region lights up.
@@ -1742,23 +2069,40 @@ pub struct AbsentFiles {
     pub foreign: Vec<String>,
 }
 
+/// What one addon's manifest did: every load failure verbatim, which of them were files that
+/// simply are not there, and whether anything actually **raised**.
+struct FileLoad {
+    /// Every load failure, in order, unchanged in content and meaning (1213: `errors` is never
+    /// quietly shrunk — every past record's number is still readable off this list).
+    errors: Vec<String>,
+    /// The subset of [`Self::errors`] that is a named file the provider does not have, split by
+    /// whose package is incomplete.
+    absent: AbsentFiles,
+    /// **Did anything raise, fail to parse, or drop a frame** — the question
+    /// [`AddonReport::loaded`] asks (decision 2155).
+    ///
+    /// It is `false` for an addon whose only failures are absent files, because on the reference
+    /// that addon *loads*: `0x6edaa0` logs `"Couldn't open %s"` and returns null, and the walk
+    /// carries on to the next manifest entry with nothing raised (wow-re
+    /// `ui/scratch/xml-toc-path-resolution.md` §4, VERIFIED — the same rule 2107 unified for the
+    /// two loaders that reach it from Lua). Until this existed the survey scored 24 corpus addons
+    /// as not surviving a session start on nothing but a locale file their own zip omits, FuBar
+    /// and 22 of its plugins among them.
+    raised: bool,
+}
+
 /// Run the addon's manifest through the same two arms the real loader uses — `.lua` as a chunk,
-/// anything else as FrameXML — with the AddOns root as the provider's path space (decision 1186).
-///
-/// Returns the errors **and**, beside them, the split of which entries did not resolve. The
-/// absent ones are still in `errors` — 1213's rule, for the fifth time: this asks a new question
-/// and gets a new column, it does not quietly shrink an old one.
-fn load_addon_files(
-    script: &UiScript,
-    root: &Path,
-    name: &str,
-    toc: &Toc,
-) -> (Vec<String>, AbsentFiles) {
+/// anything else as FrameXML — in the client's **install-relative** path space (decision 2155:
+/// `Interface/AddOns/<Folder>`, exactly what `ui_script::addons::Addon::prefix` hands its own
+/// loader, so a chunk name here and a chunk name in a live session are the same string).
+fn load_addon_files(script: &UiScript, root: &Path, name: &str, toc: &Toc) -> FileLoad {
     let provider = |req: &str| -> Option<Vec<u8>> { read_under(root, req) };
+    let base = addon_base(name);
     let mut errors = Vec::new();
     let mut absent = AbsentFiles::default();
+    let mut raised = false;
     for file in &toc.files {
-        let path = benilla_ui::loader::join_ref(name, file);
+        let path = benilla_ui::loader::join_ref(&base, file);
         let Some(bytes) = read_under(root, &path) else {
             errors.push(format!("{file}: not found"));
             // WHOSE package is incomplete. `join_ref` has already collapsed the `..`s the way the
@@ -1767,7 +2111,7 @@ fn load_addon_files(
             // inside the addon's own folder is the addon shipping a manifest it does not satisfy,
             // while one pointing out of it wants a neighbour that is not installed.
             let own = path
-                .strip_prefix(name)
+                .strip_prefix(base.as_str())
                 .is_some_and(|rest| rest.starts_with('/'));
             if own {
                 absent.own.push(file.clone());
@@ -1779,23 +2123,58 @@ fn load_addon_files(
         if is_lua(file) {
             // Named as the client names it, so the survey sees what a player would: an addon
             // that PARSES a traceback for its own folder (the whole FuBar family) needs the real
-            // `Interface\AddOns\<Folder>\<File>` shape, not mlua's Rust-caller default.
-            if let Err(e) =
-                script.run_chunk_named(&bytes, &benilla_ui::script::addon_chunk_name(name, file))
+            // `Interface\AddOns\<Folder>\<File>` shape, not mlua's Rust-caller default. Built
+            // from the RESOLVED path, like the loader's own `<Script file=>` naming — one rule,
+            // so the two doors into a VM cannot disagree about what a file is called (2155).
+            if let Err(e) = script.run_chunk_named(&bytes, &format!("@{}", path.replace('/', "\\")))
             {
                 errors.push(format!("{file}: {e}"));
+                raised = true;
             }
             continue;
         }
         match benilla_ui::framexml::parse(&benilla_ui::source::decode(&bytes)) {
             Ok(doc) => {
                 let report = benilla_ui::loader::load_in(script, &doc, &path, &provider);
+                // Retained with the file prefix so the survey's `warnings` column can see them
+                // (2135); they were dropped with the report before that, which is why an
+                // unresolved `inherits=` scored as a clean load.
+                for w in report.warnings {
+                    script.report_warning(&format!("{file}: {w}"));
+                }
+                // A file the DOCUMENT named and the provider does not have — the `.toc` arm's rule
+                // one level down (decision 2155). Recorded as absent, under the same own/foreign
+                // split, and never as something that raised: the reference logs `Couldn't open %s`
+                // for an `<Include>` and `Error loading %s` for a `<Script file=>`, and carries on.
+                for m in report.missing_files {
+                    let own = m
+                        .split_once("no provider hit for \"")
+                        .and_then(|(_, rest)| rest.split_once('"'))
+                        .is_some_and(|(p, _)| {
+                            p.strip_prefix(base.as_str())
+                                .is_some_and(|r| r.starts_with('/'))
+                        });
+                    errors.push(format!("{file}: {m}"));
+                    if own {
+                        absent.own.push(format!("{file}: {m}"));
+                    } else {
+                        absent.foreign.push(format!("{file}: {m}"));
+                    }
+                }
+                raised |= !report.errors.is_empty();
                 errors.extend(report.errors.into_iter().map(|e| format!("{file}: {e}")));
             }
-            Err(e) => errors.push(format!("{file}: {e}")),
+            Err(e) => {
+                errors.push(format!("{file}: {e}"));
+                raised = true;
+            }
         }
     }
-    (errors, absent)
+    FileLoad {
+        errors,
+        absent,
+        raised,
+    }
 }
 
 fn is_lua(entry: &str) -> bool {
@@ -1807,7 +2186,14 @@ fn is_lua(entry: &str) -> bool {
         .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("lua"))
 }
 
-/// `root/rel`, refusing to escape — the same lexical AddOns-root sandbox the loader applies.
+/// One addon file, read **through the client's own reader** — the loose AddOns tree, then the
+/// player's patch chain ([`crate::ui_script::addons::read_addon_file`], decision 2155).
+///
+/// It delegates rather than re-implementing, and that is the whole point of it still existing as a
+/// name: this was a private copy of the loader's `read_under`, and a copy of a resolution rule is
+/// a copy that drifts. It had already drifted — the client resolves `..\Blizzard_AuctionUI\…`
+/// and `..\..\FrameXML\…` off the chain and this could not, so the survey reported two addon
+/// families as broken packages when the miss was the instrument's.
 ///
 /// **Bytes, like the loader's** (decision 1193). Until then this function carried a private
 /// lossy-UTF-8 + BOM-strip of its own, so the harness could survey files the *client* refused to
@@ -1815,14 +2201,16 @@ fn is_lua(entry: &str) -> bool {
 /// round. The client reads bytes now, so the harness can simply read bytes too, and the one place
 /// that still needs text ([`read_text`]) says so.
 fn read_under(root: &Path, rel: &str) -> Option<Vec<u8>> {
-    let rel = Path::new(rel);
-    if rel
-        .components()
-        .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        return None;
-    }
-    std::fs::read(root.join(rel)).ok()
+    crate::ui_script::addons::read_addon_file(root, rel)
+}
+
+/// Where one addon's files sit in the install's path space — `Interface/AddOns/<Folder>`.
+///
+/// The survey's copy of [`crate::ui_script::addons::Addon::prefix`], and it must stay its copy:
+/// every path this module builds is handed to the same reader and named by the same rule, so a
+/// divergence here is a survey measuring a client nobody runs.
+fn addon_base(name: &str) -> String {
+    format!("Interface/AddOns/{name}")
 }
 
 /// [`read_under`] for the **source scanner**, which greps text rather than running it.
@@ -2085,7 +2473,6 @@ const PROBE_FRAME_KINDS: &[&str] = &[
     "MovieFrame",
     "GameTooltip",
     "Minimap",
-    "Cooldown",
 ];
 
 /// **Type the receiver of a `:` call where the file says what it is** — the whole basis of the
@@ -2832,6 +3219,23 @@ pub fn normalise(raw: &str) -> String {
     normalise_error(raw)
 }
 
+/// The byte index of the next `'` that actually OPENS a quote — one with a non-alphanumeric on at
+/// least one side. See [`normalise_error`] step 2.
+fn quote_open(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = s[from..].find('\'') {
+        let i = from + rel;
+        let prev_word = i > 0 && b[i - 1].is_ascii_alphanumeric();
+        let next_word = b.get(i + 1).is_some_and(u8::is_ascii_alphanumeric);
+        if !(prev_word && next_word) {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
 /// One load error with everything addon-specific removed, so two addons hitting the same wall
 /// produce the same string. See [`blockers`] for why the crudeness is the point.
 fn normalise_error(raw: &str) -> String {
@@ -2847,10 +3251,16 @@ fn normalise_error(raw: &str) -> String {
     // 2 · Every quoted name becomes `'X'` — the name is what varies between two addons that hit
     //     the same wall, and it is already ranked by `demand`. Both quote kinds, because mlua
     //     writes a chunk name as `[string "MyFrame:OnLoad"]`.
+    //
+    //     **An APOSTROPHE INSIDE A WORD is not a quote.** The reference's own diagnostics are
+    //     written in English — `Couldn't find region named '%s'`, `Couldn't find relative frame:
+    //     %s` — and the `'` in `Couldn't` opened a quote that then swallowed the rest of the line,
+    //     so the row read `Couldn'X'` and named nothing. Letters on both sides is the whole test:
+    //     a real opening quote is preceded by a space, a bracket or the line start.
     let squashed = core.replace('"', "'");
     let mut collapsed = String::with_capacity(squashed.len());
     let mut rest = squashed.as_str();
-    while let Some(open) = rest.find('\'') {
+    while let Some(open) = quote_open(rest) {
         collapsed.push_str(&rest[..open]);
         collapsed.push_str("'X'");
         match rest[open + 1..].find('\'') {
@@ -2909,6 +3319,97 @@ mod tests {
             vec!["error: 'X' is obsolete"],
             "the file, the source position and the quoted name are all per-addon noise"
         );
+    }
+
+    /// **A raise in a DEMAND-LOADED SIBLING is that sibling's row, not the surveyed addon's**
+    /// (decision 2107) — the FuBar shape, verbatim from the corpus.
+    ///
+    /// `FuBar.lua:1034`'s `LoadLoadOnDemandPlugins` demand-loads every installed `FuBar_*` the
+    /// moment any one of them seats, so surveying `FuBar_MoneyFu` runs `FuBar_BattlegroundFu`'s
+    /// file scope. Its embedded `Glory-2.0` wants a `Deformat-2.0` a dozen of its siblings ship and
+    /// it does not — this module's one-VM-per-addon limitation, and `FuBar_BattlegroundFu`'s own
+    /// row, where the survey counts it once. It cost 49 addons their session-start row.
+    #[test]
+    fn a_raise_in_another_installed_addons_file_is_that_addons_row() {
+        let installed: BTreeSet<String> = ["fubar", "fubar_moneyfu", "fubar_battlegroundfu", "ace"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let sibling = "LoadAddOn: FuBar_BattlegroundFu/lib\\Glory-2.0\\Glory-2.0.lua: runtime \
+                       error: ...Ons\\FuBar_BattlegroundFu\\lib\\Glory-2.0\\Glory-2.0.lua:23: \
+                       Glory-2.0 requires Deformat-2.0";
+        assert!(
+            raised_inside_another_addons_own_file(sibling, "FuBar_MoneyFu", &installed),
+            "a sibling's own file is the sibling's row"
+        );
+        // The surveyed addon's OWN file is always its own row — including a library it embeds
+        // whose folder name is itself an installed addon.
+        let mine = "runtime error: Interface\\AddOns\\FuBar_MoneyFu\\Libs\\Ace\\Ace.lua:8: boom";
+        assert!(!raised_inside_another_addons_own_file(
+            mine,
+            "FuBar_MoneyFu",
+            &installed
+        ));
+        // A chunk naming no addon folder at all is KEPT — the surveyed addon drove it.
+        let ours = "runtime error: [string \"Frame:OnEvent\"]:2: attempt to index a nil value";
+        assert!(!raised_inside_another_addons_own_file(
+            ours,
+            "FuBar_MoneyFu",
+            &installed
+        ));
+        // A folder that is not installed is not somebody else's row either.
+        let stranger = "runtime error: Interface\\AddOns\\NotInstalled\\x.lua:1: boom";
+        assert!(!raised_inside_another_addons_own_file(
+            stranger,
+            "FuBar_MoneyFu",
+            &installed
+        ));
+    }
+
+    /// **A raise inside a `LoadAddOn` the surveyed addon made is the LOADED addon's row** — even
+    /// when the raise site names no file at all (decision 2107).
+    ///
+    /// An inline `<OnEvent>` body is compiled under the frame's name, so the folder test is blind
+    /// to it. `Stubby.lua:581` demand-loads every addon it finds; Auctioneer's
+    /// `AuctioneerFrame:OnEvent` raises inside that call. Six addons — Stubby and the five that
+    /// pull it in — were failing on that one raise, which Auctioneer's own row already carries.
+    #[test]
+    fn a_raise_inside_a_demand_load_belongs_to_the_addon_being_loaded() {
+        let installed: BTreeSet<String> = ["stubby", "auctioneer", "enchantrix"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let through_loadaddon =
+            "runtime error: [string \"AuctioneerFrame:OnEvent\"]:4: attempt to \
+             index field 'Core' (a nil value)\n\
+             stack traceback:\n\
+             \t[C]: in ?\n\
+             \t[string \"AuctioneerFrame:OnEvent\"]:4: in function <...>\n\
+             \t[C]: in function 'LoadAddOn'\n\
+             \tInterface\\AddOns\\Stubby\\Stubby.lua:581: in upvalue 'inspectAddOn'";
+        assert!(
+            raised_inside_another_addons_own_file(through_loadaddon, "Stubby", &installed),
+            "the LoadAddOn frame sits between the raise and Stubby's own code"
+        );
+        assert!(
+            raised_inside_another_addons_own_file(through_loadaddon, "Enchantrix", &installed),
+            "…and the same for an addon that only pulled Stubby in"
+        );
+        // The surveyed addon's OWN frame ABOVE the boundary keeps the raise: it drove it itself.
+        let ours_first = "runtime error: [string \"StubbyFrame:OnEvent\"]:2: boom\n\
+             stack traceback:\n\
+             \tInterface\\AddOns\\Stubby\\Stubby.lua:12: in function 'Stubby.Thing'\n\
+             \t[C]: in function 'LoadAddOn'";
+        assert!(!raised_inside_another_addons_own_file(
+            ours_first, "Stubby", &installed
+        ));
+        // No LoadAddOn anywhere: 1226's conservative KEEP is untouched.
+        let plain = "runtime error: [string \"StubbyFrame:OnEvent\"]:2: boom\n\
+             stack traceback:\n\
+             \t[C]: in ?";
+        assert!(!raised_inside_another_addons_own_file(
+            plain, "Stubby", &installed
+        ));
     }
 
     /// mlua's `[string "Frame:OnLoad"]:2:` chunk name is a position, not words.
@@ -3553,6 +4054,75 @@ mod dependency_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// **A dependency's `ADDON_LOADED` lands before the dependent's FIRST LINE runs** (2166).
+    ///
+    /// The reference emits, per addon: its dependencies → its own `.toc` files (`0x51f3fa`) →
+    /// `Bindings.xml` → the SavedVariables chunks → **`ADDON_LOADED` at `0x51f5ad`** — and only
+    /// then moves to the next addon. So by the time a dependent's file scope runs, every
+    /// dependency has already had its own event.
+    ///
+    /// This harness deferred all of them to `drive_session_start` instead, which is a state the
+    /// client never produces and which no earlier test could see: the one above reads the
+    /// dependency's state from a `PLAYER_LOGIN` handler, and that passes either way. **The
+    /// discriminating read is at FILE SCOPE**, and it is the corpus's own shape — `KTMAutoHider`'s
+    /// `<OnLoad>` calls into `KLHThreatMeter`'s GUI, which is nil until KLHThreatMeter's own
+    /// `ADDON_LOADED` builds it.
+    ///
+    /// The control below is what stops this test passing for the wrong reason: `EagerLib` must
+    /// initialise **on its own event and nowhere else**, so a consumer that sees it has genuinely
+    /// received the event and not merely run a file.
+    #[test]
+    fn a_dependencys_addon_loaded_precedes_the_dependents_file_scope() {
+        let tmp =
+            std::env::temp_dir().join(format!("benilla-harness-eager-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let write = |name: &str, toc: &str, file: &str, body: &str| {
+            let dir = tmp.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{name}.toc")), toc).unwrap();
+            std::fs::write(dir.join(file), body).unwrap();
+        };
+        write(
+            "EagerLib",
+            "## Interface: 11200\nlib.lua\n",
+            "lib.lua",
+            "EagerLibFrame = CreateFrame(\"Frame\")\n\
+             EagerLibFrame:RegisterEvent(\"ADDON_LOADED\")\n\
+             EagerLibFrame:SetScript(\"OnEvent\", function()\n\
+             if event == \"ADDON_LOADED\" and arg1 == \"EagerLib\" then EagerLibReady = {} end\n\
+             end)\n",
+        );
+        // The consumer reads it AT FILE SCOPE — no handler, no later event.
+        write(
+            "EagerUser",
+            "## Interface: 11200\n## Dependencies: EagerLib\nuse.lua\n",
+            "use.lua",
+            "EagerUserSaw = EagerLibReady.anything\n",
+        );
+
+        let reports = survey(&tmp);
+        let of = |n: &str| reports.iter().find(|r| r.name == n).unwrap();
+
+        assert!(
+            of("EagerUser").errors.is_empty(),
+            "the dependency's ADDON_LOADED must precede the dependent's file scope: {:?}",
+            of("EagerUser").errors
+        );
+        assert!(
+            of("EagerUser").loaded && of("EagerUser").session_errors.is_empty(),
+            "...and the row is clean end to end: {:?}",
+            of("EagerUser").session_errors
+        );
+        // The control: EagerLib's own row still gets its own event, and nothing raised there.
+        assert!(
+            of("EagerLib").loaded && of("EagerLib").session_errors.is_empty(),
+            "the library's own row is unaffected: {:?}",
+            of("EagerLib").session_errors
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// **A manifest entry with no file is split by WHOSE package is short** — the column that
     /// stops a session hunting for a client bug that is not one.
     ///
@@ -3576,10 +4146,10 @@ mod dependency_tests {
     /// **A template named through a local resolves; the shapes that still cannot are asserted too.**
     ///
     /// The literal-only scan was an honest under-report — stated at `missing_templates` — and a
-    /// decision was then made on the number it produced: `assets/ui/ItemButtonTemplate.xml`
-    /// declined to build `ItemButtonTemplate` citing a demand of zero "on both axes". The zero was
-    /// real and the demand was not: pfUI binds `local tpl = "ContainerFrameItemButtonTemplate"`
-    /// and passes the variable, so the one addon that wanted it was invisible to the ranking.
+    /// decision was then made on the number it produced:
+    /// `Interface\FrameXML\ItemButtonTemplate.xml` declined to build `ItemButtonTemplate` citing a
+    /// demand of zero "on both axes". The zero was real and the demand was not: pfUI binds `local
+    /// tpl = "ContainerFrameItemButtonTemplate"` and passes the variable, so the one addon that wanted it was invisible to the ranking.
     ///
     /// Both halves are asserted, because a scanner that quietly widened would be the worse fix:
     /// the shape it now sees, AND the shapes it still does not, so the next decision quoting this
@@ -3690,9 +4260,11 @@ mod dependency_tests {
         let wants = of("WantsNeighbour");
         assert_eq!(
             wants.absent_foreign_files,
-            vec!["NotInstalled/templates.xml".to_string()],
+            vec!["Interface/AddOns/NotInstalled/templates.xml".to_string()],
             "`..` is collapsed the way the client collapses it, and the RESOLVED path is what is \
-             reported — the collapse is the interesting half"
+             reported — the collapse is the interesting half. The path is INSTALL-relative since \
+             2155, which is the space the reference's file layer is actually handed: this exact \
+             shape is Auctioneer's, and its real neighbour resolves off the chain now."
         );
         assert!(
             wants.absent_own_files.is_empty(),
@@ -3700,13 +4272,21 @@ mod dependency_tests {
             wants.absent_own_files
         );
 
-        // NOTHING is subtracted. Both are still load failures, still in `errors`, still counted
-        // in every headline — the split is a new column beside them, never a quieter old one.
+        // **NOTHING is subtracted from `errors`** (1213) — both rows are still there, verbatim, so
+        // every figure any past record quoted is still readable off this list. What changed in
+        // 2155 is which of them `loaded` counts: on the reference these addons LOAD, because
+        // `0x6edaa0` logs `Couldn't open %s` and the walk carries on with nothing raised
+        // (`ui/scratch/xml-toc-path-resolution.md` §4). Both halves are asserted together,
+        // because either one alone is a rule that has already been got wrong in both directions.
         for r in [short, wants] {
-            assert!(!r.loaded, "{}: still a load failure", r.name);
+            assert!(
+                r.loaded,
+                "{}: a file the package does not contain is not something that RAISED",
+                r.name
+            );
             assert!(
                 r.errors.iter().any(|e| e.contains("not found")),
-                "{}: the error is still there verbatim: {:?}",
+                "{}: …and the row is still there verbatim: {:?}",
                 r.name,
                 r.errors
             );
@@ -4403,6 +4983,56 @@ mod dependency_tests {
             "the region leaves publish into their own name table, and the corpus scrapes them"
         );
         assert_eq!(script.widget_kind("NoSuchFrameAnywhere"), None);
+    }
+
+    /// **The seated session answers the two login-scoped catalogues** (2167) — the auction browse
+    /// tree and the player's talent pages.
+    ///
+    /// Both are DBC reads the client answers with no session behind them, so an empty answer is a
+    /// state the reference cannot be in — and both were read AT FILE SCOPE by corpus addons that
+    /// then did arithmetic or subscripting on the answer. `Auctioneer` subscripts `classes[10]`
+    /// (`AucCore.lua:106`) and `KLHThreatMeter` negates `GetTalentInfo`'s rank
+    /// (`KTM_My.lua:721`); nil is what both were getting.
+    ///
+    /// The subscript and the arithmetic are what this asserts, not a count: the ten-class set and
+    /// the warrior's three pages come off the player's own DBCs, and pinning their contents here
+    /// would be pinning the install rather than the seat.
+    #[test]
+    fn the_seated_session_answers_the_login_scoped_catalogues() {
+        if benilla_formats::wow_data().is_none() {
+            eprintln!("skipping: no WoW client data");
+            return;
+        }
+        let mut script = UiScript::new().unwrap();
+        script.set_screen_size(1024.0, 768.0);
+        seat_a_session(&mut script);
+
+        // Auctioneer's own line, reduced: ten subscripts into the packed return.
+        assert_eq!(
+            script
+                .eval::<i64>(
+                    "local c = {GetAuctionItemClasses()} \
+                     local t = {} for i = 1, 10 do t[c[i]] = true end \
+                     return table.getn(c)"
+                )
+                .ok(),
+            Some(10),
+            "the browse tree is the reference's ten auctionable classes"
+        );
+        // KLHThreatMeter's own line, reduced: a positional read and arithmetic on the rank.
+        assert_eq!(
+            script
+                .eval::<i64>("local _, _, _, _, rank = GetTalentInfo(3, 13) return -rank")
+                .ok(),
+            Some(0),
+            "a talent read by POSITION answers a number — nil is what the corpus was getting"
+        );
+        assert!(
+            script
+                .eval::<bool>("return GetNumTalentTabs() == 3 and GetNumTalents(1) > 0")
+                .unwrap_or(false),
+            "the seated warrior has his three pages"
+        );
     }
 
     /// **The UI probe actually INVOKES an addon's override**, which is the only thing that makes it

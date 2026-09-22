@@ -93,6 +93,22 @@ pub(crate) fn pick_model_roots(
         .chain(mount)
 }
 
+/// **Where every model's skeleton is right now** — the owned palette rows and the per-part link
+/// that indexes them, as one [`SystemParam`].
+///
+/// They are two halves of one lookup ([`update_hover`]'s `palette_of` reads both, in that order,
+/// and neither has ever been wanted alone) and they are bundled because the picker sits exactly on
+/// Bevy's 16-param function-system ceiling — the seat this freed went to the `IsSelectable` grader
+/// (decision 2060), which has to run *inside* the pick rather than after it so [`Hovered`] is never
+/// published in its ungraded state.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(super) struct PickPose<'w, 's> {
+    /// The owned palette table (decision 0720): the picker reads the same world-space matrices the
+    /// vertex stage skins with, straight from the CPU rows.
+    palettes: Res<'w, benilla_world::rig_palette::RigPalettes>,
+    rigs: Query<'w, 's, &'static benilla_world::rig_palette::RigSkin>,
+}
+
 /// Recompute the unit under the cursor each frame — the real client's two-phase pick (wow-re
 /// pick-volume RE `bd630be` + `31562f1d`): **broad** = the cursor ray vs the *current animation's*
 /// bounds sphere (world-placed + world-scaled, no pad); **pass 1** = the ray vs the unit's **posed
@@ -109,7 +125,7 @@ pub(crate) fn pick_model_roots(
 /// body — held weapons, the helm, the shoulders, a mount — is its own pass-1/pass-2 candidate
 /// resolving to the same unit, because the reference registers the whole CM2 attachment tree into
 /// the pick scene under one candidate node (`0x480d90` walking `[model+0x1dc]`/`[+0x1e4]`).
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub(super) fn update_hover(
     camera: Query<(&Camera, &GlobalTransform), With<WorldCamera>>,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -118,14 +134,14 @@ pub(super) fn update_hover(
     // The frame's world-occlusion distance: the final pick is discarded iff the world hit is
     // strictly nearer (behind terrain/WMO/doodad geometry — the post-hoc compare below).
     occlusion: Res<PickOcclusion>,
-    // The V-plates' screen rects (last frame's layout — the plate drive runs after this chain).
-    plate_rects: Res<crate::vplates::PlateRects>,
+    // The unit whose plate the pointer is inside (last frame's layout — the plate drive runs
+    // after this chain), published by the plate widgets themselves.
+    plate_hover: Res<crate::vplates::PlateHover>,
     mut hovered: ResMut<Hovered>,
     mesh_assets: Res<Assets<Mesh>>,
-    // The owned palette table (decision 0720): the picker reads the same world-space matrices
-    // the vertex stage skins with, straight from the CPU rows.
-    palettes: Res<benilla_world::rig_palette::RigPalettes>,
-    rigs: Query<&benilla_world::rig_palette::RigSkin>,
+    pose: PickPose,
+    // `IsSelectable`'s second clause reads the active player's guid — see the grader at the publish.
+    self_guid: Res<crate::net::SelfGuid>,
     // Last frame's pick, for pass 2's sticky-hover (the reference's anti-flicker cache: the previous
     // pick outranks everything in the halo retry, so the hover doesn't strobe between two units).
     mut last_pick: Local<Option<Entity>>,
@@ -183,6 +199,24 @@ pub(super) fn update_hover(
     hovered.corpse = None;
     hovered.corpse_guid = None;
     hovered.distance = f32::MAX;
+    hovered.refused = false;
+    // **The plate publishes the mouseover, and it does so THROUGH the UI gate below, not around
+    // it.** A plate is mouse-enabled UI (2148): with the pointer inside one, the UI pointer pass
+    // owns the cursor, `PointerOverUi` is true, and the world pick correctly stands down — so this
+    // has to be read before that early return or hovering a plate would clear the mouseover it is
+    // supposed to set. That is the reference's own arrangement: the plate's OnEnter (`0x7cb850`)
+    // publishes `[0xb4e2c8]` directly, with none of the world hover's grading, and the frame walk
+    // stops there — no world pick behind it. Freelook still wins, because there the plates have
+    // handed the mouse back (`0x60f830`).
+    if !rig.is_looking() {
+        if let Some(entity) = plate_hover.0 {
+            hovered.target = Some(entity);
+            hovered.guid = units.get(entity).ok().map(|(g, _)| g.0);
+            hovered.distance = 0.0; // topmost UI — it beats any world GameObject at a tie
+            *last_pick = Some(entity);
+            return;
+        }
+    }
     if rig.is_looking() || pointer_over_ui.0 {
         *last_pick = None;
         return;
@@ -193,18 +227,6 @@ pub(super) fn update_hover(
     let Some(cursor) = window.cursor_position() else {
         return;
     };
-    // The plate is mouse-enabled UI on the reference: the cursor inside a plate's rect makes
-    // that plate's unit the mouseover (OnEnter `0x7cb850` → `[0xb4e2c8]`) and the frame walk
-    // stops there — no world pick behind it. So plate hover brightens the model, lights the
-    // plate bar, and click-selects, exactly like hovering the body. Reverse order = the later-drawn
-    // (visually topmost) plate wins an overlap.
-    if let Some(&(_, entity)) = plate_rects.0.iter().rev().find(|(r, _)| r.contains(cursor)) {
-        hovered.target = Some(entity);
-        hovered.guid = units.get(entity).ok().map(|(g, _)| g.0);
-        hovered.distance = 0.0; // a plate is topmost UI — it beats any world GameObject at a tie
-        *last_pick = Some(entity);
-        return;
-    }
     let Ok(ray) = camera.viewport_to_world(cam_tf, cursor) else {
         return;
     };
@@ -285,8 +307,8 @@ pub(super) fn update_hover(
         let palette_of =
             |sk: &[(&Mesh3d, &benilla_world::rig_palette::RigPart)]| -> Option<Vec<Mat4>> {
                 sk.first().and_then(|(_, part)| {
-                    let rig = rigs.get(part.0).ok()?;
-                    palettes.world_palette(rig.slot, rig.bones() as usize)
+                    let rig = pose.rigs.get(part.0).ok()?;
+                    pose.palettes.world_palette(rig.slot, rig.bones() as usize)
                 })
             };
         // The halo ladder (alive 3 / dead 2), with the corpse rung now **byte-verified** rather
@@ -417,16 +439,86 @@ pub(super) fn update_hover(
             if net.kind == EntityKind::Corpse {
                 hovered.corpse = Some(entity);
                 hovered.corpse_guid = Some(guid.0);
-            } else {
+            } else if selectable_pick(entity, &roots, self_guid.0) {
                 hovered.target = Some(entity);
                 hovered.guid = Some(guid.0);
+            } else {
+                hovered.refused = true;
             }
-        } else {
+        } else if selectable_pick(entity, &roots, self_guid.0) {
             hovered.target = Some(entity);
+        } else {
+            hovered.refused = true;
         }
+        // Set on EVERY arm, the refusal included — see [`Hovered::refused`].
         hovered.distance = t;
     }
     *last_pick = best.map(|(_, e)| e);
+}
+
+/// **The hover grader's `IsSelectable` verdict** — `0x4828d0`, the step between the pick and the
+/// mouseover publish:
+///
+/// ```text
+/// 48297d  mov  eax,[esi]              ; the picked object's vtable
+/// 482982  call [eax+0x54]             ; slot 21 = 0x60be60 IsSelectable — the SAME predicate
+/// 482985  test eax,eax                ;   SetSelection runs, reached there via the +0x58 thunk
+/// 482987  je   0x4829ed               ; FALSE -> 0x482090(0,0) + ResetCursor 0x523d30
+/// ```
+///
+/// So the refusal is **total, and it is one rule**: the mouseover globals `[0xb4e2c8]/[0xb4e2cc]`
+/// are cleared (their only two writers image-wide live in the publisher `0x492890`, which that jump
+/// skips), the cursor is reset, and the type dispatch that would have chosen an Interact/Attack
+/// cursor never runs. No tooltip, no cursor, no brighten and no click, out of one predicate rather
+/// than four.
+///
+/// **It is a grader, not a filter, and the difference is observable.** A census over the pick itself
+/// (`0x480a50`, `0x480d90`, `0x713cb0`, `0x481190`, `0x480df0`) finds **zero** reads of
+/// `[obj+0x110]`/`[+0xa0]` — positive control: four such reads inside `CanAttack` — so the flagged
+/// unit is registered as a candidate and *wins* the trace before anything looks at it. That is why
+/// the caller records [`Hovered::refused`] and keeps the pick's distance instead of skipping the
+/// candidate: a trigger stalker in front of a chest takes the pick, and the chest behind it must not
+/// inherit the mouseover.
+///
+/// Applied to the **unit** arms only. A corpse reaches `0x482982` too, but slot 21 there is
+/// `CGCorpse_C`'s, not `CGUnit_C`'s — the `xor eax,eax` base stub sits at slot **22** (`+0x58`),
+/// which is what makes a non-unit unselectable for `SetSelection`, and is not what this call goes
+/// through.
+///
+/// A **plate** hover is a deliberate non-case: the reference publishes it straight from
+/// `0x7cb869 call 0x492890` with no grader at all, so a plate on a flagged unit *would* tooltip —
+/// but the per-tick plate gate `0x60f600` refuses the same units one step earlier
+/// (`0x60f622`/`0x60f628`, unconditional, re-run every OnUpdate), which `crate::vplates` already
+/// models. There is no reachable state where the two disagree.
+///
+/// Run at the publish rather than as a system of its own, deliberately. The reference really does
+/// pick and *then* grade, but a second Bevy system means [`Hovered`] is briefly readable in its
+/// ungraded state by anything that forgot to order after `TargetUpdate` — a one-frame tooltip pop
+/// for a unit that must never have one. Written once, already graded, that state does not exist.
+///
+/// wow-re `object-layer/scratch/not-selectable-mouse-refusal.md`; decision 2060.
+#[allow(clippy::type_complexity)] // the picker's own root query, borrowed as-is
+fn selectable_pick(
+    entity: Entity,
+    roots: &Query<
+        (
+            Entity,
+            &GlobalTransform,
+            &NetEntity,
+            Option<&ModelAnimations>,
+            Option<&AnimDriver>,
+            Option<&ObjectStore>,
+            Option<&Children>,
+            Option<&crate::entities::mount::MountChild>,
+            Option<&InheritedVisibility>,
+            Option<&HeldAttached>,
+        ),
+        (With<Guid>, Without<SelfPlayer>),
+    >,
+    self_guid: Option<u64>,
+) -> bool {
+    let store = roots.get(entity).ok().and_then(|r| r.5);
+    super::relations::is_selectable(store, self_guid)
 }
 
 /// Recompute the **GameObject** under the cursor each frame into [`HoveredObject`] (decision 0236):
@@ -467,6 +559,14 @@ pub(super) struct GoPickSet<'w, 's> {
     /// taken as its own `SystemParam` because [`update_hovered_object`] is at Bevy's 16-param
     /// function-system ceiling.
     cards: Query<'w, 's, &'static BillboardCard>,
+    /// The headless probe's frame counter and its say-once report ([`super::hover_probe`], 2250).
+    /// `Local`s: in a player run the probe is unarmed, so these are one `u64` and one `None` that
+    /// nothing ever reads.
+    frame: Local<'s, u64>,
+    report: Local<'s, super::hover_probe::ProbeReport>,
+    /// `WOW_HOVER_PROBE=lock`'s held target (2255) — the object the probe rests its aim on for the
+    /// remainder of the run.
+    lock: Local<'s, super::hover_probe::LockedAim>,
 }
 
 /// The number of `ChildOf` hops [`net_entity_of`] will climb before giving up — a malformed-data
@@ -514,7 +614,27 @@ fn net_entity_of(
     cur
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The state the GameObject gates read beside the object's own store, bundled because this system
+/// sits at Bevy's 16-`SystemParam` ceiling: the ask-once template cache (GENERIC's eligibility is
+/// its `data[1]`, decision 0762; MEETINGSTONE's is its `data[2]`), the faction catalog behind the
+/// eligibility faction term (decision 0764), and the live meeting-stone queue — benilla's
+/// `[0xb72038]`, the other half of MEETINGSTONE(23)'s own highlightable predicate (decision 2283).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct GoGateInputs<'w> {
+    pub(crate) templates: Res<'w, crate::go_templates::GameObjectTemplates>,
+    pub(crate) factions: Option<Res<'w, super::ring::Factions>>,
+    /// `Option` because a headless/net-less build mounts no UI dialog verbs; absent reads as the
+    /// reference's zero-initialized `[0xb72038]`, i.e. not queued.
+    pub(crate) stone: Option<Res<'w, crate::ui_dialog_verbs::MeetingStone>>,
+}
+
+impl GoGateInputs<'_> {
+    /// `[0xb72038]` — the area we are queued at, `0` when we are not (or when there is no VM).
+    pub(crate) fn queued_area(&self) -> u32 {
+        self.stone.as_deref().map_or(0, |s| s.area)
+    }
+}
+
 pub(super) fn update_hovered_object(
     camera: Query<(&Camera, &GlobalTransform), With<WorldCamera>>,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -532,16 +652,16 @@ pub(super) fn update_hovered_object(
     child_of: Query<&ChildOf>,
     guids: Query<&Guid>,
     stores: Query<&ObjectStore>,
-    // GENERIC's eligibility is its template's `data[1]` (decision 0762) — the ask-once cache.
-    go_templates: Res<crate::go_templates::GameObjectTemplates>,
-    // The faction term of eligibility (decision 0764): the GO's own template reaction toward us.
-    factions: Option<Res<super::ring::Factions>>,
+    // The three state reads the GameObject gates need beside the object's own store, as one
+    // param (the 16-`SystemParam` ceiling) — see [`GoGateInputs`].
+    go_gate: GoGateInputs,
     self_q: Query<&ObjectStore, With<crate::net::SelfPlayer>>,
     parts: PickParts,
     // The picker's own state, one bundled param ([`GoPickSet`] — the fn sits at Bevy's
     // 16-param ceiling): the pick-set cache, its stream edges, and the sticky-hover memory.
     mut cache: GoPickSet,
 ) {
+    *cache.frame = cache.frame.wrapping_add(1);
     let added_parts = &cache.added;
     let removed_parts = &mut cache.removed;
     let pickable = &mut *cache.cache;
@@ -579,14 +699,32 @@ pub(super) fn update_hovered_object(
     hovered.target = None;
     hovered.guid = None;
     hovered.distance = f32::MAX;
-    if rig.is_looking() || pointer_over_ui.0 {
+    // The sticky-hover cache drops the moment the pointer is not ours, exactly as before — the
+    // probe's aim below must not change *when* that happens.
+    let yielded = rig.is_looking() || pointer_over_ui.0;
+    if yielded {
         *last_pick = None;
-        return;
     }
     let (Ok((camera, cam_tf)), Ok(window)) = (camera.single(), window.single()) else {
         return;
     };
-    let Some(cursor) = window.cursor_position() else {
+    // The aim. A person's pointer always wins; the probe (2250) answers only for a window that has
+    // no cursor at all, which is every automated run — see [`super::hover_probe`].
+    //
+    // **Resolved and PUBLISHED ahead of the yield below** (2255), because the UI mouse feed reads
+    // the published aim as its pointer: a frame that returned early without publishing would take
+    // the pointer off the UI, drop `PointerOverUi`, and unlatch the very gate that skipped the
+    // pick — the probe would flicker the interface on and off instead of resting on it.
+    let probing = super::hover_probe::armed();
+    let probe_aim = cache
+        .lock
+        .point(camera, cam_tf, |e| parts.get(e).ok().map(|(_, gt, ..)| *gt))
+        .or_else(|| super::hover_probe::point(window, *cache.frame));
+    super::hover_probe::publish(probe_aim);
+    if yielded {
+        return;
+    }
+    let Some(cursor) = window.cursor_position().or(probe_aim) else {
         return;
     };
     if pickable.is_empty() {
@@ -597,6 +735,38 @@ pub(super) fn update_hovered_object(
         return;
     };
     let self_store = self_q.single().ok();
+
+    // The probe's census (2250): once a second, where the pickable GameObjects actually ARE on
+    // screen. Without it a headless "no hit" is unreadable — it cannot tell a pick fault from a
+    // camera that is simply not looking at the thing, which is the single question a person with a
+    // mouse never has to ask.
+    if probing && (*cache.frame).is_multiple_of(60) {
+        let rows: Vec<String> = pickable
+            .iter()
+            .filter_map(|&e| {
+                let (_, gt, vis, ..) = parts.get(e).ok()?;
+                let world = gt.translation();
+                let screen = camera.world_to_viewport(cam_tf, world).ok();
+                Some(format!(
+                    "{:?}{} → {}",
+                    resolve_net(e),
+                    if vis.get() { "" } else { " (unseen)" },
+                    screen.map_or_else(
+                        || "off-camera".to_string(),
+                        |p| format!("{:.0},{:.0}", p.x, p.y)
+                    ),
+                ))
+            })
+            .take(8)
+            .collect();
+        info!(
+            "hover probe census: window {:.0}x{:.0}, {} pickable — {}",
+            window.width(),
+            window.height(),
+            pickable.len(),
+            rows.join(" · ")
+        );
+    }
 
     // Pass 1 — the exact resident geometry, pure nearest-wins (priority-independent).
     let mut best: Option<(f32, Entity)> =
@@ -623,7 +793,7 @@ pub(super) fn update_hovered_object(
                 // permissive default, so a fresh spawn isn't a dead zone for its first frames.
                 stores.get(net).map_or(1, |s| {
                     let reaction = crate::target::cursor_mode::go_reaction(
-                        factions.as_deref(),
+                        go_gate.factions.as_deref(),
                         s.0.gameobject_faction(),
                         self_store,
                     );
@@ -633,7 +803,10 @@ pub(super) fn update_hovered_object(
                             self_store, go_guid,
                         ),
                         meeting_stone_queued: crate::target::cursor_mode::meeting_stone_queued(
-                            go_guid.and_then(|g| go_templates.get(g)?.meeting_stone_area),
+                            go_guid
+                                .and_then(|g| go_gate.templates.get(g)?.meeting_stone)
+                                .map(|m| m.area),
+                            go_gate.queued_area(),
                         ),
                     };
                     u32::from(crate::target::cursor_mode::go_highlightable(
@@ -658,6 +831,12 @@ pub(super) fn update_hovered_object(
     let picked = best.map(|(t, e)| (t, resolve_net(e)));
     *last_pick = picked.map(|(_, net)| net);
     let Some((distance, net_entity)) = picked else {
+        if probing {
+            cache.report.say(format!(
+                "aim {cursor:?} — no GameObject hit (pickable {})",
+                pickable.len()
+            ));
+        }
         return;
     };
     let Ok(guid) = guids.get(net_entity) else {
@@ -675,9 +854,9 @@ pub(super) fn update_hovered_object(
     // than the old behaviour (which tooltipped the portcullis itself) and documented rather than
     // silently accepted; closing it wants the single-pick arbitration, which is its own slice.
     if let Ok(store) = stores.get(net_entity) {
-        let tmpl = go_templates.get(guid.0);
+        let tmpl = go_gate.templates.get(guid.0);
         let reaction = crate::target::cursor_mode::go_reaction(
-            factions.as_deref(),
+            go_gate.factions.as_deref(),
             store.0.gameobject_faction(),
             self_store,
         );
@@ -693,11 +872,44 @@ pub(super) fn update_hovered_object(
                     Some(guid.0),
                 ),
                 meeting_stone_queued: crate::target::cursor_mode::meeting_stone_queued(
-                    tmpl.and_then(|t| t.meeting_stone_area),
+                    tmpl.and_then(|t| t.meeting_stone).map(|m| m.area),
+                    go_gate.queued_area(),
                 ),
             },
         ) {
+            if probing {
+                cache.report.say(format!(
+                    "guid {:#x} type {} at {distance:.1} yd — hover ✗ (tmpl {:?}, highlight {:?}): \
+                     the eligibility gate refused it, so there is no tooltip BY DESIGN",
+                    guid.0,
+                    store.0.gameobject_type_id(),
+                    tmpl.map(|t| t.name.as_str()),
+                    tmpl.map(|t| t.highlight_column),
+                ));
+            }
             return;
+        }
+        if probing {
+            cache.report.say(format!(
+                "guid {:#x} type {} at {distance:.1} yd — hover ✓, published (tmpl {:?}, highlight \
+                 {:?}, occlusion {:.1})",
+                guid.0,
+                store.0.gameobject_type_id(),
+                tmpl.map(|t| t.name.as_str()),
+                tmpl.map(|t| t.highlight_column),
+                occlusion.distance,
+            ));
+            // `lock` takes its target here and nowhere else: past the eligibility gate, so the
+            // probe holds something that actually publishes a mouseover rather than the first
+            // lamp-post the grid grazed. The hit point is re-expressed in the PART's frame so the
+            // aim survives the camera settling and the object moving (see [`LockedAim`]).
+            if super::hover_probe::locks() {
+                if let Some((t, part)) = best {
+                    if let Ok((_, gt, ..)) = parts.get(part) {
+                        cache.lock.hold(part, gt, ray.origin + *ray.direction * t);
+                    }
+                }
+            }
         }
     }
     hovered.target = Some(net_entity);

@@ -49,8 +49,9 @@
 //!    impact tag: the `$AHn` digit block "has zero effect on the victim dispatch", so a beast's
 //!    bite and the parry clang both sound.
 //!
-//! Plus the victim's injury vocal (`Injury`/`InjuryCritical`/`InjuryCrushing`) on every
-//! damaging, undefended hit.
+//! Plus the victim's injury vocal (`Injury`/`InjuryCritical`/`InjuryCrushing`) on a damaging,
+//! undefended hit — the ordinary one **rolled** at the victim's own class-2 threshold, 60 for a
+//! creature and 30 for a player, while a crit and a crushing blow always sound (decision 2073).
 //!
 //! A `text_only` flush (supersede/attack-stop) drops its sounds — only the floating number
 //! flushes (decision 0149's flush law, inherited from the shared dispatch).
@@ -138,7 +139,8 @@ use benilla_world::schedule::WorldStage;
 use super::creature::CreatureVoices;
 use super::kit::{
     bark_chance_pass, object_sound_playing, play_kit_ext, Bus, KitRef, PlayExtras, SoundCategory,
-    SoundKits, Volume, EXERTION_CHANCE_CREATURE, EXERTION_CHANCE_PLAYER,
+    SoundKits, Volume, EXERTION_CHANCE_CREATURE, EXERTION_CHANCE_PLAYER, INJURY_CHANCE_CREATURE,
+    INJURY_CHANCE_PLAYER,
 };
 use super::{AudioListener, SoundConfig, SoundOutput};
 
@@ -257,7 +259,15 @@ fn swing_weapon(
     offhand: bool,
     materials: Option<&benilla_formats::MaterialCatalog>,
 ) -> (u32, bool) {
-    let hand = wielded.and_then(|w| if offhand { w.off } else { w.main });
+    // `0x625400`/`0x625460` pass `visFlag = 0`, so a disarmed hand's weapon is not here to be
+    // heard either — the punch a disarmed unit throws must not clang like a sword (1863).
+    let hand = wielded.and_then(|w| {
+        if offhand {
+            w.armed_off()
+        } else {
+            w.armed_main()
+        }
+    });
     match hand {
         // class 2 = weapon; anything else in hand (held misc) swings as unarmed.
         Some((2, subclass)) => {
@@ -328,7 +338,15 @@ fn swing_weight(
     offhand: bool,
     sub_classes: &benilla_formats::ItemSubClassCatalog,
 ) -> Option<u32> {
-    match wielded.and_then(|w| if offhand { w.off } else { w.main }) {
+    // `0x623870`, `visFlag = 0` again: the disarmed hand whooshes with the small unarmed
+    // samples, by this function's own empty-hand leg (1863).
+    match wielded.and_then(|w| {
+        if offhand {
+            w.armed_off()
+        } else {
+            w.armed_main()
+        }
+    }) {
         None => Some(0),
         Some((class, subclass)) if u32::from(class) == ITEM_CLASS_WEAPON => {
             sub_classes.weapon_swing_size(ITEM_CLASS_WEAPON, u32::from(subclass))
@@ -362,12 +380,14 @@ fn defended(victim_state: u32) -> bool {
 /// (`0x623690 test eax,eax; je`), which is what an unarmed parry sounds like.
 fn defending_item(wielded: Option<&Wielded>, block: bool) -> Option<(u8, u8)> {
     let w = wielded?;
+    // Both probes are `0x625400(sel)` with `visFlag = 0` (1863): a disarmed parry finds no
+    // mainhand weapon and falls through, and an unarmed parry rings nothing at all.
     if !block {
-        if let Some((2, _)) = w.main {
+        if let Some((2, _)) = w.armed_main() {
             return Some((2, w.materials[0]));
         }
     }
-    let (class, _) = w.off?;
+    let (class, _) = w.armed_off()?;
     matches!(class, 2 | 4).then_some((class, w.materials[1]))
 }
 
@@ -422,6 +442,9 @@ type CombatUnit = (
 /// parameter ceiling — and because they are one thing: the melee sound vocabulary. Each is
 /// independently optional, like every DBC-backed resource here; absent, its own branch goes
 /// quiet rather than the system failing.
+/// The attachment a **whiffed** swing's whoosh is born at — `0x624bdd call 0x712cb0(1)`.
+const MISS_ATTACH: u16 = 1;
+
 #[derive(bevy::ecs::system::SystemParam)]
 struct MeleeTables<'w> {
     impacts: Option<Res<'w, WeaponImpacts>>,
@@ -434,7 +457,6 @@ struct MeleeTables<'w> {
     voices: Option<Res<'w, CreatureVoices>>,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn combat_sounds(
     mut swings: MessageReader<SwingMessage>,
     mut contacts: MessageReader<SwingImpact>,
@@ -442,6 +464,7 @@ fn combat_sounds(
     mut last: Local<LastSwing>,
     units: Query<CombatUnit>,
     tables: MeleeTables,
+    attach: crate::entities::AttachPoints,
     mut items: Option<ResMut<crate::items::Items>>,
     net_commands: Res<crate::net::NetCommands>,
     kits: Option<ResMut<SoundKits>>,
@@ -580,11 +603,16 @@ fn combat_sounds(
             } else {
                 COMBAT_MISS_1H
             };
+            // **ATTACHMENT 1, not the fired key** — the one place in the whole event-position
+            // table where a *whiff* and a *hit* of the same tag disagree (`0x624baa`:
+            // `0x624bdd call 0x712cb0(1)`, else `GetPosition`). The whoosh comes from the hand,
+            // the impact from where the weapon met something.
+            let at = attach.point(ev.entity, MISS_ATTACH, attacker_tr.translation);
             play(
                 &mut kits,
                 &mut out,
                 kit,
-                attacker_tr.translation,
+                at,
                 PlayExtras {
                     bus: Bus::DEFAULT,
                     ..default()
@@ -608,7 +636,10 @@ fn combat_sounds(
             &mut kits,
             &mut out,
             kit,
-            attacker_tr.translation,
+            // **EVENT POINT** — `0x624c6e mov ecx,[ebx+0x10]` straight into `0x457f60`, which
+            // pushes it through to `0x458890`. 353 of the 363 shipped `$CSS` records sit off
+            // their model's origin, on a moving bone; Thunderaan's is 26.4 yd out.
+            ev.pos.unwrap_or(attacker_tr.translation),
             PlayExtras {
                 bus: Bus::WEAPON_SWING,
                 // `0x457f74`/`0x457f7d`: half volume when the hit flags carry `HITINFO_MISS`,
@@ -634,10 +665,15 @@ fn combat_sounds(
         let swing = &imp.swing;
         let attacker = units.get(swing.attacker).ok();
         let victim = swing.victim.and_then(|v| units.get(v).ok());
-        // Positioned at the attacker; the receive-time fallback (unresolved attacker) emits at
-        // the victim — the only anchor the packet leaves us.
-        let Some(pos) = attacker
-            .map(|(t, ..)| t.translation)
+        // **The fired tag's own point** (`edi = [ebx+0x10]`, pushed at `0x6248ef` for the
+        // CustomAttack column and `0x624950` for the generic weapon impact — wow-re
+        // `anim-event-position-law.md` §3). A big creature's `$AH1` sits 4.7 yd out on the jaw
+        // (`trex.m2`) and Thunderaan's `$CAH` 26.4 yd out; the attacker's origin was standing in
+        // for both. The receive-time fallback carries no point — no tag fired — so it keeps the
+        // attacker, then the victim, which is the only anchor that packet leaves us.
+        let Some(pos) = imp
+            .pos
+            .or_else(|| attacker.map(|(t, ..)| t.translation))
             .or_else(|| victim.map(|(t, ..)| t.translation))
         else {
             continue;
@@ -794,27 +830,49 @@ fn combat_sounds(
             && swing.hit_info & HITINFO_ABSORB_OR_RESIST == 0
             && !matches!(swing.victim_state, VICTIM_PARRY | VICTIM_BLOCK)
         {
+            // The vocal's **class**, which decides both gates below: crushing `0x8000` → 9,
+            // else critical `0x80` → 3, else 2 (`0x62462c`/`0x624649`/`0x624666`).
+            let crushing = swing.hit_info & HITINFO_CRUSHING != 0;
             // The `AISOUNDDESC` gate (`0x4591f0` from `0x6234cb`): a server-pushed object sound
-            // live on the victim suppresses its own vocal, classes 0-3 and 8. The CGPlayer twin
+            // live on the victim suppresses its own vocal — **classes 0-3 and 8 only**
+            // (`0x6234bb`/`0x6234bf`/`0x6234c4`), so a CRUSHING blow's class 9 punches through a
+            // scripted voice line where an ordinary hit and a crit do not. The CGPlayer twin
             // `0x62f880` omits the gate, so a player is never suppressed. Filtered off the victim
             // rather than `continue`d, because everything else in this iteration still stands.
             let vocal_victim = victim.filter(|(_, _, net, ..)| {
-                net.kind == EntityKind::Player
+                crushing
+                    || net.kind == EntityKind::Player
                     || !swing.victim.is_some_and(|v| object_sound_playing(&out, v))
             });
             if let Some((victim_tr, _, net, victim_is_you, _)) = vocal_victim {
-                let crushing = swing.hit_info & HITINFO_CRUSHING != 0;
+                // The class chance roll (decision 2073), inside the victim's own `[vt+0x88]` and
+                // therefore keyed on the VICTIM's type: class 2 is 60 for a creature and 30 for a
+                // player, while classes 3 and 9 carry 100 and always sound. So an ordinary wound
+                // grunt thins out under sustained melee and the big hits punch through it.
+                if !crushing && !crit {
+                    let threshold = if net.kind == EntityKind::Player {
+                        INJURY_CHANCE_PLAYER
+                    } else {
+                        INJURY_CHANCE_CREATURE
+                    };
+                    if !bark_chance_pass(threshold, kits.roll()) {
+                        continue;
+                    }
+                }
+                // **A zero column plays NOTHING** (decision 2075). benilla used to walk down the
+                // family here — crushing → critical → ordinary — on the reasoning that "crushing
+                // rows are often 0 in data"; they are, and the reference is simply silent for
+                // them. `0x623490` tests the selected id exactly once (`0x6234e6 test ebx,ebx ;
+                // 0x6234e8 je 0x62350e`, the shared epilogue), and no fallback is even reachable:
+                // the row pointer dies at `0x6234e4`, so neither the bus pick `0x623b10` (which
+                // takes the category) nor the play `0x458890` (bus, kit, &pos) ever sees the row
+                // to re-read a column from. The CGPlayer twin `0x62f880` is identical
+                // (`0x62f8be`/`0x62f8c3`). wow-re
+                // `object-layer/scratch/wound-parry-gate-and-injury-vocal.md` §13.
                 let vocal = net
                     .display_id
                     .and_then(|d| voices.0.for_display(d))
-                    .map(|v| {
-                        let idx = if crushing { 2 } else { usize::from(crit) };
-                        // Crushing rows are often 0 in data — fall back down the family.
-                        [v.injury[idx], v.injury[usize::from(crit)], v.injury[0]]
-                            .into_iter()
-                            .find(|k| *k != 0)
-                            .unwrap_or(0)
-                    })
+                    .map(|v| v.injury[if crushing { 2 } else { usize::from(crit) }])
                     .unwrap_or(0);
                 // Your own wounds get the CGPlayer twin's private bus 8 (cap 1); everyone
                 // else's share the world's bus 7 (cap 2).

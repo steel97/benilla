@@ -10,8 +10,12 @@
 //!   selection is native and *synchronous* — `QuestLogTitleButton_OnClick` calls
 //!   `SelectQuestLogEntry(i)` then immediately re-reads `GetQuestLogSelection()` in the same click
 //!   (ref `QuestLogFrame.lua:318,308-346`); a drain-next-frame intent would read stale. The app
-//!   reads it back each frame ([`super::UiScript::quest_log_selection`]) and pushes the matching
-//!   detail; the refresh lands as a `QUEST_LOG_UPDATE` event, exactly like the ref's async data.
+//!   reads it back each frame ([`super::UiScript::quest_log_selection`]) only to RE-POINT it across
+//!   a rebuild. The **detail that selection names is resolved at call time**, off the row's own
+//!   [`QuestLogEntryView::detail`] — never from a selection baked into the push (decision 2247).
+//!   The reference's detail bindings peek its quest cache inside the same call, so
+//!   `SelectQuestLogEntry(i)` immediately changes what `GetQuestLogQuestText()` answers; resolving
+//!   one detail per push instead made a whole log walk answer with a single row's text.
 //! - **The abandon mark** (`SetAbandonQuest`/`GetAbandonQuestName`/`AbandonQuest`) — the ref's
 //!   two-step confirm (mark on button click, act on the popup's Yes — ref `QuestLogFrame.xml:463-472`,
 //!   `StaticPopup.lua:749-761`). The mark pins the *entry index at click time* so a log shuffle
@@ -39,6 +43,7 @@
 
 use mlua::{Lua, MultiValue, Value};
 
+use super::binding_abi::{flag, number_arg};
 use super::quest::QuestItemView;
 use super::Model;
 
@@ -55,8 +60,15 @@ pub struct QuestLogEntryView {
     pub title: String,
     /// The quest's display level (`GetQuestLogTitle` return 2; the ref colors the row by it).
     pub level: u32,
-    /// The quest tag suffix (elite/dungeon/…) — `None` for a plain quest. v1 pushes `None`
-    /// (the 1.12 wire's giver panels carry no tag; a template-derived tag is a later dressing).
+    /// The quest tag suffix — the bare word, no parentheses: `Elite`, `Dungeon`, `Raid`, `PvP`,
+    /// `Life`, `World Event`, `Legendary`. `None` for a plain quest, which is most of them, and
+    /// always `None` on a header row. The app resolves it from the cached
+    /// `SMSG_QUEST_QUERY_RESPONSE` template's `Type` through `QuestInfo.dbc`
+    /// ([`benilla_formats::QuestTagNames`]); `Type` 0 names no row and takes no tag.
+    ///
+    /// `None`, never `Some("")` — the reference's row Lua branches on the tag's PRESENCE
+    /// (`if ( questTag )`, ref `QuestLogFrame.lua:194`) to decide whether to shrink the title and
+    /// reseat the watch check, so an empty string would take the wrong branch.
     pub tag: Option<String>,
     /// A zone header row (the app synthesizes these from each quest's ZoneOrSort).
     pub is_header: bool,
@@ -88,6 +100,15 @@ pub struct QuestLogEntryView {
     /// [`QuestLogDetail`] carries only what exists for the selection alone
     /// (description/rewards/money).
     pub objectives: Vec<QuestLogObjectiveView>,
+    /// This row's detail pane — description, money, rewards, reward spell. **Per row, not per
+    /// selection** (decision 2247): the reference's detail bindings read `ds:0xbb7480` (what
+    /// `SelectQuestLogEntry 0x4dfae0` wrote, synchronously) and then PEEK the quest cache in the
+    /// same call (`0x4e1130` -> `0xc0e1b0`/`0x562a40`, wow-re `ui/ledger.tsv`), so a
+    /// select-then-read pair inside ONE frame answers about the row just selected. Carrying one
+    /// detail for "the selection" instead made `SelectQuestLogEntry` inert until the next push:
+    /// every entry of an addon's log walk answered with whichever row the snapshot happened to be
+    /// built against. `None` on a header row.
+    pub detail: Option<QuestLogDetail>,
 }
 
 /// One objective ("leaderboard") line of the selected quest — the `GetQuestLogLeaderBoard` tuple.
@@ -129,6 +150,9 @@ pub struct QuestLogDetail {
     pub choices: Vec<QuestItemView>,
     /// Fixed rewards (`GetNumQuestLogRewards`/`GetQuestLogRewardInfo`).
     pub rewards: Vec<QuestLogQuestItem>,
+    /// The selected quest's reward spell (`rewSpell` on `SMSG_QUEST_QUERY_RESPONSE`), as
+    /// `GetQuestLogRewardSpell` answers it.
+    pub reward_spell: Option<super::quest::QuestRewardSpell>,
 }
 
 /// A quest-log reward row is the same shape as a questgiver panel row.
@@ -144,9 +168,6 @@ pub struct QuestLogState {
     /// The total quest count INCLUDING quests hidden under collapsed headers — the "Quests: N/20"
     /// pill must not shrink when a header collapses (`GetNumQuestLogEntries` return 2).
     pub num_quests: u32,
-    /// The detail pane for the current selection (`None` = nothing selected, selection out of
-    /// range, or the template still in flight).
-    pub detail: Option<QuestLogDetail>,
 }
 
 impl super::UiScript {
@@ -286,19 +307,40 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // GetQuestLogTitle(i) → title, level, tag, isHeader, isCollapsed, isComplete
-    // (the load-bearing 6-tuple — ref QuestLogFrame.lua:144/:272/:321/:571). Out of range → nil.
-    // isCollapsed is always false (no headers in v1); isComplete is 1 / -1 / nil.
+    // (the load-bearing 6-tuple — ref QuestLogFrame.lua:144/:272/:321/:571).
+    // `tag` is the bare word (`Elite`, `Raid`, …) or nil — the ref's Lua wraps it in the
+    // parentheses itself (`"("..questTag..")"`, ref l.195). isComplete is 1 / -1 / nil.
+    //
+    // **The arity is always SIX, and the two failure shapes are different** (wow-re
+    // `ui/scratch/questlog-title-tag.md`, §5-verified at `0x4df930`): a MISSING or non-number
+    // argument raises `Usage:` (shape A — [`number_arg`], truncating toward zero like the
+    // reference's `_ftol`), while an out-of-range NUMBER is not an error at all — it returns
+    // `nil, 0, nil, nil, nil, nil` off `mov eax,6` at all three exits. Return 2 is the NUMBER
+    // `0` there, never nil, and it is `0` for a header row too. We used to answer a single
+    // `Nil` for both, which reads the same through the reference's own
+    // `local t, l, … = GetQuestLogTitle(i)` (Lua pads with nil) but hands an addon doing
+    // arithmetic on the level a nil where the client gives it a zero.
     g.set(
         "GetQuestLogTitle",
-        lua.create_function(|lua, i: usize| {
+        lua.create_function(|lua, i: Value| {
+            let n = number_arg(lua, i, "Usage: GetQuestLogTitle(index)")?;
             let entry = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                i.checked_sub(1)
+                usize::try_from(n)
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
                     .and_then(|n| model.quest_log.entries.get(n))
                     .cloned()
             };
             let Some(e) = entry else {
-                return Ok(MultiValue::from_vec(vec![Value::Nil]));
+                return Ok(MultiValue::from_vec(vec![
+                    Value::Nil,
+                    Value::Integer(0),
+                    Value::Nil,
+                    Value::Nil,
+                    Value::Nil,
+                    Value::Nil,
+                ]));
             };
             let tag = match &e.tag {
                 Some(t) => Value::String(lua.create_string(t)?),
@@ -308,12 +350,20 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 0 => Value::Nil,
                 c => Value::Integer(i64::from(c.signum())),
             };
+            // **Returns 4 and 5 are `1`/`nil`, NOT booleans** (wow-re
+            // `ui/scratch/questlog-title-tag.md` §7's table): `isHeader` is `1` on a header row
+            // and `nil` on a quest; `isCollapsed` is `1` only for a header whose bit in
+            // `[0xbb748c]` is clear — a quest row and an EXPANDED header both answer `nil`. We
+            // pushed `true`/`false`, which every `if ( isHeader )` in FrameXML reads the same and
+            // which `isHeader == false` or a `type()` test does not. The two are one expression
+            // here because `collapsed` is meaningless off a header (the field's own doc).
+            let flag = |b: bool| if b { Value::Integer(1) } else { Value::Nil };
             Ok(MultiValue::from_vec(vec![
                 Value::String(lua.create_string(&e.title)?),
                 Value::Integer(i64::from(e.level)),
                 tag,
-                Value::Boolean(e.is_header),
-                Value::Boolean(e.collapsed),
+                flag(e.is_header),
+                flag(e.is_header && e.collapsed),
                 complete,
             ]))
         })?,
@@ -346,9 +396,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let (desc, obj) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 model
-                    .quest_log
-                    .detail
-                    .as_ref()
+                    .selected_quest_detail()
                     .map(|d| (d.description.clone(), d.objectives_text.clone()))
                     .unwrap_or_default()
             };
@@ -409,7 +457,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             name,
             lua.create_function(move |lua, ()| {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                Ok(model.quest_log.detail.as_ref().map(pick).unwrap_or(0))
+                Ok(model.selected_quest_detail().map(pick).unwrap_or(0))
             })?,
         )
     }
@@ -434,9 +482,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 let item = {
                     let model = lua.app_data_ref::<Model>().expect("model app_data");
                     model
-                        .quest_log
-                        .detail
-                        .as_ref()
+                        .selected_quest_detail()
                         .and_then(|d| i.checked_sub(1).and_then(|n| pick(d).get(n)).cloned())
                 };
                 let Some(it) = item else {
@@ -478,7 +524,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, (kind, index): (String, usize)| {
             let link = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model.quest_log.detail.as_ref().and_then(|d| {
+                model.selected_quest_detail().and_then(|d| {
                     let v = match kind.as_str() {
                         "choice" => &d.choices,
                         "reward" => &d.rewards,
@@ -497,16 +543,18 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // IsCurrentQuestFailed() → the selection's slot state is FAIL (ref appends " - (Failed)").
+    // IsCurrentQuestFailed() → 1/nil: the selection's slot state is FAIL (ref appends
+    // " - (Failed)").
     g.set(
         "IsCurrentQuestFailed",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let sel = model.quest_log_selection as usize;
-            Ok(sel
-                .checked_sub(1)
-                .and_then(|n| model.quest_log.entries.get(n))
-                .is_some_and(|e| e.complete < 0))
+            Ok(flag(
+                sel.checked_sub(1)
+                    .and_then(|n| model.quest_log.entries.get(n))
+                    .is_some_and(|e| e.complete < 0),
+            ))
         })?,
     )?;
 
@@ -650,15 +698,23 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // ── v1 stubs (each the seam of a named later slice — see the module doc) ─────────────────────
+    // GetQuestLogRewardSpell() → texture, name, isTradeskillSpell (0x4e1130): the selected
+    // quest's reward spell, three nils when it has none.
     g.set(
         "GetQuestLogRewardSpell",
-        // THREE values on every reachable path, and the reference's own kinds include
-        // `(nil,nil,nil)` — so the empty answer is three nils, not one (decision 1842).
-        lua.create_function(|_, ()| Ok((Value::Nil, Value::Nil, Value::Nil)))?,
+        lua.create_function(|lua, ()| {
+            let spell = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                model
+                    .selected_quest_detail()
+                    .and_then(|d| d.reward_spell.clone())
+            };
+            super::quest::reward_spell_returns(lua, spell)
+        })?,
     )?;
     g.set(
         "IsUnitOnQuest",
-        lua.create_function(|_, (_q, _unit): (Value, Value)| Ok(false))?,
+        lua.create_function(|_, (_q, _unit): (Value, Value)| Ok(flag(false)))?,
     )?;
     // ── The quest watch (the on-screen tracker's state — ref QuestLogFrame.lua:469-505 shift-click
     // toggle, :613-663 QuestWatch_Update). The set lives engine-side, keyed by the entries' stable
@@ -732,7 +788,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "IsQuestWatched",
         lua.create_function(|lua, i: u32| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(watch_id_at(&model, i).is_some_and(|id| model.quest_log_watched.contains(&id)))
+            Ok(flag(
+                watch_id_at(&model, i).is_some_and(|id| model.quest_log_watched.contains(&id)),
+            ))
         })?,
     )?;
     g.set(
@@ -805,6 +863,23 @@ mod tests {
                         cur: 3,
                         req: 10,
                     }],
+                    detail: Some(QuestLogDetail {
+                        description: "Speak with Marshal McBride.".into(),
+                        objectives_text: "Report to Marshal McBride.".into(),
+                        required_money: 0,
+                        reward_money: 40,
+                        choices: vec![],
+                        rewards: vec![QuestItemView {
+                            item_id: 2024,
+                            name: Some("Militia Hammer".into()),
+                            texture: None,
+                            count: 1,
+                            quality: 1,
+                            usable: true,
+                            link: Some("|cffffffff|Hitem:2024:0:0:0|h[Militia Hammer]|h|r".into()),
+                        }],
+                        reward_spell: None,
+                    }),
                     ..Default::default()
                 },
                 QuestLogEntryView {
@@ -819,25 +894,18 @@ mod tests {
                         cur: 10,
                         req: 10,
                     }],
+                    detail: Some(QuestLogDetail {
+                        description: "The kobolds have overrun the camp.".into(),
+                        objectives_text: "Kill 10 Kobold Vermin.".into(),
+                        required_money: 0,
+                        reward_money: 250,
+                        choices: vec![],
+                        rewards: vec![],
+                        reward_spell: None,
+                    }),
                     ..Default::default()
                 },
             ],
-            detail: Some(QuestLogDetail {
-                description: "Speak with Marshal McBride.".into(),
-                objectives_text: "Report to Marshal McBride.".into(),
-                required_money: 0,
-                reward_money: 40,
-                choices: vec![],
-                rewards: vec![QuestItemView {
-                    item_id: 2024,
-                    name: Some("Militia Hammer".into()),
-                    texture: None,
-                    count: 1,
-                    quality: 1,
-                    usable: true,
-                    link: Some("|cffffffff|Hitem:2024:0:0:0|h[Militia Hammer]|h|r".into()),
-                }],
-            }),
         }
     }
 
@@ -863,7 +931,7 @@ mod tests {
             .eval::<bool>(
                 "local t, l, tag, h, c, done = GetQuestLogTitle(1)\n\
                  return t == 'A Threat Within' and l == 1 and tag == nil\n\
-                    and h == false and c == false and done == nil"
+                    and h == nil and c == nil and done == nil"
             )
             .unwrap());
         assert!(s
@@ -871,6 +939,112 @@ mod tests {
                 "local t, _, _, _, _, done = GetQuestLogTitle(2)\n\
                  return t == 'Kobold Camp Cleanup' and done == 1"
             )
+            .unwrap());
+    }
+
+    /// The §5-verified arity contract (wow-re `ui/scratch/questlog-title-tag.md`, `0x4df930`):
+    /// six values ALWAYS, an out-of-range number is not an error, and return 2 is the number `0`
+    /// — while a missing or non-number argument raises `Usage:`.
+    #[test]
+    fn out_of_range_is_six_values_with_a_zero_level_and_a_bad_arg_raises() {
+        let mut s = UiScript::new().unwrap();
+        // Empty log: the first return is still nil (so the ref's `if ( questLogTitleText )`
+        // reads the same), but the tuple is full and the level is a NUMBER.
+        assert_eq!(s.arity("GetQuestLogTitle(1)").unwrap(), 6);
+        assert!(s
+            .eval::<bool>("local t, l = GetQuestLogTitle(1) return t == nil and l == 0")
+            .unwrap());
+
+        s.set_quest_log(two_quests());
+        // Index 0 and a negative index are out of range, not errors — same six values.
+        for i in ["0", "-1", "99"] {
+            assert!(
+                s.eval::<bool>(&format!(
+                    "local t, l = GetQuestLogTitle({i}) return t == nil and l == 0"
+                ))
+                .unwrap(),
+                "index {i} is out of range, not an error"
+            );
+        }
+        // `_ftol` truncates toward zero, so 1.9 addresses entry 1.
+        assert!(s
+            .eval::<bool>("return GetQuestLogTitle(1.9) == 'A Threat Within'")
+            .unwrap());
+
+        // A missing / non-number argument is the other shape.
+        for bad in ["", "nil", "{}", "print"] {
+            let e = format!(
+                "{:?}",
+                s.eval::<mlua::Value>(&format!("return GetQuestLogTitle({bad})"))
+                    .unwrap_err()
+            );
+            assert!(
+                e.contains("Usage: GetQuestLogTitle(index)"),
+                "arg `{bad}` must raise Usage:, got {e}"
+            );
+        }
+    }
+
+    /// §7's table for returns 4 and 5: `1` on a header, `nil` on a quest; `isCollapsed` is `1`
+    /// only for a COLLAPSED header — an expanded one and every quest row answer `nil`.
+    #[test]
+    fn is_header_and_is_collapsed_are_one_or_nil_never_booleans() {
+        let mut s = UiScript::new().unwrap();
+        let mut state = two_quests();
+        state.entries.insert(
+            0,
+            QuestLogEntryView {
+                title: "Elwynn Forest".into(),
+                is_header: true,
+                collapsed: true,
+                ..Default::default()
+            },
+        );
+        state.entries.insert(
+            1,
+            QuestLogEntryView {
+                title: "Westfall".into(),
+                is_header: true,
+                collapsed: false,
+                ..Default::default()
+            },
+        );
+        s.set_quest_log(state);
+
+        // A collapsed header: both flags are the number 1.
+        assert!(s
+            .eval::<bool>(
+                "local _, l, _, h, c = GetQuestLogTitle(1) return h == 1 and c == 1 and l == 0"
+            )
+            .unwrap());
+        // An EXPANDED header: isHeader 1, isCollapsed nil.
+        assert!(s
+            .eval::<bool>("local _, _, _, h, c = GetQuestLogTitle(2) return h == 1 and c == nil")
+            .unwrap());
+        // A quest row: both nil — and `false` would be wrong, so pin the type too.
+        assert!(s
+            .eval::<bool>(
+                "local _, _, _, h, c = GetQuestLogTitle(3)\n\
+                 return h == nil and c == nil and type(h) ~= 'boolean'"
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn tag_is_the_bare_word_and_nil_when_absent() {
+        // The third return is the BARE word — the ref's own Lua adds the parentheses
+        // (`"("..questTag..")"`, ref QuestLogFrame.lua:195), so pushing "(Elite)" here would
+        // paint "((Elite))". An untagged quest pushes nil, not "", because the ref branches on
+        // presence (`if ( questTag )`, ref l.194).
+        let mut s = UiScript::new().unwrap();
+        let mut state = two_quests();
+        state.entries[1].tag = Some("Elite".into());
+        s.set_quest_log(state);
+        assert!(s
+            .eval::<bool>("local _, _, tag = GetQuestLogTitle(1) return tag == nil")
+            .unwrap());
+        assert!(s
+            .eval::<bool>("local _, _, tag = GetQuestLogTitle(2) return tag == 'Elite'")
             .unwrap());
     }
 
@@ -886,6 +1060,78 @@ mod tests {
             2
         );
         assert_eq!(s.quest_log_selection(), 2);
+    }
+
+    /// **The bug decision 2247 fixes, in the shape every addon hits it.** The classic quest-log
+    /// walk — `SelectQuestLogEntry(i)` then `GetQuestLogQuestText()`, once per entry, all inside
+    /// ONE frame with no push between — must answer about the row just selected. It used to answer
+    /// with whichever row the snapshot had been built against, for every entry: Questie 3.7.1 fed
+    /// that text to its `getQuestHash` Levenshtein match and wrote the WRONG same-name chain step
+    /// into a character's saved history (two of the director's Tirisfal quests, both resolved to
+    /// the shortest sibling — the signature of matching against an unrelated string).
+    #[test]
+    fn a_log_walk_answers_per_entry_without_a_push_between() {
+        let mut s = UiScript::new().unwrap();
+        s.set_quest_log(two_quests());
+        let walk: String = s
+            .eval(
+                "local out = ''\n\
+                 for i = 1, GetNumQuestLogEntries() do\n\
+                   SelectQuestLogEntry(i)\n\
+                   local desc, obj = GetQuestLogQuestText()\n\
+                   out = out .. i .. '=' .. desc .. '|'\n\
+                 end\n\
+                 return out",
+            )
+            .unwrap();
+        assert_eq!(
+            walk, "1=Speak with Marshal McBride.|2=The kobolds have overrun the camp.|",
+            "each entry must answer with its OWN detail inside a single frame"
+        );
+    }
+
+    /// The same seam for the money/reward getters, which read the detail through their own path.
+    #[test]
+    fn the_detail_counts_follow_the_selection_too() {
+        let mut s = UiScript::new().unwrap();
+        s.set_quest_log(two_quests());
+        assert_eq!(
+            s.eval::<i64>("SelectQuestLogEntry(1); return GetQuestLogRewardMoney()")
+                .unwrap(),
+            40
+        );
+        assert_eq!(
+            s.eval::<i64>("SelectQuestLogEntry(2); return GetQuestLogRewardMoney()")
+                .unwrap(),
+            250
+        );
+        assert_eq!(
+            s.eval::<i64>("SelectQuestLogEntry(2); return GetNumQuestLogRewards()")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A header row has no quest under it, so its detail reads as nothing at all rather than as
+    /// the previous selection's — the same staleness, one row over.
+    #[test]
+    fn a_header_selection_has_no_detail() {
+        let mut s = UiScript::new().unwrap();
+        let mut state = two_quests();
+        state.entries.insert(
+            0,
+            QuestLogEntryView {
+                title: "Elwynn Forest".into(),
+                is_header: true,
+                ..Default::default()
+            },
+        );
+        s.set_quest_log(state);
+        assert!(s
+            .eval::<bool>(
+                "SelectQuestLogEntry(1); local d = GetQuestLogQuestText(); return d == ''"
+            )
+            .unwrap());
     }
 
     #[test]
@@ -1036,23 +1282,15 @@ mod tests {
         s.set_quest_log(state);
 
         // No clock sample yet: nothing to subtract from, so nothing is claimed.
-        assert_eq!(
-            s.eval::<i64>("return select('#', GetQuestTimers())")
-                .unwrap(),
-            0
-        );
+        assert_eq!(s.arity("GetQuestTimers()").unwrap(), 0);
         assert!(s
             .eval::<bool>("return GetQuestLogTimeLeft() == nil")
             .unwrap());
 
         // 400 s in.
         s.set_server_unix_time(1_000_400.0);
-        assert!(s
-            .eval::<bool>(
-                "local n, a = select('#', GetQuestTimers()), GetQuestTimers()\n\
-                 return n == 1 and a == 499"
-            )
-            .unwrap());
+        assert_eq!(s.arity("GetQuestTimers()").unwrap(), 1);
+        assert_eq!(s.eval::<i64>("return (GetQuestTimers())").unwrap(), 499);
         // The timer maps back to entry 2 — the untimed row 1 does not shift the mapping.
         assert_eq!(s.eval::<i64>("return GetQuestIndexForTimer(1)").unwrap(), 2);
         assert!(s
@@ -1080,11 +1318,7 @@ mod tests {
         // the row (its `js`), while GetQuestLogTimeLeft clamps at 0 and keeps answering.
         s.set_server_unix_time(1_000_910.0);
         assert_eq!(s.eval::<i64>("return GetQuestLogTimeLeft()").unwrap(), 0);
-        assert_eq!(
-            s.eval::<i64>("return select('#', GetQuestTimers())")
-                .unwrap(),
-            0
-        );
+        assert_eq!(s.arity("GetQuestTimers()").unwrap(), 0);
         assert!(s
             .eval::<bool>("return GetQuestIndexForTimer(1) == nil")
             .unwrap());
@@ -1103,12 +1337,8 @@ mod tests {
         s.set_quest_log(state);
         s.set_server_unix_time(1_000_400.0);
 
-        assert!(s
-            .eval::<bool>(
-                "local n, a = select('#', GetQuestTimers()), GetQuestTimers()\n\
-                 return n == 1 and a == 499"
-            )
-            .unwrap());
+        assert_eq!(s.arity("GetQuestTimers()").unwrap(), 1);
+        assert_eq!(s.eval::<i64>("return (GetQuestTimers())").unwrap(), 499);
         assert_eq!(s.eval::<i64>("return GetQuestIndexForTimer(1)").unwrap(), 1);
         s.run("SelectQuestLogEntry(2)").unwrap();
         assert!(s

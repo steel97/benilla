@@ -38,9 +38,12 @@
 //!
 //! At character select no addon has been *loaded* — `load_third_party` is a world-entry step
 //! (1191 §2) — so `GetNumAddOns()` would answer 0. The screen asks
-//! [`crate::ui_script::addons::installed`] instead: the same discovery, the same manifest parser,
-//! the same enable files. Two views of one folder, never two folders. With the dropdown that read
-//! happens **once per roster character at open** ([`AddonsPanel::open_for`]).
+//! [`crate::ui_script::addons::installed_rows`] instead, and resolves the enable bits through
+//! [`crate::ui_script::addons::EnableStore`] exactly as the world-entry walk does: the same
+//! discovery, the same manifest parser, the same store. Two views of one folder, never two
+//! folders. Both reads happen **once at open** ([`AddonsPanel::open_for`]) — the folder walk used
+//! to run once per roster character, which decision 2311 retired along with the per-character
+//! `installed()` it was there to feed.
 
 use bevy::prelude::*;
 use bevy::ui_render::ui_material::MaterialNode;
@@ -224,39 +227,34 @@ impl Default for AddonsPanel {
 }
 
 impl AddonsPanel {
-    /// Open for this realm's roster, reading the folder fresh — once per character, so each
-    /// staged column is that character's own enable file applied to one shared list. The
-    /// reference's `AddonList_OnShow` also re-reads (`AddonList_Update`), so a folder that
-    /// changed under us is picked up.
+    /// Open for this realm's roster: the folder read **once** into one metadata list, and one
+    /// staged column per character off the enable store. The reference's `AddonList_OnShow` also
+    /// re-reads (`AddonList_Update`), so a folder that changed under us is picked up.
+    ///
+    /// **The store is loaded for the whole roster, not per character** (decision 2311). A column
+    /// is not "that character's file, everything else enabled": an addon the character has no row
+    /// for takes what the realm's *other* characters agree on, and only falls to the manifest's
+    /// `## DefaultState` when they disagree or nobody has said anything. Reading it the other way
+    /// is what made a newly created character re-enable every addon in the All view — its
+    /// all-enabled column turned every disabled row Mixed, and Mixed reads as on.
     pub(super) fn open_for(&mut self, realm: String, chars: Vec<String>) {
-        self.list.clear();
+        self.list = addons::installed_rows();
         self.staged.clear();
-        if chars.is_empty() {
-            // A fresh account: no character means no enable file to key. `None` is the "nobody's
-            // file" read (everything enabled), staged into one anonymous column so the boxes
-            // still toggle; Okay has no file to write ([`Self::save_staged`] walks `chars`).
-            self.list = addons::installed(None);
-            self.staged
-                .push(self.list.iter().map(|a| a.enabled).collect());
+        let store = addons::EnableStore::load(&realm, &chars);
+        // A fresh account stages one anonymous column: no character means no file to key, and
+        // Okay has none to write ([`Self::save_staged`] walks `chars`).
+        let columns: Vec<Option<&str>> = if chars.is_empty() {
+            vec![None]
         } else {
-            for (c, name) in chars.iter().enumerate() {
-                let id = (realm.clone(), name.clone());
-                let rows = addons::installed(Some(&id));
-                if c == 0 {
-                    self.staged.push(rows.iter().map(|a| a.enabled).collect());
-                    self.list = rows;
-                } else {
-                    // Same folder, same deterministic (alphabetical) discovery, read
-                    // back-to-back: every call answers the same rows in the same order, only the
-                    // `enabled` bits differ. That is what lets ONE metadata list carry N columns.
-                    debug_assert_eq!(
-                        rows.len(),
-                        self.list.len(),
-                        "installed() must be deterministic across per-character reads"
-                    );
-                    self.staged.push(rows.iter().map(|a| a.enabled).collect());
-                }
-            }
+            chars.iter().map(|c| Some(c.as_str())).collect()
+        };
+        for character in columns {
+            self.staged.push(
+                self.list
+                    .iter()
+                    .map(|a| store.enabled_for(&a.name, a.default_state, character))
+                    .collect(),
+            );
         }
         self.baseline = self.staged.clone();
         self.realm = realm;
@@ -314,7 +312,7 @@ impl AddonsPanel {
     /// actually matters.
     pub(super) fn any_installed() -> bool {
         static ANY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ANY.get_or_init(|| !addons::installed(None).is_empty())
+        *ANY.get_or_init(|| !addons::installed_rows().is_empty())
     }
 
     /// The rows currently visible, as `(index, addon)` — enable state is the view's to answer
@@ -390,10 +388,12 @@ impl AddonsPanel {
     }
 
     /// Is this addon enabled *for the current view* — the bit the gate is fed? A single character
-    /// reads their own column. The All view answers **"any staged character has it on"** — OURS
-    /// (1293): the reference feeds `AddOn_CanLoad` a NULL character there and that read's exact
-    /// semantics are un-carved, so we state the natural reading rather than guess at bytes nobody
-    /// has verified.
+    /// reads their own column. The All view answers **"any staged character has it on"**, which
+    /// 1293 stated as the natural reading of an un-carved mechanism and which the bytes have
+    /// since confirmed: `AddonList_Update` computes `enabled = (checkboxState > 0)` off
+    /// `GetAddOnEnableState(nil, i)`, whose `1` (enabled for some) therefore counts as on
+    /// (wow-5875-re `addon-enable-store.md` §4). What 1293 got wrong was not this fold but what
+    /// each column holds — see [`Self::open_for`] and decision 2311.
     fn effective_enabled(&self, i: usize) -> bool {
         self.box_state(i) != BoxState::Off
     }
@@ -514,13 +514,13 @@ fn status_label<'a>(strings: &'a GlueStrings, token: &'a str) -> &'a str {
 }
 
 /// Flip the *Load out of date AddOns* box: the `checkAddonVersion` CVar **inverted** (1292 §2,
-/// byte-verified — ticked = `"0"`). Written through [`UiScript::set_cvar_engine`] so it rides the
-/// change queue like a Lua `SetCVar` and the host's sync persists it (the minimap-zoom pattern) —
-/// nothing else to do: the statuses repaint from [`drive_addons_panel`]'s per-frame mirror, no
-/// rescan, because the gate re-reads the flag per query (1292 §2.2).
-fn toggle_force_load(script: &mut UiScript) {
-    let checking = script.cvar("checkAddonVersion").is_none_or(|v| v != "0");
-    script.set_cvar_engine("checkAddonVersion", if checking { "0" } else { "1" });
+/// byte-verified — ticked = `"0"`). A host write into the registry (2303), which is what
+/// persists it and what the VM's mirror learns — nothing else to do: the statuses repaint from
+/// [`drive_addons_panel`]'s per-frame mirror, no rescan, because the gate re-reads the flag per
+/// query (1292 §2.2).
+fn toggle_force_load(cvars: &mut crate::cvars::Cvars) {
+    let checking = cvars.addon_version_check();
+    cvars.set("checkAddonVersion", if checking { "0" } else { "1" });
 }
 
 /// The panel's clickable parts.
@@ -566,32 +566,24 @@ struct AddonsUi;
 #[derive(Component)]
 pub(super) struct ScrollBand;
 
-/// A panel button whose child [`Hilight`] lights on hover (the checkboxes' `UI-CheckBox-Highlight`,
-/// the close X, the dropdown arrow, the open list's `UI-QuestTitleHighlight` rows, the scroll
-/// arrows) — driven per frame by [`drive_addons_panel`] with **no respawn**, which is the point.
-#[derive(Component)]
-pub(super) struct HoverLit;
-
 /// Spawn/despawn the panel, run its flows, and repaint when anything it shows has changed.
 ///
 /// Ordered before the select screen's own click handling so a click that lands on the panel is
 /// never also read as a click on the screen behind it.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn drive_addons_panel(
     mut commands: Commands,
     mut panel: ResMut<AddonsPanel>,
     art: Res<GlueArt>,
     assets: Res<AssetServer>,
     strings: Option<Res<GlueStrings>>,
-    mut script: Option<NonSendMut<UiScript>>,
+    script: Option<NonSendMut<UiScript>>,
+    mut cvars: ResMut<crate::cvars::Cvars>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
     mut sounds: MessageWriter<GlueSound>,
     clicks: Res<crate::glue::GlueClicks>,
     hovers: Query<(Entity, &AddonsAction, Ref<Interaction>)>,
-    lit: Query<(&Interaction, &Children), With<HoverLit>>,
-    mut hilights: Query<&mut Visibility, With<Hilight>>,
     band: Query<(&ComputedNode, &UiGlobalTransform), With<ScrollBand>>,
     window: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
@@ -648,9 +640,7 @@ pub(super) fn drive_addons_panel(
             AddonsAction::ForceLoad => {
                 // No VM (a bare test world / a capture): nothing to write to and nothing the
                 // walk would read differently — the box is inert, honestly.
-                if let Some(script) = script.as_deref_mut() {
-                    toggle_force_load(script);
-                }
+                toggle_force_load(&mut cvars);
             }
         }
     }
@@ -754,21 +744,9 @@ pub(super) fn drive_addons_panel(
         return;
     }
 
-    // ── hover: highlights + the tooltip, with the tree left alone ─────────────────────────────
-    for (interaction, children) in &lit {
-        let want = if *interaction == Interaction::None {
-            Visibility::Hidden
-        } else {
-            Visibility::Inherited
-        };
-        for &child in children {
-            if let Ok(mut vis) = hilights.get_mut(child) {
-                if *vis != want {
-                    *vis = want;
-                }
-            }
-        }
-    }
+    // ── hover: the tooltip, with the tree left alone ──────────────────────────────────────────
+    // (The sheens are `crate::glue::glue_hilights`' — this panel used to drive its own, which is
+    // one of the four copies that let the realm list ship with none.)
 
     let hover = hovers.iter().find_map(|(_, a, i)| {
         if !matches!(*i, Interaction::Hovered | Interaction::Pressed) {
@@ -837,7 +815,7 @@ fn checkbox_button<A: Component>(
     state: BoxState,
     node: Node,
 ) {
-    let mut b = parent.spawn((action, Button, HoverLit, node));
+    let mut b = parent.spawn((action, Button, node));
     match &art.checkbox {
         Some(c) => {
             b.insert((
@@ -1013,7 +991,6 @@ fn spawn_panel(
                     let mut x = b.spawn((
                         AddonsAction::Cancel,
                         Button,
-                        HoverLit,
                         abs(BG_W - 42.0 - 32.0, 3.0, 32.0, 32.0),
                     ));
                     if let Some(cb) = &art.close_btn {
@@ -1136,7 +1113,6 @@ fn spawn_panel(
                         let mut arrow = d.spawn((
                             AddonsAction::DropdownToggle,
                             Button,
-                            HoverLit,
                             abs(DROP_W - 16.0 - 24.0, 18.0, 24.0, 24.0),
                         ));
                         match (&art.dropdown_arrow_up, &art.dropdown_arrow_down) {
@@ -1351,7 +1327,6 @@ fn spawn_panel(
                             b.spawn((
                                 action,
                                 Button,
-                                HoverLit,
                                 ImageNode {
                                     image: up.up.clone(),
                                     rect: Some(tc_rect(up.size, crate::glue::art::SCROLL_BTN_TC)),
@@ -1557,7 +1532,6 @@ fn spawn_panel(
                             let mut row = list.spawn((
                                 AddonsAction::DropdownPick(view),
                                 Button,
-                                HoverLit,
                                 Node {
                                     height: px(ROW_H),
                                     min_width: px(120.0),
@@ -1621,7 +1595,6 @@ fn spawn_panel(
 /// the row's TOPLEFT at (−14, 0), spawned as the row strip's child so the anchor is structural.
 /// `## URL` rides as an extra line (1197: information, not a launch button). A MIXED checkbox
 /// hover shows `ENABLED_FOR_SOME` alone — the reference's GlueTooltip split, on the same box.
-#[allow(clippy::too_many_arguments)]
 fn spawn_tooltip(
     parent: &mut ChildSpawnerCommands,
     art: &GlueArt,
@@ -1737,7 +1710,7 @@ mod tests {
             dependencies: deps.iter().map(|d| (*d).to_string()).collect(),
             interface: iface,
             load_on_demand: false,
-            enabled: true,
+            default_state: true,
         }
     }
 
@@ -1746,7 +1719,7 @@ mod tests {
     /// `p.view = Some(c)` themselves.
     fn panel_for(chars: usize, list: Vec<InstalledAddOn>) -> AddonsPanel {
         let staged: Vec<Vec<bool>> = (0..chars.max(1))
-            .map(|_| list.iter().map(|a| a.enabled).collect())
+            .map(|_| list.iter().map(|a| a.default_state).collect())
             .collect();
         AddonsPanel {
             open: true,
@@ -1959,7 +1932,7 @@ mod tests {
         assert_eq!(p.staged, vec![vec![true, true]]);
         p.staged[0][0] = false;
         assert!(
-            p.list[0].enabled,
+            p.list[0].default_state,
             "the read-in list is never mutated — only `staged` is, which is what makes Cancel free"
         );
         p.close();
@@ -2007,52 +1980,185 @@ mod tests {
         p.staged[1][1] = false;
         p.save_staged();
 
-        // Read back through the same folder view the world-entry walk uses — the two views of
-        // one folder that 1197 §3 demands can never disagree.
-        let alice = ("TestRealm".to_string(), "Alice".to_string());
-        let bob = ("TestRealm".to_string(), "Bob".to_string());
-        let carol = ("TestRealm".to_string(), "Carol".to_string());
-        let read = |id: &(String, String)| -> Vec<bool> {
-            addons::installed(Some(id))
-                .iter()
-                .map(|a| a.enabled)
+        // Read back through the same store the world-entry walk resolves against — the two views
+        // of one folder that 1197 §3 demands can never disagree.
+        let roster = ["Alice".to_string(), "Bob".to_string(), "Carol".to_string()];
+        let store = addons::EnableStore::load("TestRealm", &roster);
+        let rows = addons::installed_rows();
+        let read = |who: &str| -> Vec<bool> {
+            rows.iter()
+                .map(|a| store.enabled_for(&a.name, a.default_state, Some(who)))
                 .collect()
         };
         assert_eq!(
-            read(&alice),
+            read("Alice"),
             vec![false, true],
             "Alice's file carries HER edit"
         );
-        assert_eq!(read(&bob), vec![true, false], "Bob's carries HIS");
+        assert_eq!(read("Bob"), vec![true, false], "Bob's carries HIS");
+        let carol = ("TestRealm".to_string(), "Carol".to_string());
         assert!(
             !addons::enable_state_path(Some(&carol)).unwrap().exists(),
             "an unchanged column writes no file — only the diffs against the open-time baseline"
         );
+        // And Carol, who has no file at all, is NOT "everything enabled": she takes what the
+        // others agree on, which here is nothing — Alpha and Beta are each on for one and off
+        // for the other — so both fall to their manifests' `## DefaultState` (2311).
+        assert_eq!(read("Carol"), vec![true, true]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The force-load box IS the `checkAddonVersion` CVar inverted, and a toggle goes through
-    /// the engine write ([`UiScript::set_cvar_engine`]) so it rides the change queue — that is
-    /// the whole persistence story (the host's sync drains the queue and dirties the config);
-    /// the panel itself only repaints from its per-frame mirror, rescanning nothing (1292 §2.2).
+    /// **Creating a character does not re-enable everything** — the director's report,
+    /// 2026-09-17: *"after creating a new char all addons are enabled again, even after disabling
+    /// all of them just before"*.
+    ///
+    /// The walk is theirs, verbatim: Disable All in the All view, Okay, create a character, open
+    /// the list again. What used to happen is the whole bug in one line — the new character had
+    /// no `AddOns.txt`, benilla read an absent row as **enabled**, and that all-true column turned
+    /// every row in the All view from Off to Mixed, which paints a check and reads as on
+    /// (`effective_enabled`). One click there would then have written the all-enabled state back
+    /// onto every other character's file: a one-way ratchet.
+    ///
+    /// The reference does not do this and the mechanism is carved (wow-5875-re
+    /// `addon-enable-store.md` §4): the enable query counts only nodes with an **explicit** entry,
+    /// so a character with no file contributes no opinion and inherits the aggregate — here, the
+    /// unanimous `disabled` the player just saved. Decision 2311.
     #[test]
-    fn the_force_load_box_flips_the_cvar_through_the_engine_queue() {
-        let mut script = UiScript::new().unwrap();
-        script.register_cvars([("checkAddonVersion", "1")]);
+    fn a_new_character_inherits_the_disable_it_did_not_ask_for() {
+        let _l = crate::local_state::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp =
+            std::env::temp_dir().join(format!("benilla-charsel-newchar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let home = tmp.join("benilla-config");
+        for name in ["Alpha", "Beta"] {
+            let dir = home.join("AddOns").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{name}.toc")), "## Interface: 11200\n").unwrap();
+        }
+        let _c = crate::local_state::test_env::EnvGuard::unset("WOW_CAPTURE");
+        let _h =
+            crate::local_state::test_env::EnvGuard::set("BENILLA_HOME", home.to_str().unwrap());
 
-        toggle_force_load(&mut script);
+        // The roster before the create, and the player's Disable All + Okay over it.
+        let mut p = AddonsPanel::default();
+        p.open_for(
+            "TestRealm".into(),
+            vec!["Onemage".into(), "Onerogue".into()],
+        );
+        p.set_all(false);
+        p.save_staged();
+        p.close();
+
+        // …then a character is created, so the roster the panel opens over has one more name and
+        // that name has no enable file at all.
+        p.open_for(
+            "TestRealm".into(),
+            vec!["Onemage".into(), "Onerogue".into(), "Freshling".into()],
+        );
+        assert!(p.view.is_none(), "reopens on All, the reference's default");
+        assert_eq!(p.staged.len(), 3);
         assert_eq!(
-            script.take_cvar_changes(),
-            vec![("checkAddonVersion".to_string(), "0".to_string())],
+            p.staged[2],
+            vec![false, false],
+            "the new character inherits the unanimous disable, not a blank slate"
+        );
+        for i in 0..p.list.len() {
+            assert_eq!(
+                p.box_state(i),
+                BoxState::Off,
+                "row {i} reads OFF in the All view — Mixed here is the bug, and it paints a check"
+            );
+            assert!(!p.effective_enabled(i), "…so nothing is loadable either");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The other side of the same law: a new character does **not** inherit a disable the roster
+    /// never agreed on. One character off, one on, and the newcomer takes the manifest's
+    /// `## DefaultState` — so this is not "new characters copy whoever is strictest".
+    #[test]
+    fn a_new_character_inherits_nothing_when_the_roster_disagrees() {
+        let _l = crate::local_state::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp =
+            std::env::temp_dir().join(format!("benilla-charsel-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let home = tmp.join("benilla-config");
+        for name in ["Alpha", "Beta"] {
+            let dir = home.join("AddOns").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{name}.toc")),
+                // Beta ships `## DefaultState: disabled`, so the tie-break is visible.
+                if name == "Beta" {
+                    "## Interface: 11200\n## DefaultState: disabled\n"
+                } else {
+                    "## Interface: 11200\n"
+                },
+            )
+            .unwrap();
+        }
+        let _c = crate::local_state::test_env::EnvGuard::unset("WOW_CAPTURE");
+        let _h =
+            crate::local_state::test_env::EnvGuard::set("BENILLA_HOME", home.to_str().unwrap());
+
+        let mut p = AddonsPanel::default();
+        p.open_for(
+            "TestRealm".into(),
+            vec!["Onemage".into(), "Onerogue".into()],
+        );
+        p.view = Some(0);
+        p.set_all(false); // the mage turns both off; the rogue keeps the defaults
+        p.view = Some(1);
+        p.set_all(true);
+        p.save_staged();
+        p.close();
+
+        p.open_for(
+            "TestRealm".into(),
+            vec!["Onemage".into(), "Onerogue".into(), "Freshling".into()],
+        );
+        assert_eq!(
+            p.staged[2],
+            vec![true, false],
+            "split roster → each row falls to its own `## DefaultState`"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The force-load box IS the `checkAddonVersion` CVar inverted, and a toggle is a host
+    /// write into the registry (2303) — that is the whole persistence story (the write dirties
+    /// the config and reaches the VM's mirror through the outbox); the panel itself only
+    /// repaints from its per-frame mirror, rescanning nothing (1292 §2.2).
+    #[test]
+    fn the_force_load_box_flips_the_cvar_in_the_registry() {
+        let mut cvars = crate::cvars::Cvars::default();
+        assert!(
+            cvars.addon_version_check(),
+            "the registrar default: check ON"
+        );
+
+        toggle_force_load(&mut cvars);
+        assert_eq!(
+            cvars.get("checkAddonVersion"),
+            Some("0"),
             "tick: check ON (\"1\") flips to \"0\" — box ticked = version gate open"
         );
-        assert_eq!(script.cvar("checkAddonVersion").as_deref(), Some("0"));
-
-        toggle_force_load(&mut script);
+        assert!(!cvars.addon_version_check());
         assert_eq!(
-            script.take_cvar_changes(),
-            vec![("checkAddonVersion".to_string(), "1".to_string())],
-            "untick: back to the registrar default, and the queue carries it again"
+            cvars.take_events().len(),
+            1,
+            "a host write is an accepted move — the config dirties and the mirror learns it"
+        );
+
+        toggle_force_load(&mut cvars);
+        assert_eq!(
+            cvars.get("checkAddonVersion"),
+            Some("1"),
+            "untick: back to the registrar default"
         );
     }
 

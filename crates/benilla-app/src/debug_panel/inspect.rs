@@ -88,6 +88,11 @@ type MotionReadout = (
     Option<&'static crate::net::Spline>,
     Option<&'static crate::net::RemoteMotion>,
     Option<&'static crate::net::UnitMoveModes>,
+    // The clamp's memo, for the card's `ground` line — the only place a "this mob is under the
+    // world" sighting becomes a measurement instead of a picture.
+    Option<&'static crate::net::GroundClamped>,
+    // Where the unit is standing *now*, which the `ground` line reads the terrain against.
+    &'static Transform,
 );
 
 /// The inspector's entity LIGHT readout (decision 0776): the lane this object's parts render
@@ -97,6 +102,21 @@ type MotionReadout = (
 type EntityLightReadout = (
     &'static benilla_world::interior::InteriorAnchor,
     Has<benilla_world::interior::ContainmentAttach>,
+);
+
+/// One pickable part as the card's `parts alive` and glow-card lines read it: the object, its
+/// draw verdict, its transform, whether it is a billboard card, the material + mesh tag the glow
+/// line names, and the visibility class the STACKED count reads. A tuple alias like
+/// [`EntityLightReadout`] above, for the same reason: as an inline `Query<>` the field trips
+/// clippy's `type_complexity` at the workspace gate.
+type PartReadout = (
+    &'static benilla_world::interact::WorldObject,
+    &'static bevy::camera::visibility::ViewVisibility,
+    &'static GlobalTransform,
+    Has<benilla_world::billboard::BillboardCard>,
+    Option<&'static MeshMaterial3d<benilla_assets::materials::WowModelMaterial>>,
+    Option<&'static bevy::mesh::MeshTag>,
+    Option<&'static bevy::camera::visibility::VisibilityClass>,
 );
 
 /// Everything the identity card reads off the **net entity** under the cursor, as one named
@@ -109,9 +129,19 @@ type EntityLightReadout = (
 pub(super) struct InspectStores<'w, 's> {
     stores: Query<'w, 's, &'static ObjectStore>,
     kinds: Query<'w, 's, &'static crate::net::NetEntity>,
+    /// Every pickable part with its draw verdict, for the card's `parts alive` line: a prop
+    /// spawned twice reads twice its model's batch count here, and nowhere else.
+    objects: Query<'w, 's, PartReadout>,
+    /// The realized materials + images, for the card line: which material a glow card is bound
+    /// to, whether that material still says ADDITIVE, and whether its texture is resident.
+    model_mats: Res<'w, Assets<benilla_assets::materials::WowModelMaterial>>,
+    images: Res<'w, Assets<bevy::image::Image>>,
     collision: Query<'w, 's, GoCollisionReadout>,
     lit: Query<'w, 's, EntityLightReadout>,
     motion: Query<'w, 's, MotionReadout>,
+    /// The MCNK heightfield under the hovered unit — the `ground` line's third number, and the one
+    /// that separates "the server put it there" from "we sank it".
+    points: benilla_world::world_point::WorldPoint<'w, 's>,
     factions: Option<Res<'w, crate::target::ring::Factions>>,
     self_store: Query<'w, 's, &'static ObjectStore, With<crate::net::SelfPlayer>>,
     /// The live standings — the other half of the reaction resolve (`ring_reaction` takes the
@@ -125,8 +155,17 @@ pub(super) struct InspectStores<'w, 's> {
     /// on the category gate or on something else.
     plate_mode: Res<'w, crate::vplates::VPlateMode>,
     /// The ask-once GO template cache — the readable head a TEXT object's line reports
-    /// (decision 1105).
+    /// (decision 1105), and the highlight column + name the tooltip ladder reports (2246).
     go_templates: Res<'w, crate::go_templates::GameObjectTemplates>,
+    /// `[0xb72038]` — the meeting-stone queue, the other half of MEETINGSTONE(23)'s own
+    /// highlightable term (decision 2283), so the card's `interact` verdict reads the same
+    /// predicate the cursor and the click do.
+    stone: Option<Res<'w, crate::ui_dialog_verbs::MeetingStone>>,
+    /// **The published GameObject mouseover** — the one the tooltip actually reads
+    /// ([`crate::target::HoveredObject`]). The card's own pick is a dev pick and does not go
+    /// through the publish, so without this the card can show an object the game is not hovering
+    /// at all and give no sign of the difference (2246).
+    hovered_go: Res<'w, crate::target::HoveredObject>,
     /// The GameObject **animation** readout (decision 1151) — what the §243 arm is playing right
     /// now, for the card's `anim` line. Its own query rather than a `collision` member because it
     /// needs the model components: they sit on the same entity as [`crate::go_anim::GoAnim`], but
@@ -157,7 +196,6 @@ pub(super) struct InspectStores<'w, 's> {
 /// The inspector overlay, drawn only while armed: a weak top-centre "armed" pill (so it's obvious the
 /// mode is on and how to leave it) and, whenever the cursor is over an identified object, a compact
 /// identity card pinned to the cursor. No chrome, no panel — its own lightweight surface.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn inspect_ui(
     mut contexts: EguiContexts,
     inspect: Res<InspectMode>,
@@ -171,7 +209,7 @@ pub(super) fn inspect_ui(
     drivers: Query<&crate::creature_anim::AnimDriver>,
     anim_data: Option<Res<crate::creature_anim::AnimData>>,
     spells: Option<Res<crate::ui_action::Spells>>,
-    mut names: ResMut<crate::names::NameCache>,
+    names: Res<crate::names::NameCache>,
     net_commands: Res<crate::net::NetCommands>,
     // Bundled into one param (Bevy's system-function arity ceiling): the copy-click button, and
     // the flag it must yield to — a left press this frame the UI already consumed as a
@@ -227,17 +265,87 @@ pub(super) fn inspect_ui(
     let (reputations, plates, plate_mode) =
         (&*stores.reputations, &stores.plates.0, &*stores.plate_mode);
     let go_templates = &*stores.go_templates;
+    let queued_area = stores.stone.as_deref().map_or(0, |s| s.area);
+    let hovered_go = &*stores.hovered_go;
     // The picked submesh's shading payload — off the hit entity itself (see the field's doc).
     let tag_line = mouseover
         .entity
         .and_then(|e| stores.tags.get(e).ok())
         .map(|t| format!("tag {}", benilla_world::mesh_tag::describe(t.0)));
-    let (stores, kinds, collision, lit, motion, go_anims) = (
+    // The duplicate readout: every live part naming this same object, and how many of them
+    // drew this frame. A doodad has one part per render batch; a doubled placement shows twice
+    // that here — the census the FPS probe prints as `orphan_parts=`, at the cursor.
+    let parts_line = {
+        let (mut alive, mut drawn, mut stacked) = (0usize, 0usize, 0usize);
+        let mut cards: Vec<String> = Vec::new();
+        for (w, vv, gt, card, mat, tag, class) in stores.objects.iter() {
+            if w.kind == obj.kind && w.id == obj.id {
+                alive += 1;
+                drawn += usize::from(vv.get());
+                // A part whose `VisibilityClass` lists its mesh class more than once is queued
+                // that many times — drawn stacked on itself (`model_render::park`'s dedup).
+                stacked += usize::from(class.is_some_and(|c| c.len() > 1));
+                if card {
+                    // One glow card, as the draw sees it: its live world scale (the placement
+                    // scale times the bone's pulse), its tag alpha, and the bound material's
+                    // marker word — ADDITIVE is `clutter_fade.z` bit 2, the bit `specialize`
+                    // keys the (ONE, ONE) blend on and the shader keys the alpha fold on; a card
+                    // whose material lost it draws its texture unweighted, a hard bright disc.
+                    let scale = gt.compute_transform().scale.x;
+                    let alpha = tag.map_or(-1.0, |t| benilla_world::mesh_tag::alpha_of(t.0));
+                    let m = mat.and_then(|m| stores.model_mats.get(&m.0));
+                    let state = match m {
+                        Some(m) => {
+                            let z = m.extension.clutter_fade.z as u32;
+                            let tex = m.base.base_color_texture.as_ref().map_or(
+                                "none".to_string(),
+                                |h| {
+                                    let loaded = stores.images.get(h).is_some();
+                                    format!("{}{}", h.id(), if loaded { "" } else { " MISSING" })
+                                },
+                            );
+                            format!(
+                                "add {} fade {:.0} unlit {:.0} nodw {} tex {tex}",
+                                u8::from(z & 4 != 0),
+                                m.extension.model_flags.y,
+                                m.extension.model_flags.w,
+                                u8::from(z & 1 != 0),
+                            )
+                        }
+                        None => match mat {
+                            Some(_) => "material UNREALIZED".to_string(),
+                            None => "no material".to_string(),
+                        },
+                    };
+                    cards.push(format!(
+                        "[scale {scale:.2} α {alpha:.2} vis {} {state}]",
+                        u8::from(vv.get())
+                    ));
+                }
+            }
+        }
+        let stacked = if stacked > 0 {
+            format!(", STACKED {stacked}")
+        } else {
+            String::new()
+        };
+        if cards.is_empty() {
+            format!("parts alive {alive}, drawn {drawn}{stacked}")
+        } else {
+            format!(
+                "parts alive {alive}, drawn {drawn}{stacked}, cards {} {}",
+                cards.len(),
+                cards.join(" ")
+            )
+        }
+    };
+    let (stores, kinds, collision, lit, motion, points, go_anims) = (
         &stores.stores,
         &stores.kinds,
         &stores.collision,
         &stores.lit,
         &stores.motion,
+        &stores.points,
         &stores.go_anims,
     );
     let store = net_entity.and_then(|p| stores.get(p).ok());
@@ -313,7 +421,8 @@ pub(super) fn inspect_ui(
                     self_store, go_guid,
                 ),
                 meeting_stone_queued: crate::target::cursor_mode::meeting_stone_queued(
-                    go_guid.and_then(|g| go_templates.get(g)?.meeting_stone_area),
+                    go_guid.and_then(|g| Some(go_templates.get(g)?.meeting_stone?.area)),
+                    queued_area,
                 ),
             };
             let interact = if crate::target::cursor_mode::go_highlightable(s, reaction, overrides) {
@@ -321,6 +430,44 @@ pub(super) fn inspect_ui(
             } else {
                 "interact ✗"
             };
+            // **The TOOLTIP's own ladder** (decision 2246), which `interact` above is not and is
+            // routinely mistaken for. "No tooltip on this" has three possible stages and the card
+            // could name none of them, so every report of it cost a session of code reading:
+            //
+            //  · `hover ✗` — the **mouseover-eligibility** slot `+0x54`
+            //    ([`crate::target::cursor_mode::mouseover_eligible`]) said no, so the reference
+            //    publishes the NULL mouseover and there is no tooltip *by design*. For a
+            //    GENERIC(5) signpost this is the template's `data[1]` highlight column, which is
+            //    why the `tmpl` field sits beside it.
+            //  · `hover ✓` but `shown ✗` — eligible, and the publish still did not take it: the
+            //    pick lost to the occlusion verdict, to a nearer unit, or to the pointer being
+            //    over UI. The fault is in the pick, not the gate.
+            //  · `shown ✓` and still no plate on screen — the fault is downstream in
+            //    [`crate::ui_tooltip`], and `tmpl` says whether the name it needs has arrived.
+            //
+            // `tmpl —` is the one that looks like a bug and is not: the template query is
+            // ask-once and answers a frame or two later, and until it does the tooltip has no
+            // name to draw.
+            let tmpl = go_guid.and_then(|g| go_templates.get(g));
+            let hover_gate = crate::target::cursor_mode::mouseover_eligible(
+                s.0.gameobject_type_id(),
+                flags,
+                s.0.gameobject_dynamic_flags(),
+                tmpl.map(|t| t.highlight_column),
+                reaction,
+                overrides,
+            );
+            let published = go_guid.is_some_and(|g| hovered_go.guid == Some(g));
+            let tooltip_line = format!(
+                " · hover {} · shown {} · tmpl {}",
+                if hover_gate { "✓" } else { "✗" },
+                if published { "✓" } else { "✗" },
+                match tmpl {
+                    None => "—".to_string(),
+                    Some(t) if t.name.is_empty() => "(unnamed)".to_string(),
+                    Some(t) => format!("{:?}", t.name),
+                }
+            );
             // TEXT (type 9) only: the **readable head** (decision 1105). A book that opens no
             // window is either "no page in the template" or a fault downstream, and only this
             // line tells the two apart — the symptom is identical from the chair, and the first
@@ -356,7 +503,7 @@ pub(super) fn inspect_ui(
                 .map(|deg| format!(" · tilt {deg:.0}°"))
                 .unwrap_or_default();
             format!(
-                "go type {} · state {state} {word} · {solidity} · flags {flags:#x}{flag_text} · {interact}{page_text}{tilt}",
+                "go type {} · state {state} {word} · {solidity} · flags {flags:#x}{flag_text} · {interact}{tooltip_line}{page_text}{tilt}",
                 s.0.gameobject_type_id()
             )
         });
@@ -473,7 +620,7 @@ pub(super) fn inspect_ui(
     let motion_line = net_entity
         .filter(|_| is_unit)
         .and_then(|p| motion.get(p).ok())
-        .map(|(spline, remote, modes)| {
+        .map(|(spline, remote, modes, _, _)| {
             let moving = match (spline, remote) {
                 (Some(sp), _) => format!(
                     "motion {:.2} yd/s · {} path {:.0}% of {:.0}s",
@@ -491,6 +638,42 @@ pub(super) fn inspect_ui(
                 Some(m) => format!("{moving} · {m}"),
                 None => moving,
             }
+        });
+    // **Where its feet came from** ([`crate::net::GroundClamped`]) — the ground clamp's own memo,
+    // shown because "that mob is standing inside the hill" is a claim about three numbers and no
+    // screenshot carries them:
+    //
+    //   `ground z 12.34 · seat 12.42 (drop +0.08) · terrain 12.34 · walk hit`
+    //
+    // - **`z`** is where we are drawing it; **`seat`** is the pose the server last wrote, before
+    //   the clamp had its say, and **`drop`** = `seat − z` is the clamp's own correction. A big
+    //   positive drop is *ours*; a `z` far under `terrain` with `drop ≈ 0` is the server's.
+    // - **`terrain`** is the MCNK height under it — so "is it under the world?" reads off the card
+    //   rather than off a guess about what the hill looks like from here.
+    // - **the arm and the probe verdict**: `walk` is the swept step continuing a server path,
+    //   `idle` the settle from the seat, and they answer a MISS differently — an idle miss leaves
+    //   the unit at its seat, a walk miss descends. `MISS` is upper-case because on the `walk` arm
+    //   it is the interesting state, not a neutral one.
+    //
+    // The same three numbers `WOW_GROUND_CENSUS` prints per unit, on the unit the director is
+    // actually pointing at: the census answers "is anything sunk in this scene", this answers "why
+    // is *that* one".
+    let ground_line = net_entity
+        .filter(|_| is_unit)
+        .and_then(|p| motion.get(p).ok())
+        .and_then(|(_, _, _, clamped, t)| clamped.map(|c| (c, t)))
+        .map(|(c, t)| {
+            let z = t.translation.y;
+            format!(
+                "ground z {z:.2} · seat {:.2} (drop {:+.2}) · terrain {} · {} {}",
+                c.seat_y,
+                c.seat_y - z,
+                points
+                    .terrain_height_under(t.translation)
+                    .map_or_else(|| "none".to_string(), |v| format!("{v:.2}")),
+                if c.walking() { "walk" } else { "idle" },
+                if c.hit { "hit" } else { "MISS" },
+            )
         });
     // An `AnimationData` id as the card names it — shared by the creature and GameObject anim
     // lines below, which read the same id space.
@@ -583,6 +766,9 @@ pub(super) fn inspect_ui(
     if let Some(line) = &motion_line {
         lines.push(line.clone());
     }
+    if let Some(line) = &ground_line {
+        lines.push(line.clone());
+    }
     if let Some(line) = &anim_line {
         lines.push(line.clone());
     }
@@ -592,6 +778,7 @@ pub(super) fn inspect_ui(
     if let Some(line) = &tag_line {
         lines.push(line.clone());
     }
+    lines.push(parts_line.clone());
     lines.push(format!("{:.1} yd away", mouseover.distance));
 
     // The inspector owns left-click while armed (player::control suppresses left-orbit during inspect),

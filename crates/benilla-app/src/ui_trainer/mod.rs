@@ -38,7 +38,7 @@ use crate::items::Items;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, NetCommands};
 use crate::ui_action::{PlayerActions, Spells};
-use crate::ui_script::UiInput;
+use crate::ui_script::{UiFeed, UiInput};
 use crate::ui_session::{close_npc_session_out_of_range, npc_switched, NpcSession};
 use crate::ui_spellbook::SkillLines;
 
@@ -67,10 +67,10 @@ pub(crate) struct TrainerOpen {
     /// The trainer's greeting line (`SMSG_TRAINER_LIST`'s trailing string).
     pub(crate) greeting: String,
     /// A `SMSG_TRAINER_LIST` that **begins a window session** has landed and the feed has not yet
-    /// handed it to the engine. Drives the engine's filter/collapse reset
-    /// ([`UiScript::reset_trainer_filter`]) — the reference's builder rewrites both masks on every
-    /// list packet (decision 1128). It is not the same edge as a snapshot change: those re-push the
-    /// same list.
+    /// handed it to the engine. Drives the engine's filter/collapse/**selection** reset
+    /// ([`UiScript::reset_trainer_list_state`]) — the reference's builder rewrites all three on every
+    /// list packet (decision 1128; 2231 for the selection, `0x4d7b42`). It is not the same edge as a
+    /// snapshot change: those re-push the same list.
     ///
     /// "Begins a session", not "a packet arrived", because the two are the same thing in the
     /// reference and are **not** in benilla (B253/B256's arc): the reference gets a list packet only
@@ -82,7 +82,9 @@ pub(crate) struct TrainerOpen {
     pub(crate) fresh_list: bool,
     /// The post-buy re-list **we asked for** ([`crate::net::apply`]'s `trainer_buy_succeeded`) is in
     /// flight: the answering packet repaints the open window rather than opening one, so it must not
-    /// reset the filter/collapse masks. Cleared by the packet it belongs to, and by any close.
+    /// reset the filter/collapse masks — nor the selection, which is what leaves the learned spell
+    /// selected-but-hidden and so takes the detail pane down with it, the reference's own
+    /// post-purchase behaviour (2231). Cleared by the packet it belongs to, and by any close.
     pub(crate) refresh_pending: bool,
 }
 
@@ -128,10 +130,13 @@ impl TrainerOpen {
 #[derive(Resource, Default)]
 pub(crate) struct TrainerErrors(pub Vec<u32>);
 
+mod net;
+
 pub(crate) struct UiTrainerPlugin;
 
 impl Plugin for UiTrainerPlugin {
     fn build(&self, app: &mut App) {
+        net::register(app);
         app.init_resource::<TrainerOpen>()
             .init_resource::<TrainerErrors>()
             .add_systems(
@@ -141,26 +146,41 @@ impl Plugin for UiTrainerPlugin {
                     // push before the input pass so an open/close is on screen the same frame; drain
                     // after it (mirrors ui_merchant/ui_gossip).
                     close_npc_session_out_of_range::<TrainerOpen>.before(feed_trainer),
-                    feed_trainer.before(UiInput),
+                    feed_trainer.in_set(UiFeed),
                     drain_trainer.after(UiInput),
                 ),
             );
     }
 }
 
-/// The red error-line text for a trainer refusal (`SMSG_TRAINER_BUY_FAILED`'s
-/// [`benilla_protocol::messages::train_fail`] code). The money case is the exact enUS `GlobalString`
-/// (`ERR_NOT_ENOUGH_MONEY`); the skill/unavailable cases are best-effort English — the real client
-/// builds these in C++, so their exact wording is a wow-re confirm item (rarely reached: the Train
-/// button is disabled unless the service is available and affordable).
-fn train_error_text(code: u32) -> String {
+/// A trainer refusal (`SMSG_TRAINER_BUY_FAILED`'s
+/// [`benilla_protocol::messages::train_fail`] code) is **silent on every player-facing surface**,
+/// and goes to the log instead. That is the reference's own behaviour, byte-carved rather than
+/// assumed (wow-re dispatch, 2026-09-07; handler `0x5e5f10`, registered at `0x5e3291`, arms at
+/// `0x5e5f95` / `0x5e5fb8` / `0x5e5fdc`, a code ≥ 3 doing nothing at all):
+///
+/// - there is **no GlobalStrings key and no message-catalog id** — the handler passes neither;
+/// - there is **no `DisplayError 0x496720` and no `0x4945b0`** anywhere in its body, so the line
+///   never reaches `UIErrorsFrame`, the info line, or chat;
+/// - all three arms call **`0x63cd00`**, the developer console's printf, with a hardcoded C format
+///   string whose `%d` is the spell id — the strings below, which are the *client's own* and are
+///   each referenced exactly once image-wide (`0x8604bc`, `0x860494`, `0x860464`);
+/// - no Lua event fires either: the reference UI knows only `TRAINER_SHOW`/`TRAINER_CLOSED`/
+///   `TRAINER_UPDATE`, and `BuyTrainerService 0x4da210` runs no client-side money or skill test
+///   before sending, so there is no second path that would speak.
+///
+/// benilla showed a red `UI_ERROR_MESSAGE` here, one of whose three sentences was a re-typed
+/// `ERR_NOT_ENOUGH_MONEY` and two of which were invented (decision 2045). Both problems have the
+/// same answer, and it is the reference's: say it to the log and nothing to the player. Rarely
+/// reached either way — the Train button is disabled unless the service is available and
+/// affordable.
+fn train_error_log_line(code: u32) -> &'static str {
     use benilla_protocol::messages::train_fail;
     match code {
-        train_fail::NOT_ENOUGH_MONEY => "You don't have enough money.",
-        train_fail::NOT_ENOUGH_SKILL => "You do not have the required skill.",
-        _ => "That trainer service is not available.",
+        train_fail::NOT_ENOUGH_MONEY => "Not enough money for trainer service",
+        train_fail::NOT_ENOUGH_SKILL => "Not enough skill points for trainer service",
+        _ => "Trainer service unavailable",
     }
-    .to_string()
 }
 
 /// Resolve one wire [`TrainerSpell`] into the Lua-facing [`TrainerService`]: name/subtext/icon from
@@ -169,7 +189,6 @@ fn train_error_text(code: u32) -> String {
 /// the ability-req names + rank from the same spell catalog, the state/cost/gates straight off the
 /// wire. `known` is the player's known-spell set ([`PlayerActions::spells`]) — each prerequisite
 /// ability is coloured by whether the player already knows that specific spell (see below).
-#[allow(clippy::too_many_arguments)] // the resolver's full catalog set
 fn resolve_service(
     wire: &TrainerSpell,
     trainer_type: u32,
@@ -177,8 +196,10 @@ fn resolve_service(
     skill_lines: Option<&SkillLineCatalog>,
     known: &BTreeSet<u32>,
     icons: Option<&ItemDisplays>,
-    items: &mut Items,
+    items: &Items,
     commands: &NetCommands,
+    // The VM's own `GlobalStrings.lua`, for [`service_group`]'s three header labels.
+    get: &dyn Fn(&str) -> Option<String>,
 ) -> TrainerService {
     // The trainer offers a LEARN wrapper (decision 0247); the ability it teaches is the taught
     // spell, and the tree GROUPS by that hop (`0x4d7c60` → `[skillrec+4]`). It is the only thing
@@ -216,20 +237,17 @@ fn resolve_service(
     // and INDEPENDENT of the service's overall category — so a spell gated only by LEVEL still shows
     // its already-learned prev-rank prerequisite WHITE, not red. The req id is a real ability id (not
     // a learn wrapper — verified there too), so there's no hop: look it up directly. The name carries
-    // its rank exactly as the client does — `"Name (Rank)"` when the spell has a rank subtext, else
-    // the bare name (the client's `"%s (%s)"`). The client also ORs `KnownHigherRank`; benilla has no
-    // rank chain, and sequential trainer ranks never reach that clause, so the direct known-check
-    // covers every real case.
+    // its rank exactly as the client does — `SpellDisplay::ranked_name`, the shared composer for the
+    // client's `"%s (%s)"` literal (decision 2243). The client also ORs `KnownHigherRank`; benilla
+    // has no rank chain, and sequential trainer ranks never reach that clause, so the direct
+    // known-check covers every real case.
     let ability_reqs = wire
         .req_spells
         .iter()
         .filter(|&&s| s != 0)
         .map(|&s| {
             let name = match spells.get(s) {
-                Some(d) => match d.rank.as_deref() {
-                    Some(rank) if !rank.is_empty() => format!("{} ({})", d.name, rank),
-                    _ => d.name.clone(),
-                },
+                Some(d) => d.ranked_name(),
                 None => format!("Spell {s}"),
             };
             TrainerAbilityReq {
@@ -244,8 +262,15 @@ fn resolve_service(
     // unresolved `0` drops the service from the tree exactly as the client's builder does. Log the
     // genuine miss (catalog present but no line) so DBC gaps surface rather than silently swallowing
     // a service the server offered. The tradeskill arm resolves no line at all and cannot miss.
-    let (group_key, group_name) =
-        service_group(wire.spell, taught, trainer_type, cat, spells, skill_lines);
+    let (group_key, group_name) = service_group(
+        wire.spell,
+        taught,
+        trainer_type,
+        cat,
+        spells,
+        skill_lines,
+        get,
+    );
     if group_key == 0 && skill_lines.is_some() {
         debug!(
             "ui_trainer: trainer spell {} (teaches {taught}) has no skill line — dropped from the tree",
@@ -282,15 +307,15 @@ fn resolve_service(
 
 /// Build the Lua-facing snapshot from [`TrainerOpen`] + the spell/skill catalogs — `None` when no
 /// trainer is open.
-#[allow(clippy::too_many_arguments)] // the resolver's full catalog set
 fn snapshot(
     open: &TrainerOpen,
     spells: &SpellCatalog,
     skill_lines: Option<&SkillLineCatalog>,
     known: &BTreeSet<u32>,
     icons: Option<&ItemDisplays>,
-    items: &mut Items,
+    items: &Items,
     commands: &NetCommands,
+    get: &dyn Fn(&str) -> Option<String>,
 ) -> Option<TrainerState> {
     open.trainer?;
     Some(TrainerState {
@@ -309,6 +334,7 @@ fn snapshot(
                     icons,
                     items,
                     commands,
+                    get,
                 )
             })
             .collect(),
@@ -322,7 +348,6 @@ fn snapshot(
 /// content change). Diffed against a `Local` memory, exactly like the gossip/merchant feeds. A
 /// different trainer while the window is already open is a real close+open (the client's `ShowUIPanel`
 /// early-returns when visible, so the open sound only re-plays after a hide — decision 0096).
-#[allow(clippy::too_many_arguments)]
 fn feed_trainer(
     script: Option<NonSendMut<UiScript>>,
     // ResMut only to consume the fresh-packet latch below — the feed never authors trainer content.
@@ -333,10 +358,10 @@ fn feed_trainer(
     // A tradeskill trainer's rows front the CREATED ITEM's icon, so the feed needs the ask-once
     // template cache + `ItemDisplayInfo.dbc` — the tradeskill window's own pair ([`service_icon`]).
     icons: Option<Res<ItemDisplays>>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     mut errors: ResMut<TrainerErrors>,
     commands: Res<NetCommands>,
-    mut names: ResMut<NameCache>,
+    names: Res<NameCache>,
     mut last: Local<crate::ui_script::VmMemo<Option<TrainerState>>>,
     mut last_trainer: Local<crate::ui_script::VmMemo<Option<u64>>>,
     mut last_name: Local<crate::ui_script::VmMemo<Option<String>>>,
@@ -347,12 +372,12 @@ fn feed_trainer(
     let last = last.get(&script);
     let last_trainer = last_trainer.get(&script);
     let last_name = last_name.get(&script);
-    // Refusals surface as the client's red error line (the merchant/equip/cast path's exact shape).
+    // Refusals go to the log and nowhere else — the reference's own console-only handling
+    // ([`train_error_log_line`]). Logged rather than dropped for the reason 0651 logs the server's
+    // dot-command answers: a refusal nothing said and a packet nothing noticed look identical
+    // afterwards.
     for code in errors.0.drain(..) {
-        script.fire_event(
-            "UI_ERROR_MESSAGE",
-            vec![ScriptValue::Str(train_error_text(code))],
-        );
+        info!("ui_trainer: {} (code {code})", train_error_log_line(code));
     }
     // Nothing to resolve a name/icon from yet — try again once Spell.dbc lands.
     let Some(spells) = spells.as_deref() else {
@@ -369,7 +394,7 @@ fn feed_trainer(
     // reference's builder does (decision 1128) — before the snapshot goes in, so `TRAINER_SHOW`
     // finds the reset mask and the window's own show handler pushes the SAVED filter back over it.
     if open.fresh_list {
-        script.reset_trainer_filter(open.trainer_type);
+        script.reset_trainer_list_state(open.trainer_type);
         open.fresh_list = false;
     }
     let fresh = snapshot(
@@ -378,8 +403,16 @@ fn feed_trainer(
         Some(&skill_lines.catalog),
         &actions.spells,
         icons.as_deref(),
-        &mut items,
+        &items,
         &commands,
+        &|key: &str| {
+            script
+                .lua()
+                .globals()
+                .get::<String>(key)
+                .ok()
+                .filter(|t| !t.is_empty())
+        },
     );
     // The trainer's name resolves through the NameCache (a creature-name query, ask-once — the
     // real client's `UnitName("npc")`). `None`/empty while in flight; the title shows the static

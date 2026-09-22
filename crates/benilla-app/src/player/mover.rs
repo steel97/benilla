@@ -39,7 +39,7 @@ use bevy::prelude::*;
 use super::{
     move_trace, Player, CAPSULE_HEIGHT, FEATHER_TERMINAL_VELOCITY, FOOT_CONE_HEIGHT, GRAVITY,
     GROUND_COS, GROUND_PROBE, HOVER_CLIMB_RATE, HOVER_HEIGHT, JUMP_SPEED, LAND_PROBE, SKIN_WIDTH,
-    STEP_SLOPE_RATIO, STEP_SNAP_SLACK, STEP_UP_ADVANCE, STEP_UP_HEIGHT, TERMINAL_VELOCITY,
+    STEP_SLOPE_RATIO, STEP_SNAP_SLACK, STEP_UP_ADVANCE_PER_YARD, STEP_UP_HEIGHT, TERMINAL_VELOCITY,
     WATER_WALK_PITCH_FLOOR, WEDGE_MIN_FALL, WEDGE_STALL_RATIO, WEDGE_STILL_FRAMES,
 };
 
@@ -111,7 +111,6 @@ pub(super) struct Outcome {
 /// Advance the player mover one frame: settle hold, ground classify, the slide, and the
 /// step-down snap. Writes `player.pos`/`vel_y`/`horiz_vel` (the settle *release* is the terrain
 /// streamer's — decision 0737).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn step(
     player: &mut Player,
     time: &Time,
@@ -401,6 +400,7 @@ pub(super) fn step(
             player.horiz_vel,
             time.delta(),
             Support {
+                rise: STEP_UP_HEIGHT,
                 offset: hover_offset,
                 water: water_floor,
                 steep: player.steep_support,
@@ -409,16 +409,21 @@ pub(super) fn step(
         // The step-up probe (this is the LOCAL mover; a remote's dead-reckon is not a report
         // anyone is looking at): a walk frame that went nowhere writes the `stup` deep report —
         // the surface profile ahead, the advance ladder, the candidate faces.
+        // **The local controller is the caller that HAS a fall** (decision 2174), so the no-floor
+        // drop is spent here: `pos.z -= achieved` before the classify, exactly as `0x636e45` does,
+        // and the frame that leaves a ledge starts its fall lower instead of flat. The two
+        // open-loop callers decline it — they have nothing that would ever end it.
+        let resolved = g.center - Vec3::Y * g.unsupported.unwrap_or(0.0);
         super::step_probe::watch(
             world,
             capsule,
             center,
-            g.center,
+            resolved,
             player.horiz_vel,
             dt,
             time.elapsed_secs(),
         );
-        center = g.center;
+        center = resolved;
         climb = g.climb;
         snap_probe = g.snap;
         player.steep_support = g.steep_support;
@@ -554,6 +559,7 @@ pub(super) fn step(
         dx: (center - pre_move).xz().length(),
         grounded,
         on_walkable,
+        moving,
         vel_y: player.vel_y,
         snap: snap_probe,
         climb,
@@ -587,8 +593,14 @@ pub(super) fn step(
 ///
 /// They travel together because they are the same question asked twice: how far below the feet does
 /// "the ground" start, and does the thing under us count as a floor at all.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(crate) struct Support {
+    /// **The mover's rise budget** — the reference's `H` (`0x617430`): how high the atomic step-up
+    /// may lift the body, and the yardstick of its certify reach (`H·tan50°`). [`STEP_UP_HEIGHT`]
+    /// for a player body — our own, and every watched one — and
+    /// [`super::CREATURE_STEP_UP_HEIGHT`] for a creature the server walks (decision 1125 has the
+    /// byte split: `0x5fa550`'s FALSE leg reads the constant `2.0`).
+    pub(crate) rise: f32,
     /// The body rests this far **above** the surface — HOVER's float (decision 0866),
     /// [`super::HOVER_HEIGHT`] while the mode is up and `0.0` for everyone else, which is the
     /// ordinary case.
@@ -612,6 +624,19 @@ pub(crate) struct Support {
     pub(crate) steep: bool,
 }
 
+impl Default for Support {
+    /// A player body on an ordinary frame: no hover, no liquid floor, a walkable support, and the
+    /// player's own rise budget.
+    fn default() -> Self {
+        Self {
+            rise: STEP_UP_HEIGHT,
+            offset: 0.0,
+            water: None,
+            steep: false,
+        }
+    }
+}
+
 /// What one grounded walk step resolved against the world came out as ([`grounded_step`]).
 pub(crate) struct GroundedStep {
     /// The resolved capsule centre.
@@ -631,6 +656,22 @@ pub(crate) struct GroundedStep {
     /// The election snap's `(probe reach, what it found)` — trace fodder, `None` when the step-up
     /// took the frame instead. The inner pair is `(hit distance, hit normal.y)`.
     pub(crate) snap: Option<(f32, Option<(f32, f32)>)>,
+    /// **The fall's opening drop, when the election found NO floor at all** — `Some(yd)` iff the
+    /// probe came back empty and the body is not mid-ride, `None` on every frame a surface was
+    /// found (including a step-up commit and a mid-ledge steep support, which both leave
+    /// [`Self::ground`] `None` for their own reasons and must not be confused with this).
+    ///
+    /// It is **not applied to [`Self::center`]** (decision 2174). The reference's finalize does
+    /// write `pos.z -= achieved` on its no-hit leg — and then *classifies*, electing a fall that
+    /// gravity finishes and a landing ends. That election is the **caller's**, and only one of this
+    /// function's three callers has one: the local controller ([`step`]) applies this drop and
+    /// falls. The creature ground clamp and the remote dead-reckon have no fall to elect and sweep
+    /// again next frame from their own answer, so for them the drop is not an opening — it is a
+    /// ratchet with no floor to end it, and it walked Stormwind's patrolling guards 31 yd down
+    /// through the world while their colliders were still streaming in. They read this as "our
+    /// world could not answer" and hold the server's pose instead, which is the law their idle
+    /// paths already obey ([`crate::net::motion::spline::grounded_y`]).
+    pub(crate) unsupported: Option<f32>,
 }
 
 /// **One grounded walk step, resolved against the world** — step-up → slide → election snap, from
@@ -682,7 +723,8 @@ pub(crate) fn grounded_step(
             center,
             horiz_vel / speed,
             travel,
-            travel.max(STEP_UP_ADVANCE),
+            travel.max(support.rise * STEP_UP_ADVANCE_PER_YARD),
+            support.rise,
         )
     } else {
         StepAttempt {
@@ -840,7 +882,7 @@ pub(crate) fn grounded_step(
     let reach = d.x.hypot(d.z) * STEP_SLOPE_RATIO
         + STEP_SNAP_SLACK
         + if support.steep || popped.is_some() {
-            STEP_UP_HEIGHT
+            support.rise
         } else {
             0.0
         }
@@ -865,6 +907,8 @@ pub(crate) fn grounded_step(
     let snap = Some((reach, floor.map(|(d, n, _)| (d, n))));
     let mut ground = None;
     let mut steep_support = false;
+    // The no-floor drop, measured here and spent by whoever has a fall to elect (see the field).
+    let mut unsupported = None;
     // **A ride's height is earned; the snap follows ground *down*, it never undoes a climb.**
     //
     // This is where our capsule and the reference's cone part company, and it has to be said out
@@ -955,7 +999,10 @@ pub(crate) fn grounded_step(
         // the director was still feeling after 1132 capped the other two legs: their fence
         // step-downs came through *this* branch, `snap miss (reach 1.25) dy=-1.250`, five of them in
         // one capture. The cap is a property of our body, not of which leg found the floor.
-        slid.y -= (reach - surface_offset).max(0.0).min(cone_reach);
+        // **Measured, not applied** (decision 2174) — [`GroundedStep::unsupported`] is the whole
+        // story: this is the first frame of a fall, and only a caller that can finish one may
+        // spend it.
+        unsupported = Some((reach - surface_offset).max(0.0).min(cone_reach));
     }
     GroundedStep {
         center: slid,
@@ -972,6 +1019,7 @@ pub(crate) fn grounded_step(
         steep_support: ((rode || popped.is_some()) && ground.is_none()) || steep_support,
         ground,
         snap,
+        unsupported,
     }
 }
 
@@ -1287,6 +1335,7 @@ pub(crate) fn step_up(
     dir_h: Vec3,
     look: f32,
     advance: f32,
+    rise: f32,
 ) -> StepAttempt {
     let none = |verdict| StepAttempt {
         contact: None,
@@ -1306,8 +1355,8 @@ pub(crate) fn step_up(
         verdict,
     };
 
-    // Rise: the free headroom, at most H.
-    let up = cast(center, Vec3::Y * STEP_UP_HEIGHT).map_or(STEP_UP_HEIGHT, |h| h.distance);
+    // Rise: the free headroom, at most H — the mover's own budget (`Support::rise`).
+    let up = cast(center, Vec3::Y * rise).map_or(rise, |h| h.distance);
     if up < 1e-3 {
         return at(StepVerdict::NoHeadroom);
     }
@@ -1350,6 +1399,7 @@ pub(crate) fn step_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::state::STEP_UP_ADVANCE;
     use crate::player::AIR_NUDGE_SPEED;
     use crate::player::CAPSULE_RADIUS;
     use bevy::ecs::system::RunSystemOnce;
@@ -1427,7 +1477,15 @@ mod tests {
                 let start = Vec3::new(-1.0, CAPSULE_HEIGHT * 0.5, 0.0);
                 let run = cast(start, Vec3::X).map_or(1.0, |h| h.distance);
                 let center = start + Vec3::X * run;
-                step_up(&cast, center, Vec3::X, TRAVEL_60FPS, advance).verdict
+                step_up(
+                    &cast,
+                    center,
+                    Vec3::X,
+                    TRAVEL_60FPS,
+                    advance,
+                    STEP_UP_HEIGHT,
+                )
+                .verdict
             })
             .unwrap()
     }
@@ -1809,9 +1867,8 @@ mod tests {
                     Vec3::X * 7.0,
                     dt,
                     Support {
-                        offset: 0.0,
-                        water: None,
                         steep: true,
+                        ..Support::default()
                     },
                 );
                 g.center.y - center.y
@@ -2001,6 +2058,7 @@ mod tests {
                     Vec3::X,
                     TRAVEL_60FPS,
                     STEP_UP_ADVANCE,
+                    STEP_UP_HEIGHT,
                 )
                 .verdict
             })
@@ -2269,8 +2327,8 @@ mod tests {
     /// **B322, the lift** (decision 1616): the director's *"it doesn't bring you to surface when
     /// used in water"*, for the case the reference actually surfaces — a body standing in liquid
     /// too shallow to swim in. The surface is solid geometry over there, so a body inside it is a
-    /// body inside a wall, and the sweep's depenetration is what puts it on top. Ours is a queried
-    /// plane with no sweep, so the resolve has to say it.
+    /// body inside a wall that the swept resolve keeps on top. Ours is a queried plane with no
+    /// sweep, so the resolve has to say it.
     #[test]
     fn water_walking_lifts_a_wader_out_of_the_water() {
         const SURFACE: f32 = 0.0;

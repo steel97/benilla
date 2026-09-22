@@ -41,7 +41,7 @@ pub(crate) struct FeedMemory {
     /// what a charter slot's tooltip lines are built from. Lazy, so its arrival moves nothing else
     /// here (the same reason `names_generation` exists one line up).
     petition_records: gate::Watch,
-    /// `Items::enchant_display_epoch` — one step per displayable countdown change (the slot
+    /// `Items::countdown_display_epoch` — one step per displayable countdown change (the slot
     /// views read second-floored countdowns), including the last elapse's collapsing push.
     enchant_deadlines: gate::Watch,
     /// The item guid **of the bag itself** in each of the ten bag slots — container ids 1..=10
@@ -50,6 +50,29 @@ pub(crate) struct FeedMemory {
     /// [`ContainerState`] therefore cannot answer: two different empty 16-slot bags swapped
     /// between two slots produce identical container states and must still close both windows.
     bag_guids: [u64; 10],
+    /// The item guid in each of the **24 vault slots** (absolute player slots 39..62), indexed
+    /// `slot − 1`. Diffed frame to frame to tell `PLAYERBANKSLOTS_CHANGED`'s two producers apart —
+    /// see [`SlotGuids`] and the fire site below. Same reason [`Self::bag_guids`] exists: the
+    /// pushed [`ContainerState`] cannot answer a question about item IDENTITY, because two
+    /// different instances of one template push the same slot view.
+    vault_guids: [u64; BANK_SLOTS as usize],
+}
+
+/// The player descriptor's own item-slot guids, as the reference's watchers read them — the ten
+/// bag slots and the 24 vault slots, in one value because they are one registration family
+/// (`0x5dd8a0` installs `0x5ddcf0` over four bands of `PLAYER_FIELD_*_SLOT_*` with `len = 8`, the
+/// guid's width).
+///
+/// These ride beside the pushed containers rather than inside them because they are read off the
+/// player descriptor, not built from the containers — and because they answer what a derived view
+/// cannot: *which item*, not *what it looks like*.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct SlotGuids {
+    /// Container ids 1..=10 — the four equipped bag slots, then the six bank bag slots — indexed
+    /// `id − 1`. `BAG_CLOSED`'s diff (decision 1777).
+    pub bags: [u64; 10],
+    /// The 24 vault slots, indexed `slot − 1`. `PLAYERBANKSLOTS_CHANGED`'s producer discriminator.
+    pub vault: [u64; BANK_SLOTS as usize],
 }
 
 /// A spell's tooltip text: the $-substituted description (the real "Use: Restores 392 to 653
@@ -69,6 +92,9 @@ fn spell_desc_text(
     spells: Option<&crate::ui_action::Spells>,
     id: u32,
     home_area: Option<&str>,
+    // The `$d`/`$s` tokens resolve `INT_SPELL_DURATION_*` / `INT_SPELL_POINTS_SPREAD_TEMPLATE`
+    // out of the VM (decision 2045); `benilla-formats` names the key, this side renders it.
+    text: &dyn Fn(&str, &[i64]) -> Option<String>,
 ) -> Option<String> {
     let sp = spells?;
     let d = sp.catalog.get(id)?;
@@ -81,6 +107,7 @@ fn spell_desc_text(
                 radii: &sp.radii,
                 lookup: &|i| sp.catalog.get(i),
                 home_area,
+                text,
             };
             Some(benilla_formats::substitute(desc, d, &ctx)).filter(|t| !t.is_empty())
         }
@@ -105,19 +132,15 @@ fn charges_count(spells: &[benilla_protocol::messages::ItemSpellEntry]) -> i32 {
         .unwrap_or(0)
 }
 
-/// A reputation rank (0..=7) → its enUS standing label (GlobalStrings
-/// `FACTION_STANDING_LABEL1..8`) — the "Requires <Faction> - <Standing>" tail.
-fn standing_label(rank: u32) -> &'static str {
-    [
-        "Hated",
-        "Hostile",
-        "Unfriendly",
-        "Neutral",
-        "Friendly",
-        "Honored",
-        "Revered",
-        "Exalted",
-    ][rank.min(7) as usize]
+/// A reputation rank (0..=7) → its standing label, `FACTION_STANDING_LABEL{rank+1}` off the
+/// player's own `GlobalStrings.lua` — the tail of the `ITEM_REQ_REPUTATION` line.
+///
+/// Keys rather than an eight-string table (decision 2045): the bare tokens, not the `_FEMALE`
+/// twins, which is the spelling the reference itself uses wherever it builds a standing label
+/// (`FACTION_STANDING_LABEL%d` `0x84b5dc`, wow-re `ui/scratch/quest-leaderboard-law.md` §5).
+/// `None` for an install that does not carry the row — the line then names no standing.
+fn standing_label(rank: u32, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    get(&format!("FACTION_STANDING_LABEL{}", rank.min(7) + 1))
 }
 
 /// Build an item template's tooltip view (decision 0274 P1): the full wire fields plus the
@@ -126,7 +149,6 @@ fn standing_label(rank: u32) -> &'static str {
 /// `0x506f70`; its bare name otherwise), the skill requirement's name off `SkillLine.dbc`, the
 /// reputation requirement off `Faction.dbc` names (the red check is the engine's, against the
 /// player's rank map).
-#[allow(clippy::too_many_arguments)] // one app-resolved catalog per argument, by design
 fn template_view(
     t: &ItemInfo,
     spells: Option<&crate::ui_action::Spells>,
@@ -136,13 +158,17 @@ fn template_view(
     sub_classes: Option<&benilla_formats::ItemSubClassCatalog>,
     classes: Option<&benilla_formats::ItemClassCatalog>,
     icons: Option<&ItemDisplays>,
+    // The VM's own `GlobalStrings.lua`, for the reputation-requirement line (decision 2045).
+    get: &dyn Fn(&str) -> Option<String>,
+    // The same table, for the `$`-engine's own keyed tokens — see [`spell_desc_text`].
+    text: &dyn Fn(&str, &[i64]) -> Option<String>,
 ) -> benilla_ui::script::ItemTemplateView {
     let spell_name = |id: u32| -> Option<String> {
         spells
             .and_then(|s| s.catalog.get(id))
             .map(|sd| sd.name.clone())
     };
-    let spell_text = |id: u32| spell_desc_text(spells, id, home_area);
+    let spell_text = |id: u32| spell_desc_text(spells, id, home_area, text);
     benilla_ui::script::ItemTemplateView {
         name: t.name.clone(),
         quality: t.quality,
@@ -158,6 +184,10 @@ fn template_view(
         item_type: classes.and_then(|c| c.name(t.class)).map(str::to_string),
         item_sub_type: sub_classes
             .and_then(|c| c.name(t.class, t.subclass))
+            .map(str::to_string),
+        // …and the tooltip's own spelling of the same row — DisplayName alone.
+        sub_class_display: sub_classes
+            .and_then(|c| c.display_name(t.class, t.subclass))
             .map(str::to_string),
         flags: t.flags,
         bonding: t.bonding,
@@ -197,11 +227,21 @@ fn template_view(
             .flatten(),
         required_honor_rank: t.required_honor_rank,
         required_city_rank: t.required_city_rank,
+        // `ITEM_REQ_REPUTATION` ("%s - %s" after its own "Requires ") — `0x854b8c`, the key the
+        // reference's own item tooltip builds this line with (wow-re
+        // `ui/scratch/tooltip-content-law.md` §"required-spell / honor-rank"). Both holes are
+        // filled in the template's order; an install missing either key shows no line.
         required_rep_line: (t.required_rep_faction != 0)
             .then(|| {
-                factions
-                    .and_then(|c| c.faction_name(t.required_rep_faction))
-                    .map(|f| format!("Requires {f} - {}", standing_label(t.required_rep_rank)))
+                let faction = factions.and_then(|c| c.faction_name(t.required_rep_faction))?;
+                let standing = standing_label(t.required_rep_rank, get)?;
+                Some(benilla_ui::strings::fill(
+                    &get("ITEM_REQ_REPUTATION")?,
+                    &[
+                        benilla_ui::strings::Arg::S(faction),
+                        benilla_ui::strings::Arg::S(&standing),
+                    ],
+                ))
             })
             .flatten(),
         required_rep_faction: t.required_rep_faction,
@@ -232,7 +272,7 @@ fn template_view(
 pub(super) fn feed_item_sets(
     script: Option<NonSendMut<UiScript>>,
     sets: Option<Res<super::ItemSets>>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     commands: Res<NetCommands>,
     spells: Option<Res<crate::ui_action::Spells>>,
     skill_lines: Option<Res<crate::ui_spellbook::SkillLines>>,
@@ -257,6 +297,9 @@ pub(super) fn feed_item_sets(
     let skill_catalog = skill_lines.as_deref().map(|s| &s.catalog);
     let mut done: Vec<u32> = Vec::new();
     let mut push: Vec<(u32, benilla_ui::script::ItemSetView)> = Vec::new();
+    // Scoped, so the push below can take the VM mutably: the build reads the string table, the
+    // push writes the store, and the two cannot hold it at once.
+    let token_text = crate::ui_script::token_text(&script);
     for (&set_id, last) in pending.iter_mut() {
         let Some(row) = sets.0.set(set_id) else {
             done.push(set_id); // no such row — drop the ask for good
@@ -273,7 +316,7 @@ pub(super) fn feed_item_sets(
                 .bonuses
                 .iter()
                 .filter_map(|&(n, spell)| {
-                    spell_desc_text(spell_res, spell, None).map(|text| (n, text))
+                    spell_desc_text(spell_res, spell, None, &token_text).map(|desc| (n, desc))
                 })
                 .collect(),
             required_skill: row.required_skill,
@@ -295,6 +338,7 @@ pub(super) fn feed_item_sets(
             push.push((set_id, view));
         }
     }
+    drop(token_text);
     for (id, view) in push {
         script.set_item_set(id, view);
     }
@@ -343,7 +387,6 @@ pub(super) fn feed_random_properties(
     *pushed.get(&script) = true;
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn feed_item_stats(
     script: Option<NonSendMut<UiScript>>,
     mut items: ResMut<Items>,
@@ -376,12 +419,22 @@ pub(super) fn feed_item_stats(
     // player is bound. But the item feed idles whenever nothing is pending, and the bind point
     // arrives long after world entry (`SMSG_BINDPOINTUPDATE` at login and on every re-bind), so the
     // push cannot sit behind that gate.
-    let home_area: Option<String> = home_bind
+    let home_area: Option<&str> = home_bind
         .as_deref()
         .and_then(|b| b.0)
-        .and_then(|id| area_names.as_deref()?.0.resolve(id as i32))
-        .map(str::to_string);
-    script.set_bind_location(home_area.as_deref().unwrap_or_default());
+        .and_then(|id| area_names.as_deref()?.0.resolve(id as i32));
+    // …pushed on CHANGE, per VM: the memo resets with the VM, so a rebuilt one is fed again
+    // the frame it appears. It used to push every frame — with a fresh String each time —
+    // because it cannot sit behind the pending gate below; the memo compare is the gate it can
+    // sit behind, and the re-substitute rides the same edge.
+    if last_home.as_deref() != home_area {
+        script.set_bind_location(home_area.unwrap_or_default());
+        *last_home = home_area.map(str::to_string);
+        // A bind-point change re-substitutes every held view: templates pushed before the
+        // login's SMSG_BINDPOINTUPDATE landed carry a raw $z otherwise (the hearthstone's login
+        // race).
+        pending.extend(items.cached_template_ids());
+    }
 
     pending.extend(items.take_fresh());
     pending.extend(script.take_item_stat_asks());
@@ -390,32 +443,46 @@ pub(super) fn feed_item_stats(
     }
     let spell_res = spells.as_deref();
     let skill_catalog = skill_lines.as_deref().map(|s| &s.catalog);
-    // A bind-point change re-substitutes every held view: templates pushed before the login's
-    // SMSG_BINDPOINTUPDATE landed carry a raw $z otherwise (the hearthstone's login race).
-    if *last_home != home_area {
-        *last_home = home_area.clone();
-        pending.extend(items.cached_template_ids());
-    }
     let ready: Vec<u32> = pending
         .iter()
         .copied()
         .filter(|&id| items.template(id, 0, &commands).is_some())
         .collect();
-    for id in ready {
-        pending.remove(&id);
-        let Some(t) = items.template(id, 0, &commands) else {
-            continue;
+    // Built first, pushed after: the reference-string lookup borrows the VM and `set_item_template`
+    // needs it mutably, so the resolve and the push cannot interleave.
+    let views: Vec<(u32, benilla_ui::script::ItemTemplateView)> = {
+        let get = |key: &str| {
+            script
+                .lua()
+                .globals()
+                .get::<String>(key)
+                .ok()
+                .filter(|t| !t.is_empty())
         };
-        let view = template_view(
-            &t.clone(),
-            spell_res,
-            skill_catalog,
-            home_area.as_deref(),
-            factions.as_deref().map(|f| f.catalog()),
-            sub_classes.as_deref().map(|s| &s.0),
-            classes.as_deref().map(|c| &c.0),
-            icons.as_deref(),
-        );
+        ready
+            .into_iter()
+            .filter_map(|id| {
+                pending.remove(&id);
+                let t = items.template(id, 0, &commands)?.clone();
+                Some((
+                    id,
+                    template_view(
+                        &t,
+                        spell_res,
+                        skill_catalog,
+                        home_area,
+                        factions.as_deref().map(|f| f.catalog()),
+                        sub_classes.as_deref().map(|s| &s.0),
+                        classes.as_deref().map(|c| &c.0),
+                        icons.as_deref(),
+                        &get,
+                        &crate::ui_script::token_text(&script),
+                    ),
+                ))
+            })
+            .collect()
+    };
+    for (id, view) in views {
         script.set_item_template(id, view);
     }
 }
@@ -424,7 +491,6 @@ pub(super) fn feed_item_stats(
 /// bits) + the full skill-rank map, read off the self player's descriptor, plus the equip
 /// proficiencies (`SMSG_SET_PROFICIENCY`) and the faction → reputation-rank map (DBC base for our
 /// race/class + the `SMSG_INITIALIZE_FACTIONS` standing, ranked) — pushed on change.
-#[allow(clippy::too_many_arguments)] // a Bevy system's full input set
 pub(super) fn feed_player_req(
     script: Option<NonSendMut<UiScript>>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
@@ -538,16 +604,15 @@ pub(super) fn feed_player_req(
 /// read the action feed's ITEM arm does). `None` = the slot is empty (guid 0/unsent) — an
 /// *unresolved* occupied slot is `Some` with empty fields instead, so the bag shows the item
 /// exists before its query answers.
-#[allow(clippy::too_many_arguments)] // the slot resolve's full read set (stores + both clocks)
 fn resolve_slot(
     guid: u64,
-    items: &mut Items,
+    items: &Items,
     icons: Option<&ItemDisplays>,
     rolls: crate::items::RollCatalogs,
     commands: &NetCommands,
     cooldowns: &crate::cooldowns::Cooldowns,
     spells: Option<&benilla_formats::SpellCatalog>,
-    names: &mut crate::names::NameCache,
+    names: &crate::names::NameCache,
     // The petition record cache, for a charter slot's tooltip lines — a LAZY fill, so it is taken
     // mutably for the same reason `names` is: the read is what issues the query.
     petitions: &mut crate::ui_petition::PetitionState,
@@ -565,6 +630,9 @@ fn resolve_slot(
     // (both live on `Items`): one `Option<ms>` per enchant slot.
     let enchant_ms: [Option<u64>; 7] =
         std::array::from_fn(|s| items.enchant_remaining_display_ms(guid, s as u32));
+    // The item's own expiry countdown, read off the same deadline store and floored the same way
+    // — `SMSG_ITEM_TIME_UPDATE`'s only surface (decision 1933).
+    let duration_ms = items.duration_remaining_display_ms(guid);
     let (entry, count, durability, readable, creator, flags, already_bound, roll, enchant_lines) =
         match items.object(guid) {
             Some(fields) => (
@@ -631,6 +699,7 @@ fn resolve_slot(
             flags,
             already_bound,
             enchants: enchant_lines,
+            duration_ms,
             ..Default::default()
         });
     };
@@ -678,6 +747,7 @@ fn resolve_slot(
         flags,
         already_bound,
         enchants: enchant_lines,
+        duration_ms,
         equip_slots: find_equip_slot(t.inventory_type, has_relic_slot),
         bar_placeable: t.placeable_on_action_bar(),
         cooldown: t.use_spell.and_then(|u| {
@@ -712,7 +782,7 @@ fn resolve_slot(
 fn bag_family_name(
     player: Option<&ObjectStore>,
     bag_slot: u8,
-    items: &mut Items,
+    items: &Items,
     families: Option<&benilla_formats::ItemBagFamilyCatalog>,
     commands: &NetCommands,
 ) -> Option<String> {
@@ -766,12 +836,12 @@ pub(crate) fn resolve_item_locks(
         .extend(pending.resolve(|bag, slot1| slot_guid_count(player, bag, slot1, &items)));
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)] // the param list IS the input set
+#[allow(clippy::type_complexity)] // the param list IS the input set
 pub(crate) fn feed_containers(
     script: Option<NonSendMut<UiScript>>,
     // `ChrClasses.dbc` field 16, for the fit rule's relic half — see `find_equip_slot` (1803).
     classes: Option<Res<crate::chr_classes::ChrClassTable>>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     icons: Option<Res<ItemDisplays>>,
     // The two item-DBC catalogs, as one param (the 16-SystemParam ceiling): `SpellItemEnchantment`'s
     // name column — the tooltip's enchant lines (decision 0915) — and `ItemRandomProperties`, the
@@ -796,7 +866,7 @@ pub(crate) fn feed_containers(
     bag_families: Option<Res<crate::ui_items::ItemBagFamilies>>,
     pending: Res<PendingItemOps>,
     mut lock_cleared: ResMut<LockTransitions>,
-    mut names: ResMut<crate::names::NameCache>,
+    names: Res<crate::names::NameCache>,
     // Paired into one param (the 16-SystemParam ceiling this signature already sits at): the UI
     // clock, and the petition record cache a charter slot's tooltip lines read — `ResMut` because
     // that cache is LAZY and the hover is what issues its query.
@@ -830,7 +900,7 @@ pub(crate) fn feed_containers(
     // that rebuilt every bag snapshot for the whole life of a ticking enchant.
     let deadlines_moved = memory
         .enchant_deadlines
-        .moved(items.enchant_display_epoch());
+        .moved(items.countdown_display_epoch());
     // Bound as `let`s (not a bare OR-chain) so the gate trace below can name each input.
     let sweep = cooldowns.sweep_pending(clock.anchor);
     let self_changed = !self_q.1.is_empty();
@@ -930,7 +1000,7 @@ pub(crate) fn feed_containers(
                 bag_family_name(
                     player,
                     e.bag_slot,
-                    &mut items,
+                    &items,
                     bag_families.as_deref().map(|c| &c.0),
                     &commands,
                 )
@@ -994,13 +1064,13 @@ pub(crate) fn feed_containers(
             let guid = store.0.player_pack_slot(i).unwrap_or(0);
             if let Some(mut slot) = resolve_slot(
                 guid,
-                &mut items,
+                &items,
                 icons.as_deref(),
                 rolls,
                 &commands,
                 &cooldowns,
                 spell_catalog,
-                &mut names,
+                &names,
                 &mut petitions,
                 now,
                 ui_now,
@@ -1049,13 +1119,13 @@ pub(crate) fn feed_containers(
             for (j, &guid) in slot_guids.iter().enumerate() {
                 if let Some(mut slot) = resolve_slot(
                     guid,
-                    &mut items,
+                    &items,
                     icons.as_deref(),
                     rolls,
                     &commands,
                     &cooldowns,
                     spell_catalog,
-                    &mut names,
+                    &names,
                     &mut petitions,
                     now,
                     ui_now,
@@ -1084,13 +1154,13 @@ pub(crate) fn feed_containers(
             let guid = store.0.player_bank_slot(i).unwrap_or(0);
             if let Some(mut slot) = resolve_slot(
                 guid,
-                &mut items,
+                &items,
                 icons.as_deref(),
                 rolls,
                 &commands,
                 &cooldowns,
                 spell_catalog,
-                &mut names,
+                &names,
                 &mut petitions,
                 now,
                 ui_now,
@@ -1135,13 +1205,13 @@ pub(crate) fn feed_containers(
             for (j, &guid) in slot_guids.iter().enumerate() {
                 if let Some(mut slot) = resolve_slot(
                     guid,
-                    &mut items,
+                    &items,
                     icons.as_deref(),
                     rolls,
                     &commands,
                     &cooldowns,
                     spell_catalog,
-                    &mut names,
+                    &names,
                     &mut petitions,
                     now,
                     ui_now,
@@ -1174,13 +1244,13 @@ pub(crate) fn feed_containers(
             let guid = store.0.player_keyring_slot(i).unwrap_or(0);
             if let Some(mut slot) = resolve_slot(
                 guid,
-                &mut items,
+                &items,
                 icons.as_deref(),
                 rolls,
                 &commands,
                 &cooldowns,
                 spell_catalog,
-                &mut names,
+                &names,
                 &mut petitions,
                 now,
                 ui_now,
@@ -1202,7 +1272,7 @@ pub(crate) fn feed_containers(
         // `HasKey()` — the gate that decides whether the keyring exists in the UI at all. Pushed
         // beside the containers because it is the same knowledge (item templates) read over the
         // same slot arrays, and it must be fresh on exactly the frames a BAG_UPDATE fires.
-        let key = has_key(&store.0, &mut items, &commands);
+        let key = has_key(&store.0, &items, &commands);
         if key != memory.had_key {
             gate.audit("feed_containers", "the HasKey() flip");
             debug!(
@@ -1233,7 +1303,10 @@ pub(crate) fn feed_containers(
         &mut script,
         memory,
         player.is_some().then_some(fresh),
-        std::array::from_fn(|i| player.map_or(0, |s| bag_slot_guid(s, i as i64 + 1))),
+        SlotGuids {
+            bags: std::array::from_fn(|i| player.map_or(0, |s| bag_slot_guid(s, i as i64 + 1))),
+            vault: std::array::from_fn(|i| player.map_or(0, |s| vault_slot_guid(s, i as u8))),
+        },
         transitioned,
     ) {
         gate.audit("feed_containers", "a bag diff or a lock event");
@@ -1241,8 +1314,8 @@ pub(crate) fn feed_containers(
 }
 
 /// The feed's outward half: diff `source` against what was last pushed, push each changed bag into
-/// the VM and fire the reference's events — `BAG_UPDATE(bagID)` (`PLAYERBANKSLOTS_CHANGED(slot)`
-/// for the vault), one `BAG_UPDATE_DELAYED` per batch, then the lock transitions.
+/// the VM and fire the reference's events — `BAG_UPDATE(bagID)` (`PLAYERBANKSLOTS_CHANGED` for
+/// the vault), one `BAG_UPDATE_DELAYED` per batch, then the lock transitions.
 ///
 /// **`source: None` means the self player STORE is absent this frame — "no data source", never
 /// "the player has no items."** The two absent windows are pre-arrival at login (the fresh VM's
@@ -1262,11 +1335,12 @@ pub(crate) fn apply_container_source(
     script: &mut UiScript,
     memory: &mut FeedMemory,
     source: Option<HashMap<i64, ContainerState>>,
-    // The ten bag slots' own guids ([`bag_slot_guid`]) — `BAG_CLOSED`'s diff. Rides beside the
-    // source rather than inside it because it is read off the player descriptor, not built from
-    // the containers, and the absent-source path must leave the memory alone rather than diff
-    // against zeros (that path is the logout despawn window — see this function's own note).
-    bag_guids: [u64; 10],
+    // The player's item-slot guids ([`bag_slot_guid`], [`vault_slot_guid`]) — `BAG_CLOSED`'s diff
+    // and `PLAYERBANKSLOTS_CHANGED`'s producer discriminator. Rides beside the source rather than
+    // inside it because it is read off the player descriptor, not built from the containers, and
+    // the absent-source path must leave the memory alone rather than diff against zeros (that path
+    // is the logout despawn window — see this function's own note).
+    guids: SlotGuids,
     transitioned: Vec<(i64, u32)>,
 ) -> bool {
     // Diff whole bags; push + fire BAG_UPDATE per transition, one BAG_UPDATE_DELAYED per batch. A
@@ -1275,16 +1349,20 @@ pub(crate) fn apply_container_source(
     // below rather than leaning on that invariant.
     let mut pushed = false;
     if let Some(fresh) = source {
-        pushed |= diff_and_push(script, memory, fresh, bag_guids);
+        pushed |= diff_and_push(script, memory, fresh, guids);
     }
     // The lock-transition event (decision 0218: the bag windows' own repaint trigger) — after the
     // container push above, so a listener's repaint reads the corrected `.locked` state.
     pushed |= !transitioned.is_empty();
-    for (bag, slot) in transitioned {
-        script.fire_event(
-            "ITEM_LOCK_CHANGED",
-            vec![ScriptValue::Int(bag), ScriptValue::Int(i64::from(slot))],
-        );
+    // **`ITEM_LOCK_CHANGED` carries NO arguments** (decision 2140, found by the argument gate).
+    // All five fire sites in the image — `0x495415`, `0x495455`, `0x49557d` (the local lock/unlock
+    // paths), `0x5d859a` and `0x5d94b9` (the item field watchers) — are
+    // `FrameScript_SignalEvent 0x703e50`, an `__fastcall(ecx = id)` with a plain `ret` and no vararg
+    // mechanism at all, so the event cannot carry one. Every stock consumer repaints from `this`
+    // (`ContainerFrame.lua:39`, `PaperDollFrame.lua:601`, `BankFrame.lua:209`). The `(bag, slot)`
+    // pair benilla pushed is the LATER clients' shape, invented here.
+    for _ in transitioned {
+        script.fire_event("ITEM_LOCK_CHANGED", Vec::new());
     }
     // Whether anything went into the VM — the caller's gate audit reads it (1439).
     pushed
@@ -1298,6 +1376,12 @@ pub(crate) fn apply_container_source(
 /// the descriptor bytes `0x540`–`0x55f` (equipped bags 19–22) and `0x6a0`–`0x6cf` (bank bags
 /// 63–68) with callback `0x4f8ec0`, and the backpack and keyring loops with `0x4f8db0`, which
 /// never reaches the event at all. So exactly these ten slots close a window.
+/// The guid of the item in vault slot `i` (0-based, 24 of them — absolute player slots 39..62).
+/// `0` = empty. The band `0x5dd8a0`'s L2 loop registers `0x5ddcf0` over (`edi=0x5e0`..`0x698`).
+fn vault_slot_guid(store: &ObjectStore, i: u8) -> u64 {
+    store.0.player_bank_slot(i).unwrap_or(0)
+}
+
 fn bag_slot_guid(store: &ObjectStore, id: i64) -> u64 {
     match id {
         1..=4 => store.0.player_inv_slot(BAG_SLOT_FIRST + (id as u8 - 1)),
@@ -1312,7 +1396,7 @@ fn diff_and_push(
     script: &mut UiScript,
     memory: &mut FeedMemory,
     fresh: HashMap<i64, ContainerState>,
-    bag_guids: [u64; 10],
+    guids: SlotGuids,
 ) -> bool {
     // **`BAG_CLOSED` — the only thing in the image that hides an open bag window** (CARVED, wow-re
     // `system/ui/scratch/equipped-bag-slot-events.md`: one fire site, `0x4f92b5`, and
@@ -1328,7 +1412,7 @@ fn diff_and_push(
         .filter(|&id| {
             let (was, now) = (
                 memory.bag_guids[id as usize - 1],
-                bag_guids[id as usize - 1],
+                guids.bags[id as usize - 1],
             );
             was != 0 && now != was
         })
@@ -1338,12 +1422,55 @@ fn diff_and_push(
     let emptied: Vec<i64> = closed
         .iter()
         .copied()
-        .filter(|&id| bag_guids[id as usize - 1] == 0)
+        .filter(|&id| guids.bags[id as usize - 1] == 0)
         .collect();
-    memory.bag_guids = bag_guids;
+    memory.bag_guids = guids.bags;
     for id in &closed {
         script.fire_event("BAG_CLOSED", vec![ScriptValue::Int(*id)]);
     }
+    // **`PLAYERBANKSLOTS_CHANGED` has TWO producers in the reference, and they carry different
+    // arguments** (CARVED — wow-re `system/object-layer/scratch/bank-slot-event-law.md` §3/§4;
+    // decision 2140). benilla had one fire for both, so half of them were argless where the
+    // reference pushes a string:
+    //
+    // * **P1, the player-descriptor path** — `0x5ddcf0`'s watcher sees the slot's own GUID field
+    //   change and fires `0x5ddd6e`, `FrameScript_SignalEvent 0x703e50`, `__fastcall(ecx = id)`
+    //   with a plain `ret`: **zero Lua values**. This is an item arriving, leaving, or being
+    //   exchanged for a different one.
+    // * **P2, the item-object path** — the changed ITEM's own watched fields move (stack count,
+    //   spell charges, enchantment, flags, durability, entry) or its `CGItem` enters the world;
+    //   `0x4c7180` resolves it to a flat slot and fires `0x4c728d`,
+    //   `SignalEvent2(347, "%s", "player")`: **`arg1` is the unit token `"player"`**. This is the
+    //   same item, changed.
+    //
+    // So the discriminator is the slot's item GUID, not its pushed view — and that is not a
+    // refinement, it is the only thing that answers: two different instances of one template push
+    // an identical `ContainerSlot`, so a view diff reads a swap of two identical stacks as *no
+    // change at all* and fires nothing where the reference fires P1 twice. Exactly 1777's reason
+    // for diffing `BAG_CLOSED` on the bag's own guid, one band over.
+    //
+    // Planned here, before `memory` is rewritten, and fired below after the push — a listener must
+    // repaint off the corrected state. It is deliberately OUTSIDE the `changed` gate for the same
+    // identical-swap reason: that transition moves no container state.
+    let vault: Vec<bool> = {
+        let empty = HashMap::new();
+        let now = fresh.get(&BANK_CONTAINER).map_or(&empty, |c| &c.slots);
+        let was = memory
+            .pushed
+            .get(&BANK_CONTAINER)
+            .map_or(&empty, |c| &c.slots);
+        (1..=u32::from(BANK_SLOTS))
+            .filter_map(|slot| {
+                let i = slot as usize - 1;
+                if guids.vault[i] != memory.vault_guids[i] {
+                    Some(false)
+                } else {
+                    (now.get(&slot) != was.get(&slot)).then_some(true)
+                }
+            })
+            .collect()
+    };
+    memory.vault_guids = guids.vault;
     let changed: Vec<i64> = fresh
         .keys()
         .chain(memory.pushed.keys())
@@ -1385,12 +1512,12 @@ fn diff_and_push(
         for &bag in &changed {
             script.set_container(bag, fresh.get(&bag).cloned());
         }
-        // Ahead of BAG_UPDATE below, which is the reference handler's own order.
-        for (bag, slot) in restacked {
-            script.fire_event(
-                "ITEM_LOCK_CHANGED",
-                vec![ScriptValue::Int(bag), ScriptValue::Int(i64::from(slot))],
-            );
+        // Ahead of BAG_UPDATE below, which is the reference handler's own order. One event per
+        // restacked slot and no arguments (see the note above) — `restacked` keeps the `(bag,
+        // slot)` pairs rather than a count because they are what identifies the slot for anyone
+        // reading this at a breakpoint; the event itself has never carried them.
+        for _ in &restacked {
+            script.fire_event("ITEM_LOCK_CHANGED", Vec::new());
         }
         // Name the bags, not just the count: "3 changed" can't tell you WHICH container moved, and
         // the negative ids (−1 bank, −2 keyring) are exactly the ones you go looking for.
@@ -1417,35 +1544,149 @@ fn diff_and_push(
             // NEITHER `BAG_UPDATE` nor `BAG_CLOSED`: `0x4f8cc0` installs its container listener
             // over the six bank-bag fields (`0x6a0`–`0x6c8`) and over nothing in the 24 vault
             // fields (`0x5e0`–`0x698`).
-            if bag == BANK_CONTAINER {
-                let empty = HashMap::new();
-                let now_slots = fresh.get(&bag).map(|c| &c.slots).unwrap_or(&empty);
-                let was_slots = memory.pushed.get(&bag).map(|c| &c.slots).unwrap_or(&empty);
-                for slot in 1..=u32::from(BANK_SLOTS) {
-                    if now_slots.get(&slot) != was_slots.get(&slot) {
-                        script.fire_event("PLAYERBANKSLOTS_CHANGED", vec![]);
-                    }
-                }
-            } else if !emptied.contains(&bag) {
+            if bag != BANK_CONTAINER && !emptied.contains(&bag) {
                 script.fire_event("BAG_UPDATE", vec![ScriptValue::Int(bag)]);
             }
         }
         memory.pushed = fresh;
-        script.fire_event("BAG_UPDATE_DELAYED", vec![]);
-        return true;
     }
-    // A `BAG_CLOSED` with nothing else to say still went into the VM — two identical bags swapped
-    // between two slots change no container state at all.
-    !closed.is_empty()
+    // The vault band's announce, planned above. One event per changed slot, as the watcher does —
+    // the slot travels in *how many times it fires*, never in an argument (1776).
+    for &same_item in &vault {
+        let args = if same_item {
+            vec![ScriptValue::Str("player".into())]
+        } else {
+            Vec::new()
+        };
+        script.fire_event("PLAYERBANKSLOTS_CHANGED", args);
+    }
+    // A `BAG_CLOSED` or a vault event with nothing else to say still went into the VM — two
+    // identical bags (or two identical items) swapped between two slots change no container state
+    // at all.
+    !changed.is_empty() || !closed.is_empty() || !vault.is_empty()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_container_source, charges_count, FeedMemory};
+    use super::{
+        apply_container_source, charges_count, ContainerSlot, FeedMemory, SlotGuids,
+        BANK_CONTAINER, BANK_SLOTS,
+    };
 
-    /// No bag in any of the ten bag slots — every test below drives the backpack (container 0),
-    /// which has no bag slot behind it and can never raise `BAG_CLOSED`.
-    const NO_BAGS: [u64; 10] = [0; 10];
+    /// No bag in any of the ten bag slots, nothing in the vault — every test below drives the
+    /// backpack (container 0), which has no bag slot behind it and can never raise `BAG_CLOSED`.
+    const NO_BAGS: SlotGuids = SlotGuids {
+        bags: [0; 10],
+        vault: [0; BANK_SLOTS as usize],
+    };
+
+    /// **`PLAYERBANKSLOTS_CHANGED` has two producers and they carry different arguments**
+    /// (decision 2140; CARVED, wow-re `object-layer/scratch/bank-slot-event-law.md` §3/§4).
+    ///
+    /// benilla fired the argless one for every transition, which is right for half of them and
+    /// wrong for the other half — and the half it got wrong is the one a view diff cannot even
+    /// see. The three arms below are the three the carve distinguishes:
+    ///
+    ///  · a slot's item GUID changes (arrive / leave / exchange) → `0x5ddd6e`, **no arguments**;
+    ///  · the same item's own fields change (a restack) → `0x4c728d`, **`arg1 = "player"`**;
+    ///  · two IDENTICAL items exchanged between two slots → the pushed views are equal, so the
+    ///    container diff sees nothing at all, and the reference fires the argless one **twice**.
+    #[test]
+    fn playerbankslots_changed_names_its_producer_by_the_slot_guid() {
+        let mut s = UiScript::new().unwrap();
+        s.run(
+            "SEEN = {} \
+             local f = CreateFrame('Frame') \
+             f:RegisterEvent('PLAYERBANKSLOTS_CHANGED') \
+             f:SetScript('OnEvent', function() \
+                 table.insert(SEEN, event .. ' ' .. tostring(arg1)) end)",
+        )
+        .unwrap();
+        let seen = |s: &mut UiScript| {
+            let out = s.eval::<Vec<String>>("return SEEN").unwrap();
+            s.run("SEEN = {}").unwrap();
+            out
+        };
+        // The vault, with `slot` holding `count` of item 1234.
+        let vault = |slot: u32, count: u32| {
+            HashMap::from([(
+                BANK_CONTAINER,
+                ContainerState {
+                    name: None,
+                    num_slots: u32::from(BANK_SLOTS),
+                    slots: HashMap::from([(
+                        slot,
+                        ContainerSlot {
+                            item_id: 1234,
+                            count,
+                            ..Default::default()
+                        },
+                    )]),
+                },
+            )])
+        };
+        let mut guids = NO_BAGS;
+        let mut memory = FeedMemory::default();
+
+        // An item ARRIVES in vault slot 1 — the descriptor path, no arguments.
+        guids.vault[0] = 0xF00D;
+        apply_container_source(&mut s, &mut memory, Some(vault(1, 5)), guids, Vec::new());
+        assert_eq!(seen(&mut s), vec!["PLAYERBANKSLOTS_CHANGED nil"]);
+
+        // The SAME item restacks — its own `ITEM_FIELD_STACK_COUNT` moved, which is the item
+        // watcher's path, and the reference pushes the unit token there.
+        apply_container_source(&mut s, &mut memory, Some(vault(1, 9)), guids, Vec::new());
+        assert_eq!(seen(&mut s), vec!["PLAYERBANKSLOTS_CHANGED player"]);
+
+        // Nothing moved at all.
+        apply_container_source(&mut s, &mut memory, Some(vault(1, 9)), guids, Vec::new());
+        assert!(seen(&mut s).is_empty(), "an unchanged vault says nothing");
+
+        // Two IDENTICAL stacks exchanged between slots 1 and 2. Both slot views are equal before
+        // and after, so `fresh == memory.pushed` and the container diff is empty — the guids are
+        // the only witness, and the reference fires twice.
+        let two = || {
+            HashMap::from([(
+                BANK_CONTAINER,
+                ContainerState {
+                    name: None,
+                    num_slots: u32::from(BANK_SLOTS),
+                    slots: HashMap::from([
+                        (
+                            1,
+                            ContainerSlot {
+                                item_id: 1234,
+                                count: 9,
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            2,
+                            ContainerSlot {
+                                item_id: 1234,
+                                count: 9,
+                                ..Default::default()
+                            },
+                        ),
+                    ]),
+                },
+            )])
+        };
+        guids.vault[1] = 0xBEEF;
+        apply_container_source(&mut s, &mut memory, Some(two()), guids, Vec::new());
+        assert_eq!(seen(&mut s), vec!["PLAYERBANKSLOTS_CHANGED nil"]);
+        guids.vault.swap(0, 1);
+        let pushed = apply_container_source(&mut s, &mut memory, Some(two()), guids, Vec::new());
+        assert_eq!(
+            seen(&mut s),
+            vec![
+                "PLAYERBANKSLOTS_CHANGED nil".to_string(),
+                "PLAYERBANKSLOTS_CHANGED nil".to_string()
+            ],
+            "the swap the pushed containers cannot see"
+        );
+        assert!(pushed, "and the feed reports that it spoke to the VM");
+    }
 
     /// **`BAG_CLOSED`, the only thing that hides an open bag window** — and the three ways to get
     /// its condition wrong (CARVED, wow-re `system/ui/scratch/equipped-bag-slot-events.md`).
@@ -1493,7 +1734,7 @@ mod tests {
 
         // Equip a bag into the first equipped bag slot: BAG_UPDATE, and no BAG_CLOSED — the slot
         // was empty, which is the `0x4f9247 je` arm.
-        guids[0] = 0xAAAA;
+        guids.bags[0] = 0xAAAA;
         apply_container_source(&mut s, &mut memory, Some(pouch(6)), guids, Vec::new());
         assert_eq!(seen(&mut s), vec!["BAG_UPDATE 1"]);
 
@@ -1507,12 +1748,12 @@ mod tests {
 
         // SWAP for a different bag: closed FIRST, then updated. This is the arm a "the bag went
         // away" reading gets wrong — the slot is still occupied.
-        guids[0] = 0xBBBB;
+        guids.bags[0] = 0xBBBB;
         apply_container_source(&mut s, &mut memory, Some(pouch(10)), guids, Vec::new());
         assert_eq!(seen(&mut s), vec!["BAG_CLOSED 1", "BAG_UPDATE 1"]);
 
         // UNEQUIP: closed, and **no** BAG_UPDATE.
-        guids[0] = 0;
+        guids.bags[0] = 0;
         apply_container_source(&mut s, &mut memory, Some(HashMap::new()), guids, Vec::new());
         assert_eq!(seen(&mut s), vec!["BAG_CLOSED 1"]);
 
@@ -1541,11 +1782,11 @@ mod tests {
             ])
         };
         let mut guids = NO_BAGS;
-        guids[4] = 0x1111;
-        guids[5] = 0x2222;
+        guids.bags[4] = 0x1111;
+        guids.bags[5] = 0x2222;
         apply_container_source(&mut s, &mut memory, Some(two()), guids, Vec::new());
         let _ = seen(&mut s);
-        guids.swap(4, 5);
+        guids.bags.swap(4, 5);
         let pushed = apply_container_source(&mut s, &mut memory, Some(two()), guids, Vec::new());
         assert_eq!(seen(&mut s), vec!["BAG_CLOSED 5", "BAG_CLOSED 6"]);
         assert!(
@@ -1620,8 +1861,9 @@ mod tests {
     }
 
     /// **The spent-ammo signal** (decision 1509, B267's second half). A stack ticking down must
-    /// fire `ITEM_LOCK_CHANGED` for that slot, **before** the `BAG_UPDATE` for its bag — the
-    /// reference's `ITEM_FIELD_STACK_COUNT` mirror handler's own order.
+    /// fire `ITEM_LOCK_CHANGED`, **before** the `BAG_UPDATE` for its bag — the reference's
+    /// `ITEM_FIELD_STACK_COUNT` mirror handler's own order. The event carries no arguments
+    /// (2140): `0x5d94b9` is a `SignalEvent` site, which has no vararg mechanism at all.
     ///
     /// This is not cosmetic ordering. Quiver's auto-shot timer has no other way to learn a shot
     /// fired: it starts the reload drain from this event, and without it the bar fills once and
@@ -1688,8 +1930,11 @@ mod tests {
         );
         assert_eq!(
             s.eval::<String>("return table.concat(ORDER, ' ')").unwrap(),
-            "ITEM_LOCK_CHANGED:0,1 BAG_UPDATE:0,nil",
-            "the shot signal fires for (bag 0, slot 1) and precedes BAG_UPDATE"
+            "ITEM_LOCK_CHANGED:nil,nil BAG_UPDATE:0,nil",
+            "the shot signal fires — with NO arguments, as all five of the reference's fire sites \
+             do (decision 2140) — and precedes BAG_UPDATE. The slot it names travels in the fact \
+             that it fired at all, which is enough: every consumer repaints from its own `this`, \
+             and Quiver's shot timer only needs to know that A shot happened"
         );
 
         // A DIFFERENT item in the same slot: a swap. The count differs too, and it must still
@@ -1761,6 +2006,12 @@ mod tests {
             radii: benilla_formats::load_spell_radii(&mut chain).expect("SpellRadius.dbc"),
         };
 
+        // No string table: what this test is about is whether a line is built at all, and
+        // Fireball's description reaches no keyed token — a `$s1` spread renders from the spell's
+        // own columns. A fixture that pretended to hold GlobalStrings would be claiming coverage
+        // this assertion does not have.
+        let no_strings = |_: &str, _: &[i64]| None;
+
         // Every "Opening"/"Closing" the lock chain can reach — the key spells (3365/3366/6247/6477
         // are all literally named "Opening") carry no description, so NO Use: line may be built.
         for id in [3365u32, 3366, 6246, 6247, 6477, 21651] {
@@ -1770,7 +2021,7 @@ mod tests {
                 "spell {id} has a name — which is exactly what must NOT leak into the tooltip"
             );
             assert_eq!(
-                super::spell_desc_text(Some(&spells), id, None),
+                super::spell_desc_text(Some(&spells), id, None, &no_strings),
                 None,
                 "spell {id} ({:?}) has no description, so the reference prints no trigger line",
                 d.name
@@ -1779,7 +2030,7 @@ mod tests {
 
         // The control: a described spell still produces its line, so this is a law about EMPTY
         // descriptions and not a blanket mute. Fireball (133) is the tooltip suite's own anchor.
-        let fireball = super::spell_desc_text(Some(&spells), 133, None)
+        let fireball = super::spell_desc_text(Some(&spells), 133, None, &no_strings)
             .expect("a described spell still yields its line");
         assert!(
             fireball.contains("damage"),

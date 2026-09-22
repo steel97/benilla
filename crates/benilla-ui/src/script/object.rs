@@ -16,7 +16,7 @@
 
 use std::ffi::c_void;
 
-use mlua::{LightUserData, Lua, Table, Value};
+use mlua::{LightUserData, Lua, ObjectLike, Table, Value};
 
 use super::binding_abi::optional_string;
 use super::{Model, REG_FRAME_META, REG_FRAME_METHODS, REG_SCRIPTS, REG_WRAPPERS};
@@ -26,9 +26,11 @@ use crate::widget::{FrameHandle, FrameKind};
 
 // The frame method-table clusters — split out purely for size (each module's own doc says what
 // lives there); this file keeps the shared id/handle plumbing, `install`, and `CreateFrame`.
+pub(crate) mod anchor_args;
 mod events_regions;
 mod frame_state;
 mod layout_methods;
+pub(crate) use layout_methods::eff_scale;
 pub(crate) mod movable;
 pub(crate) mod toplevel;
 pub(crate) use layout_methods::{anchor_bits_eq, anchor_retarget_is_structural};
@@ -77,18 +79,22 @@ pub(super) fn frame_wrapper(lua: &Lua, id: u32) -> mlua::Result<Table> {
     }
     let t = lua.create_table()?;
     t.raw_set(0, Value::LightUserData(id_to_lud(id)))?;
-    let meta: Table = lua.named_registry_value(REG_FRAME_META)?;
-    t.set_metatable(Some(meta))?;
-    wrappers.set(id, t.clone())?;
-
-    let name: Option<String> = {
+    // The frame's kind and name in one borrow. **The KIND picks the metatable, here rather than
+    // per lookup** — the region side's shape since its leaves split, and decision 2310's whole
+    // change on this side: a wrapper is built once per frame, so resolving the class chain at
+    // construction costs nothing, while resolving it inside `__index` put a Rust call, a model
+    // borrow and a registry lookup in front of EVERY widget method access in the client. A frame's
+    // kind never changes and `id_to_frame` never loses an entry, so the choice cannot go stale.
+    let (kind, name): (Option<FrameKind>, Option<String>) = {
         let model = lua.app_data_ref::<Model>().expect("model app_data");
-        model
+        let frame = model
             .id_to_frame
             .get(&id)
-            .and_then(|h| model.arena.frame(*h))
-            .and_then(|f| f.name.clone())
+            .and_then(|h| model.arena.frame(*h));
+        (frame.map(|f| f.kind), frame.and_then(|f| f.name.clone()))
     };
+    t.set_metatable(Some(frame_meta_for(lua, kind)?))?;
+    wrappers.set(id, t.clone())?;
     if let Some(name) = name {
         publish_global(lua, &name, &t)?;
     }
@@ -102,6 +108,111 @@ pub(super) fn publish_global(lua: &Lua, name: &str, wrapper: &Table) -> mlua::Re
         g.set(name, wrapper.clone())?;
     }
     Ok(())
+}
+
+/// A widget **name string** argument, already looked up in `_G` — every Lua binding that takes
+/// "a frame or its name" resolves one of these ([`prefetch_named_target`] then
+/// [`resolve_named_target`]).
+///
+/// **The client has ONE widget namespace and it is the Lua globals table.** The wrapper binder
+/// `0x701bd0` publishes `_G[name] = T` for a named widget (non-overwriting, via `lua_settable`),
+/// and every by-name resolver reads that table back — `0x76c760` (globals index → Lua type 5 →
+/// **raw** `t[0]` → `lua_touserdata` → `IsA`; `SetParent`'s string arm `0x7a1550`, `SetScrollChild`
+/// `0x790fa0`, the XML `parent=` chain) and the layout-vtable `+0x28` entry `0x76c700`, which
+/// expands a leading `$parent` (`0x76c5b0`) and then calls `0x76c760`. There is no engine-side
+/// name→frame map behind either: for frames and regions a name's only effects are the copy into
+/// `[widget+0x98]` and that `_G` publish. (`CSimpleFont` names are the one exception — they key a
+/// Storm hash at `0xcf4e78` — and fonts are not anchor targets.) `wow-5875-re`
+/// `system/ui/scratch/name-string-widget-resolution.md`; `system/ui/ledger.tsv` rows
+/// `0x76c5b0`/`0x76c700`/`0x76c760`/`0x7a2540`.
+///
+/// So the name is not a *frame name* — it is a **global**, and a frame's published name is only the
+/// commonest way one comes to exist. Resolving against a private registry instead makes an alias
+/// invisible: `Bar8Button1 = CharacterBag3Slot` at an addon's file scope is a global that is no
+/// frame's name, and Bartender2 anchors every bar's buttons through exactly those (decision 2105).
+///
+/// ## Why the lookup is its own phase
+///
+/// The reference's read is **`lua_gettable 0x6f3a40` → `luaV_index 0x6f7cf0`**, not `lua_rawget`
+/// (the binary holds both, 0xc0 apart; only the former walks `__index`, MAXTAGLOOP 100). So a
+/// metatable on `_G` is honoured — and a `__index` can be a *Lua* function that calls straight back
+/// into a widget binding. Running that under a live `Model` guard would take a second borrow and
+/// panic, so the `_G` read is done with **no guard alive** and the decode happens after.
+pub(crate) struct NamedTarget {
+    /// The name as the client looked it up — after `$parent` expansion where the caller allows it.
+    /// This is the spelling a diagnostic must quote.
+    pub(crate) name: String,
+    /// `_G[name]`, kept only when it is a table (the Lua-type-5 gate). Identity is checked later.
+    wrapper: Option<Table>,
+}
+
+impl NamedTarget {
+    /// A name argument we could not even read (a non-UTF-8 Lua string) — it names nothing, and the
+    /// caller's miss path quotes this placeholder the way it always has.
+    pub(crate) fn unreadable() -> Self {
+        Self {
+            name: "<non-utf8>".into(),
+            wrapper: None,
+        }
+    }
+}
+
+/// Read `_G[name]` for a name-string argument. **Call with no `Model` borrow alive** — see
+/// [`NamedTarget`].
+///
+/// `parent_base` is the name a leading `$parent` expands to, or `None` for the bindings that do not
+/// expand it. `0x76c5b0` has exactly two call sites — `SetName 0x76c691` and `0x76c71c` inside the
+/// layout resolver `0x76c700` — so `SetPoint`/`SetAllPoints`' `relativeTo` **is** expanded at
+/// runtime, and `SetParent`, `SetScrollChild` and the XML `parent=` chain (which call `0x76c760`
+/// directly) are **not**.
+pub(crate) fn prefetch_named_target(
+    lua: &Lua,
+    name: &str,
+    parent_base: Option<&str>,
+) -> NamedTarget {
+    let name = match parent_base {
+        Some(base) => crate::framexml::resolve_name(name, base),
+        None => name.to_string(),
+    };
+    let wrapper = match lua.globals().get::<Value>(name.as_str()) {
+        Ok(Value::Table(t)) => Some(t),
+        _ => None,
+    };
+    NamedTarget { name, wrapper }
+}
+
+/// Decode a [`NamedTarget`] to the stable id of a live frame **or** region (the namespace is one —
+/// a Texture or FontString publishes into `_G` on the same rule a Frame does).
+///
+/// `SetPoint` type-checks against the **root** `CScriptRegion` id `[0xcf0c3c]`, which every widget
+/// accepts; `SetParent`/`SetScrollChild` use the narrower Frame id `[0xcf0c10]`, so those callers
+/// narrow the result to `id_to_frame` themselves.
+pub(crate) fn resolve_named_target(model: &Model, target: &NamedTarget) -> Option<u32> {
+    let id = decode_id(target.wrapper.as_ref()?).ok()?;
+    (model.id_to_frame.contains_key(&id) || model.id_to_region.contains_key(&id)).then_some(id)
+}
+
+/// The name a leading `$parent` expands to: the first widget at or above `start` with a non-empty
+/// name (`0x76c5b0`'s `+0x9c` walk, skipping an empty `GetName`), and
+/// [`crate::framexml::DEFAULT_PARENT_NAME`] (`"Top"`) when there is none (rf27 rules 3/5).
+///
+/// `start` is the anchoring widget's **parent**: a frame's own anchors say `$parent` of its
+/// enclosing frame, and a region's say `$parent` of its owner — which is that region's `+0x9c`.
+pub(crate) fn parent_token_base(model: &Model, start: Option<FrameHandle>) -> String {
+    let mut cur = start;
+    while let Some(p) = cur {
+        let Some(f) = model.arena.frame(p) else { break };
+        if let Some(n) = f.name.as_deref().filter(|n| !n.is_empty()) {
+            return n.to_string();
+        }
+        cur = f.parent;
+    }
+    crate::framexml::DEFAULT_PARENT_NAME.to_string()
+}
+
+/// [`parent_token_base`] for a frame's own anchors — the walk starts at its parent.
+pub(crate) fn frame_parent_token_base(model: &Model, h: FrameHandle) -> String {
+    parent_token_base(model, model.arena.frame(h).and_then(|f| f.parent))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -153,9 +264,11 @@ fn enum_token(s: &str) -> String {
     s.trim().to_ascii_uppercase()
 }
 
-fn strata_from_str(s: &str) -> Option<Strata> {
+/// The reference's strata NAME table (`0x8119f8`) has eight rows, `BACKGROUND`..`TOOLTIP`; stratum
+/// 0 (`WORLD`) has no name and no XML or Lua can put a frame there — the WorldFrame's constructor
+/// is its only writer (decision 1984, wow-re `worldframe-widget.md` §4).
+pub(crate) fn strata_from_str(s: &str) -> Option<Strata> {
     Some(match enum_token(s).as_str() {
-        "WORLD" => Strata::World,
         "BACKGROUND" => Strata::Background,
         "LOW" => Strata::Low,
         "MEDIUM" => Strata::Medium,
@@ -200,9 +313,33 @@ pub fn frame_kind_from_tag(s: &str) -> Option<FrameKind> {
     frame_kind_from_str(s)
 }
 
+/// **The type registry lookup both doors share** (`0x6ee280`'s table `[0xcee9d8]`, its only
+/// reader) — the tag's [`FrameKind`] if a factory is registered under it right now, else `None`.
+///
+/// "Right now" is the WorldFrame's one-shot: the reference unlinks and releases that record the
+/// moment the first `<WorldFrame>` is instantiated (`0x6ee439`), so a second one — from any XML, or
+/// `CreateFrame("WorldFrame")` — takes the lookup's miss leg (decision 1984).
+///
+/// One function because the two doors disagree only in what a MISS does, never in what a miss is
+/// (decision 2191): the Lua binding raises ([`create_frame`]), the XML loader logs
+/// `"Unknown frame type: %s"` and skips the node (`crate::loader`), and wow-re's
+/// `taxiroute-widget-type.md`/`lootbutton-widget-type.md` verify both legs off the same `0x6ee280`.
+pub(crate) fn registered_frame_kind(lua: &Lua, kind: &str) -> Option<FrameKind> {
+    let frame_kind = frame_kind_from_str(kind)?;
+    let one_shot_spent = frame_kind == FrameKind::WorldFrame
+        && lua
+            .app_data_ref::<Model>()
+            .expect("model app_data")
+            .world_frame_made;
+    (!one_shot_spent).then_some(frame_kind)
+}
+
 fn frame_kind_from_str(s: &str) -> Option<FrameKind> {
     Some(match enum_token(s).as_str() {
         "FRAME" => FrameKind::Frame,
+        // The world frame's own registered type (decision 1983; `0x495948` in the registration
+        // batch, the one row passing `1` as its third argument).
+        "WORLDFRAME" => FrameKind::WorldFrame,
         // `TaxiRouteFrame` — a registered `CreateFrame` type that is a `CSimpleFrame` and NOTHING
         // else, so it maps to `Frame` rather than earning a kind (decision 1828; wow-re
         // `ui/scratch/taxiroute-widget-type.md`). Factory `0x495ba0` allocates `0x314`, the same
@@ -234,6 +371,8 @@ fn frame_kind_from_str(s: &str) -> Option<FrameKind> {
         "SCROLLFRAME" => FrameKind::ScrollFrame,
         "MODEL" => FrameKind::Model,
         "PLAYERMODEL" => FrameKind::PlayerModel,
+        "DRESSUPMODEL" => FrameKind::DressUpModel,
+        "TABARDMODEL" => FrameKind::TabardModel,
         "MESSAGEFRAME" => FrameKind::MessageFrame,
         "SCROLLINGMESSAGEFRAME" => FrameKind::ScrollingMessageFrame,
         "COLORSELECT" => FrameKind::ColorSelect,
@@ -241,7 +380,6 @@ fn frame_kind_from_str(s: &str) -> Option<FrameKind> {
         "MOVIEFRAME" => FrameKind::MovieFrame,
         "GAMETOOLTIP" => FrameKind::GameTooltip,
         "MINIMAP" => FrameKind::Minimap,
-        "COOLDOWN" => FrameKind::Cooldown,
         _ => return None,
     })
 }
@@ -255,6 +393,17 @@ pub(super) fn as_f32(v: &Value) -> f32 {
     }
 }
 
+/// [`as_f32`]'s double-width sibling, for the shape-C positions whose store is `f64` — today only
+/// `ColorSelect:SetColorRGB`, whose channels go through a quantizer where a detour via `f32` could
+/// move a value across a rounding boundary (`colorselect`'s module doc).
+pub(super) fn as_f64(v: &Value) -> f64 {
+    match v {
+        Value::Number(n) => *n,
+        Value::Integer(i) => *i as f64,
+        _ => 0.0,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // install — build the method tables, metatables, CreateFrame, and registry roots
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -264,6 +413,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     lua.set_named_registry_value(REG_WRAPPERS, lua.create_table()?)?;
     lua.set_named_registry_value(REG_SCRIPTS, lua.create_table()?)?;
 
+    // The Region-map arm collection, opened before either method table is built and closed by
+    // `region_map::install` below (its [`super::region_map::Arms`] doc says why it is app_data).
+    super::region_map::open_arms(lua);
     install_frame_methods(lua)?;
     super::region::install(lua)?;
     super::statusbar::install(lua)?;
@@ -273,23 +425,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // implementation each, so a method pulled off a frame works on a texture (decision 1501).
     super::region_map::install(lua)?;
 
-    // Shared frame metatable: __index is a Rust dispatcher over the frame method table (RF-0023),
-    // checking the frame's *kind-specific* method table first. Per-kind resolution matters beyond
-    // correctness: addons duck-type widgets (`if frame.SetValue then …`), so a plain frame must
-    // resolve `SetValue` to nil — one shared table would make every frame quack like every widget.
-    let frame_meta = lua.create_table()?;
-    let frame_index = lua.create_function(|lua, (this, key): (Table, Value)| {
-        for reg in kind_method_registries(lua, &this) {
-            let methods: Table = lua.named_registry_value(reg)?;
-            let v = methods.get::<Value>(key.clone())?;
-            if !v.is_nil() {
-                return Ok(v);
-            }
-        }
-        let methods: Table = lua.named_registry_value(REG_FRAME_METHODS)?;
-        methods.get::<Value>(key)
-    })?;
-    frame_meta.set("__index", frame_index)?;
+    // The per-kind metatable cache ([`frame_meta_for`]) and the base metatable in it: the one a
+    // plain `Frame` wears, whose `__index` is the shared frame method table itself.
+    lua.set_named_registry_value(REG_KIND_METAS, lua.create_table()?)?;
+    let frame_meta = frame_meta_for(lua, None)?;
     lua.set_named_registry_value(REG_FRAME_META, frame_meta.clone())?;
     // RF-0023 publishes the shared metatable as _G["__framescript_meta"].
     lua.globals().set("__framescript_meta", frame_meta)?;
@@ -317,10 +456,45 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // SetupFullscreenScale(frame) — the registered binding `0x48c270` the stock WorldMapFrame.xml,
+    // CinematicFrame.xml and UIOptionsFrame.xml call from OnShow (decision 1980; wow-re
+    // `system/ui/scratch/setup-fullscreen-scale.md`, VERIFIED at the bytes): the frame's scale
+    // becomes `min(0.75 · a, 1.0)` for the CONFIGURED aspect `a` — the `gxResolution` width over
+    // height (the `widescreen` CVar's default of 1 selects it; at 0 the aspect is 4:3 and the
+    // scale 1) — and nothing else is written: no anchor, size or position, and `UIParent`'s
+    // scale never enters. It is the same `CSimpleFrame::SetScale` the Lua method calls. The
+    // window's aspect is the configured one here (the UI-unit rect keeps the pixel ratio); NaN
+    // takes the 1.0 leg as the reference's `fcomp` does. The three raises are the binding's own.
+    lua.globals().set(
+        "SetupFullscreenScale",
+        lua.create_function(|lua, frame: Value| {
+            let Value::Table(frame) = frame else {
+                return Err(mlua::Error::runtime("Usage: SetupFullscreenScale(frame)"));
+            };
+            if decode_id(&frame).is_err() {
+                return Err(mlua::Error::runtime(
+                    "SetupFullscreenScale(): Couldn't find 'this' in frame object",
+                ));
+            }
+            if frame_handle_of(lua, &frame).is_err() {
+                return Err(mlua::Error::runtime(
+                    "SetupFullscreenScale(): Wrong object type, expected frame",
+                ));
+            }
+            let scale = {
+                let model = lua.app_data_ref::<Model>().expect("model");
+                fullscreen_scale(model.screen.width() / model.screen.height())
+            };
+            frame.call_method::<()>("SetScale", scale)
+        })?,
+    )?;
+
     // GetCursorPosition() → x, y — the last cursor position the host fed (`mouse_move`/
-    // `mouse_button`), UI units y-up like every other coordinate read. The real client scales by
-    // the UI scale; ours is the constant 1 (`GetEffectiveScale`), so the ref's `/scale` dance is
-    // an identity. The world map polls this every OnUpdate for hover/click math.
+    // `mouse_button`), UI units y-up like every other coordinate read — the SCREEN's units, which
+    // is what the reference hands Lua too; a caller inside a scaled frame divides by its
+    // `GetEffectiveScale()` (the reference's own `MouseIsOver` does, and the stock world map at
+    // a scale under 1 is the case that made the division load-bearing here — decision 1985). The
+    // world map polls this every OnUpdate for hover/click math.
     lua.globals().set(
         "GetCursorPosition",
         lua.create_function(|lua, ()| {
@@ -332,8 +506,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // The modifier-key mirror ([`UiScript::set_modifiers`], fed by the app's input pass before
     // any mouse event each frame) — the reference handlers fork on these at click time
     // (ContainerFrame.lua's shift-split / ctrl-dressup, ActionBarFrame.xml's shift-pickup,
-    // SpellBookFrame.lua's shift-pickup). Era booleans, not 1.12's 1/nil — the house API target
-    // (decision 0068); every transcribed `if IsShiftKeyDown()` reads both identically.
+    // SpellBookFrame.lua's shift-pickup).
+    //
+    // **1/nil, not a Lua boolean.** These three shipped Era booleans on 0068's reasoning that
+    // "every transcribed `if IsShiftKeyDown()` reads both identically" — true while we wrote every
+    // caller, and false the day real 1.12 addons load (1188/1751). `ColorPickerPlus.lua:121` is
+    // `if IsShiftKeyDown() == 1 then`, and a `true` reads there as "not held" (decision 2118).
     for (name, pick) in [
         ("IsShiftKeyDown", 0usize),
         ("IsControlKeyDown", 1),
@@ -344,7 +522,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             lua.create_function(move |lua, ()| {
                 let model = lua.app_data_ref::<Model>().expect("model");
                 let m = [model.modifiers.0, model.modifiers.1, model.modifiers.2];
-                Ok(m[pick])
+                Ok(crate::script::binding_abi::flag(m[pick]))
             })?,
         )?;
     }
@@ -352,17 +530,71 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
-/// The registry keys of a frame's kind-specific method tables, in resolution order — the `__index`
-/// dispatcher walks them before the shared table, mirroring the client's class chain (CheckButton
-/// resolves through Button's map, RF-28). Empty for plain kinds (and for anything that isn't a live
-/// frame, e.g. a region wrapper passing through).
-fn kind_method_registries(lua: &Lua, this: &Table) -> &'static [&'static str] {
-    let Ok(id) = decode_id(this) else { return &[] };
-    let model = lua.app_data_ref::<Model>().expect("model app_data");
-    let Some(h) = model.id_to_frame.get(&id) else {
-        return &[];
-    };
-    match model.arena.frame(*h).map(|f| f.kind) {
+/// The registry table of per-kind frame metatables, keyed by the head of the kind's method chain
+/// (`""` for a kind with none). Lua-side, like every other root here — the MAXCSTACK discipline.
+const REG_KIND_METAS: &str = "__benilla_frame_meta_by_kind";
+
+/// The metatable a frame of `kind` wears — built once per kind, cached in [`REG_KIND_METAS`].
+///
+/// ## `__index` is a TABLE, and that is the whole point (decision 2310)
+///
+/// This used to be one shared metatable whose `__index` was a **Rust function** that resolved the
+/// receiver's kind and walked its registries per lookup. Every `frame:SetPoint(...)` — every plain
+/// `frame.Foo` read, including the `if frame.SetValue then` duck-type probe addons open with —
+/// therefore crossed into Rust, took a model borrow, resolved a handle and did one to three
+/// named-registry string lookups. Measured in a release build: **217 ns for a plain Frame, 320 ns
+/// for a Button, against 8.7 ns for a plain Lua table `__index`.** A live sample of a quest-accept
+/// spike with the director's addon set put ~20 % of the whole UI tick inside that metamethod
+/// before any method body ran — Questie redraws its map notes with ~19 widget calls per cluster
+/// over hundreds of clusters, and pays the tax on every one.
+///
+/// A table costs one `luaH_get` inside `luaV_gettable`, in C, with no call at all.
+///
+/// ## The chain is the reference's own, expressed as metatables
+///
+/// 1.12's widget classes are not a Lua metatable chain — each class owns a flat method map and its
+/// lookup tail-calls exactly one base's lookup ([`super::region_map`]'s header has the tables). But
+/// `luaV_gettable` follows a table `__index` iteratively, so a chain of metatables IS that probe
+/// sequence: `CheckButton`'s map, miss, `Button`'s map, miss, `Frame`'s map. So rather than merging
+/// each kind's methods into one flat copy, this links the existing tables — no copies to go stale
+/// when a method table is written after the fact, and the per-kind surface stays exactly what
+/// [`kind_method_registries`] declares. Duck typing is preserved by construction: a plain Frame's
+/// chain never reaches `StatusBar`'s map, so `frame.SetValue` is still nil.
+fn frame_meta_for(lua: &Lua, kind: Option<FrameKind>) -> mlua::Result<Table> {
+    let chain = kind_method_registries(kind);
+    let key = chain.first().copied().unwrap_or("");
+    let metas: Table = lua.named_registry_value(REG_KIND_METAS)?;
+    if let Value::Table(meta) = metas.raw_get::<Value>(key)? {
+        return Ok(meta);
+    }
+    // Link `own -> base -> ... -> Frame`, idempotently: a base table shared by several kinds (every
+    // button kind reaches `Button`'s) is simply re-pointed at the same place.
+    let frame_methods: Table = lua.named_registry_value(REG_FRAME_METHODS)?;
+    let mut below = frame_methods.clone();
+    for reg in chain.iter().rev() {
+        let own: Table = lua.named_registry_value(reg)?;
+        let link = lua.create_table()?;
+        link.set("__index", below)?;
+        own.set_metatable(Some(link))?;
+        below = own;
+    }
+    let meta = lua.create_table()?;
+    meta.set("__index", below)?;
+    metas.raw_set(key, meta.clone())?;
+    Ok(meta)
+}
+
+/// The registry keys of a frame's kind-specific method tables, **in resolution order** — the
+/// client's own class chain (CheckButton resolves through Button's map, RF-28). Empty for a plain
+/// kind, and for a wrapper whose frame is not live.
+///
+/// Every chain here is *its own table followed by its base's whole chain*, which is what lets
+/// [`frame_meta_for`] realize it as a metatable chain instead of a search: `CheckButton`'s table
+/// gets `Button`'s as its `__index`, `Button`'s gets `Frame`'s, and one `luaV_gettable` walks the
+/// lot in C. Keep that property when adding a kind — a chain that is not a suffix of its base's
+/// cannot be expressed this way.
+fn kind_method_registries(kind: Option<FrameKind>) -> &'static [&'static str] {
+    match kind {
         Some(FrameKind::StatusBar) => &[super::statusbar::REG_STATUSBAR_METHODS],
         Some(FrameKind::EditBox) => &[super::editbox::REG_EDITBOX_METHODS],
         Some(FrameKind::ScrollingMessageFrame) => {
@@ -399,8 +631,22 @@ fn kind_method_registries(lua: &Lua, this: &Table) -> &'static [&'static str] {
             super::modelframe::REG_PLAYERMODEL_METHODS,
             super::modelframe::REG_MODEL_METHODS,
         ],
+        // Three of its own, then PlayerModel's three, then Model's 23: `CGDressUpModelFrame`'s
+        // lookup probes `0x84f190` and misses into `CGCharacterModelBase`'s `0x506260`, which
+        // misses into `CSimpleModel`'s `0x76f870` (1969).
+        Some(FrameKind::DressUpModel) => &[
+            super::dressup::REG_DRESSUPMODEL_METHODS,
+            super::modelframe::REG_PLAYERMODEL_METHODS,
+            super::modelframe::REG_MODEL_METHODS,
+        ],
+        // Ten of its own (`0x84ee40`), then PlayerModel's three, then Model's 23 — the same
+        // derived → base probe as its sibling (1977).
+        Some(FrameKind::TabardModel) => &[
+            super::tabard::REG_TABARDMODEL_METHODS,
+            super::modelframe::REG_PLAYERMODEL_METHODS,
+            super::modelframe::REG_MODEL_METHODS,
+        ],
         Some(FrameKind::Minimap) => &[super::minimap::REG_MINIMAP_METHODS],
-        Some(FrameKind::Cooldown) => &[super::cooldown::REG_COOLDOWN_METHODS],
         Some(FrameKind::GameTooltip) => &[super::tooltip::REG_TOOLTIP_METHODS],
         _ => &[],
     }
@@ -422,11 +668,14 @@ fn kind_method_registries(lua: &Lua, this: &Table) -> &'static [&'static str] {
 /// `virtual="true"`, or of a shape that does not fit the kind asked for — is still a warning plus a
 /// working frame, because the registry lookup itself succeeded and that is the only thing the miss
 /// branch tests.
-fn create_frame(
+pub(super) fn create_frame(
     lua: &Lua,
     (kind, name, parent, inherits): (String, Option<Value>, Option<Value>, Option<Value>),
 ) -> mlua::Result<Table> {
-    let frame_kind = frame_kind_from_str(&kind)
+    // The Lua door's miss RAISES: `0x7060b0` reaches `"CreateFrame: Unknown frame type '%s'"`
+    // (`0x872fa8`) through `luaL_error 0x6f4940`, which never returns. The XML door's does not —
+    // see [`registered_frame_kind`].
+    let frame_kind = registered_frame_kind(lua, &kind)
         .ok_or_else(|| mlua::Error::runtime(format!("CreateFrame: unknown frame type '{kind}'")))?;
     // **`name` and `inherits` are `lua_tostring` positions, and a NUMBER is a string to it.**
     // `0x7060b0` reads both through `0x6f3690` with no type guard at all, so `CreateFrame("Frame",
@@ -473,7 +722,7 @@ fn create_frame(
     if template.is_none() {
         if let Some(v) = inherits.as_ref().filter(|v| !v.is_nil()) {
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.warnings.push(format!(
+            model.record_warning(format!(
                 "CreateFrame: the 4th argument (inherits) must be a template-name string, got {}; \
                  ignored for '{}'",
                 v.type_name(),
@@ -515,10 +764,32 @@ fn create_frame(
         }
     }
 
+    // **A leading `$parent` in the NAME is expanded, here as in XML.** `CreateFrame 0x7060b0`
+    // does not store the name itself: it builds a synthetic node, sets `name=` on it
+    // (`0x706225 push 0x838090 "name"` → `0x70622d` SetAttribute) alongside `parent=` and
+    // `inherits=`, and hands it to the XML frame builder `0x6ee280` with the parent object in
+    // `edx` — so the name reaches `CScriptRegion::SetName 0x76c650` by exactly the route an XML
+    // `name=` does, and `0x76c691` is one of the expander's two call sites (wow-re
+    // `name-string-widget-resolution.md` §5/§6).
+    //
+    // The base is the frame's **parent's** first named ancestor — the same walk `$parent` in a
+    // `relativeTo` takes, one link higher than the anchoring frame's own.
+    //
+    // Not academic: `FonzAppraiser` names every widget it builds this way (`"$parentDropdown"..n`,
+    // `"$parentCloseButton"`, ~30 sites), and until decision 2176 made an unresolvable anchor
+    // raise, the unexpanded name only showed up as a warning nobody read.
+    let name = name.map(|n| {
+        let model = lua.app_data_ref::<Model>().expect("model app_data");
+        crate::framexml::resolve_name(&n, &parent_token_base(&model, parent_handle))
+    });
+
     // Create in the arena, mint the id, seed a default layout input. All under one write borrow.
     let id = {
         let mut model = lua.app_data_mut::<Model>().expect("model app_data");
         let h = model.arena.create(frame_kind, name, parent_handle);
+        if frame_kind == FrameKind::WorldFrame {
+            model.world_frame_made = true;
+        }
         // The client's CreateFrame inheritance (the ctor doc's "loader/CreateFrame concern" —
         // widget/mod.rs `create`): a child enters its PARENT's stratum at the parent's level + 1.
         // The ctor's bare MEDIUM/0 left a DIALOG-strata popup drawing its own translucent
@@ -545,7 +816,9 @@ fn create_frame(
         let messages = crate::loader::apply_template(lua, &wrapper, &kind, &template);
         if !messages.is_empty() {
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.warnings.extend(messages);
+            for m in messages {
+                model.record_warning(m);
+            }
         }
     }
     Ok(wrapper)
@@ -566,4 +839,62 @@ fn install_frame_methods(lua: &Lua) -> mlua::Result<()> {
     toplevel::install(lua, &m)?;
     lua.set_named_registry_value(REG_FRAME_METHODS, m)?;
     Ok(())
+}
+
+/// `0x48c270`'s law: `g = 0.75 · aspect`, and the scale is `g` below 1.0, else 1.0 — NaN lands on
+/// the 1.0 leg (the `fcomp` compare fails every ordered test).
+pub(crate) fn fullscreen_scale(aspect: f32) -> f32 {
+    let g = 0.75 * aspect;
+    if g < 1.0 {
+        g
+    } else {
+        1.0
+    }
+}
+
+#[cfg(test)]
+mod fullscreen_scale_tests {
+    use super::fullscreen_scale;
+    use crate::script::UiScript;
+
+    #[test]
+    fn the_scale_is_three_quarters_of_the_aspect_capped_at_one() {
+        assert_eq!(fullscreen_scale(4.0 / 3.0), 1.0);
+        assert_eq!(fullscreen_scale(16.0 / 9.0), 1.0);
+        assert!((fullscreen_scale(5.0 / 4.0) - 0.9375).abs() < 1e-6);
+        assert_eq!(fullscreen_scale(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn the_verb_scales_the_frame_and_raises_its_three_strings() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(1280.0, 1024.0);
+        s.run(r#"f = CreateFrame("Frame", "FS") SetupFullscreenScale(f)"#)
+            .unwrap();
+        assert!((s.eval::<f64>("return f:GetScale()").unwrap() - 0.9375).abs() < 1e-6);
+        s.set_screen_size(1600.0, 900.0);
+        s.run("SetupFullscreenScale(f)").unwrap();
+        assert_eq!(s.eval::<f64>("return f:GetScale()").unwrap(), 1.0);
+        for (call, needle) in [
+            (
+                "SetupFullscreenScale()",
+                "Usage: SetupFullscreenScale(frame)",
+            ),
+            (
+                "SetupFullscreenScale(7)",
+                "Usage: SetupFullscreenScale(frame)",
+            ),
+            (
+                "SetupFullscreenScale({})",
+                "Couldn't find 'this' in frame object",
+            ),
+            (
+                "SetupFullscreenScale(f:CreateTexture())",
+                "Wrong object type, expected frame",
+            ),
+        ] {
+            let err = s.run(call).unwrap_err().to_string();
+            assert!(err.contains(needle), "{call}: {err}");
+        }
+    }
 }

@@ -9,7 +9,7 @@
 //!   `OnLeave`/`OnEnter` pair (RF-0025's `motion=true` hover boundary) — and, before that,
 //!   advances an armed drag gesture, an in-flight **Slider thumb drag**, and an in-flight
 //!   **frame move** (`StartMoving`, [`super::object`]'s `movable` cluster). All three move within
-//!   one frame, crossing no hover boundary, so they must run before the boundary early-return.
+//!   one frame, crossing no hover boundary, so they must run before the boundary test.
 //! - [`UiScript::mouse_button`] resolves `OnMouseDown`/`OnMouseUp`, the `OnClick`
 //!   press/release-registration rules ([`button::wants_click`]), the **drag trio** + **world
 //!   drop** below, the **Slider thumb-drag** capture (a left press on a thumb, decision 0250 §5),
@@ -29,10 +29,11 @@
 //! frame carries no such script), and SUPPRESSES `OnClick` for that release — an un-started
 //! gesture leaves the ordinary click path untouched. The **world drop**
 //! ([`cursor::world_drop_click`]) fires only on a completed left CLICK over the game world:
-//! press AND release both landed over no frame, no drag started (the byte-verified trigger — the
-//! client's `0x495300` runs on the WorldFrame click release; a drag release routes as a drag,
-//! never a click), routed by the app-fed pick ([`super::Model::world_pick`], decisions 0571 +
-//! 0574 — an object pick keeps everything, terrain drops items only, nothing drops any arm).
+//! press AND release both landed on **the world** ([`over_world`] — the world frame, or no frame
+//! at all where none is loaded), no drag started (the byte-verified trigger — the client's
+//! `0x495300` runs on the WorldFrame click release; a drag release routes as a drag, never a
+//! click), routed by the app-fed pick ([`super::Model::world_pick`], decisions 0571 + 0574 — an
+//! object pick keeps everything, terrain drops items only, nothing drops any arm).
 //!
 //! ## Division of labor with [`cursor`]
 //!
@@ -47,7 +48,7 @@ use mlua::Value;
 
 use crate::layout::Rect;
 use crate::order;
-use crate::widget::FrameHandle;
+use crate::widget::{ButtonState, FrameHandle};
 
 use super::clip::{effective_clip, scroll_clip_sources};
 use super::{button, cursor, editbox, event, Model, UiScript};
@@ -127,6 +128,32 @@ pub(super) fn install(lua: &mlua::Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+/// Whether `h` is the world frame — the one frame whose mouse hits belong to the 3D world
+/// (decisions 1983/1984, `worldframe-widget.md`: "the hover walk probes strata 8→0 and the world
+/// frame wins exactly when nothing else mouse-enabled is under the cursor; the press runs the
+/// frame's Lua `OnMouseDown` (never consuming), then the `BUTTON1`/`BUTTON2` binding — which
+/// **is** the world click; the release mirrors it").
+fn is_world_handle(model: &Model, h: FrameHandle) -> bool {
+    model
+        .arena
+        .frame(h)
+        .is_some_and(|f| f.kind == crate::widget::FrameKind::WorldFrame)
+}
+
+/// Whether a press/release target is **the world** rather than the UI — the predicate the world
+/// drop is gated on, and the one thing decision 1983 silently changed the meaning of.
+///
+/// Before the stock `WorldFrame` joined the manifest (1983, 2026-09-04) the world was simply
+/// *where no frame is*, and this was spelled `hit.is_none()` throughout. The stock file anchors a
+/// mouse-enabled frame over the whole screen, so from that day every world click hit a frame and
+/// the world drop stopped firing — B380 (decision 2089). The world frame IS the reference's click
+/// target for a world click, so it answers **yes** here; `None` still answers yes too, because a
+/// harness with no `WorldFrame.xml` loaded (most tests, an install-less checkout) has nothing
+/// under the cursor at all and means the same thing by it.
+fn over_world(model: &Model, target: Option<FrameHandle>) -> bool {
+    target.is_none_or(|h| is_world_handle(model, h))
+}
+
 /// Whether `(x, y)` falls inside one of this frame's hyperlink spans — the engine half of the
 /// reference's per-span `CSimpleHyperlinkButton` children.
 fn link_span_hit(model: &Model, fh: FrameHandle, x: f32, y: f32) -> bool {
@@ -150,6 +177,19 @@ impl UiScript {
     /// can be checked against is a handle set snapshotted earlier ([`Self::live_targets`]'s). The
     /// addon harness's use probe asks exactly that — a pointer event is only an addon's to be
     /// judged by when the frame under the cursor is one the addon itself created.
+    /// Whether a frame id names a [`FrameKind::WorldFrame`] — the reference's world frame, whose
+    /// mouse hits belong to the 3D world (decisions 1983/1984). The hit test still answers it (it
+    /// is mouse-enabled by construction, so an addon's `OnEnter`/`OnMouseDown` on it fire — the
+    /// reference runs those, then the click's `BUTTON1`/`BUTTON2` binding, which IS the world
+    /// click), but the app's pointer arbiter does not count it as being over the UI.
+    pub fn is_world_frame(&self, id: u32) -> bool {
+        let model = self.model_ref();
+        model
+            .id_to_frame
+            .get(&id)
+            .is_some_and(|h| is_world_handle(&model, *h))
+    }
+
     pub fn hit_test_frame(&self, x: f32, y: f32) -> Option<FrameHandle> {
         let model = self.model_ref();
         let sorted = order::traversal(&model.arena);
@@ -171,6 +211,13 @@ impl UiScript {
             // `<TitleRegion setAllPoints="true"/>` stay inert so it drags by its tab and not its
             // body, and a hover over plain text reassigns to whatever is underneath.
             (model.arena.is_mouse_enabled(fh) || link_span_hit(&model, fh, x, y))
+                // **The nameplate's own `+0x3c` veto** (`0x7cba30`): while a ground-targeted spell
+                // is armed a plate refuses the hit test *before* the rect is tested, and the point
+                // falls through to the `WorldFrame` behind it so the reticle can be placed through
+                // a plate. It is not the mouse-enabled bit — see
+                // [`super::UiScript::set_nameplate_hit_test_veto`] for why that distinction is
+                // load-bearing rather than pedantic.
+                && !model.nameplates.vetoes(fh)
                 && model.resolved.get(&fh).is_some_and(|r| {
                     point_in_rect(inset_rect(*r, model.arena.hit_rect_insets(fh)), x, y)
                 })
@@ -229,8 +276,9 @@ impl UiScript {
     /// `OnEnter(self, motion=true)` on the newly-captured frame (if any). Tracks the current
     /// mouseover in the model. Also advances an armed [`super::Model::drag`] gesture (decision 0216 §3)
     /// and an in-flight [`super::Model::moving`] frame ([`super::object`]'s `movable` cluster):
-    /// both run BEFORE the no-boundary-crossed early return below, since dragging within one
-    /// frame crosses no hover boundary at all. Returns the captured frame id (so the app can drive
+    /// both run BEFORE the boundary test below, since dragging within one frame crosses no hover
+    /// boundary at all. A **DISABLED Button** takes the hover — `GetMouseFocus()` answers it — but
+    /// fires neither script ([`button::hover_notify_runs`]). Returns the captured frame id (so the app can drive
     /// `PointerOverUi`). Handler errors are collected into [`UiScript::errors`], never panicking.
     pub fn mouse_move(&mut self, x: f32, y: f32) -> Option<u32> {
         // A drag-active EditBox tracks every move (`0x77a860`): extend the selection to the
@@ -238,10 +286,10 @@ impl UiScript {
         editbox::drag_update(&self.lua, x, y);
         let new_id = self.hit_test(x, y);
         #[allow(clippy::type_complexity)]
-        let (old_id, drag_start, boundary_crossed, slider_change, color_change): (
+        let (leave_id, drag_start, enter_id, slider_change, color_change): (
             Option<u32>,
             Option<(u32, String)>,
-            bool,
+            Option<u32>,
             Option<(u32, f32)>,
             Option<(u32, f64, f64, f64)>,
         ) = {
@@ -263,7 +311,7 @@ impl UiScript {
             let new_handle = new_id.and_then(|id| model.id_to_frame.get(&id).copied());
             if new_handle == model.mouseover {
                 // no boundary crossed
-                (None, drag_start, false, slider_change, color_change)
+                (None, drag_start, None, slider_change, color_change)
             } else {
                 // Fire OnLeave only if the frame we're leaving is still live.
                 let old_id = model.mouseover.and_then(|h| {
@@ -274,8 +322,30 @@ impl UiScript {
                         .then(|| model.frame_to_id.get(&h).copied())
                         .flatten()
                 });
+                let old_handle = model.mouseover;
                 model.mouseover = new_handle;
-                (old_id, drag_start, true, slider_change, color_change)
+                // **Crossing a button's boundary moves NO button state**, and the comment that
+                // used to sit here claimed the opposite off two mis-attributed addresses:
+                // `0x7793f0` is the drag-start override, not a leave, and `0x7791e0` is the hide
+                // override, not an enter. The real enter/leave notifies `0x779490`/`0x7794e0`
+                // read `[+0x328]` only as a DISABLED guard and never write it (wow-re
+                // `scratch/button-state-edge-set.md`, a §5 census of every store to the field).
+                //
+                // So a press held over a button and walked off it stays PUSHED in the reference —
+                // it is the *drag threshold* (below) that un-presses one, and only for a frame
+                // that registered for drag. Decision 2134.
+                //
+                // **A DISABLED Button swallows its own hover notify** and so runs neither script:
+                // both `0x779490` and `0x7794e0` open `mov eax,[esi+0x328]; test eax,eax; je`,
+                // branching past the base notify that owns the `<OnEnter>`/`<OnLeave>` slots
+                // ([`button::hover_notify_runs`]). The gate is per-side — leaving a button that
+                // was disabled *while* hovered is as silent as entering one — and it is applied
+                // AFTER `model.mouseover` moves, because the reference reassigns the hover target
+                // `[root+0x7c]` before it fires either notify: a disabled button is still the
+                // mouse focus, it just says nothing.
+                let old_id = old_id.filter(|_| button::hover_notify_runs(&model, old_handle));
+                let enter_id = new_id.filter(|_| button::hover_notify_runs(&model, new_handle));
+                (old_id, drag_start, enter_id, slider_change, color_change)
             }
         };
         // The thumb-drag value change fires OnValueChanged (outside the borrow) — the scrollbar's
@@ -307,17 +377,14 @@ impl UiScript {
                 self.push_error(e);
             }
         }
-        if !boundary_crossed {
-            return new_id;
-        }
-        if let Some(oid) = old_id {
+        if let Some(oid) = leave_id {
             if let Err(e) =
                 event::fire_widget_handler(&self.lua, oid, "OnLeave", vec![Value::Boolean(true)])
             {
                 self.push_error(e);
             }
         }
-        if let Some(nid) = new_id {
+        if let Some(nid) = enter_id {
             if let Err(e) =
                 event::fire_widget_handler(&self.lua, nid, "OnEnter", vec![Value::Boolean(true)])
             {
@@ -365,7 +432,7 @@ impl UiScript {
     /// if that frame carries no such script), and SUPPRESSES `OnClick` for this release (an
     /// un-started gesture leaves the ordinary click path untouched). The **world drop**
     /// ([`cursor::world_drop_click`]) fires ONLY on a completed left CLICK over the world —
-    /// press AND release both over no frame, no started drag (the byte-verified trigger: the
+    /// press AND release both [`over_world`], no started drag (the byte-verified trigger: the
     /// client's `0x495300` runs on the WorldFrame click release; a drag release routes as a
     /// drag, never a click — wow-re cursor-dragdrop-payload.md, and the director's report it
     /// confirmed) — routed by the app-fed pick (decisions 0571 + 0574): over an object nothing
@@ -493,13 +560,29 @@ impl UiScript {
             let mut model = self.model_mut();
             let hit_handle = hit_id.and_then(|id| model.id_to_frame.get(&id).copied());
             if down {
-                match hit_handle {
-                    Some(h) => {
-                        model.mouse_down_on.insert(button.to_string(), h);
-                    }
-                    None => {
-                        model.mouse_down_on.remove(button);
-                    }
+                let displaced = match hit_handle {
+                    Some(h) => model.mouse_down_on.insert(button.to_string(), h),
+                    None => model.mouse_down_on.remove(button),
+                };
+                // `0x7792b1`: the press edge, `SetButtonState(PUSHED, 0)`.
+                //
+                // It is unconditional *past* `0x779210`'s own two gates, and the first of them is
+                // the registration mask `[this+0x330]` tested as `m | m << 8` at `0x77924b` —
+                // "registered for this mouse button EITHER WAY, up or down". That is
+                // [`button::wants_press_visual`], and it is why a right-click lights up an action
+                // slot (it registers `RightButtonUp`) and does nothing at all to a plain
+                // `LeftButtonUp` button. Past it the edge is gated only on the button's own
+                // `locked == 0 && state != DISABLED`.
+                if let Some(h) = hit_handle.filter(|&h| button::wants_press_visual(&model, h, button))
+                {
+                    button::edge(&mut model, h, ButtonState::on_mouse_down);
+                }
+                // A press arriving while this same mouse button was already holding another
+                // frame is a release we never got (the OS ate it — a focus loss, a modal). Give
+                // the displaced frame that release rather than leaving it pushed forever; the
+                // reference never reaches this because its capture guarantees the release.
+                if let Some(h) = displaced {
+                    button::edge(&mut model, h, ButtonState::on_mouse_up);
                 }
                 // `0x7663e6` writes the resolved target into `root+0x80` — capture-else-hover, so
                 // this is an `or`, not an assignment: an existing capture is not displaced by a
@@ -554,16 +637,31 @@ impl UiScript {
                 );
                 let release = cursor::take_drag(&mut model, button);
                 let started = release.as_ref().is_some_and(|r| r.started);
-                // The world drop: press AND release both over no frame, no drag started —
+                // **The release edge** — `0x7793de`'s `SetButtonState(NORMAL, 0)`, on the frame
+                // the PRESS captured and regardless of where the cursor now is (`0x7792d0` runs
+                // no hit test of its own). It is guarded on the button's own `locked == 0` and on
+                // the state actually being PUSHED, and it is **skipped when the base finalized a
+                // drag** — `0x7792df`'s `0x76c040` test, which is this `started` (the button
+                // already un-pressed at the drag-start edge below, and un-pressing again would
+                // fire nothing but would be a second transition the reference does not make).
+                if let (Some(h), false) = (pressed, started) {
+                    button::edge(&mut model, h, ButtonState::on_mouse_up);
+                }
+                // The world drop: press AND release both over THE WORLD, no drag started —
                 // a completed left click on the game world (never a drag release, which just
                 // keeps carrying; decision 0218's byte-verified trigger). What actually drops
                 // is routed inside `world_drop_click` by the app-fed world pick (decisions
                 // 0571 + 0574): an object pick keeps everything, terrain drops items only,
                 // nothing drops any arm.
+                //
+                // "Over the world" is [`over_world`], not `is_none()`: since 1983 the stock
+                // `WorldFrame` is a real mouse-enabled frame covering the screen, so a world
+                // click hits IT — which is exactly what the reference's own world click is
+                // (1984). Spelling this as "no frame" is what B380 was (decision 2089).
                 let dropped = button == "LeftButton"
                     && !started
-                    && hit_id.is_none()
-                    && pressed.is_none()
+                    && over_world(&model, hit_handle)
+                    && over_world(&model, pressed)
                     && cursor::world_drop_click(&mut model);
                 let wants = format!("{button}Up");
                 let click = if started {
@@ -767,7 +865,12 @@ impl UiScript {
                 self.push_error(e);
             }
         }
-        hit_id.is_some() || world_dropped
+        // Whether the **UI** consumed the event. A hit on the world frame is not the UI
+        // consuming anything — "the press runs the frame's Lua `OnMouseDown` (never consuming),
+        // then the `BUTTON1`/`BUTTON2` binding" (1984) — so it answers no unless the click was
+        // itself the world drop. Without that clause the stock `WorldFrame` would report every
+        // click in the game as eaten by the interface.
+        hit_id.is_some_and(|id| !self.is_world_frame(id)) || world_dropped
     }
 
     /// Fire `OnDragStop` on a gesture's source — the ONE place that ends a started drag, so the

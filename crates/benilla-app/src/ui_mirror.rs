@@ -3,7 +3,7 @@
 //!
 //! The net bridge queues [`MirrorTimerEdge`]s and the drain fires the reference client's
 //! FrameScript events into the script VM — `MIRROR_TIMER_START` / `_PAUSE` / `_STOP`, the exact
-//! contract `assets/ui/MirrorTimer.xml` (the transcribed 1.12 `MirrorTimer1/2/3`) registers for.
+//! contract stock `Interface\FrameXML\MirrorTimer.xml` (`MirrorTimer1/2/3`) registers for.
 //! The bars themselves are the reference's: the frame stores the value and integrates
 //! `value + scale * elapsed` every OnUpdate, so a packet every few seconds is enough to paint a
 //! smooth countdown.
@@ -22,7 +22,6 @@ use bevy::prelude::*;
 use benilla_protocol::messages::{MirrorTimerKind, MirrorTimerStart};
 
 use crate::ui_action::Spells;
-use crate::ui_script::UiInput;
 use crate::ui_unit::UnitFeed;
 
 /// One mirror-timer edge off the wire, queued by the net bridge for the bars.
@@ -114,6 +113,7 @@ fn feed_mirror_timers(
     script: Option<NonSendMut<UiScript>>,
     mut feed: ResMut<MirrorTimerFeed>,
     spells: Option<Res<Spells>>,
+    mut tutorials: Option<MessageWriter<crate::tutorial::TutorialEvent>>,
 ) {
     let Some(mut script) = script else {
         // No VM (a capture/headless run): drop the edges rather than let them pile up unbounded.
@@ -135,6 +135,26 @@ fn feed_mirror_timers(
         let Some(kind) = MirrorTimerKind::from_wire(raw) else {
             continue;
         };
+        // The handler's two tutorial arms (`0x5e7ab0` type 0, `0x5e7acd` type 1; 1976).
+        if matches!(edge, MirrorTimerEdge::Start(_)) {
+            match kind {
+                MirrorTimerKind::Fatigue => {
+                    if let Some(t) = tutorials.as_mut() {
+                        t.write(crate::tutorial::TutorialEvent::trigger(
+                            crate::tutorial::id::FATIGUE,
+                        ));
+                    }
+                }
+                MirrorTimerKind::Breath => {
+                    if let Some(t) = tutorials.as_mut() {
+                        t.write(crate::tutorial::TutorialEvent::trigger(
+                            crate::tutorial::id::BREATH,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
         let name = ScriptValue::Str(script_name(kind).into());
         let (event, args): (&str, Vec<ScriptValue>) = match edge {
             MirrorTimerEdge::Start(start) => (
@@ -171,12 +191,45 @@ fn feed_mirror_timers(
 
 /// The mirror-timer UI seam: the queue + its drain, ordered like the cast bar's — before the VM
 /// ticks, so an edge and its first OnUpdate land on the same frame.
+/// The mirror timers' packet handlers (decision 0874; in the net handler table since 2313):
+/// breath / fatigue / feign-death. Pure queue handlers — every meaning (which bar, what colour,
+/// what caption, how fast it drains) is resolved at the UI seam in this module, and the
+/// countdown itself is the FrameXML's own OnUpdate integration.
+mod net {
+    use benilla_protocol::{SessionEvent, SessionEventKind};
+    use bevy::prelude::*;
+
+    use super::{MirrorTimerEdge, MirrorTimerFeed};
+    use crate::net::NetHandlerApp;
+
+    /// Register the handlers — called from [`super::UiMirrorPlugin`].
+    pub(super) fn register(app: &mut App) {
+        use SessionEventKind as K;
+        app.net_handler(K::MirrorTimerStart, on_edge)
+            .net_handler(K::MirrorTimerPause, on_edge)
+            .net_handler(K::MirrorTimerStop, on_edge);
+    }
+
+    fn on_edge(In(ev): In<SessionEvent>, mut feed: ResMut<MirrorTimerFeed>) {
+        let edge = match ev {
+            SessionEvent::MirrorTimerStart(start) => MirrorTimerEdge::Start(start),
+            SessionEvent::MirrorTimerPause { kind, paused } => {
+                MirrorTimerEdge::Pause { kind, paused }
+            }
+            SessionEvent::MirrorTimerStop { kind } => MirrorTimerEdge::Stop { kind },
+            _ => return,
+        };
+        feed.0.push(edge);
+    }
+}
+
 pub(crate) struct UiMirrorPlugin;
 
 impl Plugin for UiMirrorPlugin {
     fn build(&self, app: &mut App) {
+        net::register(app);
         app.init_resource::<MirrorTimerFeed>()
-            .add_systems(Update, feed_mirror_timers.in_set(UnitFeed).before(UiInput));
+            .add_systems(Update, feed_mirror_timers.in_set(UnitFeed));
     }
 }
 

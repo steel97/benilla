@@ -91,7 +91,6 @@ impl UiScript {
     /// [`crate::order::traversal`] zipped with the resolved rects and region visuals. Already sorted
     /// ascending by `ZKey`. Call [`UiScript::resolve`] first for populated rects.
     pub fn extract(&self) -> Vec<ExtractedQuad> {
-        let now = self.now();
         let model = self.model_ref();
         let list = order::traversal(&model.arena);
         let mut out = Vec::with_capacity(list.len());
@@ -100,7 +99,7 @@ impl UiScript {
         // [`effective_clip`] walks a quad's owner up through this to find every ancestor ScrollFrame
         // it is clipped by (nested ScrollFrames intersect).
         let scroll_sources = scroll_clip_sources(&model);
-        for (target, zkey) in list {
+        for &(target, zkey) in list.iter() {
             let (rect, alpha, content, clip, scale) = match target {
                 ZTarget::Frame(fh) => {
                     let frame = model.arena.frame(fh);
@@ -114,25 +113,23 @@ impl UiScript {
                             zoom: m.zoom,
                             inside_zoom: m.inside_zoom,
                         },
-                        // A shown Cooldown's phase (the reference machine's derived state): the
-                        // sweep scrub while `now < start+duration`, else the 1 s flash's own
-                        // progress. `tick` hides the widget at flash end, so a stale slot never
-                        // draws (decision 0137 phase 4).
-                        Some(crate::widget::KindState::Cooldown(cd)) if cd.duration > 0.0 => {
-                            let fraction = ((now - cd.start) / cd.duration) as f32;
-                            let flash = (fraction >= 1.0).then(|| {
-                                ((now - cd.sweep_end()) / crate::widget::COOLDOWN_FLASH_SECS)
-                                    .clamp(0.0, 1.0) as f32
-                            });
-                            QuadContent::Cooldown { fraction, flash }
-                        }
                         // A `<Model>`/`<PlayerModel>` pane's content hole, carrying the pane's own
                         // name so the app can join it to the bake that window keeps (see
                         // [`QuadContent::ModelPane`]). Both widget kinds share `KindState::Model`
                         // because the client's `CGCharacterModelBase` extends `CSimpleModel`, and
                         // both draw the same way here.
-                        Some(crate::widget::KindState::Model(_)) => QuadContent::ModelPane {
+                        Some(crate::widget::KindState::Model(m)) => QuadContent::ModelPane {
+                            handle: fh,
                             name: frame.and_then(|f| f.name.clone()),
+                            model: m.path.clone(),
+                            facing: m.facing,
+                            model_scale: m.scale,
+                            position: m.position,
+                            own_alpha: frame.map_or(1.0, |f| f.alpha),
+                            icon: m.icon.clone(),
+                            camera: m.camera,
+                            light: m.light,
+                            fog: m.armed_fog(),
                         },
                         _ => QuadContent::Frame,
                     };
@@ -181,7 +178,11 @@ impl UiScript {
                         owner_frame.map(|f| &f.kind_state)
                     {
                         if sl.thumb == Some(rh) {
-                            let tsize = model.region_data.get(&rh).and_then(|d| d.size);
+                            // The thumb's OWN size getters, not its authored `<Size>` — the same
+                            // `CSimpleTexture::GetWidth`/`GetHeight` fallback the drag law reads
+                            // (`slider::thumb_extent`), so a Lua-built `SetThumbTexture(path)` knob
+                            // draws at its art's texel span instead of smeared over the whole track.
+                            let tsize = super::region::virtual_span(&model, rh);
                             rect = rect
                                 .map(|r| slider::thumb_rect(r, tsize, sl.vertical, sl.fraction()));
                             thumb_fill = true;
@@ -232,6 +233,9 @@ impl UiScript {
                     // (UIPanelButtonTemplate's gold/white/gray trio).
                     let mut state_font: Option<&FontObject> = None;
                     let mut state_color: Option<[f32; 4]> = None;
+                    // The current instance's OWN justify (`<…Font justifyH=>`, a local write on
+                    // the embedded font — [`crate::widget::ButtonState::normal_justify_h`]).
+                    let mut state_justify: Option<super::JustifyH> = None;
                     // `Button:SetFont` — the face/size/flags written on the button's own embedded
                     // fonts rather than on any object they inherit.
                     let mut button_font: Option<&crate::widget::ButtonFont> = None;
@@ -239,11 +243,12 @@ impl UiScript {
                         owner_frame.map(|f| &f.kind_state)
                     {
                         let hovered = owner.is_some() && model.mouseover == owner;
-                        // ANY registered mouse button holds a button down, not only the left one
-                        // (`0x77924b`, see `button::wants_press_visual`) — which is what makes a
-                        // right-click on a bar or spellbook slot flash its pushed art.
-                        let held = owner.is_some_and(|o| super::button::press_held(&model, o));
-                        if !bs.region_visible(rh, hovered, held) {
+                        // The PRESS is not read here. Which state texture shows is latched on the
+                        // transition (`ButtonState::set_state`), so the press reaches the paint
+                        // through the press EDGE at the moment the button goes down — not by
+                        // being re-derived every frame. `hovered` survives because the Highlight
+                        // is not a state texture and carries no latch.
+                        if !bs.region_visible(rh, hovered) {
                             continue;
                         }
                         if bs.text == Some(rh) {
@@ -281,16 +286,31 @@ impl UiScript {
                             // shows its label. Every state-colour caller in our own UI ships the
                             // matching font object, so the two readings agree on all of them.
                             let highlighted = hovered || bs.locked_highlight;
-                            let (name, color) = if !bs.enabled && bs.disabled_font.is_some() {
-                                (bs.disabled_font.as_ref(), bs.disabled_color)
-                            } else if bs.enabled && highlighted && bs.highlight_font.is_some() {
-                                (bs.highlight_font.as_ref(), bs.highlight_color)
+                            let (name, color, justify) = if !bs.enabled()
+                                && bs.disabled_font.is_some()
+                            {
+                                (
+                                    bs.disabled_font.as_ref(),
+                                    bs.disabled_color,
+                                    bs.disabled_justify_h,
+                                )
+                            } else if bs.enabled() && highlighted && bs.highlight_font.is_some() {
+                                (
+                                    bs.highlight_font.as_ref(),
+                                    bs.highlight_color,
+                                    bs.highlight_justify_h,
+                                )
                             } else {
-                                (bs.normal_font.as_ref(), bs.normal_color)
+                                (
+                                    bs.normal_font.as_ref(),
+                                    bs.normal_color,
+                                    bs.normal_justify_h,
+                                )
                             };
                             state_font = name.and_then(|n| model.font_object(n));
                             button_font = bs.font.as_ref();
                             state_color = color;
+                            state_justify = justify;
                         }
                     }
                     // A TITLE REGION NEVER DRAWS. It is a hit rectangle, not a visual: wow-re
@@ -311,6 +331,15 @@ impl UiScript {
                     if data_ref.is_some_and(|d| d.hidden) {
                         continue;
                     }
+                    // THE NAMEPLATE GLOW IS SHOWN AND NOT DRAWN — the one region in the engine
+                    // whose paint the director replaced with something else (decision 0184: the
+                    // lit plate brightens its bar instead of wearing the additive rim). It has to
+                    // stay a real, shown, ADD-blended `Nameplate-Glow` region because
+                    // `glow:IsShown()` IS the mouseover signal every 1.12 nameplate addon reads —
+                    // so the deviation lives here, at the paint, and nowhere in the model.
+                    if data_ref.is_some_and(super::nameplate::is_unpainted_glow) {
+                        continue;
+                    }
                     let mut data = data_ref.cloned().unwrap_or_default();
                     // The single-hop draw multiply (`propagation.md`): the region's own alpha times
                     // its immediate owner's — never a product up the tree, because the owner's own
@@ -318,18 +347,34 @@ impl UiScript {
                     let alpha = owner_frame.map(|f| f.effective_alpha).unwrap_or(1.0)
                         * data.alpha.unwrap_or(1.0);
                     if let Some(fo) = state_font {
-                        // The font object's paint wholesale, except a color the Lua explicitly
-                        // SetTextColor'd (the client's explicitly-set mask keeps it — ui ledger
-                        // FONTINSTANCE+0x38, color bit 0x404).
-                        data.font_path = fo.font.clone().or(data.font_path);
-                        data.font_height = fo.height.or(data.font_height);
+                        // The font object's paint, **behind the severance mask on every axis** —
+                        // the same `font_explicit` gate `font::repaint` applies and the
+                        // `button_font` block below names as the law ("it loses to a face the
+                        // label FontString set for *itself*, which severs one level further
+                        // down"). Three of these six axes did not have it: face and height were
+                        // `fo.x.or(data.x)`, which makes the OBJECT outrank an explicit
+                        // `SetFont`, and the outline was written unconditionally — so a label
+                        // that called `SetFont(path, h, "OUTLINE")` for itself had all three put
+                        // back from the object on the very next extract, every frame, forever.
+                        // That is the *shape* of the report this was found under (decision 2112:
+                        // an addon's `SetFont` silently not taking); MSBT's own strings are not
+                        // a button's label and never met it, but any addon that restyles a
+                        // `<ButtonText>` did.
+                        if !data.font_explicit.face {
+                            data.font_path = fo.font.clone().or(data.font_path);
+                        }
+                        if !data.font_explicit.height {
+                            data.font_height = fo.height.or(data.font_height);
+                        }
                         // Same severance as the colour below: a region that called
                         // `SetShadowColor`/`SetShadowOffset` keeps its own, or the font object it
                         // inherits would silently overwrite the value the addon just set.
                         if !data.font_explicit.shadow {
                             data.font_shadow = fo.shadow.or(data.font_shadow);
                         }
-                        data.outline = fo.outline;
+                        if !data.font_explicit.outline {
+                            data.outline = fo.outline;
+                        }
                         // Test the severance MASK, which is what the sentence above claims and what
                         // wow-re pinned, not `vertex_color.is_none()`. The nil-check was an
                         // equivalent proxy for exactly as long as an explicit `SetTextColor` was the
@@ -342,13 +387,22 @@ impl UiScript {
                         if !data.font_explicit.color {
                             data.vertex_color = fo.color.or(data.vertex_color);
                         }
-                        // The object's own justify (`<NormalFont inherits=… justifyH="LEFT"/>` —
-                        // how the ref left-aligns a ButtonText).
-                        if let Some(j) = fo.justify_h {
-                            data.justify.set_h(j);
+                        // The instance's justify: its own `<…Font justifyH=>` (a local write on
+                        // the embedded font, decision 1996), else the object's. Between frames
+                        // the label's own word carries the NORMAL instance's value
+                        // (`button::apply_normal_font`, the live link); a hover or a disable swaps
+                        // it here the way the client re-links the label to another instance
+                        // (`0x779810`) — behind the severance mask like every other axis, so a
+                        // label that `SetJustifyH`'d for itself keeps its own.
+                        if !data.font_explicit.justify_h {
+                            if let Some(j) = state_justify.or(fo.justify_h) {
+                                data.justify.set_h(j);
+                            }
                         }
-                        if let Some(j) = fo.justify_v {
-                            data.justify.set_v(j);
+                        if !data.font_explicit.justify_v {
+                            if let Some(j) = fo.justify_v {
+                                data.justify.set_v(j);
+                            }
                         }
                     }
                     // `Button:SetFont` sits BETWEEN the two: it is a local set on the button's own
@@ -418,6 +472,11 @@ impl UiScript {
                             shadow: data.font_shadow,
                             outline: data.outline,
                             alpha_gradient: data.alpha_gradient,
+                            // A property of the OWNER, not of the string: the plate's own name
+                            // and level and an addon's replacements for them are all drawn
+                            // inside the same sliding rect.
+                            world_seat: owner
+                                .is_some_and(|o| super::nameplate::is_world_seated(&model, o)),
                         }
                     } else {
                         // The draw gate is the TEXTURE slot, never the colour (`0x7706e0`: `+0xcc`
@@ -442,7 +501,11 @@ impl UiScript {
                             color: has_texture
                                 .then(|| texture_color(fill, data.vertex_color))
                                 .flatten(),
-                            additive: data.additive,
+                            // ADD is the one blend mode the renderer acts on; the other four of
+                            // the client's `alphaMode` enum are carried on `RegionData::blend`
+                            // (and answered by `GetBlendMode`) but drawn as straight alpha — the
+                            // stated v1 gap, see [`crate::script::BlendMode`].
+                            additive: data.blend == crate::script::BlendMode::Add,
                             tex_coords: data.tex_coords,
                             circular: data.circular,
                             portrait_unit: data.portrait_unit,
@@ -462,9 +525,25 @@ impl UiScript {
                     (rect, alpha, content, clip, scale)
                 }
             };
+            // **A `Model` frame's scene draws out of its bucket's ARTWORK batch, last** — wow-re
+            // `ui/scratch/model-frame-draw-order.md` (2026-09-04): the batch object carries a
+            // third sub-array beside the quads and the text, a render-callback list, and
+            // `0x76fb00` drains the three in that order; `0x76d160` registers the model's callback
+            // only for `layer == 2` (`0x76d17f cmp ebx,2`). So a model is neither a separate pass
+            // nor the frame's own layer-0 slot — it is ARTWORK content, after that layer's quads.
+            // This is what puts the world map's player arrow over the zone overlays: both frames
+            // sit at `WorldMapFrame.level + 1`, the overlays are ARTWORK quads there, and the
+            // arrow's callback drains after them (the director's report, and the case the carve
+            // was dispatched on). A model's own OVERLAY/HIGHLIGHT regions still draw over it. The
+            // CALLBACK rank (1995) is what puts the scene after that layer's font strings too,
+            // whatever their link stamps — the content key alone sat at the text rank.
+            let z = match &content {
+                QuadContent::ModelPane { .. } => zkey.callback(order::DrawLayer::Artwork).raw(),
+                _ => zkey.raw(),
+            };
             out.push(ExtractedQuad {
                 target,
-                z: zkey.raw(),
+                z,
                 rect,
                 alpha,
                 content,

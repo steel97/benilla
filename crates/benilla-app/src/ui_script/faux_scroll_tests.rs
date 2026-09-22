@@ -40,7 +40,7 @@ fn load_inline(s: &UiScript, xml: &str) {
 fn harness() -> UiScript {
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
-    load_xml(&s, "Fonts.xml");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, "ScrollTemplates.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
@@ -304,20 +304,38 @@ fn dragging_the_bar_steps_the_offset_by_rows_and_repaints() {
         "the drag repainted the owner's list"
     );
 
-    // A sub-row nudge rounds to the NEAREST row (`floor(v/itemHeight + 0.5)`) and lands on the
-    // same one, so the offset does not move.
+    // A sub-row nudge on the BAR reaches nothing at all: `FauxScrollFrame_Update` set the bar's
+    // step to one row, and `SetValue` quantises onto `min + n·step` before its change compare
+    // (2133, `0x789930`), so 51px resolves to the 48 the bar already holds — no
+    // `OnValueChanged`, no `SetVerticalScroll`, no repaint. This is the snap a 1.12 list
+    // scrollbar has and ours did not: the bar cannot come to rest between two rows.
     let settled = s.eval::<i64>("return TestRepaints").unwrap();
     s.run("TestScrollScrollBar:SetValue(51)").unwrap();
+    assert_eq!(
+        s.eval::<f64>("return TestScrollScrollBar:GetValue()")
+            .unwrap(),
+        48.0,
+        "51px is not a lattice point; the bar stays on row 3's"
+    );
+    assert_eq!(
+        s.eval::<i64>("return TestRepaints").unwrap(),
+        settled,
+        "and a value that did not move fires nothing"
+    );
+
+    // The unconditional repaint is still there — it lives one level up, on the path a wheel or a
+    // `SetVerticalScroll` takes. `FauxScrollFrame_OnVerticalScroll` ends in a bare
+    // `updateFunction();` (UIPanelTemplates.lua:228-232) with no compare against the previous
+    // offset, so a sub-row scroll through the FRAME repaints even though the bar does not move.
+    // Our deleted kit repainted only when the row actually changed; the reference does not, and
+    // that difference is the migration's, not a regression to chase (1860).
+    s.run("TestScroll:SetVerticalScroll(51)").unwrap();
     assert_eq!(
         s.eval::<i64>("return FauxScrollFrame_GetOffset(TestScroll)")
             .unwrap(),
         3,
-        "51px is still row 3 once rounded"
+        "51px is still row 3 once rounded (`floor(v/itemHeight + 0.5)`)"
     );
-    // …but it STILL repaints. `FauxScrollFrame_OnVerticalScroll` ends in a bare
-    // `updateFunction();` (UIPanelTemplates.lua:228-233) — unconditional, with no compare against
-    // the previous offset. Our deleted kit repainted only when the row actually changed; the
-    // reference does not, and that difference is the migration's, not a regression to chase (1860).
     assert!(
         s.eval::<i64>("return TestRepaints").unwrap() > settled,
         "the reference repaints on every scroll, changed row or not"
@@ -329,11 +347,11 @@ fn dragging_the_bar_steps_the_offset_by_rows_and_repaints() {
 /// on `FauxScrollFrameTemplate` whose `<OnVerticalScroll>` calls `FauxScrollFrame_OnVerticalScroll`,
 /// driven by a drag of the shared bar.
 ///
-/// The `SetScrollChild` line is the gap, made visible: the reference's template declares that child
-/// as `<ScrollChild><Frame name="$parentScrollChildFrame">`, our XML loader has no `<ScrollChild>`
-/// element, and `SetVerticalScroll` clamps into `[0, GetVerticalScrollRange()]` — which is computed
-/// from that child. Without it the range is 0, the handler fires with `arg1 = 0` and an addon's list
-/// never leaves the top. With it, the whole reference path runs.
+/// The `SetScrollChild` line predates 1205 (the loader's `<ScrollChild>`) and stays as the
+/// addon-shaped way of seating a child by hand; the range it asserts is that child's overflow
+/// (1338). The offset itself never depended on the range — the engine stores what the bar hands it
+/// (decision 2017) — so what this drives is bar value → `SetVerticalScroll` → `<OnVerticalScroll>`
+/// → `FauxScrollFrame_OnVerticalScroll`'s `floor(v / step + 0.5)`, the reference's path end to end.
 #[test]
 fn the_reference_on_vertical_scroll_path_runs_once_a_scroll_child_exists() {
     let mut s = harness();
@@ -399,7 +417,7 @@ fn the_reference_on_vertical_scroll_path_runs_once_a_scroll_child_exists() {
 #[test]
 fn scrolling_edit_helpers_answer_bare_calls_from_a_handler() {
     let s = UiScript::new().unwrap();
-    load_xml(&s, "Fonts.xml");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
     load_xml(&s, "ScrollTemplates.xml");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
     load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");

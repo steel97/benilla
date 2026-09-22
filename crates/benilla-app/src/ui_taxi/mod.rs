@@ -24,19 +24,19 @@
 //! `CMSG_ACTIVATETAXIEXPRESS` with the full node chain; a click on the `Current` node is a
 //! client-side no-op.
 //!
-//! `TaxiFrame.xml` (`crates/benilla-app/assets/ui/TaxiFrame.xml`) is the window; its header comment
+//! Stock `Interface\FrameXML\TaxiFrame.xml` is the window; the toc's header comment
 //! carries the three engine-forced deviations from the literal reference Lua (a static node-button
 //! pool, the title reading an event arg, the error line's call target).
 
 use benilla_protocol::messages::TaxiMask;
 use bevy::prelude::*;
 
-use benilla_ui::script::{ScriptValue, TaxiUiState, UiScript};
+use benilla_ui::script::{TaxiUiState, UiScript};
 
 use crate::names::NameCache;
 use crate::net::{ClientCommand, NetCommands};
 use crate::player::Player;
-use crate::ui_script::UiInput;
+use crate::ui_script::{UiFeed, UiInput};
 use crate::ui_session::{close_npc_session_out_of_range, NpcSession};
 
 mod routing;
@@ -99,63 +99,17 @@ impl TaxiState {
 /// A flight master's answered node status (`SMSG_TAXINODE_STATUS`, upserted by the net bridge):
 /// `known = false` (an undiscovered nearest node) shows the green `TalkToMeGreen` overhead icon —
 /// the client's `0x5ecdd0` handler → `0x607480` marker swap (resource table `0xc4d9d8` index 4),
-/// byte-verified in the 0497 §5. Read by [`crate::quest_markers`], which owns the shared overhead
-/// attach slot both this and the questgiver markers ride.
+/// byte-verified in the 0497 §5.
+///
+/// **The query and the teardown are [`crate::quest_markers::query`]'s, not this module's**
+/// (decision 1918). `0x5eb170` — the only `CMSG_TAXINODE_STATUS_QUERY` sender in the image — has
+/// exactly one live caller, `0x607380` @`0x6073e8`, which is the same per-unit function that issues
+/// the questgiver query and which tears the shared marker slot down before either. The green `!`
+/// and the gold `!` are the *same* `unit+0xb2c`, so they cannot have separate lifetimes; this
+/// component is the fact, and its owner is the sweep.
 #[derive(Component, Clone, Copy)]
 pub(crate) struct FlightMasterStatus {
     pub(crate) known: bool,
-}
-
-/// Ask each streamed flight master for its node status (`CMSG_TAXINODE_STATUS_QUERY`) — the
-/// client's sender `0x5eb170`, triggered on unit refresh and on mouseover, gated on
-/// `UNIT_NPC_FLAG_FLIGHTMASTER` (bit 3) and a non-hostile reaction (`0x6061e0 > 1`). Our shape:
-/// once per FM while it stays streamed (the `asked` set prunes to the live index, so a despawn +
-/// re-stream re-asks — the refresh trigger), and a re-ask when the hover lands on one (the
-/// mouseover trigger; the learn push — vmangos pairing `SMSG_NEW_TAXI_PATH` with a fresh status —
-/// clears the icon without it, this just keeps the edge honest).
-#[allow(clippy::type_complexity, clippy::too_many_arguments)] // a Bevy system's full input set
-fn query_fm_statuses(
-    self_q: Query<&crate::net::ObjectStore, With<crate::net::SelfPlayer>>,
-    units: Query<
-        (&crate::net::Guid, &crate::net::ObjectStore),
-        (With<crate::net::NetEntity>, Without<crate::net::SelfPlayer>),
-    >,
-    index: Res<crate::net::GuidIndex>,
-    factions: Option<Res<crate::target::Factions>>,
-    reputations: Res<crate::net::Reputations>,
-    hovered: Res<crate::target::Hovered>,
-    commands: Res<NetCommands>,
-    mut asked: Local<std::collections::HashSet<u64>>,
-    mut last_hover: Local<Option<u64>>,
-) {
-    /// `UNIT_NPC_FLAG_FLIGHTMASTER` (bit 3) — the cursor classifier's bit.
-    const NPC_FLAG_FLIGHTMASTER: u32 = 0x8;
-    let self_store = self_q.iter().next();
-    asked.retain(|g| index.0.contains_key(g));
-    // The mouseover re-ask: on the hover edge onto an already-asked FM, forget it so the loop
-    // below re-sends this frame.
-    let hover_edge = (hovered.guid != *last_hover)
-        .then_some(hovered.guid)
-        .flatten();
-    *last_hover = hovered.guid;
-    if let Some(g) = hover_edge {
-        asked.remove(&g);
-    }
-    for (guid, obj) in &units {
-        if obj.0.unit_npc_flags() & NPC_FLAG_FLIGHTMASTER == 0 {
-            continue;
-        }
-        if crate::target::ring_reaction(factions.as_deref(), &reputations, Some(obj), self_store)
-            <= 1
-        {
-            continue; // hostile — the client's reaction gate skips the query
-        }
-        if asked.insert(guid.0) {
-            let _ = commands
-                .0
-                .send(ClientCommand::TaxiNodeStatusQuery { guid: guid.0 });
-        }
-    }
 }
 
 /// The taxi window is an NPC session: the standardized range guard ([`crate::ui_session`])
@@ -176,13 +130,12 @@ impl NpcSession for TaxiState {
 /// on `OK` instead — the flight starts and the map has nothing left to show), present a
 /// first-visit discovery, and push the `UnitOnTaxi` ride flag off [`Player::server_riding`].
 /// Diffed against `Local` memory, the trainer/merchant feed shape.
-#[allow(clippy::too_many_arguments)]
 fn feed_taxi(
     script: Option<NonSendMut<UiScript>>,
     mut state: ResMut<TaxiState>,
     catalogs: Option<Res<TaxiCatalogs>>,
     player: Res<Player>,
-    mut names: ResMut<NameCache>,
+    names: Res<NameCache>,
     commands: Res<NetCommands>,
     mut cache: ResMut<TaxiRouteCache>,
     mut last: Local<crate::ui_script::VmMemo<Option<TaxiUiState>>>,
@@ -284,12 +237,14 @@ fn feed_taxi(
     if fresh != *last || (fresh.is_some() && name_changed) {
         script.set_taxi(fresh.clone());
         match (&*last, &fresh) {
-            (None, Some(_)) | (Some(_), Some(_)) => script.fire_event(
-                "TAXIMAP_OPENED",
-                vec![ScriptValue::Str(
-                    flightmaster_name.clone().unwrap_or_default(),
-                )],
-            ),
+            // **No arguments** — `0x4dba96` is the event's one fire site image-wide and it is a
+            // `FrameScript_SignalEvent 0x703e50`, `__fastcall(ecx = id)` with a plain `ret` and
+            // no vararg push at all. The flight master's name we used to pass was an invention:
+            // `TaxiFrame_OnEvent` reads `UnitName("npc")` for it and never looks at `arg1`
+            // (decision 2140, found by the argument gate).
+            (None, Some(_)) | (Some(_), Some(_)) => {
+                script.fire_event("TAXIMAP_OPENED", Vec::new());
+            }
             (Some(_), None) => script.fire_event("TAXIMAP_CLOSED", vec![]),
             (None, None) => {}
         }
@@ -368,10 +323,13 @@ fn drain_taxi(
     }
 }
 
+mod net;
+
 pub(crate) struct UiTaxiPlugin;
 
 impl Plugin for UiTaxiPlugin {
     fn build(&self, app: &mut App) {
+        net::register(app);
         app.init_resource::<TaxiState>()
             .init_resource::<TaxiRouteCache>()
             .add_systems(
@@ -382,9 +340,8 @@ impl Plugin for UiTaxiPlugin {
                     // frame; push before the input pass so an open/close is on screen the same
                     // frame; drain after it (mirrors ui_merchant/ui_trainer).
                     close_npc_session_out_of_range::<TaxiState>.before(feed_taxi),
-                    feed_taxi.before(UiInput),
+                    feed_taxi.in_set(UiFeed),
                     drain_taxi.after(UiInput),
-                    query_fm_statuses,
                 ),
             );
     }
@@ -420,83 +377,5 @@ mod tests {
         assert_eq!(state.npc(), None);
         assert_eq!(state.reply, None);
         assert!(!state.discovered);
-    }
-
-    /// The flight-master status ask: once per streamed FM, re-asked on a re-stream (the client's
-    /// refresh trigger) and on the hover edge (the mouseover trigger). No `Factions` catalog in
-    /// the app → reaction falls through to neutral (3 > 1), so the gate is the NPC flag alone.
-    #[test]
-    fn fm_status_is_asked_once_per_stream_and_reasked_on_hover() {
-        use std::collections::HashMap;
-
-        use benilla_protocol::messages::ObjectFields;
-        use benilla_protocol::EntityKind;
-
-        use crate::net::{Guid, GuidIndex, NetEntity, ObjectStore, SelfPlayer};
-
-        let mut app = App::new();
-        app.add_systems(Update, query_fm_statuses);
-        let (tx, rx) = crossbeam_channel::unbounded();
-        app.insert_resource(NetCommands(tx));
-        app.init_resource::<crate::net::Reputations>();
-        app.init_resource::<crate::target::Hovered>();
-        app.world_mut()
-            .spawn((ObjectStore(ObjectFields::default()), SelfPlayer));
-        // UNIT_NPC_FLAGS (field 147) = 0x8 flightmaster; a plain vendor (0x4) must not query.
-        let fm = app
-            .world_mut()
-            .spawn((
-                Guid(42),
-                NetEntity {
-                    kind: EntityKind::Unit,
-                    display_id: None,
-                    scale: 1.0,
-                },
-                ObjectStore(ObjectFields::from_pairs(&[(147, 0x8)])),
-            ))
-            .id();
-        app.world_mut().spawn((
-            Guid(43),
-            NetEntity {
-                kind: EntityKind::Unit,
-                display_id: None,
-                scale: 1.0,
-            },
-            ObjectStore(ObjectFields::from_pairs(&[(147, 0x4)])),
-        ));
-        app.insert_resource(GuidIndex([(42, fm)].into_iter().collect()));
-
-        let drain = |rx: &crossbeam_channel::Receiver<ClientCommand>| {
-            let mut asked = Vec::new();
-            while let Ok(c) = rx.try_recv() {
-                if let ClientCommand::TaxiNodeStatusQuery { guid } = c {
-                    asked.push(guid);
-                }
-            }
-            asked
-        };
-        app.update();
-        assert_eq!(
-            drain(&rx),
-            [42],
-            "one query for the FM, none for the vendor"
-        );
-        app.update();
-        assert_eq!(drain(&rx), [] as [u64; 0], "asked once while streamed");
-
-        // Despawn from the index and back — the refresh trigger re-asks.
-        app.insert_resource(GuidIndex(HashMap::default()));
-        app.update();
-        app.insert_resource(GuidIndex([(42, fm)].into_iter().collect()));
-        app.update();
-        assert_eq!(drain(&rx), [42], "a re-stream re-asks");
-
-        // The hover edge onto the FM re-asks; holding the hover doesn't repeat.
-        app.world_mut()
-            .resource_mut::<crate::target::Hovered>()
-            .guid = Some(42);
-        app.update();
-        app.update();
-        assert_eq!(drain(&rx), [42], "the mouseover edge re-asks exactly once");
     }
 }

@@ -82,7 +82,6 @@ pub struct SpawnedModel {
 /// WMO-display GameObject's doodad props ([`crate::entities`]'s `wmo_props`, the ship's sails), which
 /// pass a doodad-LOCAL `transform` + `card_owner` and parent the returned entities under the moving
 /// gameobject (every downstream system reads propagated `GlobalTransform`s, so the composition holds).
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_model_entities(
     commands: &mut Commands,
     mat_cache: &mut MaterialCache,
@@ -113,6 +112,22 @@ pub fn spawn_model_entities(
     // (decision 0778). `None` everywhere else (exterior props fade; WMO groups use their own
     // per-submesh interior flag + batch class).
     interior_slot: Option<u16>,
+    // The placement's **draw-set gate** — its fade sphere plus, for a WMO prop, the building
+    // instance and the rooms that name it. `Some` on the world-static lanes, where the caller
+    // builds it ONCE ([`super::fx::emitter_fade`]) and hands the same value to every rider of the
+    // placement: the emitters, the ribbon trails, the glow lights — and, since 2059, the anim
+    // host, which used to fabricate its own with `instance: None, room: None` and so judged a
+    // particles-only WMO prop as exterior scene. Standing inside a sealed room that is
+    // `ExteriorGate::Windows([])`, which "admits nothing": every meshless prop of the building the
+    // camera was standing in was parked, its event track unscanned, and Stratholme's
+    // burning-building `$DSL` never fired.
+    //
+    // `None` on the entity-hosted lane (a transport's props), which carries no `EmitterFade` at
+    // all on purpose — a mover has no baked world point for one to measure from
+    // (`benilla_app::entities::wmo_props`). The bare sphere below is what its mesh lane needs, and
+    // `radius` is read for exactly that: in the `Some` arm the gate carries its own and this
+    // parameter is never consulted again.
+    fade: Option<&crate::particles::EmitterFade>,
     radius: f32,
     local_center: Vec3,
     // The model's authored **all-animation** bound in Bevy model-local space
@@ -135,6 +150,18 @@ pub fn spawn_model_entities(
     // The shared delta table both registries slot into (decision 1381) — registration allocates
     // here and bakes the slot into the material.
     anim_table: &mut crate::mat_anim_table::MatAnimTable,
+    // **Is this placement a WMO doodad prop hanging off a streamed entity?** (The WMO-gameobject
+    // lane — a transport's deck cargo and cabin furniture.) It is the LANE, where `card_owner`
+    // below is only the anchor: that anchor is minted per placement and only when the model has
+    // billboard batches at all, so it answers "does this prop have cards to follow", never "which
+    // lane is this". Reading it as the lane is what left the marker below un-set on 133 of the
+    // ship's 134 props.
+    //
+    // What it decides here: [`crate::entity_shade::DoodadDefLit`] on every batch, which is the
+    // engine asserting its OWN invariant instead of trusting a caller to remember it (2047 — and
+    // 2041's lesson one level up). A prop's light is its `CMapDoodadDef`'s; it is under the net
+    // entity so it rides the deck, and the entity light node's descendant walk must pass it by.
+    entity_hosted: bool,
     // `Some(anchor)` for a prop spawned ON a streamed entity (the WMO-gameobject path): a boneless
     // model's billboard cards FOLLOW this anchor (`BillboardCard::following` — the entity-path law,
     // decision 0153) instead of baking a world pivot, so they track the moving owner and
@@ -164,6 +191,16 @@ pub fn spawn_model_entities(
     // its host bone off (0130 phase 4), and the FILE sequence slot its variation roll landed
     // on, which the emitters' rate/gate tracks must be sampled against (decision 0760).
 ) -> SpawnedModel {
+    // One gate for this placement, from here down: the caller's when it has one, else the bare
+    // sphere (which is the same value `emitter_fade` would build from the same inputs — the
+    // constructor is shared, so the two arms cannot drift). Every `radius`/world-centre read below
+    // goes through it.
+    let fade = match fade {
+        Some(f) => f.clone(),
+        None => {
+            crate::particles::EmitterFade::sphere(radius, transform.transform_point(local_center))
+        }
+    };
     let kind = object.kind;
     let is_wmo = kind == ModelKind::Wmo;
     let mut out = Vec::with_capacity(submeshes.len());
@@ -360,7 +397,7 @@ pub fn spawn_model_entities(
             interior_prop: interior_probe,
             order_free: matches!(sub.blend, ModelBlend::Opaque | ModelBlend::AlphaTest)
                 && !sub.additive,
-            never_fade: radius > crate::model_fade::NEVER_FADE_RADIUS,
+            never_fade: fade.radius > crate::model_fade::NEVER_FADE_RADIUS,
         };
         // A merged FADER blob lives permanently in the reference's own fading render state —
         // the blend twin (blend on, cutout ref on unfaded alpha, depth-write forced on) — with
@@ -379,7 +416,7 @@ pub fn spawn_model_entities(
         let merge_sphere = if steady_interior_prop {
             Vec4::new(0.0, 0.0, 0.0, f32::INFINITY)
         } else {
-            Vec4::from((transform.transform_point(local_center), radius))
+            Vec4::from((fade.center, fade.radius))
         };
         if crate::static_merge::census_enabled() {
             let key = merge
@@ -402,27 +439,61 @@ pub fn spawn_model_entities(
         // prop lane admits steady interior props + never-fade exterior props while an
         // exterior FADER prop stays on the entity path (the exile protocol has no prop
         // shape — that keep is today's default look) and is TALLIED, never silent.
+        // The census label for a batch that stays on the entity path (`EntityPathWhy`):
+        // refined below as each divert declines it.
+        let mut why: &'static str = "gx-off";
         if let Some((gx, site)) = staticgx.as_mut() {
-            let facts = if !crate::static_gx::enabled() || shared_geometry[batch_idx] {
+            let facts = if !crate::static_gx::enabled() {
+                None
+            } else if shared_geometry[batch_idx] {
+                why = "shared-geometry";
                 None
             } else {
+                why = match site {
+                    crate::static_gx::GxSite::Doodad { .. } if is_wmo => "doodad-site-wmo",
+                    crate::static_gx::GxSite::Doodad { .. } if class.excluded => "no-merge-anim",
+                    crate::static_gx::GxSite::Doodad { .. } if !class.merges() => {
+                        "no-merge-transparent"
+                    }
+                    crate::static_gx::GxSite::Doodad { .. } if class.interior_prop => {
+                        "interior-prop"
+                    }
+                    crate::static_gx::GxSite::Doodad { .. } => "fader-lane-off",
+                    crate::static_gx::GxSite::Wmo { .. } if !is_wmo => "wmo-site-m2",
+                    crate::static_gx::GxSite::Wmo { .. } if class.excluded => "wmo-no-merge-anim",
+                    crate::static_gx::GxSite::Wmo { .. } if !class.merges() => {
+                        "wmo-no-merge-transparent"
+                    }
+                    crate::static_gx::GxSite::Wmo { .. } => "wmo-no-group",
+                    crate::static_gx::GxSite::Prop { .. } if is_wmo => "prop-site-wmo",
+                    crate::static_gx::GxSite::Prop { .. } if class.excluded => "prop-no-merge-anim",
+                    crate::static_gx::GxSite::Prop { .. } if !class.merges() => {
+                        "prop-no-merge-transparent"
+                    }
+                    crate::static_gx::GxSite::Prop { .. } => "exterior-fader-prop",
+                };
                 match site {
                     crate::static_gx::GxSite::Doodad { owner }
                         if !is_wmo && class.merges() && !class.interior_prop =>
                     {
-                        let fade = (!class.never_fade && !crate::static_gx::fade_lane_disabled())
-                            .then(|| crate::static_gx::GxFadeSeed {
-                                radius,
-                                local_center,
-                                stat_mesh: stat_mesh.clone(),
-                                aabb: *stat_aabb,
-                                cutout: cutout.clone(),
-                                blend: blend.clone(),
-                            });
+                        // `fade_seed`, not `fade`: the placement's draw-set gate is in scope
+                        // here under that name, and shadowing it with the retained pass's
+                        // per-batch seed reads as the same thing twice.
+                        let fade_seed = (!class.never_fade
+                            && !crate::static_gx::fade_lane_disabled())
+                        .then(|| crate::static_gx::GxFadeSeed {
+                            radius: fade.radius,
+                            local_center,
+                            stat_mesh: stat_mesh.clone(),
+                            aabb: *stat_aabb,
+                            cutout: cutout.clone(),
+                            blend: blend.clone(),
+                        });
                         // Never-fade admits bare; a fader admits only WITH its seed (the
                         // fade lane lever empties the seed, sending faders back to the
                         // entity path).
-                        (class.never_fade || fade.is_some()).then_some((*owner, None, None, fade))
+                        (class.never_fade || fade_seed.is_some())
+                            .then_some((*owner, None, None, fade_seed))
                     }
                     crate::static_gx::GxSite::Wmo { instance, groups }
                         if is_wmo && class.merges() =>
@@ -469,6 +540,7 @@ pub fn spawn_model_entities(
                 }
             };
             if let Some((owner, wmo, prop, fade)) = facts {
+                why = "gx-declined";
                 if gx.divert(crate::static_gx::GxBatch {
                     geometry: &sub.geometry,
                     transform,
@@ -550,7 +622,7 @@ pub fn spawn_model_entities(
                     anim_table,
                     materials,
                     id,
-                    crate::doodad_anim::UvLoop::Shared(anim.clone()),
+                    crate::doodad_anim::UvLoop::Shared(Some(anim.clone())),
                 );
             }
         }
@@ -587,9 +659,15 @@ pub fn spawn_model_entities(
         // (`mesh_tag::probe_bits` — bits 16-29 since the 0355 re-lane): this site kept the old
         // bits-0..=15 write through that re-lane, so every static interior prop read probe slot 0,
         // taking whichever probe won the streaming race — the director's inn-doodad regression.
-        let mesh_tag = match interior_slot {
-            Some(slot) if interior_probe => MeshTag(crate::mesh_tag::probe_bits(slot)),
-            _ => MeshTag(alpha_bits(1.0)),
+        // ONE decision for "does this batch's payload carry a probe slot", read twice below —
+        // once for the tag's bits and once for the component that SAYS so
+        // ([`crate::mesh_tag::InteriorProbePayload`]). Two independent predicates could drift,
+        // and a reader that disagrees with the writer about which payload a part is on is
+        // exactly B373.
+        let probe_slot = interior_slot.filter(|_| interior_probe);
+        let mesh_tag = match probe_slot {
+            Some(slot) => MeshTag(crate::mesh_tag::probe_bits(slot)),
+            None => MeshTag(alpha_bits(1.0)),
         };
         // A billboard batch (glow card / chain) faces the camera each frame, so its transform is owned
         // by the billboard system. It still distance-fades with its doodad (same `radius` band) — the
@@ -616,6 +694,7 @@ pub fn spawn_model_entities(
                     kind,
                     blend: sub.blend,
                 },
+                crate::model_render::EntityPathWhy(why),
                 // The picker's triangles (decision 0857): the render forms are `RENDER_WORLD`-only,
                 // so the inspector/probe rays read the model's resident geometry. The caster
                 // centres a card at its pivot, the same bake the render form draws with.
@@ -650,6 +729,7 @@ pub fn spawn_model_entities(
                     kind,
                     blend: sub.blend,
                 },
+                crate::model_render::EntityPathWhy(why),
                 // The picker's triangles (decision 0857) — same rule as the card above.
                 crate::interact::PickMesh(sub.geometry.clone()),
                 mesh_tag,
@@ -696,6 +776,26 @@ pub fn spawn_model_entities(
             (entity, local_center)
         };
         by_batch[batch_idx] = Some(entity);
+        // This batch's payload is a PROBE SLOT, said as a component so the exterior-payload
+        // writer can see it (`mesh_tag::InteriorProbePayload`). Cards included, for the same
+        // reason they carry the slot at all: they are batches of the same model, shaded through
+        // the same light node (0778) — and `entity_shade`'s card pass reaches a card by walking
+        // UP from its owner, a route its descendant-walk guard never covers.
+        if probe_slot.is_some() {
+            commands
+                .entity(entity)
+                .insert(crate::mesh_tag::InteriorProbePayload);
+        }
+        // …and, on the entity-hosted lane, that this batch's light is its own doodad def's rather
+        // than its host's. Asserted here rather than by the caller so the rule cannot be half
+        // applied: this is the site that knows about EVERY batch, cards included, and a card is
+        // exactly what the caller cannot reach (it is a world root kept out of the returned list,
+        // and the shade writer's card pass finds it by walking UP to the host).
+        if entity_hosted {
+            commands
+                .entity(entity)
+                .insert(crate::entity_shade::DoodadDefLit);
+        }
         // Animated material alpha (decision 0130 phase 2): the rare batch whose colour-alpha/weight
         // tracks animate (fire flicker) or constantly dim gets its per-instance sampler; the
         // visibility authority composes the value into the render-alpha tag + the A ≤ 0 cull.
@@ -727,7 +827,7 @@ pub fn spawn_model_entities(
         // which is steady indoors). Adding `DoodadFade` is what makes the fade system drive the tag.
         if !steady_interior_prop {
             commands.entity(entity).insert(DoodadFade {
-                radius,
+                radius: fade.radius,
                 local_center: fade_center,
                 cutout,
                 blend,
@@ -760,7 +860,8 @@ pub fn spawn_model_entities(
         }
         commands.entity(h.root).insert(DoodadAnimHost {
             meshes: skinned_meshes,
-            fade: (radius, transform.transform_point(local_center)),
+            // The caller's one gate, not a second construction of it (2059).
+            fade: fade.clone(),
             clip: h.clip,
             armed_at: now,
             // Born already expired, so the first frame runs the holder setup's `variationIdx = -1`

@@ -161,20 +161,26 @@ pub(super) fn channel_list(channel: String, members: &[(u64, u8)], chat_log: &mu
     chat_log.push_event(ev);
 }
 
-/// A whisper target wasn't online — ERR_CHAT_PLAYER_NOT_FOUND_S (GlobalStrings:1534).
-pub(super) fn chat_player_not_found(name: &str, chat_log: &mut ChatLog) {
-    chat_log.push_event(ChatEvent::text_only(
-        ChatEventKind::System,
-        format!("No player named '{name}' is currently playing."),
+/// A whisper target wasn't online — `ERR_CHAT_PLAYER_NOT_FOUND_S`, catalog row 241, whose `%s`
+/// the server's own name fills.
+///
+/// The KEY travels rather than a composed sentence (decision 2045): this is the net-apply pass and
+/// there is no VM here, so `ui_action`'s drain is what resolves it against the player's own
+/// `GlobalStrings.lua` — and the row, not this call site, is what says the line goes to chat
+/// (`kind 0`) and makes no sound.
+pub(super) fn chat_player_not_found(name: &str, errors: &mut crate::ui_action::UiErrorKeys) {
+    errors.0.push(crate::ui_action::UiError::s(
+        "ERR_CHAT_PLAYER_NOT_FOUND_S",
+        name,
     ));
 }
 
-/// A cross-faction whisper was refused — ERR_CHAT_WRONG_FACTION (GlobalStrings:1537).
-pub(super) fn chat_wrong_faction(chat_log: &mut ChatLog) {
-    chat_log.push_event(ChatEvent::text_only(
-        ChatEventKind::System,
-        "You can only whisper to members of your alliance.".to_string(),
-    ));
+/// A cross-faction whisper was refused — `ERR_CHAT_WRONG_FACTION`, catalog row 240. Same route and
+/// the same reason as [`chat_player_not_found`], with no argument to fill.
+pub(super) fn chat_wrong_faction(errors: &mut crate::ui_action::UiErrorKeys) {
+    errors
+        .0
+        .push(crate::ui_action::UiError::key("ERR_CHAT_WRONG_FACTION"));
 }
 
 /// A server notice (`SMSG_NOTIFICATION`) — the **red UIErrorsFrame line**, never a chat line.
@@ -186,8 +192,9 @@ pub(super) fn chat_wrong_faction(chat_log: &mut ChatLog) {
 /// (wow-re `system/ui/ui.md` l.2459). Nothing on this path touches the chat composer.
 ///
 /// **This used to push into the chat feed**, as a stand-in from before benilla had an errors
-/// frame. It has had a real one for a long time (`assets/ui/ErrorsFrame.xml`, the ref
-/// `UIErrorsFrame` as a genuine `MessageFrame`), and the stand-in outlived its reason: vmangos
+/// frame. It has had a real one for a long time — the ref `UIErrorsFrame`, a genuine
+/// `MessageFrame` (ours until 1751's fourteenth window, the chain's own
+/// `Interface\FrameXML\UIErrorsFrame.xml` since) — and the stand-in outlived its reason: vmangos
 /// `Player::SetGameMaster` answers `.gm on|off` with **both** `SendSysMessage` and
 /// `SendNotification` (`Objects/Player.cpp:2676-2677`/`2701-2702`), so a client that sinks the
 /// notification into chat prints "GM mode is ON" **twice** where the reference prints it once.
@@ -382,8 +389,8 @@ mod tests {
     /// handler `0x401800` is "read the cstring, `mov edx,1`, `call 0x4945b0`" — event `0xe0`
     /// `UI_ERROR_MESSAGE`, the UIErrorsFrame toast — plus a console log, and it never reaches the
     /// chat composer. Benilla used to park the notice in the chat feed for want of an errors
-    /// frame; it has had one since `assets/ui/ErrorsFrame.xml`, and the stand-in was what printed
-    /// "GM mode is ON" twice.
+    /// frame; it has had one since our own `ErrorsFrame.xml` (the chain's `UIErrorsFrame.xml`
+    /// since 1751), and the stand-in was what printed "GM mode is ON" twice.
     ///
     /// The pair is the test: BOTH halves of one toggle, one chat line, one toast.
     #[test]

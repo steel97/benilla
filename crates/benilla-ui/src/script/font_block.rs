@@ -242,10 +242,16 @@ pub(super) fn install(
                 let (path, height) = set_font_args(&file, &height, widget)?;
                 let rh = resolve(lua, &this)?;
                 let mut model = lua.app_data_mut::<Model>().expect("model");
+                // The verdict is the host's when there is a host: nil is a *load* failure
+                // (`0x5c1ae0` under the `0x44d040` font-factory cache), so a path naming no file
+                // — an addon's TTF the AddOns folder does not hold — has to come back falsey, and
+                // only the store knows. With no probe installed, a non-empty path is 1: a VM with
+                // no font backend has nothing for a load to fail against (decision 2103).
+                let ok =
+                    !path.is_empty() && model.font_probe.as_ref().is_none_or(|probe| probe(&path));
                 let d = model.region_data.entry(rh).or_default();
                 // Every argument supplied is an EXPLICIT set: it must survive a later mutation of
                 // the font object this region inherits.
-                let ok = !path.is_empty();
                 if ok {
                     d.font_path = Some(path);
                     d.font_explicit.face = true;
@@ -266,6 +272,21 @@ pub(super) fn install(
     )?;
     // GetFont() → 3 values: path, height, flagsString (`mov eax,3` at `0x79f407`). The flags string
     // is `""` when there are none — built into a zeroed static buffer at `0xceea60` — never nil.
+    //
+    // **The HEIGHT slot is a number even on a FontString that was never given a font**, and that is
+    // not the obvious reading: §9.3 records that the FontString reads back *through* its resolved
+    // `CGxFont`, so it looks as though a NULL one should nil all three. It does not. `0x7727b0`'s
+    // fifth instruction is an *unconditional* `fld [esi+0xe4]`, and its `+0xe0` test sits behind a
+    // branch `GetFont` never takes (`0x79d499 push 0`) — so slot 2 never touches the `CGxFont` at
+    // all and always pushes a double (wow-re `font-object-lua-surface.md` §9.3a, §5-cross-checked).
+    // We answer 0 there: `+0xe4` has **no constructor writer** in the reference, so its value on
+    // this path is a recycled float that nothing can reproduce, and 0 is what the Font object's own
+    // ctor-determined `+0x48` gives (decision 2129).
+    //
+    // A nil here is not a cosmetic difference. `aux-addon/tabs/search/frame.lua:481` computes
+    // `aux.select(2, child:GetFont()) + arg1*2` in its font-resize wheel handler — `aux.select`,
+    // the addon's own (`util.lua:26`), which is why that line survives 2171 taking the global
+    // `select` away.
     m.set(
         "GetFont",
         lua.create_function(move |lua, this: Table| {
@@ -276,7 +297,7 @@ pub(super) fn install(
                 Some(p) => Value::String(lua.create_string(&p)?),
                 None => Value::Nil,
             };
-            let height = d.and_then(|d| d.font_height);
+            let height = d.and_then(|d| d.font_height).unwrap_or(0.0);
             let flags = d.map(|d| d.outline).unwrap_or_default().as_str();
             Ok((path, height, flags))
         })?,
@@ -285,11 +306,20 @@ pub(super) fn install(
     // ── the text colour ─────────────────────────────────────────────────────────────────────
     // SetTextColor(r, g, b [, a]) → 0 values; alpha defaults to 1.0 (`lua_isnumber(L,5)`-gated,
     // `0x3f800000`). A FontString has no texel of its own, so its vertex colour IS the colour it
-    // draws — the same `+0xb8` slot `SetVertexColor` writes.
+    // draws — the same `+0xb8` slot `SetVertexColor` writes. The three channels are SHAPE C
+    // (`FontString:SetTextColor 0x79d9c0`, `2=C 3=C 4=C 5=B`, wow-re `numeric-arg-coercion-law.md`):
+    // a bare `lua_tonumber`, so a nil or a non-number is 0.0 and the call never raises — the stock
+    // trainer/trade-skill rows' OnLeave hands it `this.r, this.g, this.b` before anything set them
+    // (1973).
     m.set(
         "SetTextColor",
         lua.create_function(
-            move |lua, (this, r, g, b, a): (Table, f32, f32, f32, Option<f32>)| {
+            move |lua, (this, r, g, b, a): (Table, Value, Value, Value, Option<f32>)| {
+                let (r, g, b) = (
+                    super::object::as_f32(&r),
+                    super::object::as_f32(&g),
+                    super::object::as_f32(&b),
+                );
                 let rh = resolve(lua, &this)?;
                 let mut model = lua.app_data_mut::<Model>().expect("model");
                 let d = model.region_data.entry(rh).or_default();
@@ -328,7 +358,15 @@ pub(super) fn install(
     m.set(
         "SetShadowColor",
         lua.create_function(
-            move |lua, (this, r, g, b, a): (Table, f32, f32, f32, Option<f32>)| {
+            // Shape C on r, g, b (`FontString:SetShadowColor 0x79dd40`, `2=C 3=C 4=C 5=B`) — the
+            // same law this module's header already states for its `SetTextColor` sibling, which
+            // 1973 closed there and not here.
+            move |lua, (this, r, g, b, a): (Table, Value, Value, Value, Option<f32>)| {
+                let (r, g, b) = (
+                    super::object::as_f32(&r),
+                    super::object::as_f32(&g),
+                    super::object::as_f32(&b),
+                );
                 let rh = resolve(lua, &this)?;
                 let mut model = lua.app_data_mut::<Model>().expect("model");
                 let d = model.region_data.entry(rh).or_default();

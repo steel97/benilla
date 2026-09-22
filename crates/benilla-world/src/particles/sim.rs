@@ -139,7 +139,6 @@ fn inherit_trigger(accum: &mut f32, held: &mut Vec3, dt: f32, delta: Vec3, live:
 /// PARTICLE's velocity into the child's inherit add (`(1+S11·var)·v` — for children the
 /// inherit vector IS the particle velocity, copied per call at `0x7b5b5e`). A burst child
 /// latches on its first call of the rising-edge frame. A child never self-emits ambiently.
-#[allow(clippy::too_many_arguments)] // the birth fold's full frame, same as the parent path
 fn drive_child(
     child: &mut ChildEmitter,
     now: &benilla_formats::ParamsNow,
@@ -184,7 +183,7 @@ fn drive_child(
             child.particles.push(Particle {
                 pos: p.pos + fold(local),
                 vel,
-                age: 0.0,
+                age: birth_age(child.def.burst(), dt, &mut child.rng),
                 life: now.lifespan,
                 phase,
                 fresh: true,
@@ -193,6 +192,27 @@ fn drive_child(
             });
         }
     }
+}
+
+/// A particle's **birth age** — the reference's third spawn-kernel argument, `U01 · w`
+/// (`0x7b88c4`/`0x7b88c7` in the plane kernel, byte-identical in sphere and spline; wow-re
+/// `part-birth-age-and-quad-edge.md` §1.3/§1.4).
+///
+/// `w` is **not** the lifespan, which is the reading that would halve every pool's steady-state
+/// population: the burst loop pushes a literal `0` (`0x7b5600`) and both continuous loops push the
+/// **substep dt** (`0x7b5779` interpolated, `0x7b57e2` plain). So a burst's N particles are all born
+/// at age 0 together, while a poured one is born already aged by a random fraction of the frame it
+/// was born in — which de-synchronises the births that share a frame, and is why a steady stream
+/// does not visibly pulse at the frame rate.
+///
+/// **Named approximation:** the reference substeps at a hard `0.1 s` (`[0x81d828]`, `0x7b58e7`), so
+/// its `w` is bounded by construction; we do not substep, so the frame delta is clamped here
+/// instead. Identical below 0.1 s, which is every frame that is not a hitch.
+fn birth_age(is_burst: bool, dt: f32, rng: &mut u32) -> f32 {
+    if is_burst {
+        return 0.0;
+    }
+    rand01(rng) * dt.min(0.1)
 }
 
 /// The **draw-set gate's** scene inputs, bundled: the far-clip wall the gate bounds emitters at
@@ -241,9 +261,20 @@ pub(crate) struct SceneGates<'w, 's> {
     exterior_windows: Res<'w, crate::wmo_portal::ExteriorWindows>,
     camera_claim: Res<'w, crate::wmo_portal::CameraInteriorClaim>,
     portals: Query<'w, 's, &'static crate::wmo_portal::WmoPortalInstance>,
+    /// Streamed-in buildings this frame: a room admit can only change with the camera, a
+    /// window, a claim, a surface, or a new portal set — the last is this.
+    new_portals: Query<'w, 's, (), Changed<crate::wmo_portal::WmoPortalInstance>>,
 }
 
 impl SceneGates<'_, '_> {
+    /// Any of the three resources a draw-set verdict reads moved this frame.
+    pub(crate) fn changed(&self) -> bool {
+        self.view.is_changed()
+            || self.exterior_windows.is_changed()
+            || self.camera_claim.is_changed()
+            || !self.new_portals.is_empty()
+    }
+
     /// The three per-frame values every draw-set caller needs before it can ask
     /// [`EmitterFade::in_draw_set`]: the far-clip wall, the built exterior gate, and the placement
     /// the camera is standing in. Built ONCE per walk (the gate is a handful of 6-plane frusta).
@@ -322,40 +353,52 @@ pub(crate) fn far_side_of_water_at(
     point_world: Vec3,
     r: f32,
 ) -> bool {
+    let above = water_height(w, claim_seed, point_world).is_none_or(|d| is_above(d, r));
+    if w.underwater.0.any() {
+        above
+    } else {
+        !above
+    }
+}
+
+/// How high `point_world` sits over its local water plane — `d = point − surface` (WoW Z, yd;
+/// Bevy Y is the same axis) against the nearest **admitted** surface over the point's XY, the
+/// claim taken from the nearest ancestor of `claim_seed` with a room verdict (`Unknown` admits
+/// both sources, still floor-bounded per pool). `None` = no admitted surface — the reference's
+/// `+0x19c == 0`, which every lane reads as the above list.
+///
+/// The one plane query behind both laws: [`far_side_of_water_at`]'s one-list membership, and
+/// the straddle split's two-list band (`crate::straddle`, decision 2188), which also needs the
+/// plane's height itself for the clip.
+pub(crate) fn water_height(
+    w: &WaterInterleave,
+    claim_seed: Option<Entity>,
+    point_world: Vec3,
+) -> Option<f32> {
     let wow = benilla_assets::coords::bevy_to_wow(point_world);
     // The spatial pre-filter first — these lanes ask per DRAW, and the full `surfaces_at` walk
     // at that grain was the 2026-08-03 12-fps regression (`liquid::spatial`). No candidate
     // surface over this XY (the dominant dry-land case) is "no admitted surface" under every
     // claim, so the room walk below is skipped with the scan.
     let candidates = w.index.over(wow[0], wow[1]);
-    let above = if candidates.is_empty() {
-        true
-    } else {
-        let mut seed = claim_seed;
-        let mut room = None;
-        for _ in 0..8 {
-            let Some(e) = seed else { break };
-            if let Ok(rm) = w.rooms.get(e) {
-                room = Some(rm);
-                break;
-            }
-            seed = w.parents.get(e).ok().map(ChildOf::parent);
-        }
-        let claim = crate::liquid::unit_claim(room, &w.placements);
-        let surfaces = candidates.iter().filter_map(|&e| w.water.get(e).ok());
-        match crate::liquid::surfaces_at(surfaces, wow, claim)
-            .map(|z| wow[2] - z)
-            .min_by(|a, b| a.abs().total_cmp(&b.abs()))
-        {
-            Some(d) => is_above(d, r),
-            None => true,
-        }
-    };
-    if w.underwater.0.any() {
-        above
-    } else {
-        !above
+    if candidates.is_empty() {
+        return None;
     }
+    let mut seed = claim_seed;
+    let mut room = None;
+    for _ in 0..8 {
+        let Some(e) = seed else { break };
+        if let Ok(rm) = w.rooms.get(e) {
+            room = Some(rm);
+            break;
+        }
+        seed = w.parents.get(e).ok().map(ChildOf::parent);
+    }
+    let claim = crate::liquid::unit_claim(room, &w.placements);
+    let surfaces = candidates.iter().filter_map(|&e| w.water.get(e).ok());
+    crate::liquid::surfaces_at(surfaces, wow, claim)
+        .map(|z| wow[2] - z)
+        .min_by(|a, b| a.abs().total_cmp(&b.abs()))
 }
 
 /// The mesh lane's wrapper: the sign test at the batch's own transform (r = 0) — the
@@ -419,13 +462,33 @@ fn is_above(d: f32, r: f32) -> bool {
 ///
 /// A **draining** emitter never freezes either way: its pool has to run out, and freezing one
 /// strands it forever (the world arm's rule further down).
+///
+/// **This is the camera's half of the answer, not the whole of it** — see [`scene_frozen`].
 fn booth_frozen(cam_active: bool, throttled: bool, draining: bool) -> bool {
     !cam_active && !throttled && !draining
 }
 
+/// Does this emitter's SCENE freeze it this frame? The whole law, in one place because it has two
+/// sources and having only one of them was a defect (decision 2046).
+///
+/// [`booth_frozen`] asks about a CAMERA, and that was exact for as long as one camera meant one
+/// scene: every booth before the `<Model>` tiles owned its own. The tile atlas broke the premise —
+/// every orthographic pane on the sheet renders through ONE camera on ONE layer, and that camera
+/// is deliberately kept active whenever any cell is packed, because it is the camera that CLEARS
+/// the atlas. So the camera bit answers "drawn" for every pane on the sheet, including the ones
+/// that left the paint list, and the question can only be answered by the owner — which is what
+/// [`super::ParticleEmitter::set_frozen`] is.
+///
+/// `booth` is `(cam_active, throttled)` for a booth-layered emitter, `None` for a world-lane one.
+/// A **draining** pool ignores both sources, for [`booth_frozen`]'s reason.
+fn scene_frozen(booth: Option<(bool, bool)>, owner_frozen: bool, draining: bool) -> bool {
+    booth.is_some_and(|(cam_active, throttled)| booth_frozen(cam_active, throttled, draining))
+        || (owner_frozen && !draining)
+}
+
 /// Per-frame: emit, integrate, and expand each emitter's pool into the shared effect-quad
 /// stream ([`super::buffer::EffectQuads`]).
-#[allow(clippy::too_many_arguments, clippy::type_complexity)] // one Bevy system's full input set
+#[allow(clippy::type_complexity)] // one Bevy system's full input set
 pub(super) fn simulate_particles(
     time: Res<Time>,
     tuning: Res<ParticleTuning>,
@@ -435,7 +498,17 @@ pub(super) fn simulate_particles(
     // The water-plane interleave inputs — see [`WaterInterleave`] and [`far_side_of_water`].
     interleave: WaterInterleave,
     mut commands: Commands,
-    cam: Query<(Entity, &GlobalTransform, &Frustum, &Camera, &Projection), With<WorldCamera>>,
+    cam: Query<
+        (
+            Entity,
+            Ref<GlobalTransform>,
+            &Frustum,
+            &Camera,
+            Ref<Projection>,
+            Option<Ref<Transform>>,
+        ),
+        With<WorldCamera>,
+    >,
     owners: Owners,
     // MODEL-particle instance entities ([`super::model`]): the draw-set gate hides them with
     // their frozen emitter.
@@ -462,7 +535,7 @@ pub(super) fn simulate_particles(
             &mut ParticleEmitter,
             &mut Transform,
             &mut GlobalTransform,
-            Option<&EmitterFade>,
+            Option<Ref<EmitterFade>>,
             Option<&RenderLayers>,
             Option<&EffectLightOverride>,
             Option<&crate::interior::EmitterLitBy>,
@@ -496,7 +569,7 @@ pub(super) fn simulate_particles(
     // `$WOW_PARTICLE_DEPTHDUMP` and `$WOW_EMIT_DUMP`. Both inert without their env.
     mut dumps: super::dumps::Dumps,
 ) {
-    let Ok((world_cam, cam_tf, frustum, camera, projection)) = cam.single() else {
+    let Ok((world_cam, cam_tf, frustum, camera, projection, cam_local)) = cam.single() else {
         return;
     };
     // Clamp dt so a load hitch doesn't fling every particle out of existence in one step.
@@ -504,6 +577,14 @@ pub(super) fn simulate_particles(
     if dt <= 0.0 {
         return;
     }
+    // Every input of an emitter's draw-set verdict, still since last frame: the verdict is then
+    // still too, and a gated emitter can skip its sphere/window/room tests outright — 2.4 k
+    // resident emitters against 11 active in a parked city (decision 1979's floor).
+    let gate_inputs_still = !cam_tf.is_changed()
+        && !projection.is_changed()
+        && !cam_local.as_ref().is_some_and(|l| l.is_changed())
+        && !gates.changed()
+        && !interleave.surfaces_changed();
     let cam_pos = cam_tf.translation();
     let density = tuning.density.clamp(0.25, 1.0);
     let snap_filter = crate::collision::WorldCollision::body_filter();
@@ -516,7 +597,7 @@ pub(super) fn simulate_particles(
     // The far-clip wall, the exterior gate and the camera's own room — built once for the whole
     // emitter walk, the same values the model visibility authority and `exterior_cull` ask
     // (0784/0786: one spelling of the window test).
-    let (farclip, exterior_gate, camera_instance) = gates.scene(Some((cam_tf, projection)));
+    let (farclip, exterior_gate, camera_instance) = gates.scene(Some((&*cam_tf, &*projection)));
     // `$WOW_PARTICLE_DEPTHDUMP` (B16): is this a dump frame? Decided once per run.
     let dump_frame = dumps.depth_frame(time.elapsed_secs());
     // `$WOW_EMIT_DUMP`: is this a dump tick? Decided once per frame, for the whole walk.
@@ -542,20 +623,27 @@ pub(super) fn simulate_particles(
             .filter(|l| !l.intersects(&RenderLayers::default()))
             .and_then(|l| booth_cams.iter().find(|(_, _, cl, ..)| cl.intersects(l)));
         let is_booth = booth.is_some();
-        if let Some((_, _, _, booth_cam, throttled)) = booth {
-            if booth_frozen(booth_cam.is_active, throttled, emitter.draining) {
-                if !emitter.gated {
-                    emitter.gated = true;
-                    for slot in &emitter.model_instances {
-                        for (e, _) in &slot.meshes {
-                            if let Ok((_, _, mut cv)) = child_draws.get_mut(*e) {
-                                *cv = Visibility::Hidden;
-                            }
+        // The scene freeze ([`scene_frozen`]) — a sleeping booth camera, or an owner that froze
+        // this cloud because its scene's camera cannot say so. Same shape either way: pool + age
+        // held, no quads, model-instance entities hidden on the edge.
+        if scene_frozen(
+            booth.map(|(_, _, _, c, throttled)| (c.is_active, throttled)),
+            emitter.frozen,
+            emitter.draining,
+        ) {
+            if !emitter.gated {
+                emitter.gated = true;
+                for slot in &emitter.model_instances {
+                    for (e, _) in &slot.meshes {
+                        if let Ok((_, _, mut cv)) = child_draws.get_mut(*e) {
+                            *cv = Visibility::Hidden;
                         }
                     }
                 }
-                continue;
             }
+            continue;
+        }
+        if is_booth {
             emitter.gated = false;
         }
         let (draw_cam, e_cam_pos, e_right, e_up) = match booth {
@@ -584,7 +672,10 @@ pub(super) fn simulate_particles(
         // "all effects render at unlimited distance", and it is why the terrain under them was
         // already gone. `within_farclip` is the same rule the owner mesh uses in
         // `debug_panel::visibility` — shared, so the two can no longer drift apart.
-        if let Some(f) = fade {
+        if let Some(f) = fade.as_ref() {
+            if emitter.gated && gate_inputs_still && !f.is_changed() {
+                continue;
+            }
             let in_set = f.in_draw_set(
                 cam_pos,
                 cam_fwd,
@@ -706,6 +797,7 @@ pub(super) fn simulate_particles(
             seq,
             rng,
             owner_reach,
+            size_scale,
             water_bound,
             texture,
             recursion: _,
@@ -714,6 +806,8 @@ pub(super) fn simulate_particles(
             geometry: _,
             model_instances,
             gated: _,
+            frozen: _,
+            clip,
         } = &mut *emitter;
         // The water-interleave MODEL frame, captured before the draw-anchor local shadows the
         // `anchor` field below: the cloud anchor is "the MODEL, never the bone" — its transform
@@ -725,6 +819,28 @@ pub(super) fn simulate_particles(
         let water_gt = (*anchor).and_then(|e| owners.transforms.get(e).ok().copied());
         let water_bound = *water_bound;
         *age += dt;
+        let (clock_seq, elapsed_s) = match *host {
+            Some(h) => match hosts
+                .get(h)
+                .ok()
+                .and_then(|(p, a)| crate::doodad_anim::playing_seq(p, a))
+            {
+                Some((s, t)) => {
+                    *seq = Some(s);
+                    (Some(s), t)
+                }
+                None => (*seq, 0.0),
+            },
+            None => (*seq, *age),
+        };
+        // This frame's emitter PARAMETERS — the nine per-frame-sampled channels, on the same
+        // clock as the rate track (the reference's `m2_animate` emitter phase samples all ten;
+        // wow-re `part-emission-rate-animated.md` §1). Frost Nova rides its emission radius
+        // 0.19 → 13.2 yd out with the ring; Arcane Explosion 0 → 7.2 yd with the dome — births
+        // MUST read the frame's values, not `value[0]` (decision 0844).
+        // The instance's gseq cursor (0856/0858): the spawn age IS `sceneNow − attach` — the
+        // emitter spawns with its instance, and every lane's instance is fresh per play.
+        let gseq_now = f64::from(*age);
         // Anchored mode (see [`Particle`]): positions are emitter-relative, so tracking a moving
         // owner needs nothing beyond refreshing `placement` — the cloud rides the anchor for free
         // (the reference's per-frame `translate(−emitterPos)` draw-matrix rebuild).
@@ -784,6 +900,20 @@ pub(super) fn simulate_particles(
             commands.entity(entity).despawn();
             continue;
         }
+        // Dormant (decision 1979) — judged AFTER the owner-loss and drain-complete blocks above,
+        // which are the emitter's lifetime and must run every frame (review of 2026-09-04: a
+        // one-shot whose owner despawned never drained and lived for the session). Nothing
+        // alive, nothing draining, and the timing tracks say
+        // the emitter is not emitting at this clock — every placement, ride and water step
+        // below would compute state for zero particles. The clock derivation above already
+        // ran (it is what `emitting` reads, and `seq` must keep following the host).
+        if particles.is_empty()
+            && !*draining
+            && children.iter().all(|c| c.particles.is_empty())
+            && !def.timing.emitting(clock_seq, elapsed_s, gseq_now)
+        {
+            continue;
+        }
         // The MODEL's render alpha for this frame (decision 0827 — the reference's per-frame
         // `emitter+0x1a8 = Model+0x19c` copy at `0x718960` @`0x719073`). Two disjoint sources, the
         // same slot the reference writes both through: an entity-owned cloud takes its OWN model
@@ -792,7 +922,7 @@ pub(super) fn simulate_particles(
         // placed doodad's takes its own distance fade, whose cutoff the draw-set gate above
         // already applies as a hard stop.
         *alpha = alpha_src.map_or(1.0, |e| owner_mul.alpha(e))
-            * fade.map_or(1.0, |f| f.distance_alpha(cam_pos));
+            * fade.as_ref().map_or(1.0, |f| f.distance_alpha(cam_pos));
         // The cloud anchor (see the field doc): the model's live translation, or the last-known
         // one while the pool drains. A whole-model owner keeps anchor == owner — identical math.
         match *anchor {
@@ -928,28 +1058,6 @@ pub(super) fn simulate_particles(
         // (bug B27). A host with no live player yet keeps its last slot at that slot's opening
         // pose. Pinned lanes (doodads, effect rigs, booths) run their slot on the spawn-age
         // clock; the baked loops wrap a looping band and end-hold a clamped one.
-        let (clock_seq, elapsed_s) = match *host {
-            Some(h) => match hosts
-                .get(h)
-                .ok()
-                .and_then(|(p, a)| crate::doodad_anim::playing_seq(p, a))
-            {
-                Some((s, t)) => {
-                    *seq = Some(s);
-                    (Some(s), t)
-                }
-                None => (*seq, 0.0),
-            },
-            None => (*seq, *age),
-        };
-        // This frame's emitter PARAMETERS — the nine per-frame-sampled channels, on the same
-        // clock as the rate track (the reference's `m2_animate` emitter phase samples all ten;
-        // wow-re `part-emission-rate-animated.md` §1). Frost Nova rides its emission radius
-        // 0.19 → 13.2 yd out with the ring; Arcane Explosion 0 → 7.2 yd with the dome — births
-        // MUST read the frame's values, not `value[0]` (decision 0844).
-        // The instance's gseq cursor (0856/0858): the spawn age IS `sceneNow − attach` — the
-        // emitter spawns with its instance, and every lane's instance is fresh per play.
-        let gseq_now = f64::from(*age);
         let now = def.params.sample(clock_seq, elapsed_s, gseq_now);
 
         // 1. Age + integrate the live pool. The verified vanilla integrator (`particle_integrate`
@@ -1106,7 +1214,7 @@ pub(super) fn simulate_particles(
             particles.push(Particle {
                 pos,
                 vel,
-                age: 0.0,
+                age: birth_age(def.burst(), dt, rng),
                 life: now.lifespan,
                 phase,
                 fresh: true,
@@ -1172,6 +1280,7 @@ pub(super) fn simulate_particles(
             anchored,
             alpha: *alpha,
             ride: *ride,
+            size_scale: *size_scale,
         };
         let cam = CamBasis {
             right: e_right,
@@ -1246,9 +1355,9 @@ pub(super) fn simulate_particles(
                     // sim's own `emitter_world` is the STORE's origin — 1591).
                     ride.to_world(emitter_world),
                     &cam,
-                    cam_tf,
+                    &cam_tf,
                     camera,
-                    projection,
+                    &projection,
                     images.contains(&*texture),
                     &quads.verts[start as usize..],
                 );
@@ -1290,8 +1399,12 @@ pub(super) fn simulate_particles(
                 raster_bias: 0,
                 raster_slope: 0.0,
                 cam_relative: false,
+                no_depth_test: false,
                 main_entity: entity,
                 light: light_override.map(|l| l.0.clone()),
+                // The pane cell a UI model tile's cloud is confined to (`set_clip`); `None` for
+                // every world emitter, which owns the whole target.
+                clip: *clip,
             },
         );
         // CHILD pools: their own texture/blend/fog identity, the PARENT's anchor and rung
@@ -1332,8 +1445,11 @@ pub(super) fn simulate_particles(
                     raster_bias: 0,
                     raster_slope: 0.0,
                     cam_relative: false,
+                    no_depth_test: false,
                     main_entity: entity,
                     light: light_override.map(|l| l.0.clone()),
+                    // A child cloud draws where its parent does — same cell, same clip.
+                    clip: *clip,
                 },
             );
         }
@@ -1411,10 +1527,53 @@ fn fold_committed_light(
 #[cfg(test)]
 mod tests {
     use super::{
-        booth_frozen, fold_committed_light, follow_fraction, inherit_trigger, integrate_particle,
-        is_above, ChildEmitter, EffectLighting, EffectVertex, Particle, StepEnv, Vec3,
+        birth_age, booth_frozen, fold_committed_light, follow_fraction, inherit_trigger,
+        integrate_particle, is_above, scene_frozen, ChildEmitter, EffectLighting, EffectVertex,
+        Particle, StepEnv, Vec3,
     };
     use bevy::prelude::{Quat, Transform};
+
+    /// **A burst's particles are all born at age 0** — the burst spawn loop pushes a literal `0`
+    /// as the kernels' `w` (`0x7b5600`), so the whole puff shares one clock and ages as one body.
+    /// Reading `w` as the LIFESPAN instead — the shape an audit proposed here — would scatter the
+    /// puff over `[0, lifespan)`, halve its integrated brightness and halve every steady pool's
+    /// population, which is the arithmetic wow-re's own measured C1 (300 = rate x lifespan)
+    /// already ruled out. Pinned so that reading cannot come back.
+    #[test]
+    fn a_burst_births_every_particle_at_age_zero() {
+        let mut rng = 0x1234_5678;
+        for _ in 0..64 {
+            assert_eq!(birth_age(true, 0.016, &mut rng), 0.0);
+        }
+        // Not a function of dt: a hitch does not age a burst either.
+        assert_eq!(birth_age(true, 5.0, &mut rng), 0.0);
+    }
+
+    /// A POURED particle is born aged by a random fraction of its own frame (`U01 . dt`), which is
+    /// what de-synchronises the births sharing one frame.
+    #[test]
+    fn a_poured_particle_is_born_aged_within_its_own_frame() {
+        let mut rng = 0x9e37_79b9;
+        let dt = 0.016;
+        let mut saw_nonzero = false;
+        for _ in 0..256 {
+            let age = birth_age(false, dt, &mut rng);
+            assert!((0.0..dt).contains(&age), "age {age} outside [0, {dt})");
+            saw_nonzero |= age > 0.0;
+        }
+        assert!(saw_nonzero, "the seed is a real draw, not a constant 0");
+    }
+
+    /// The reference substeps at a hard 0.1 s, so its `w` is bounded by construction; we do not
+    /// substep, so a hitch frame is clamped here instead (the named approximation in `birth_age`).
+    #[test]
+    fn a_hitch_frame_cannot_birth_a_particle_older_than_the_substep_cap() {
+        let mut rng = 0xdead_beef;
+        for _ in 0..256 {
+            let age = birth_age(false, 5.0, &mut rng);
+            assert!((0.0..0.1).contains(&age), "age {age} outside [0, 0.1)");
+        }
+    }
 
     fn one_quad() -> Vec<EffectVertex> {
         vec![
@@ -1494,6 +1653,35 @@ mod tests {
         // A draining pool runs out on any camera — freezing one strands it.
         assert!(!booth_frozen(false, false, true));
         assert!(!booth_frozen(false, true, true));
+    }
+
+    /// **A camera is not a scene any more** (decision 2046). Every booth before the `<Model>`
+    /// tile atlas owned its own camera, so `is_active` answered "is this scene drawn". The atlas
+    /// puts EVERY orthographic pane behind one camera that stays active whenever any cell is
+    /// packed — it is the camera that clears the sheet — so for a pane that left the paint list
+    /// the camera says "drawn" and only the owner can say otherwise. Before this, a hidden
+    /// autocast-shine pane's four spline emitters kept integrating AND kept pushing quads for the
+    /// whole 600-frame linger, at the cell the packer had since given to another pane.
+    #[test]
+    fn an_owner_freezes_a_cloud_whose_camera_still_says_drawn() {
+        // The tile atlas's own shape: the camera is up, and the pane is not.
+        assert!(!scene_frozen(Some((true, false)), false, false), "drawing");
+        assert!(
+            scene_frozen(Some((true, false)), true, false),
+            "the owner parked the pane — the camera cannot see that"
+        );
+        // The booth's camera still answers entirely on its own where it owns the scene.
+        assert!(scene_frozen(Some((false, false)), false, false));
+        assert!(
+            !scene_frozen(Some((false, true)), false, false),
+            "…and a throttled camera is awake (1559)"
+        );
+        // A world-lane emitter has no booth camera at all; the owner's lever still reaches it.
+        assert!(!scene_frozen(None, false, false));
+        assert!(scene_frozen(None, true, false));
+        // Draining overrides both sources, for `booth_frozen`'s reason.
+        assert!(!scene_frozen(Some((false, false)), true, true));
+        assert!(!scene_frozen(None, true, true));
     }
 
     fn particle(pos: Vec3, vel: Vec3) -> Particle {
@@ -1612,6 +1800,7 @@ mod tests {
             anchored: true, // 0x10 CLEAR — the world store
             alpha: 1.0,
             ride: crate::ride_frame::StoredFrame::default(), // on the ground: no fold
+            size_scale: 1.0,
         };
         // Every host pose we can think of, including ones no bone reaches.
         for placement in [
@@ -1653,6 +1842,7 @@ mod tests {
             anchored: true,
             alpha: 1.0,
             ride,
+            size_scale: 1.0,
         };
         assert_eq!(
             particle_center(&frame, &placement, &p),
@@ -1683,6 +1873,7 @@ mod tests {
             anchored: false, // 0x10 SET — the emitter-local store
             alpha: 1.0,
             ride: crate::ride_frame::StoredFrame::default(),
+            size_scale: 1.0,
         };
         let moved = Transform::from_translation(Vec3::new(10.0, 0.0, 0.0));
         assert_eq!(

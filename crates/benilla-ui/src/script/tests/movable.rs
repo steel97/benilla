@@ -17,7 +17,7 @@ fn movable_panel() -> UiScript {
         starts, stops = 0, 0
         Panel = CreateFrame("Frame", "MovePanel")
         Panel:SetPoint("BOTTOMLEFT", 100, 100)
-        Panel:SetSize(200, 80)
+        Panel:SetWidth(200); Panel:SetHeight(80)
         Panel:EnableMouse(true)
         Panel:SetMovable(true)
         Panel:RegisterForDrag("LeftButton")
@@ -113,7 +113,7 @@ fn start_moving_on_a_frame_that_is_not_movable_raises_and_moves_nothing() {
         r#"
         Fixed = CreateFrame("Frame", "FixedPanel")
         Fixed:SetPoint("BOTTOMLEFT", 100, 100)
-        Fixed:SetSize(200, 80)
+        Fixed:SetWidth(200); Fixed:SetHeight(80)
         ok, err = pcall(function() Fixed:StartMoving() end)
         "#,
     )
@@ -153,7 +153,7 @@ fn stop_moving_or_sizing_is_harmless_with_nothing_moving_and_stops_only_its_own_
         r#"
         Other = CreateFrame("Frame", "OtherPanel")
         Other:SetPoint("BOTTOMLEFT", 400, 400)
-        Other:SetSize(50, 50)
+        Other:SetWidth(50); Other:SetHeight(50)
         MovePanel:StopMovingOrSizing()      -- nothing is moving
         MovePanel:StopMovingOrSizing()      -- twice
         OtherPanel:StopMovingOrSizing()
@@ -191,7 +191,7 @@ fn a_frame_stretched_between_two_anchors_moves_rigidly() {
     s.run(
         r#"
         Back = CreateFrame("Frame", "StretchBack")
-        Back:SetPoint("BOTTOMLEFT", 0, 0); Back:SetSize(800, 600)
+        Back:SetPoint("BOTTOMLEFT", 0, 0); Back:SetWidth(800); Back:SetHeight(600)
         Stretch = CreateFrame("Frame", "StretchPanel", Back)
         Stretch:SetPoint("BOTTOMLEFT", Back, "BOTTOMLEFT", 100, 100)
         Stretch:SetPoint("TOPRIGHT",   Back, "BOTTOMLEFT", 300, 200)
@@ -229,7 +229,7 @@ fn a_scaled_frame_tracks_the_cursor_one_to_one_on_screen() {
         r#"
         Scaled = CreateFrame("Frame", "ScaledPanel")
         Scaled:SetPoint("BOTTOMLEFT", 100, 100)
-        Scaled:SetSize(100, 100)
+        Scaled:SetWidth(100); Scaled:SetHeight(100)
         Scaled:SetScale(2)
         Scaled:SetMovable(true)
         Scaled:StartMoving()
@@ -266,7 +266,7 @@ fn the_three_flags_default_off_round_trip_and_user_placed_is_guarded() {
     s.run(
         r#"
         F = CreateFrame("Frame", "FlagPanel")
-        F:SetPoint("BOTTOMLEFT", 10, 10); F:SetSize(50, 50)
+        F:SetPoint("BOTTOMLEFT", 10, 10); F:SetWidth(50); F:SetHeight(50)
         "#,
     )
     .unwrap();
@@ -425,18 +425,14 @@ fn a_title_region_is_a_plain_region_and_creating_it_twice_is_destructive() {
         r#"
         TFrame = CreateFrame("Frame", "TFrame")
         TFrame:SetPoint("BOTTOMLEFT", 100, 100)
-        TFrame:SetSize(200, 80)
+        TFrame:SetWidth(200); TFrame:SetHeight(80)
         "#,
     )
     .unwrap();
 
     // GetTitleRegion answers ONE value and it is nil — not zero values, which is the asymmetry
     // Q6 flags against `GetBackdrop`.
-    assert_eq!(
-        s.eval::<i64>("return select('#', TFrame:GetTitleRegion())")
-            .unwrap(),
-        1
-    );
+    assert_eq!(s.arity("TFrame:GetTitleRegion()").unwrap(), 1);
     assert!(s
         .eval::<Option<bool>>("return TFrame:GetTitleRegion() ~= nil and true or nil")
         .unwrap()
@@ -549,7 +545,7 @@ fn a_title_region_drag_swallows_the_press_and_ends_on_release() {
         downs = 0
         TP = CreateFrame("Frame", "TP")
         TP:SetPoint("BOTTOMLEFT", 100, 100)
-        TP:SetSize(200, 80)
+        TP:SetWidth(200); TP:SetHeight(80)
         TP:EnableMouse(true)
         TP:SetScript("OnMouseDown", function() downs = downs + 1 end)
         TP:CreateTitleRegion():SetAllPoints(TP)
@@ -587,4 +583,149 @@ fn a_title_region_drag_swallows_the_press_and_ends_on_release() {
     // 0x7662c0->0x765320->0x7652b0->0x768430); a title region on a non-movable frame is the case
     // that tells it apart from `StartMoving`, which raises "Frame %s is not movable".
     assert!(!s.eval::<bool>("return TP:IsMovable()").unwrap());
+}
+
+/// A region's rect getters answer in its OWNER's units — screen ÷ the owner's effective scale —
+/// exactly as the frame getters do (decision 1985): a texture inside a frame scaled to 0.5 that
+/// covers the frame answers the frame's own width, not half of it.
+#[test]
+fn region_getters_answer_in_the_owners_units_under_scale() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    s.run(
+        r#"f = CreateFrame("Frame", "ScaledOwner") f:SetWidth(200) f:SetHeight(100)
+           f:SetPoint("BOTTOMLEFT", 100, 50) f:SetScale(0.5)
+           t = f:CreateTexture("ScaledTex") t:SetAllPoints(f)"#,
+    )
+    .unwrap();
+    s.resolve();
+    let (fl, fr, tl, tr, cx) = s
+        .eval::<(f64, f64, f64, f64, f64)>(
+            "local cx = t:GetCenter() return f:GetLeft(), f:GetRight(), t:GetLeft(), t:GetRight(), cx",
+        )
+        .unwrap();
+    assert!(
+        (fl - tl).abs() < 1e-3 && (fr - tr).abs() < 1e-3,
+        "frame {fl}..{fr} vs region {tl}..{tr}"
+    );
+    assert!(
+        (fr - fl - 200.0).abs() < 1e-3,
+        "the owner's own width, {}",
+        fr - fl
+    );
+    assert!((cx - (fl + fr) * 0.5).abs() < 1e-3);
+}
+
+/// **The layout cache's filter is the flags AND the bit, at both ends** (decision 2193).
+///
+/// `SetUserPlaced` is already guarded by `movable|resizable` at its own setter (`0x776adb`), but
+/// the drag entry (`0x7652b0` @`0x7652e5`) and the cache's own apply stamp the bit without going
+/// through it — so a frame can carry the stamp while carrying neither flag, and the reference's
+/// writer tests for both: `0x490e8e test ah,0x10` (userPlaced) AND `0x490e97 test ah,0x3`
+/// (`movable|resizable`). Clearing the flags is how a window stops being persisted, which is what
+/// an addon's `:OnDisable` does on the way out.
+#[test]
+fn the_write_filter_is_user_placed_and_movable_or_resizable() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        F = CreateFrame("Frame", "CachePanel")
+        F:SetPoint("BOTTOMLEFT", 10, 10); F:SetWidth(50); F:SetHeight(50)
+        F:SetResizable(true); F:SetUserPlaced(true)
+        "#,
+    )
+    .unwrap();
+    let names = |s: &UiScript| {
+        s.user_placed_layouts()
+            .into_iter()
+            .map(|l| l.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&s), ["CachePanel"], "stamped and resizable — written");
+
+    s.run("CachePanel:SetResizable(false)").unwrap();
+    assert!(
+        s.eval::<bool>("return CachePanel:IsUserPlaced()").unwrap(),
+        "the stamp itself survives the flag going away — nothing clears it"
+    );
+    assert!(
+        names(&s).is_empty(),
+        "but the row does not: the fourth conjunct is gone"
+    );
+
+    s.run("CachePanel:SetMovable(true)").unwrap();
+    assert_eq!(names(&s), ["CachePanel"], "either flag satisfies it");
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// **The apply is gated per ARM** (decision 2193): position behind `movable` (`0x490600 test
+/// ah,0x1`), size behind `resizable` (`0x490689 test ah,0x2`), and each arm stamps the userPlaced
+/// bit itself (`0x49067e` / `0x490706`) only if it ran. A stock frame carrying neither flag is
+/// left entirely alone, however old its row — which is what stops one addon's stamp from seating
+/// a window forever.
+#[test]
+fn the_apply_seats_position_behind_movable_and_size_behind_resizable() {
+    use crate::script::{FrameLayout, LayoutPoint};
+
+    let row = |name: &str| FrameLayout {
+        name: name.to_owned(),
+        width: 200.0,
+        height: 80.0,
+        points: vec![LayoutPoint {
+            point: "BOTTOMLEFT".into(),
+            relative_to: None,
+            relative_point: "BOTTOMLEFT".into(),
+            x: 300.0,
+            y: 200.0,
+        }],
+    };
+    // Three frames, one per flag state, all authored identically.
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    for (name, flags) in [
+        ("Neither", ""),
+        ("Movable", "F:SetMovable(true)"),
+        ("Sizable", "F:SetResizable(true)"),
+    ] {
+        s.run(&format!(
+            r#"F = CreateFrame("Frame", "{name}")
+               F:SetPoint("BOTTOMLEFT", 10, 10); F:SetWidth(50); F:SetHeight(50)
+               {flags}"#
+        ))
+        .unwrap();
+        s.restore_user_placed_layouts([row(name)]);
+    }
+    s.resolve();
+    let read = |s: &UiScript, n: &str| {
+        s.eval::<(f64, f64, f64, bool)>(&format!(
+            "local f = getglobal('{n}') \
+             return f:GetLeft(), f:GetWidth(), f:GetHeight(), f:IsUserPlaced()"
+        ))
+        .unwrap()
+    };
+    assert_eq!(
+        read(&s, "Neither"),
+        (10.0, 50.0, 50.0, false),
+        "neither flag: the row is inert, and leaves no stamp behind either"
+    );
+    assert_eq!(
+        read(&s, "Movable"),
+        (300.0, 50.0, 50.0, true),
+        "movable: seated at the saved position, still its authored size"
+    );
+    assert_eq!(
+        read(&s, "Sizable"),
+        (10.0, 200.0, 80.0, true),
+        "resizable: given the saved size, left on its authored anchors"
+    );
+    assert_eq!(
+        s.user_placed_layouts()
+            .into_iter()
+            .map(|l| l.name)
+            .collect::<Vec<_>>(),
+        ["Movable", "Sizable"],
+        "and only the two that took an arm are written back"
+    );
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
 }

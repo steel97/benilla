@@ -139,6 +139,7 @@ pub mod doodad_anim;
 pub mod entity_shade;
 pub mod exterior_cull;
 pub mod ffx_glow;
+pub mod final_pass;
 pub mod frame_pace;
 pub mod ground_fx;
 pub mod instance_tint;
@@ -146,6 +147,7 @@ pub mod interact;
 pub mod interior;
 pub mod lighting;
 pub mod liquid;
+pub mod log_ring;
 
 /// macOS `Cmd+Q`, re-pointed at the window close so the gesture goes through an exit the client
 /// can actually observe (decision 1528).
@@ -170,6 +172,7 @@ pub mod sky_order;
 pub mod skybox;
 pub mod static_gx;
 pub mod static_merge;
+pub mod straddle;
 pub mod sun;
 pub mod surface;
 pub mod terrain_stream;

@@ -103,7 +103,14 @@ const INSTRUMENT_ROOTS: &[&str] = &["art_scope", "debug_panel", "perf", "pipe_wa
 /// So they are excluded from the gated number and **counted separately**, because a rule that
 /// hides a number is worse than no rule. `art_scope` is not here: it is registered by
 /// `WorldPlugins` and lives inside the engine, so it never crosses.
-const INSTRUMENT_CONSUMERS: &[&str] = &["debug_panel", "perf", "pipe_warm"];
+///
+/// `crash` (decision 2266 §B2) is the fourth: the panic hook that writes the crash report. It is
+/// `perf::stall`'s sibling — a diagnostic that writes into `Diagnostics/` and nothing gameplay
+/// reads — and the one engine item it names, `log_ring::recent`, is a diagnostic feed kept beside
+/// the engine's `LogPlugin` because that is where the layer has to be installed. An API shaped
+/// by what a crash report wanted to attach is 1163's failure exactly, so it is counted here, not
+/// in the doorway.
+const INSTRUMENT_CONSUMERS: &[&str] = &["crash", "debug_panel", "perf", "pipe_warm"];
 
 /// Is this file one of the app-side instruments?
 fn is_instrument_consumer(rel: &str) -> bool {
@@ -345,7 +352,151 @@ fn is_instrument_consumer(rel: &str) -> bool {
 /// a ceiling — and it is the ratchet's own instruction: a count that cannot see the whole file
 /// cannot report a widening either, which is the one thing this test exists to do. The six are
 /// **not** hereby blessed as PUBLISH: they are un-sorted 1164 work, now visible enough to sort.
-const CEILING: usize = 172;
+/// And 172 → 173: `model_render::lazy::realize`, a PUBLISH. A built `WowModelMaterial` is no
+/// longer an asset the moment a spawner builds it — the engine parks the value behind a
+/// reserved handle and inserts the asset the first frame something visible is bound to it
+/// (decision 1940: 9.9k materials, 20.7k buffers and 10.2k bind groups were alive at the
+/// Stormwind auction house for 36 drawn entity batches, the variant set every spawner is handed
+/// and never switches to). A game lane that CLONES a material before anything binds it — the
+/// portrait booth relighting a part's twins onto its own light buffer, a spell kit deriving its
+/// per-instance tinted copy from the shared steady — asks the engine to realize it first. That
+/// is the whole of the crossing: one function, "make this handle's asset exist now", the
+/// doorway's own rule about when a material is real. The alternative — eager materials for
+/// the two lanes that read early — would put the store's law in the caller's hands.
+/// And 173 → 174: `particles::render::EFFECT_DRAW_STATS`, an instrument PUBLISH — the effect
+/// lane's own per-frame draw census (items in the transparent phase, draws after the merge),
+/// the number the `FPS_PROBE` line prints as `fx=`. It is the reading that refuted the
+/// additive-window regroup on the crowd rig (decision 1955): a lane whose merge walk is the
+/// only place the count exists has to publish it or stay unmeasurable.
+/// And 174 → 175: `dev_state::STILL_INPUTS_CHANGED`, an instrument PUBLISH — how many frames
+/// each whole-scene input of the still-frame skips (1979) read as changed. Counted in the
+/// world crate so the probe names ONE static instead of the four resources the skips read; the
+/// reading is what says whether a gate ever engages.
+/// And 175 → 176: `mat_anim_table::affine_row`, a PUBLISH. The mat-anim table's second row
+/// kind (decision 2019): a texture transform's rotation and scale as deltas from the identity,
+/// `[cos − 1, sin, sx − 1, sy − 1]`, so that row 0 — the pinned zero every static material
+/// reads — IS the identity. That encoding is the table's own law (the same zero-is-identity
+/// rule its translation rows and the tint table run under), and the shader's fold is written
+/// against it; a lane that owns rows in the table — the UI model tiles, sampling the cooldown's
+/// quadrant rotations off the pane's play head — has to write them in the table's encoding,
+/// not one of its own. One function, "encode this affine the way the table reads it".
+/// And 176 → 177: `mat_anim_table::MatAnimMirrors`, a PUBLISH — the mat-anim table's twin of
+/// `instance_tint::InstanceTintMirrors` (decision 2023). A lane whose materials bind a light
+/// buffer of their own reads the table out of THAT buffer, so the UI model tiles' rows — the
+/// cooldown sweep's rotations, written every frame off the pane's play head — reached a region
+/// nothing in a tile ever sampled until the tile's buffer was on a mirror list. Registered once
+/// at the tile renderer's startup, the same shape and the same reason as the palette mirror
+/// beside it.
+/// And 177 → 178: `model_fade::UnitRenderAlpha`, a PUBLISH — one streamed unit's live render
+/// alpha, composed from the unit ROOT's own presentation state. `ModelAlphas` beside it is the
+/// read side for a consumer that can wait for `PostUpdate`'s publish; this is the read side for
+/// one that cannot — the blob shadow runs in `Update`, and on the frame a unit's presentation
+/// begins the published component does not exist yet. Published as a door rather than as its
+/// three inputs (`UnitAppearFade`, `DespawnFade`, `model_render_alpha`) precisely because the
+/// lane that reconstructed the answer from parts got it wrong the same way every time: it read
+/// "no part is fading" as opaque, which is false of a *pending* unit, and put a full-strength
+/// shadow on the ground under an invisible creature for the length of a load. A caller asking
+/// one question cannot make that mistake; a caller handed the inputs can.
+/// And 178 → 179: `interior::NodeAmbient`, a PUBLISH — one light node's committed **ambient word
+/// alone**, the ramped chase toward `cap96(MOCV)`. `ParticleLight` beside it is the same words
+/// folded into the whole fixed-function term (`ambient + 0.9·diffuse + Σ lamps`), which is what a
+/// lit particle quad receives; this is the read side for a draw whose vertex format carries **no
+/// normal**, so the normal array is disabled outright and its term is the ambient product and
+/// nothing else (the weapon swing trail, decisions 2079/2086). Published rather than reconstructed
+/// for the reason the entry above gives: the caller cannot rebuild it from `ParticleLight` — the
+/// diffuse lobe and the MOLT points are already summed in and cannot be subtracted back out — and
+/// a caller that reached for the *scene* ambient instead, which is what this replaces, tinted
+/// every indoor trail with the sky.
+/// And 179 → 180: `weather::WeatherState`, a PUBLISH — the weather driver's own state, reached by
+/// `crate::cvars` because one byte of it (`weather_density`) is a **player setting** and 2181 gave
+/// it its switch. It is the same shape as `clutter::ClutterConfig` two rows of that table up: a
+/// resource the engine owns and the options window writes exactly one field of, welded to its CVar
+/// by `registered_defaults_mirror_the_code_truths`. Published as the state rather than as a
+/// density-only door for the reason the two entries above give in reverse — there is no
+/// reconstruction to get wrong here, the field is a `u8` the engine reads directly, and a
+/// one-field wrapper would be a second name for the same byte that the weld test would then have
+/// to hold in step with both sides. It was already on the far side of the wall as an INSTRUMENT
+/// item (the `#[cfg(feature = "dev")]` weather panel is its only other namer); what changed is
+/// that a game module names it now, which is exactly the crossing this gate exists to make
+/// visible.
+/// And 180 → 181: `final_pass::FinalPassTarget`, a PUBLISH — where a colour lane's final pass
+/// lands, as one noun (decision 2206). The client has two colour lanes that end in a full-screen
+/// decode: the world's (the FFXGlow combine, engine-side) and the UI's (`crate::ui_gamma`'s,
+/// game-side since 0254 — the interface is the game's). Both used to write bevy's main texture
+/// and let its `upscaling` blit copy the result out; 2206 has each render straight into its
+/// camera's target when the camera's output mode is `Skip`, and the rule that turns an output
+/// mode into a destination, a format and a scissor is one rule, not two copies of it that drift.
+/// It could not go the other way: moving the UI decode into the engine would put the UI lane's
+/// colour law on the wrong side of the wall. So the engine publishes the rule as one type with
+/// two associated functions, and the game names it once.
+/// And 181 → 182: `ffx_glow::FfxBackdrop`, a PUBLISH — the component that makes the world's
+/// FFX combine the first draw of the player-UI camera's main pass (decision 2234). The combine is engine-side
+/// (the world lane's byte math, 0161); the camera it now runs on is the game's (the interface,
+/// 0254); so the engine publishes the claim as one component the game puts on its camera and
+/// points at the world camera it owns, and the two nodes behind it stay private. It retires a
+/// full-window float image that one camera wrote and the next read back — the seam 1603 built
+/// and 2215 measured — and it could not go the other way for 2206's reason: the UI camera cannot
+/// move into the engine.
+/// And 182 → 183: `doodad_anim::register_fx_uv`, a PUBLISH — put one spell-effect material clone
+/// on the per-instance UV-scroll lane (decision 2282). The clone is the GAME's: `entities::spell_fx`
+/// makes it because one cast is one phase (the same reason 0271's animated tint clones it), and
+/// nothing engine-side knows an effect instance exists. Everything after that is the engine's —
+/// which registry, which delta-table row, which of 1408's two baked loop spellings, and the
+/// instance-clock law that separates this lane from the shared one. Published as ONE verb rather
+/// than as its three pieces (`UvLoop`'s effect variant, `register_uv`, the row) precisely because
+/// this lane's recurring bug is a caller that takes some of the pieces and not the rest: 2038's
+/// marked-but-unregistered parts froze every waterfall in the game for three days, and a
+/// registration without a row, or a row without a registration, is that same shape. One verb
+/// cannot be half-taken. It is also why the three pieces went back to `pub(crate)` in the same
+/// commit, which is the rare crossing that *lowers* the surface it replaces.
+/// And 183 → 184: `doodad_anim::UvLoops`, the argument of the verb above. A texture transform is
+/// ONE authored record with four baked channels — 1408's two translation spellings plus 2019's
+/// per-slot rotation and scaling — and which of them a batch fills is not a thing the caller gets
+/// to reason about: a scale-only transform (`Spells\GroundingTotem_Impact.mdx`) and a
+/// dead-slot-0 translation both answer `None` to the channel you would check first. So the struct
+/// carries the record whole, and `any()`/`open_offset()` on it are the two questions the game
+/// asks — which keeps the "does this batch animate" predicate and the "what does it open on" seed
+/// in the engine, where the bake's rules live, instead of copied into the effect attach where they
+/// would drift. Four positional `Option`s would have been the alternative, and swapping two of
+/// them is a silent wrong-channel bug the compiler cannot see.
+/// And 184 → 186, both for the ENTITY lane (decision 2295), which is the same crossing 2282 made
+/// for the effect lane and made for the same reason.
+/// `doodad_anim::register_entity_uv` is the second PUBLISH verb on this lane: put a unit /
+/// GameObject / held-item batch material on the UV lane, picking the shared clock or the
+/// instance's play head from the authored record rather than making the caller reason about it.
+/// It is a separate verb from `register_fx_uv` and not a flag on it because the two lanes differ
+/// in the one thing a caller cannot get right by accident — an effect's clocks are measured from
+/// its own attach (0856/0858) and a resident entity's are the scene's — and a boolean spelling of
+/// that would read as a preference.
+/// `model_render::EntityUvLane` is the argument `entity_variants` grew, and the crossing it buys
+/// is the point of the decision: building an entity batch's material and putting it on the lane
+/// are ONE act, so the engine takes the registry and the delta table *in the same call* instead of
+/// handing back six handles and trusting the game to register them. That is 2038's law spelled in
+/// the signature — a `play_uv` flip without a registration freezes every entity batch at its first
+/// key instead of its identity, which is a different wrong frame and not a fix — and it is why the
+/// lane is a bundle rather than three arguments a caller can pass two of.
+/// And 186 → 189, the second half of 2295 — the ONE entity population that needs a material of
+/// its own rather than the batch's, which the dressing path clones and registers because the
+/// clone has to exist before the part's interior and fade records are built from it.
+/// `doodad_anim::AnimMatPart` is the draw-scan marker, and it crosses for the reason 1375 put it
+/// at the spawn site in the first place: the marker and the registration are one predicate, and
+/// the game is where an entity part is spawned. The engine cannot insert it — it does not know
+/// an entity part exists — and a lane that let the two drift is 2038's three frozen days.
+/// `doodad_anim::register_tint` and `doodad_anim::TintLoop` are the tint channel's twins of the
+/// UV verbs above, for the same five batches on three GameObject models: `G_FreezingTrap`'s glow
+/// card, `OrgrimmarPentagram`, `ScholomanceCrystalBall01` — four of whose five batches bake
+/// **nothing** in file slot 0, so a shared material can only ever seed white however faithfully it
+/// is ticked. They were already `pub` for the world streamer; what crosses here is the game naming
+/// them, and it is the same crossing the UV half makes one line up.
+/// And 189 → 190: `terrain_stream::CurrentArea`, taken by `capture/probe_bg.rs` (decision 2290).
+/// It is the engine's own area authority — the `AreaTable.dbc` leaf under the player's feet, which
+/// the engine already publishes for its own audio and zone-text consumers — and the probe reports
+/// it for one reason: a battleground census has to be able to say *where the body actually is*,
+/// and a map id alone cannot. "Map 489" is true of the pen, the field and the graveyard alike; the
+/// area id is what told this instrument that the port lands at Silverwing Hold and that the
+/// release lands at the graveyard. The alternative was to re-derive the leaf in the probe from
+/// tiles the engine already resolved, which is the copy-the-rule drift this wall exists to stop.
+const CEILING: usize = 190;
 
 /// How far under [`CEILING`] the real count may sit before this test asks for the ceiling to be
 /// lowered. Slack, not tolerance: it keeps a single closure from failing the gate, while making it

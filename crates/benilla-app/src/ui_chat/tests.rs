@@ -1,8 +1,41 @@
-use crate::net::ChatKind;
-
 use super::event::{default_color, ChatEvent, ChatEventKind as K};
-use super::frames::compose;
-use super::input::{emote_send_eligible, emote_target, ParsedChat};
+use super::input::{emote_send_eligible, emote_target, EmoteGate, ParsedChat};
+
+thread_local! {
+    /// The **shipped** string table, in a VM, once per test thread — `GlobalStrings.lua` run as
+    /// the chunk it is, so `\32` and every other escape is Lua's own doing rather than a parser
+    /// of ours.
+    ///
+    /// The composer resolves `CHAT_<TYPE>_GET` / `CHAT_<X>_NOTICE` off the player's chain now
+    /// (decision 2045), so an assertion below is only worth making against the real table: a test
+    /// that graded a rendered line against a stub would pass on sentences the running client
+    /// never shows, which is the trap decision 2052 named when it moved the glue tests onto the
+    /// loader's own assembly.
+    ///
+    /// Built lazily, so a caller's `wow_data_or_skip!()` runs first.
+    static GLOBAL_STRINGS: benilla_ui::script::UiScript = {
+        let s = benilla_ui::script::UiScript::new().expect("VM");
+        crate::ui_script::test_ui::load_ui(&s, "Interface\\FrameXML\\GlobalStrings.lua");
+        s
+    };
+}
+
+/// Run something that needs the shipped string table — the feed's line producers resolve their
+/// keys through one of these now (decision 2045), and every assertion below wants the REAL table
+/// under it rather than a stub with our own idea of the wording in it.
+fn with_strings<T>(f: impl FnOnce(&dyn Fn(&str) -> Option<String>) -> T) -> T {
+    GLOBAL_STRINGS.with(|s| f(&|key: &str| s.lua().globals().get::<String>(key).ok()))
+}
+
+/// [`super::frames::compose`] against the shipped table — the shim that keeps every assertion in
+/// this file (and [`super::broadcast`]'s own) reading as a rendered line rather than as a lookup.
+pub(super) fn compose(event: &ChatEvent, kind: K, default_language: &str) -> Option<String> {
+    GLOBAL_STRINGS.with(|s| {
+        super::frames::compose(event, kind, default_language, &|key| {
+            s.lua().globals().get::<String>(key).ok()
+        })
+    })
+}
 
 /// A player-line event (the wire bridge's output shape) — sender resolved, optional flag.
 fn ev(kind: K, text: &str, sender: &str) -> ChatEvent {
@@ -230,53 +263,6 @@ fn a_received_text_emote_composes_its_sentence_and_names_the_performer() {
     assert!(line(SIT, them("-")).is_none(), "/sit prints nothing");
 }
 
-#[test]
-fn level_up_lines_follow_the_reference_order_and_forms() {
-    let _data = benilla_formats::wow_data_or_skip!();
-    use benilla_protocol::messages::LevelUpInfo;
-
-    // A caster ding with talent point + three stat gains: the PLAYER_LEVEL_UP handler's exact
-    // line order (ChatFrame.lua:1283-1324) — LEVEL_UP, HEALTH_MANA, CHAR_POINTS, STAT × positive.
-    let l = LevelUpInfo {
-        level: 10,
-        health: 22,
-        powers: [15, 0, 0, 0, 0],
-        stats: [0, 1, 2, 3, 0],
-    };
-    assert_eq!(
-        super::feed::level_up_lines(&l, 1),
-        vec![
-            "Congratulations, you have reached level 10!",
-            "You have gained 22 hit points and 15 mana.",
-            "You have gained 1 talent point.",
-            "Your Agility increases by 1.",
-            "Your Stamina increases by 2.",
-            "Your Intellect increases by 3.",
-        ]
-    );
-    // A manaless early ding: LEVEL_UP_HEALTH form, no talent line (arg4 == 0 skips), the plural
-    // form when more than one point.
-    let l = LevelUpInfo {
-        level: 2,
-        health: 12,
-        powers: [0; 5],
-        stats: [1, 0, 1, 0, 0],
-    };
-    assert_eq!(
-        super::feed::level_up_lines(&l, 0),
-        vec![
-            "Congratulations, you have reached level 2!",
-            "You have gained 12 hit points.",
-            "Your Strength increases by 1.",
-            "Your Stamina increases by 1.",
-        ]
-    );
-    assert_eq!(
-        super::feed::level_up_lines(&l, 2)[2],
-        "You have gained 2 talent points."
-    );
-}
-
 /// The three honor forms (COMBATLOG_HONORAWARD / COMBATLOG_HONORGAIN / COMBATLOG_DISHONORGAIN,
 /// GlobalStrings :786/:787/:785) and the fork between them, decision 1512.
 ///
@@ -287,30 +273,33 @@ fn level_up_lines_follow_the_reference_order_and_forms() {
 fn honor_gain_lines_pick_the_reference_form() {
     let _data = benilla_formats::wow_data_or_skip!();
     assert_eq!(
-        super::feed::honor_gain_line(None, None, 42),
-        "You have been awarded 42 honor points."
+        with_strings(|g| super::feed::honor_gain_line(None, None, 42, g)).as_deref(),
+        Some("You have been awarded 42 honor points.")
     );
     assert_eq!(
-        super::feed::honor_gain_line(Some("Grimtusk"), Some("Sergeant"), 137),
-        "Grimtusk dies, honorable kill Rank: Sergeant (Estimated Honor Points: 137)"
+        with_strings(|g| super::feed::honor_gain_line(Some("Grimtusk"), Some("Sergeant"), 137, g))
+            .as_deref(),
+        Some("Grimtusk dies, honorable kill Rank: Sergeant (Estimated Honor Points: 137)")
     );
     // A dishonorable kill: vmangos sends the same packet with a negative honor
     // (`HonorMgr.cpp:807`), and the client's fork is on the sign.
     assert_eq!(
-        super::feed::honor_gain_line(Some("Innkeeper Renee"), None, -37),
-        "Innkeeper Renee dies, dishonorable kill."
+        with_strings(|g| super::feed::honor_gain_line(Some("Innkeeper Renee"), None, -37, g))
+            .as_deref(),
+        Some("Innkeeper Renee dies, dishonorable kill.")
     );
     // The BOUNDARY, byte-verified at `0x625270`: the test is `honor <= 0`, so a zero-honor kill
     // takes the dishonorable arm. The pre-verdict reading had `< 0` and put this one on the
     // honorable side, where it would have printed "Rank:  (Estimated Honor Points: 0)".
     assert_eq!(
-        super::feed::honor_gain_line(Some("Grimtusk"), Some("Sergeant"), 0),
-        "Grimtusk dies, dishonorable kill."
+        with_strings(|g| super::feed::honor_gain_line(Some("Grimtusk"), Some("Sergeant"), 0, g))
+            .as_deref(),
+        Some("Grimtusk dies, dishonorable kill.")
     );
     // No rank title: the clause stays, empty — the reference's own shape.
     assert_eq!(
-        super::feed::honor_gain_line(Some("Grimtusk"), None, 5),
-        "Grimtusk dies, honorable kill Rank:  (Estimated Honor Points: 5)"
+        with_strings(|g| super::feed::honor_gain_line(Some("Grimtusk"), None, 5, g)).as_deref(),
+        Some("Grimtusk dies, honorable kill Rank:  (Estimated Honor Points: 5)")
     );
 }
 
@@ -320,16 +309,16 @@ fn xp_gain_lines_pick_the_reference_form() {
     // COMBATLOG_XPGAIN_FIRSTPERSON / its EXHAUSTION1 rested form / _UNNAMED (GlobalStrings
     // :801/:789/:804).
     assert_eq!(
-        super::feed::xp_gain_line(Some("Kobold Vermin"), 35, 0),
-        "Kobold Vermin dies, you gain 35 experience."
+        with_strings(|g| super::feed::xp_gain_line(Some("Kobold Vermin"), 35, 0, g)).as_deref(),
+        Some("Kobold Vermin dies, you gain 35 experience.")
     );
     assert_eq!(
-        super::feed::xp_gain_line(Some("Kobold Vermin"), 52, 17),
-        "Kobold Vermin dies, you gain 52 experience. (+17 exp Rested bonus)"
+        with_strings(|g| super::feed::xp_gain_line(Some("Kobold Vermin"), 52, 17, g)).as_deref(),
+        Some("Kobold Vermin dies, you gain 52 experience. (+17 exp Rested bonus)")
     );
     assert_eq!(
-        super::feed::xp_gain_line(None, 120, 0),
-        "You gain 120 experience."
+        with_strings(|g| super::feed::xp_gain_line(None, 120, 0, g)).as_deref(),
+        Some("You gain 120 experience.")
     );
     // The XP kind wears the shipped lavender (chat-cache row 46, 0x6F6FFF).
     assert_eq!(default_color(K::CombatXpGain), [111, 111, 255]);
@@ -342,12 +331,12 @@ fn exploration_lines_pick_the_reference_form() {
     // (UIErrorsFrame); ERR_ZONE_EXPLORED_XP (:1926) — the chat system line that rides
     // additionally iff xp > 0 (byte-verified branch `0x5e422f`; decisions 0828/0829).
     assert_eq!(
-        super::feed::exploration_toast("Westfall"),
-        "Discovered: Westfall"
+        with_strings(|g| super::feed::exploration_toast("Westfall", g)).as_deref(),
+        Some("Discovered: Westfall")
     );
     assert_eq!(
-        super::feed::exploration_line("Westfall", 85),
-        "Discovered Westfall: 85 experience gained"
+        with_strings(|g| super::feed::exploration_line("Westfall", 85, g)).as_deref(),
+        Some("Discovered Westfall: 85 experience gained")
     );
 }
 
@@ -392,23 +381,33 @@ fn channel_line_prefixes_the_stripped_channel() {
 /// same channel, the same arg4, and the reference renders them differently. `gsub(arg4,
 /// "%s%-%s.*", "")` lives at l.1463, inside the speech `else` arm, *after* every notice arm has
 /// returned — so speech says "[General]" and the join notice says "[General - Elwynn Forest]".
+///
+/// **The fixtures are built by the bridge**, not hand-stamped with a kind. CHANNEL_NOTICE and
+/// CHANNEL_NOTICE_USER are two different arms of `ChatFrame_OnEvent` — one passes arg4 alone, the
+/// other arg4/arg2/arg5 (l.1416/1424) — and which one a notice byte takes is
+/// [`super::feed::notice_event`]'s call, not the test author's. Stamping it by hand is how this
+/// test came to describe PLAYER_KICKED as a plain CHANNEL_NOTICE, which the bridge has never
+/// produced; nothing could see it while the composer ignored the distinction.
 #[test]
 fn channel_notices_compose_by_the_notice_law() {
     let _data = benilla_formats::wow_data_or_skip!();
-    let mut e = ChatEvent::text_only(K::ChannelNotice, String::new());
-    e.channel = "General - Elwynn Forest".into();
-    e.notice = "2".into(); // YOU_JOINED
+    let notice = |byte: u8, channel: &str, a: Option<&str>, b: Option<&str>| {
+        let e = super::feed::notice_event(
+            byte,
+            channel.to_string(),
+            a.map(str::to_string),
+            b.map(str::to_string),
+        )
+        .expect("the bridge builds an event for this notice");
+        let kind = e.kind.expect("a built notice always carries its kind");
+        compose(&e, kind, "Common")
+    };
     assert_eq!(
-        compose(&e, K::ChannelNotice, "Common").unwrap(),
+        notice(0x02, "General - Elwynn Forest", None, None).unwrap(), // YOU_JOINED
         "Joined Channel: [General - Elwynn Forest]"
     );
-    let mut kick = ChatEvent::text_only(K::ChannelNotice, String::new());
-    kick.channel = "World".into();
-    kick.sender = "Ann".into();
-    kick.target = "Mod".into();
-    kick.notice = "18".into(); // PLAYER_KICKED 0x12
     assert_eq!(
-        compose(&kick, K::ChannelNotice, "Common").unwrap(),
+        notice(0x12, "World", Some("Ann"), Some("Mod")).unwrap(), // PLAYER_KICKED
         "[World] Player Ann kicked by Mod."
     );
     // A member join line is a CHANNEL_JOIN event, hyperlinked like any player line.
@@ -438,16 +437,27 @@ fn chat_vm() -> benilla_ui::script::UiScript {
     // that would hide a real ordering fault. (The tooltip file is the dropdown kit's own
     // dependency — its MenuBackdrop reads `TOOLTIP_DEFAULT_COLOR`.)
     for file in [
-        "Fonts.xml",
-        "GameTooltip.xml",
+        "Interface\\FrameXML\\Fonts.xml",
+        r"Interface\FrameXML\MoneyFrame.lua",
+        r"Interface\FrameXML\MoneyFrame.xml",
+        "Interface\\FrameXML\\GameTooltip.xml",
         "Interface\\FrameXML\\UIDropDownMenu.xml",
         // The UIMenu kit is the reference's own file since 1751 window 21, so this reads both
         // stores through the one loader that speaks them.
         "Interface\\FrameXML\\UIMenu.xml",
-        "ChatFrame.xml",
+        "Interface\\FrameXML\\GlobalStrings.lua",
+        "Interface\\FrameXML\\BasicControls.xml",
+        "Interface\\FrameXML\\ChatFrame.xml",
+        "Interface\\FrameXML\\UIPanelTemplates.lua",
+        "Interface\\FrameXML\\UIPanelTemplates.xml",
+        r"Interface\FrameXML\UIParent.xml",
+        "Interface\\FrameXML\\LocaleProperties.lua",
+        "Interface\\FrameXML\\StaticPopup.xml",
+        "Interface\\FrameXML\\FloatingChatFrame.xml",
     ] {
         crate::ui_script::load_ui_for_test(&s, file);
     }
+    crate::ui_script::fire_chat_login(&mut s);
     s.set_screen_size(1600.0, 900.0);
     s.resolve();
     s
@@ -597,6 +607,11 @@ fn a_channel_notice_fires_its_token_and_the_reference_reads_arg7_and_arg10_bare(
     "#,
     )
     .unwrap();
+    // The reference prints a channel-family line only for a channel the WINDOW carries
+    // (`ChatFrame_OnEvent` l.1374-1391 walks `this.channelList`; a miss returns) — the list
+    // `/join`'s handler fills through `ChatFrame_AddChannel`.
+    s.run("ChatFrame_AddChannel(ChatFrame1, 'General - Elwynn Forest')")
+        .unwrap();
 
     let mut e = ChatEvent::text_only(K::ChannelNotice, String::new());
     e.notice = "2".into(); // YOU_JOINED
@@ -733,6 +748,10 @@ fn a_channel_notice_renders_in_the_channels_color_not_the_notice_row() {
     let mut channels = super::edit::ChannelState::default();
     channels.claim_slot("General - Elwynn Forest");
 
+    // The window has to carry the channel for the reference's handler to print the line at all
+    // (`ChatFrame_OnEvent` l.1374-1391) — `/join`'s own bookkeeping, done here by hand.
+    s.run("ChatFrame_AddChannel(ChatFrame1, 'General - Elwynn Forest')")
+        .unwrap();
     let mut e = ChatEvent::text_only(K::ChannelNotice, String::new());
     e.channel = "General - Elwynn Forest".into();
     e.notice = "2".into(); // YOU_JOINED
@@ -759,44 +778,281 @@ fn a_channel_notice_renders_in_the_channels_color_not_the_notice_row() {
     );
 }
 
-/// The two rows the reference's own guard exempts from that override, and the family it covers.
+/// **Crossing a zone border must not deregister the channel it renames** (decision 2130).
 ///
-/// The condition is `strsub(type,1,7) == "CHANNEL" and type ~= "CHANNEL_LIST" and (arg1 ~= "INVITE"
-/// or type ~= "CHANNEL_NOTICE_USER")` — so CHANNEL_LIST keeps C08080 and an INVITE notice keeps the
-/// CHANNEL_NOTICE_USER grey, while everything else in the family takes the channel's color even
-/// though their own rows differ (CHANNEL_JOIN/LEAVE are C08080, the notices C0C0C0).
+/// The walk sends `LEAVE(General - Elwynn Forest)` then `JOIN(General - Westfall)` — one DBC row,
+/// renamed, and the retail sniff in wow-re `zone-chat-channel-autojoin.md` §7 shows exactly that
+/// pair on the wire. The server answers each with a notice, and the stock `ChatFrame_OnEvent`'s
+/// `YOU_LEFT` arm **deletes the window's registration for whatever it matched**
+/// (`ChatFrame.lua` l.1382-1384):
+///
+/// ```lua
+/// this.channelList[index] = nil;
+/// this.zoneChannelList[index] = nil;
+/// ```
+///
+/// Nothing in stock FrameXML ever re-adds one on `YOU_JOINED` — `ChatFrame_AddChannel` is reachable
+/// only from the `/join` popup and the chat-tab dropdown. So if our `YOU_LEFT` still resolves to a
+/// slot, the window loses General for the rest of the session: the replacement join notice is
+/// dropped unprinted, and so is every General line spoken in the new zone. That is the director's
+/// *"sometimes I get no channel stuff"*, and this test is the observable.
+///
+/// The window is registered here the way the chat cache registers it at login — the row's
+/// **Shortcut** against its **ChannelID**, which is the id-match at `ChatFrame.lua:1379` — because
+/// that is the registration the reference's own `chat-cache.txt` produces (`ZONECHANNELS` bits, not
+/// names).
 #[test]
-fn the_channel_color_override_covers_the_family_but_not_its_two_exemptions() {
+fn a_zone_change_must_not_deregister_the_channel_it_renames() {
     let _data = benilla_formats::wow_data_or_skip!();
-    use super::event::resolved_color;
+    let mut s = chat_vm();
+    let mut windows = super::frames::ChatWindows::default();
+    let mut channels = super::edit::ChannelState {
+        channels: benilla_formats::ChatChannelsCatalog::from_rows(vec![
+            benilla_formats::ChatChannelRow {
+                id: 1,
+                flags: 0x0_0003,
+                pattern: "General - %s".into(),
+                shortcut: "General".into(),
+            },
+        ]),
+        ..Default::default()
+    };
+    channels.claim_slot("General - Elwynn Forest");
 
-    let chan = [255, 192, 192];
-    let mut joined = ev(K::ChannelJoin, "", "Ann");
-    joined.channel_number = 2;
-    assert_eq!(resolved_color(&joined, K::ChannelJoin), chan);
-    assert_eq!(resolved_color(&joined, K::ChannelLeave), chan);
-    assert_eq!(resolved_color(&joined, K::Channel), chan);
+    // `ChatFrame_RegisterForChannels(GetChatWindowChannels(1))`, by hand: it does exactly this pair
+    // of writes, and calling it needs the `this` the event dispatch supplies.
+    s.run("ChatFrame1.channelList[1] = 'General' ChatFrame1.zoneChannelList[1] = 1")
+        .unwrap();
 
-    let mut notice = ChatEvent::text_only(K::ChannelNotice, String::new());
-    notice.notice = "3".into(); // YOU_LEFT
-    notice.channel_number = 2;
-    assert_eq!(resolved_color(&notice, K::ChannelNotice), chan);
-    assert_ne!(resolved_color(&notice, K::ChannelNotice), [192, 192, 192]);
+    let channel_line = |name: &str| {
+        let mut e = ChatEvent::text_only(K::Channel, "anybody out here".into());
+        e.sender = "Bob".into();
+        e.channel = name.into();
+        e
+    };
+    let notice = |name: &str, byte: &str| {
+        let mut e = ChatEvent::text_only(K::ChannelNotice, String::new());
+        e.channel = name.into();
+        e.notice = byte.into();
+        e
+    };
 
-    // CHANNEL_LIST: exempt, keeps its own C08080.
-    let list = ChatEvent::text_only(K::ChannelList, "Ann, Bob".into());
-    assert_eq!(resolved_color(&list, K::ChannelList), [192, 128, 128]);
-
-    // INVITE (0x18) on CHANNEL_NOTICE_USER: exempt, keeps the notice grey — and the exemption is
-    // arg1's, so the same kind carrying any other token does take the channel color.
-    let mut invite = ChatEvent::text_only(K::ChannelNoticeUser, String::new());
-    invite.notice = "24".into();
-    assert_eq!(
-        resolved_color(&invite, K::ChannelNoticeUser),
-        [192, 192, 192]
+    // The control: registered by id, a General line reaches the window.
+    let before = lines_in_window(&s);
+    super::feed::deliver(
+        &mut s,
+        &mut windows,
+        &mut channels,
+        &mut channel_line("General - Elwynn Forest"),
     );
-    invite.notice = "23".into(); // PLAYER_ALREADY_MEMBER
-    assert_eq!(resolved_color(&invite, K::ChannelNoticeUser), chan);
+    assert_eq!(
+        lines_in_window(&s),
+        before + 1,
+        "the control must print — otherwise the assertion below proves nothing"
+    );
+
+    // The border crossing, in the order the walk actually produces it: `CMSG_LEAVE_CHANNEL(old)`
+    // goes out, **the slot is renamed in place before the answer can arrive**
+    // ([`super::edit::ChannelState::rename_slot`], the reference's `0x49bc50` at pass 1 step 6),
+    // `CMSG_JOIN_CHANNEL(new)` goes out, and only then do the two notices land.
+    let renamed = channels.rename_slot("General - Elwynn Forest", "General - Westfall");
+    assert_eq!(
+        renamed,
+        Some(1),
+        "renamed in place — the slot number does not move"
+    );
+
+    let before = lines_in_window(&s);
+    super::feed::deliver(
+        &mut s,
+        &mut windows,
+        &mut channels,
+        &mut notice("General - Elwynn Forest", "3"), // YOU_LEFT
+    );
+    assert_eq!(
+        lines_in_window(&s),
+        before,
+        "the leave prints NOTHING: no slot carries the old name any more, so arg7/arg8/arg9 come \
+         out defaulted and the stock handler returns at `found == 0` — which is also why it never \
+         reaches the arm that would deregister the channel"
+    );
+
+    super::feed::deliver(
+        &mut s,
+        &mut windows,
+        &mut channels,
+        &mut notice("General - Westfall", "2"), // YOU_JOINED
+    );
+
+    assert_eq!(
+        s.eval::<Option<i64>>("return ChatFrame1.zoneChannelList[1]")
+            .unwrap(),
+        Some(1),
+        "the window must still be registered for ChannelID 1 after the rename — a nil here is \
+         General going silent for the rest of the session"
+    );
+
+    // …and the observable that actually matters: speech from the NEW zone still lands.
+    let before = lines_in_window(&s);
+    super::feed::deliver(
+        &mut s,
+        &mut windows,
+        &mut channels,
+        &mut channel_line("General - Westfall"),
+    );
+    assert_eq!(
+        lines_in_window(&s),
+        before + 1,
+        "a General line in the new zone must reach the window"
+    );
+}
+
+/// **Walking out of a capital SUSPENDS Trade — it does not free it** (decision 2130).
+///
+/// The zone walk's other leave: a row that stops applying entirely, which in the 1.12 data means
+/// exactly `Trade` when you step out of a city (wow-re `zone-chat-channel-autojoin.md` §5). The
+/// `CMSG_LEAVE_CHANNEL` still goes out, but the client marks its own slot state 3 (`0x49bcf0`) and
+/// keeps the record — so the notice comes back as the `SUSPENDED` token, the stock handler's
+/// `YOU_LEFT` arm never runs, and the window keeps its registration. Walking back in re-joins
+/// through the state-3 bypass onto the same slot, with the same number.
+///
+/// Freeing it — which is what we did — cost Trade its registration on the way out and left the
+/// re-join notice unprintable on the way back in. Same bug as the border crossing, one row over.
+#[test]
+fn leaving_a_capital_suspends_trade_rather_than_deregistering_it() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = chat_vm();
+    let mut windows = super::frames::ChatWindows::default();
+    let mut channels = super::edit::ChannelState {
+        channels: benilla_formats::ChatChannelsCatalog::from_rows(vec![
+            benilla_formats::ChatChannelRow {
+                id: 2,
+                flags: 0x0_003B,
+                pattern: "Trade - %s".into(),
+                shortcut: "Trade".into(),
+            },
+        ]),
+        ..Default::default()
+    };
+    channels.claim_slot("Trade - City");
+    s.run("ChatFrame1.channelList[1] = 'Trade' ChatFrame1.zoneChannelList[1] = 2")
+        .unwrap();
+
+    let notice = |name: &str, byte: &str| {
+        let mut e = ChatEvent::text_only(K::ChannelNotice, String::new());
+        e.channel = name.into();
+        e.notice = byte.into();
+        e
+    };
+
+    // The walk: LEAVE goes out, then the eligibility test suspends the slot.
+    assert_eq!(channels.suspend_slot("Trade - City"), Some(1));
+    let before = lines_in_window(&s);
+    super::feed::deliver(
+        &mut s,
+        &mut windows,
+        &mut channels,
+        &mut notice("Trade - City", "3"), // YOU_LEFT
+    );
+    s.resolve();
+
+    // The line still PRINTS — `CHAT_SUSPENDED_NOTICE` is "Left Channel: [%s]", the same text as
+    // `CHAT_YOU_LEFT_NOTICE`. Only arg1 differs, and arg1 is what the stock handler branches on.
+    // Asserted because a missing string would make `compose_notice` answer `None` and the line
+    // would vanish silently — the failure this whole area is prone to.
+    assert_eq!(lines_in_window(&s), before + 1);
+    assert!(
+        s.extract().iter().any(|q| matches!(
+            &q.content,
+            benilla_ui::script::QuadContent::Text { text: Some(t), .. }
+                if t == "Left Channel: [1. Trade - City]"
+        )),
+        "the suspended leave renders the same text as an ordinary one"
+    );
+
+    assert_eq!(
+        channels.number_of("Trade - City"),
+        Some(1),
+        "the record and its number survive — `/1` still addresses Trade, and the state-3 bypass \
+         needs the slot to be there to bypass onto"
+    );
+    assert_eq!(
+        s.eval::<Option<i64>>("return ChatFrame1.zoneChannelList[1]")
+            .unwrap(),
+        Some(2),
+        "and the window is still registered for it: the notice carried the SUSPENDED token, so \
+         the stock handler never reached the arm that deletes the registration"
+    );
+
+    // Walking back in: the same slot, the same number, and the notice prints again.
+    let before = lines_in_window(&s);
+    super::feed::deliver(
+        &mut s,
+        &mut windows,
+        &mut channels,
+        &mut notice("Trade - City", "2"), // YOU_JOINED
+    );
+    assert_eq!(
+        lines_in_window(&s),
+        before + 1,
+        "the re-join prints — it could not have, with the registration gone"
+    );
+    assert_eq!(channels.number_of("Trade - City"), Some(1));
+    assert_eq!(
+        channels.slot_state("Trade - City"),
+        Some(super::edit::SlotState::Joined),
+        "and the slot is back to plain joined"
+    );
+}
+
+/// **A renamed row's confirming notice is `YOU_CHANGED`, and it renders "Changed Channel:"**
+/// (decision 2130).
+///
+/// `CHAT_YOU_CHANGED_NOTICE = "Changed Channel: [%s]"` is a string 1.12 ships and we had never
+/// printed, because we modelled no per-slot state to select it with (`0x02`'s arm splits on
+/// `rec+0x9c == 2`). It is what a zone-border crossing actually looks like in the reference: one
+/// line, not a leave and a join.
+#[test]
+fn a_renamed_zone_channel_confirms_as_changed_not_joined() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = chat_vm();
+    let mut windows = super::frames::ChatWindows::default();
+    let mut channels = super::edit::ChannelState {
+        channels: benilla_formats::ChatChannelsCatalog::from_rows(vec![
+            benilla_formats::ChatChannelRow {
+                id: 1,
+                flags: 0x0_0003,
+                pattern: "General - %s".into(),
+                shortcut: "General".into(),
+            },
+        ]),
+        ..Default::default()
+    };
+    channels.claim_slot("General - Elwynn Forest");
+    s.run("ChatFrame1.channelList[1] = 'General' ChatFrame1.zoneChannelList[1] = 1")
+        .unwrap();
+    channels.rename_slot("General - Elwynn Forest", "General - Westfall");
+
+    let mut e = ChatEvent::text_only(K::ChannelNotice, String::new());
+    e.channel = "General - Westfall".into();
+    e.notice = "2".into(); // YOU_JOINED
+    super::feed::deliver(&mut s, &mut windows, &mut channels, &mut e);
+    s.resolve();
+
+    let want = "Changed Channel: [1. General - Westfall]";
+    assert!(
+        s.extract().iter().any(|q| matches!(
+            &q.content,
+            benilla_ui::script::QuadContent::Text { text: Some(t), .. } if t == want
+        )),
+        "expected {want:?} in the window"
+    );
+    assert_eq!(
+        channels.slot_state("General - Westfall"),
+        Some(super::edit::SlotState::Joined),
+        "and the confirming notice resolves the state — a second crossing must read as a rename \
+         of its own, not as a leftover"
+    );
 }
 
 /// **The leave line still knows its number, because the record dies after the line** (1275).
@@ -826,11 +1082,11 @@ fn a_leave_notice_keeps_its_number_because_the_record_dies_after_the_line() {
         "arg8 — what the color resolves through"
     );
     assert_eq!(
-        super::frames::compose(&e, K::ChannelNotice, "Common").unwrap(),
+        compose(&e, K::ChannelNotice, "Common").unwrap(),
         "Left Channel: [2. General - Elwynn Forest]"
     );
     assert_eq!(
-        channels.joined,
+        channels.names(),
         [Some("World".to_string()), None],
         "and only THEN is the record gone — as a HOLE at slot 2, not a shortened list (1286)"
     );
@@ -868,7 +1124,7 @@ fn a_freed_slot_is_reused_and_the_others_keep_their_numbers() {
 
     // Leaving the city drops Trade; the hole it leaves is what the next join takes.
     assert_eq!(c.free_slot("Trade - City"), Some(2));
-    assert_eq!(c.name_of(2), None, "a hole answers 'not joined'");
+    assert!(c.joined[1].is_none(), "a hole answers 'not joined'");
     assert_eq!(c.number_of("General - The Barrens"), Some(1), "still 1");
     assert_eq!(
         c.claim_slot("Trade - City"),
@@ -900,13 +1156,10 @@ fn a_session_end_empties_the_window_and_the_boxs_memory() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = chat_vm();
     let mut windows = super::frames::ChatWindows::default();
-    let mut edit = super::edit::ChatEditState::default();
     let mut log = super::ChatLog::default();
 
     super::frames::route(&mut s, &mut windows, &ev(K::Say, "hi there", "Bob"));
     super::frames::route(&mut s, &mut windows, &ev(K::Whisper, "psst", "Ann"));
-    edit.remember_tell("Ann");
-    edit.sticky = super::edit::SendType::Guild;
     log.push_event(ChatEvent::text_only(K::System, "queued".into()));
     assert_eq!(
         lines_in_window(&s),
@@ -914,42 +1167,72 @@ fn a_session_end_empties_the_window_and_the_boxs_memory() {
         "the window has this session's lines"
     );
 
-    super::end_chat_session(Some(&mut s), &mut windows, &mut edit, &mut log);
+    super::end_chat_session(Some(&mut s), &mut log);
 
     assert_eq!(
         lines_in_window(&s),
         0,
         "and the next character starts clean"
     );
-    assert!(
-        edit.last_tell.is_empty(),
-        "the tell ring was that character's"
-    );
-    assert_eq!(
-        edit.sticky,
-        super::edit::SendType::Say,
-        "sticky back to SAY"
-    );
-    assert_eq!(windows.tell_alert_left, 0.0, "the chime throttle resets");
 }
 
-/// Every notice byte the composer renders has a token to fire, and vice versa — the two tables are
-/// the same set by assertion rather than by good intentions (they are read off the same
-/// `CHAT_<X>_NOTICE` GlobalStrings keys).
+/// **Every notice token names a string the shipped client actually has.** The composer splices
+/// the token into `CHAT_<X>_NOTICE` the way `ChatFrame_OnEvent` does (l.1416/1424), so the token
+/// table IS the render table — there is nothing left to cross-check between two lists of ours.
+/// What can still be wrong is a token that resolves to nothing, which would silently print no
+/// line at all; that is what this asserts, against the player's own `GlobalStrings.lua`.
+///
+/// The bytes with no token render nothing, and must keep rendering nothing: MODE_CHANGE (`0x0C`)
+/// fires no chat event in the reference at all, and JOINED/LEFT (`0x00`/`0x01`) are the member
+/// lines rather than notices.
 #[test]
-fn every_rendered_notice_has_a_token() {
+fn every_notice_token_resolves_and_the_tokenless_bytes_stay_silent() {
     let _data = benilla_formats::wow_data_or_skip!();
-    for byte in 0x00u8..=0x1F {
+    for byte in 0x00u8..=0x21 {
         let mut e = ChatEvent::text_only(K::ChannelNotice, String::new());
         e.channel = "World".into();
         e.notice = byte.to_string();
-        let rendered = super::frames::compose_notice(&e).is_some();
-        let token = super::event::notice_token(byte).is_some();
-        assert_eq!(
-            rendered, token,
-            "notice {byte:#04x}: renders={rendered} but token={token}"
-        );
+        let rendered = GLOBAL_STRINGS.with(|s| {
+            super::frames::compose_notice(&e, K::ChannelNotice, &|key| {
+                s.lua().globals().get::<String>(key).ok()
+            })
+        });
+        match super::event::notice_token(byte, None) {
+            Some(token) => assert!(
+                rendered.is_some(),
+                "notice {byte:#04x} has token {token} but CHAT_{token}_NOTICE resolves to nothing"
+            ),
+            None => assert_eq!(
+                rendered, None,
+                "notice {byte:#04x} has no token and must render nothing"
+            ),
+        }
     }
+}
+
+/// The one notice whose two names are **not** in the order it prints them:
+/// `CHAT_INVITE_NOTICE = "%2$s has invited you to join the channel '%1$s'."`, filled from the
+/// reference's own fixed `(arg4, arg2)` list (l.1418). This is decision 2045's whole argument in
+/// one assertion — hand-typing the English bakes in one locale's word order, and only a
+/// positional fill off the shipped string can put the inviter first while the channel is
+/// argument one.
+#[test]
+fn the_invite_notice_reorders_its_two_names() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut e = ChatEvent::text_only(K::ChannelNoticeUser, String::new());
+    e.channel = "2. Trade - City".into();
+    e.sender = "Ann".into();
+    e.notice = benilla_protocol::messages::channel_notice::INVITE.to_string();
+    let line = GLOBAL_STRINGS.with(|s| {
+        super::frames::compose_notice(&e, K::ChannelNoticeUser, &|key| {
+            s.lua().globals().get::<String>(key).ok()
+        })
+    });
+    assert_eq!(
+        line.as_deref(),
+        Some("Ann has invited you to join the channel '2. Trade - City'."),
+        "the inviter fills %2$s and the channel — arg4, zone tail and all — fills %1$s"
+    );
 }
 
 /// The `ALL` sweep list really is every variant. A new kind fails [`super::event::event_name`]'s
@@ -965,7 +1248,9 @@ fn every_kind_is_in_all() {
     seen.sort_unstable();
     seen.dedup();
     assert_eq!(seen.len(), before, "a kind is listed twice in ALL");
-    assert_eq!(before, 92, "92 kinds — update this when the kind set grows");
+    // 93 since 2077: `CHAT_MSG_FILTERED` (`0x5B`) is a real server line, not the never-wire value
+    // this tree had it filed as — the server's "your message was filtered" notice.
+    assert_eq!(before, 93, "93 kinds — update this when the kind set grows");
 }
 
 #[test]
@@ -995,6 +1280,7 @@ fn stub_table() -> super::commands::SlashCommands {
         ("SLASH_LEAVE1", "/leave"),
         ("SLASH_LIST_CHANNEL1", "/chatlist"),
         ("SLASH_CHAT_AFK1", "/afk"),
+        ("SLASH_CHAT_DND1", "/dnd"),
         ("SLASH_RANDOM1", "/random"),
         ("SLASH_RANDOM2", "/roll"),
         ("SLASH_PLAYED1", "/played"),
@@ -1023,98 +1309,6 @@ fn stub_table() -> super::commands::SlashCommands {
 }
 
 /// The Enter-path type switch (send path — no trailing-space requirement).
-fn enter_switch(text: &str) -> Option<(super::edit::TypeSwitch, String)> {
-    super::input::parse_enter_type_switch(&super::edit::ChannelState::default(), text)
-}
-
-#[test]
-fn enter_path_type_switch_converts_and_keeps_the_remainder() {
-    let _data = benilla_formats::wow_data_or_skip!();
-    use super::edit::{SendType, TypeSwitch};
-    for (cmd, want) in [
-        ("s", SendType::Say),
-        ("say", SendType::Say),
-        ("y", SendType::Yell),
-        ("sh", SendType::Yell),
-        ("g", SendType::Guild),
-        ("gc", SendType::Guild),
-        ("p", SendType::Party),
-        ("rw", SendType::RaidWarning),
-        ("bg", SendType::Battleground),
-        ("o", SendType::Officer),
-        ("e", SendType::Emote),
-    ] {
-        let (sw, rest) = enter_switch(&format!("/{cmd} hi there")).expect(cmd);
-        match sw {
-            TypeSwitch::Plain(t) => assert_eq!(t, want, "/{cmd}"),
-            _ => panic!("/{cmd} is a plain type switch"),
-        }
-        assert_eq!(rest, "hi there");
-    }
-    // Case-insensitive; a bare "/g" still converts (empty remainder = the sticky commit path).
-    assert!(enter_switch("/YELL loud").is_some());
-    let (_, rest) = enter_switch("/g").unwrap();
-    assert_eq!(rest, "");
-}
-
-#[test]
-fn enter_path_whisper_takes_name_then_message() {
-    let _data = benilla_formats::wow_data_or_skip!();
-    use super::edit::TypeSwitch;
-    for cmd in ["w", "whisper", "t", "tell", "send"] {
-        let (sw, rest) = enter_switch(&format!("/{cmd} Bob hi there")).expect(cmd);
-        match sw {
-            TypeSwitch::Whisper(target) => assert_eq!(target, "Bob"),
-            _ => panic!("expected whisper"),
-        }
-        assert_eq!(rest, "hi there");
-    }
-    // Needs a name AND a message on the enter path; a link-leading "name" is rejected.
-    assert!(enter_switch("/w").is_none());
-    assert!(enter_switch("/w Bob").is_none());
-    assert!(enter_switch("/w |Hitem:1|h[x]|h hi").is_none());
-}
-
-#[test]
-fn live_parse_waits_for_the_delimiting_space() {
-    let _data = benilla_formats::wow_data_or_skip!();
-    use super::edit::{parse_type_switch, ChannelState, ChatEditState, TypeSwitch};
-    let mut state = ChatEditState::default();
-    let chans = ChannelState::default();
-    // "/g" alone: still typing (could become /gc) — no switch until the space lands.
-    assert!(parse_type_switch(&state, &chans, "/g").is_none());
-    let (sw, rest) = parse_type_switch(&state, &chans, "/g hi").expect("switch on space");
-    assert!(matches!(
-        sw,
-        TypeSwitch::Plain(super::edit::SendType::Guild)
-    ));
-    assert_eq!(rest, "hi");
-    // "/w Bob" waits for the space AFTER the name (the ref's extract trigger).
-    assert!(parse_type_switch(&state, &chans, "/w Bob").is_none());
-    let (sw, rest) = parse_type_switch(&state, &chans, "/w Bob ").expect("extract on space");
-    assert!(matches!(sw, TypeSwitch::Whisper(t) if t == "Bob"));
-    assert_eq!(rest, "");
-    // "/r " loads the last teller only when one exists.
-    assert!(parse_type_switch(&state, &chans, "/r hi").is_none());
-    state.remember_tell("Ann");
-    let (sw, _) = parse_type_switch(&state, &chans, "/r hi").expect("reply with a teller");
-    assert!(matches!(sw, TypeSwitch::Whisper(t) if t == "Ann"));
-}
-
-#[test]
-fn tell_ring_dedups_and_cycles() {
-    let _data = benilla_formats::wow_data_or_skip!();
-    let mut state = super::edit::ChatEditState::default();
-    state.remember_tell("Ann");
-    state.remember_tell("Bob");
-    state.remember_tell("ann"); // move-to-front dedup, case-insensitive
-    assert_eq!(state.last_tell.len(), 2);
-    assert_eq!(state.last_tell.front().map(String::as_str), Some("ann"));
-    // Tab cycle: current → next, wrapping to the most recent.
-    assert_eq!(state.next_tell("ann").as_deref(), Some("Bob"));
-    assert_eq!(state.next_tell("Bob").as_deref(), Some("ann"));
-    assert_eq!(state.next_tell("").as_deref(), Some("ann"));
-}
 
 #[test]
 fn action_commands_parse() {
@@ -1140,11 +1334,22 @@ fn action_commands_parse() {
             name: "world".into()
         }
     );
+    // `/afk` and `/dnd` run the reference's OWN `SlashCmdList` bodies rather than building a bare
+    // send (2088). They used to be a `ParsedChat::AfkDnd` that went straight to the wire — correct
+    // until the away law landed, and a second implementation the moment it did: no echo, no
+    // client-side default substitution, no mirror write. The argument still rides WHOLE, which is
+    // what this row has always pinned.
     assert_eq!(
         parse_line("/afk farming"),
-        ParsedChat::AfkDnd {
-            kind: ChatKind::Afk,
-            msg: "farming".into(),
+        ParsedChat::Lua {
+            body: "SlashCmdList[\"CHAT_AFK\"](\"farming\")".into()
+        }
+    );
+    // Bare, because that is the toggle — and the empty string has to survive to the send.
+    assert_eq!(
+        parse_line("/dnd"),
+        ParsedChat::Lua {
+            body: "SlashCmdList[\"CHAT_DND\"](\"\")".into()
         }
     );
     assert_eq!(parse_line("/roll"), ParsedChat::Random { min: 1, max: 100 });
@@ -1441,6 +1646,49 @@ fn real_alias_table_resolves_the_shipped_commands() {
     }
     assert_eq!(parse_line("/macrohelp"), ParsedChat::MacroHelp);
     assert_eq!(parse_line("/convertraid"), ParsedChat::ConvertRaid);
+    // `/console` from a line that skipped the stock edit box (a probe rig) forwards to the verb
+    // the stock handler calls, so a CVar write lands like a typed one (2008). The long-bracket
+    // quoting steps its level past anything the text could close.
+    assert_eq!(
+        parse_line("/console fpsJournal 1"),
+        ParsedChat::Lua {
+            body: "ConsoleExec(\"fpsJournal 1\")".into()
+        }
+    );
+    assert_eq!(
+        parse_line("/console reloadUI"),
+        ParsedChat::Lua {
+            body: "ConsoleExec(\"reloadUI\")".into()
+        }
+    );
+    // **The quoting is a SHORT string, because 1.12's lexer has no long-string levels** (2136).
+    // The old long-bracket form stepped its `=` level past whatever the payload could close, which
+    // is a construct the reference cannot compile at all — see `lua_quoted_string`.
+    assert_eq!(super::input::lua_quoted_string("a]]b"), "\"a]]b\"");
+    assert_eq!(super::input::lua_quoted_string("a]]b]=]c"), "\"a]]b]=]c\"");
+    assert_eq!(
+        super::input::lua_quoted_string("say \"hi\"\\n"),
+        "\"say \\\"hi\\\"\\\\n\""
+    );
+    // …and the generated literal ROUND-TRIPS through a real VM, which is the assertion that
+    // actually pins the grammar: the old form compiled here and would not have on the reference,
+    // so a string check alone could not have caught it.
+    {
+        let vm = benilla_ui::script::UiScript::new().expect("VM");
+        for payload in [
+            "fpsJournal 1",
+            "a]]b",
+            "a]]b]=]c",
+            "quote \" and backslash \\",
+            "tab\there",
+        ] {
+            let lit = super::input::lua_quoted_string(payload);
+            let got: String = vm
+                .eval(&format!("return {lit}"))
+                .unwrap_or_else(|e| panic!("{lit} must compile on a 1.12-grammar VM: {e}"));
+            assert_eq!(got, payload, "and must carry the text unchanged");
+        }
+    }
     // The whole shipped surface, so a table that half-loaded fails loudly: **225 distinct emote
     // commands** over the 169 `EmotesText` names (the strings repeat — `EMOTE87_CMD1` and `_CMD2`
     // are both "/sit" — and EMOTE27 "UNUSED" has no row, so it contributes none), and **68 distinct
@@ -1474,6 +1722,80 @@ fn real_alias_table_resolves_the_shipped_commands() {
     );
 }
 
+/// **The `0x4000` "requires standing still" arm** (decision 1904) — the one gate arm that does not
+/// suppress silently. It reports [`EmoteGate::Moving`] and the CALLER turns that into a red
+/// `ERR_NOEMOTEWHILERUNNING`, but only while the caster is self-controlled.
+///
+/// The mask is the reference's own `0x20ff` — [`move_flags::INTEGRATED`] — and what it leaves out
+/// matters as much as what it holds: **SWIMMING is not in it**, so a swimmer standing still in the
+/// water emotes fine. That negative is why this arm has nothing to do with the swim suppression
+/// tested above.
+#[test]
+fn the_standing_still_arm_reports_moving_and_ignores_swimming() {
+    use super::input::EmoteGate;
+    use crate::creature_anim::move_flags;
+
+    const STILL: u32 = 0x4000;
+
+    // Not moving: it sends.
+    assert_eq!(emote_send_eligible(STILL, 0, false, 0), EmoteGate::Send);
+    // Any INTEGRATED bit trips it — a direction, a keyboard turn, or a fall.
+    for f in [
+        move_flags::FORWARD,
+        move_flags::BACKWARD,
+        move_flags::STRAFE_LEFT,
+        move_flags::TURN_RIGHT,
+        move_flags::FALLING,
+    ] {
+        assert_eq!(
+            emote_send_eligible(STILL, 0, false, f),
+            EmoteGate::Moving,
+            "move flag {f:#x}"
+        );
+    }
+    // SWIMMING is NOT in `0x20ff`: a still swimmer is still.
+    assert_eq!(
+        emote_send_eligible(STILL, 0, false, move_flags::SWIMMING),
+        EmoteGate::Send,
+        "the mover-integration mask carries no SWIMMING"
+    );
+    // WALK_MODE and LEVITATING are mode bits, not motion.
+    assert_eq!(
+        emote_send_eligible(STILL, 0, false, move_flags::WALK_MODE),
+        EmoteGate::Send
+    );
+    // Without the flag, movement is irrelevant.
+    assert_eq!(
+        emote_send_eligible(0, 0, false, move_flags::FORWARD),
+        EmoteGate::Send
+    );
+    // An unconditionally-suppressed emote never reaches this arm — it stays SILENT, which is why
+    // only 20 of the 33 rows carrying `0x4000` can actually raise the line.
+    assert_eq!(
+        emote_send_eligible(0x4400, 0, false, move_flags::FORWARD),
+        EmoteGate::Suppressed
+    );
+}
+
+/// **`IsSelfControlled`'s polarity** (`0x5fa550`, decision 1904) — the half that decides whether
+/// the moving refusal is heard. It is `true` for an ordinary player and `false` while confused,
+/// fleeing or move-disabled, so the red line fires in the NORMAL case and a feared player emotes
+/// away. STUNNED is deliberately absent from the mask.
+#[test]
+fn self_controlled_is_true_for_an_ordinary_player() {
+    use crate::player::self_controlled;
+
+    assert!(self_controlled(0));
+    assert!(self_controlled(1 << 3), "an ordinary PvP-attackable player");
+    assert!(!self_controlled(0x0040_0000), "confused");
+    assert!(!self_controlled(0x0080_0000), "fleeing");
+    assert!(!self_controlled(0x0000_0004), "move-disabled");
+    assert!(
+        self_controlled(0x0004_0000),
+        "STUNNED is not in the 0xc00004 mask — it has its own gate"
+    );
+}
+
 // ── The send-side posture-eligibility gate (`emote_send_eligible`) — the director-verified rows
 // from wow-re `emote-posture-gate.md` §3, real `Emotes.dbc` `EmoteFlags` values.
 const BOW: u32 = 0x4801;
@@ -1486,77 +1808,57 @@ const LAUGH: u32 = 0x0980;
 #[test]
 fn seated_stand_required_emotes_are_suppressed() {
     let _data = benilla_formats::wow_data_or_skip!();
-    assert!(!emote_send_eligible(BOW, 1, false)); // 0x4801 has 0x1 (requires STAND)
-    assert!(!emote_send_eligible(RUDE, 1, false));
+    assert_eq!(emote_send_eligible(BOW, 1, false, 0), EmoteGate::Suppressed); // 0x4801 has 0x1 (requires STAND)
+    assert_eq!(
+        emote_send_eligible(RUDE, 1, false, 0),
+        EmoteGate::Suppressed
+    );
 }
 
 #[test]
 fn seated_non_stand_emotes_pass() {
     let _data = benilla_formats::wow_data_or_skip!();
-    assert!(emote_send_eligible(APPLAUD, 1, false));
-    assert!(emote_send_eligible(CHEER, 1, false));
-    assert!(emote_send_eligible(LAUGH, 1, false));
-    assert!(emote_send_eligible(SALUTE, 1, false));
+    assert_eq!(emote_send_eligible(APPLAUD, 1, false, 0), EmoteGate::Send);
+    assert_eq!(emote_send_eligible(CHEER, 1, false, 0), EmoteGate::Send);
+    assert_eq!(emote_send_eligible(LAUGH, 1, false, 0), EmoteGate::Send);
+    assert_eq!(emote_send_eligible(SALUTE, 1, false, 0), EmoteGate::Send);
 }
 
 #[test]
 fn swimming_suppresses_only_the_0x80_emotes() {
     let _data = benilla_formats::wow_data_or_skip!();
-    assert!(!emote_send_eligible(LAUGH, 0, true)); // 0x0980 has 0x80
-    assert!(emote_send_eligible(CHEER, 0, true));
+    assert_eq!(
+        emote_send_eligible(LAUGH, 0, true, 0),
+        EmoteGate::Suppressed
+    ); // 0x0980 has 0x80
+    assert_eq!(emote_send_eligible(CHEER, 0, true, 0), EmoteGate::Send);
 }
 
 #[test]
 fn standing_and_dry_everyone_is_eligible() {
     let _data = benilla_formats::wow_data_or_skip!();
     for flags in [BOW, RUDE, APPLAUD, CHEER, SALUTE, LAUGH] {
-        assert!(emote_send_eligible(flags, 0, false), "flags {flags:#x}");
+        assert_eq!(
+            emote_send_eligible(flags, 0, false, 0),
+            EmoteGate::Send,
+            "flags {flags:#x}"
+        );
     }
 }
 
 #[test]
 fn unconditional_and_sleep_dead_rules() {
     let _data = benilla_formats::wow_data_or_skip!();
-    assert!(!emote_send_eligible(0x0400, 0, false)); // unconditional suppress
-    assert!(!emote_send_eligible(0, 3, false)); // SLEEP without the allow bit
-    assert!(!emote_send_eligible(0, 7, false)); // DEAD without the allow bit
-    assert!(emote_send_eligible(0x0200, 3, false)); // "allowed while asleep/dead"
+    assert_eq!(
+        emote_send_eligible(0x0400, 0, false, 0),
+        EmoteGate::Suppressed
+    ); // unconditional suppress
+    assert_eq!(emote_send_eligible(0, 3, false, 0), EmoteGate::Suppressed); // SLEEP without the allow bit
+    assert_eq!(emote_send_eligible(0, 7, false, 0), EmoteGate::Suppressed); // DEAD without the allow bit
+    assert_eq!(emote_send_eligible(0x0200, 3, false, 0), EmoteGate::Send); // "allowed while asleep/dead"
 }
 
 // ── The open-the-box law, shared by the ENTER key and an addon's ChatFrame_OpenChat ──────────
-
-/// A sticky type whose group is gone opens as SAY (ref `ChatFrame_OpenChat` l.1554-1565), and the
-/// sticky itself survives. The point of the test is that there is **one** implementation of that
-/// law: `ChatFrame_OpenChat` (3 corpus callers) and the ENTER binding both call this, so an addon
-/// opening the box lands in the same type the player's own keypress would.
-#[test]
-fn a_sticky_whose_group_is_gone_opens_as_say() {
-    let _data = benilla_formats::wow_data_or_skip!();
-    use super::edit::{sticky_on_open, SendType};
-    use crate::ui_party::GroupState;
-
-    let solo = GroupState::default();
-    let party = GroupState {
-        in_group: true,
-        group_type: 0,
-        ..GroupState::default()
-    };
-    let raid = GroupState {
-        in_group: true,
-        group_type: 1,
-        ..GroupState::default()
-    };
-
-    assert_eq!(sticky_on_open(SendType::Party, &solo), SendType::Say);
-    assert_eq!(sticky_on_open(SendType::Party, &party), SendType::Party);
-    // RAID needs an actual raid — a plain party is not one.
-    assert_eq!(sticky_on_open(SendType::Raid, &party), SendType::Say);
-    assert_eq!(sticky_on_open(SendType::Raid, &raid), SendType::Raid);
-    assert_eq!(sticky_on_open(SendType::RaidWarning, &party), SendType::Say);
-    // Everything ungated passes through untouched.
-    assert_eq!(sticky_on_open(SendType::Guild, &solo), SendType::Guild);
-    assert_eq!(sticky_on_open(SendType::Say, &solo), SendType::Say);
-}
 
 /// **The inbound addon split, and the direction a reimplementation gets backwards.**
 ///
@@ -1924,40 +2226,11 @@ fn a_combat_log_line_renders_verbatim() {
         e.flag = "AFK".into();
         e.language = "Orcish".into();
         assert_eq!(
-            super::frames::compose(&e, kind, &default_language).as_deref(),
+            compose(&e, kind, &default_language).as_deref(),
             Some("You hit Kobold Vermin for 5."),
             "{} must render verbatim",
             super::event::event_name(kind)
         );
-    }
-}
-
-/// Window 2 "Combat Log" receives the self-relevant block and window 1 "General" receives none of
-/// it — the chat-cache default registration, which is what makes the two docked tabs mean
-/// something. The types the default leaves unregistered (PARTY, FRIENDLYPLAYER, the two other
-/// CREATURE_VS rows) still *fire*; they just land in no window, which is the reference's own
-/// behaviour and the reason a damage meter works without touching the windows.
-#[test]
-fn the_combat_log_lands_in_window_two_only() {
-    let _data = benilla_formats::wow_data_or_skip!();
-    let windows = super::frames::ChatWindows::default();
-    for kind in [
-        K::CombatSelfHits,
-        K::CombatSelfMisses,
-        K::CombatPetHits,
-        K::CombatCreatureVsSelfHits,
-        K::SpellSelfDamage,
-        K::SpellSelfBuff,
-        K::SpellPeriodicSelfDamage,
-        K::SpellDamageShieldsOnSelf,
-    ] {
-        assert!(!windows.wants(0, kind), "{kind:?} must not reach General");
-        assert!(windows.wants(1, kind), "{kind:?} must reach the Combat Log");
-    }
-    // Registered by neither, deliberately — the default is self-relevant only.
-    for kind in [K::CombatPartyHits, K::CombatCreatureVsCreatureHits] {
-        assert!(!windows.wants(0, kind));
-        assert!(!windows.wants(1, kind));
     }
 }
 
@@ -1985,13 +2258,19 @@ fn both_dock_tabs_exist_and_select_their_window() {
         );
     }
     // The default dock: General selected and shown, Combat Log hidden behind its tab.
-    assert_eq!(s.eval::<i64>("return BenillaFCF.selected").unwrap(), 1);
+    assert_eq!(
+        s.eval::<i64>("return SELECTED_DOCK_FRAME:GetID()").unwrap(),
+        1
+    );
     assert!(s.eval::<bool>("return ChatFrame1:IsShown()").unwrap());
     assert!(!s.eval::<bool>("return ChatFrame2:IsShown()").unwrap());
 
     // Clicking the Combat Log tab swaps them — the path a player takes to read the combat log.
-    s.run("BenillaFCF_TabClick(2)").unwrap();
-    assert_eq!(s.eval::<i64>("return BenillaFCF.selected").unwrap(), 2);
+    s.run("FCF_SelectDockFrame(ChatFrame2)").unwrap();
+    assert_eq!(
+        s.eval::<i64>("return SELECTED_DOCK_FRAME:GetID()").unwrap(),
+        2
+    );
     assert!(s.eval::<bool>("return ChatFrame2:IsShown()").unwrap());
     assert!(!s.eval::<bool>("return ChatFrame1:IsShown()").unwrap());
     assert!(s.errors().is_empty(), "handler errors: {:?}", s.errors());
@@ -2131,149 +2410,49 @@ fn both_dock_windows_carry_the_same_chrome() {
             );
         }
     }
-    assert_eq!(
-        s.eval::<i64>("return table.getn(BenillaFCF_Textures(2))")
-            .unwrap(),
-        s.eval::<i64>("return table.getn(BenillaFCF_Textures(1))")
-            .unwrap(),
-    );
 }
 
-/// **All SEVEN chat windows must come from ONE declaration.** The structural guard that ends the
-/// class (decision 1588), widened to the whole set by 1712.
+/// **A docked chat window survives the managed-position pass.**
 ///
-/// Three rounds of the same bug: window 2 shipped with no tab (1575), then with no rect and no
-/// border art (1579), then with no `OnUpdate` and no scroll column (1588) — each time because it
-/// was a hand-mirrored partial copy of window 1 and the mirroring missed a part. The behavioural
-/// tests each catch ONE missed part after someone notices it; this catches the mirroring itself,
-/// which is the only check that can fire before a part is missing.
-///
-/// **Windows 3..7 were the fourth round of it**, and the longest-lived: they were not mirrored
-/// partially, they were declared bare — no tab, no background, no border art, no scroll column —
-/// on the argument that nothing reads a hidden, undocked window's furniture. pfUI reads all of it,
-/// for all seven, unguarded (`chat.lua:588`, `chat.lua:321-419`). This test covered exactly the two
-/// windows the argument had already exempted, so it could not fire; it now covers the set the
-/// reference declares.
-///
-/// So: every window inherits the same virtual template (the reference's own shape —
-/// `FloatingChatFrameTemplate`), and none declares any content of its own beyond its seat. A
-/// `<Layers>`, `<Frames>` or `<Scripts>` block on any instance is the defect, whatever is in it.
+/// The pass owns a frame's whole seat — it `ClearAllPoints()` first, by design (decision 1499) —
+/// and the reference's own table carries a `ChatFrame2` row. That row cost B297 a visible fix
+/// while the pass was ours, and our answer then was to drop the row from our copy. The stock pass
+/// is the one that runs now (1988), row and all, and it ends by calling `FCF_DockUpdate()` —
+/// which re-anchors every docked window onto `DEFAULT_CHAT_FRAME` in the same breath. That is the
+/// reference's answer to its own row, and this is the behavioural check that it holds: after the
+/// pass, the docked window is still exactly on the dock.
 #[test]
-fn the_seven_chat_windows_are_one_declaration() {
+fn a_docked_chat_window_survives_the_managed_position_pass() {
     let _data = benilla_formats::wow_data_or_skip!();
-    use benilla_ui::framexml::TopLevel;
-    let xml = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ui/ChatFrame.xml"),
-    )
-    .expect("ChatFrame.xml");
-    let doc = benilla_ui::framexml::parse(&xml).expect("parse");
-
-    let mut seen = 0;
-    for item in &doc.items {
-        let TopLevel::Instance(el) = item else {
-            continue;
-        };
-        let Some(name) = el.attr("name") else {
-            continue;
-        };
-        if !(1..=7).any(|i| name == format!("ChatFrame{i}")) {
-            continue;
-        }
-        seen += 1;
-        assert_eq!(
-            el.attr("inherits"),
-            Some("BenillaChatFrameTemplate"),
-            "{name} must inherit the window template, not restate it"
-        );
-        for child in &el.children {
-            assert!(
-                matches!(child.tag.as_str(), "Size" | "Anchors"),
-                "{name} declares its own <{}> — that is the mirroring this test exists to stop; \
-                 it belongs in BenillaChatFrameTemplate where EVERY window gets it",
-                child.tag
-            );
-        }
-    }
+    let mut s = benilla_ui::script::UiScript::new().expect("VM");
+    s.set_screen_size(1024.0, 768.0);
+    s.set_unit(
+        "player",
+        Some(benilla_ui::script::UnitState {
+            exists: true,
+            name: Some("Probefour".into()),
+            level: 60,
+            ..Default::default()
+        }),
+    );
+    assert!(crate::ui_script::load_default_ui(&s).is_empty());
+    s.resolve();
+    // Dock the combat log the way the reference's own default layout does, then run the pass.
+    s.run("FCF_DockFrame(ChatFrame2, 2, nil) UIParent_ManageFramePositions()")
+        .unwrap();
+    s.resolve();
+    let rect = |name: &str| {
+        s.eval::<(f64, f64, f64, f64)>(&format!(
+            "return {name}:GetLeft(), {name}:GetBottom(), {name}:GetRight(), {name}:GetTop()"
+        ))
+        .unwrap_or_else(|e| panic!("{name}: {e}"))
+    };
     assert_eq!(
-        seen,
-        7, // NUM_CHAT_WINDOWS — ChatFrame.lua:5
-        "all seven chat windows must be declared in ChatFrame.xml"
+        rect("ChatFrame2"),
+        rect("ChatFrame1"),
+        "the docked window still sits exactly on the dock"
     );
-}
-
-/// The dock's driver may not ride a frame the dock hides — the root cause of 1588 stated at the
-/// level it lived at. `FCF_OnUpdate` drives dock-GLOBAL state (one `reveal`, one selected tab,
-/// both windows' tabs) and it rode `ChatFrame1`'s `OnUpdate`; selecting the Combat Log hides
-/// ChatFrame1, and a hidden frame gets no `OnUpdate`, so the whole dock froze on first use.
-#[test]
-fn the_dock_driver_does_not_ride_a_dock_window() {
-    let _data = benilla_formats::wow_data_or_skip!();
-    let xml = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ui/ChatFrame.xml"),
-    )
-    .expect("ChatFrame.xml");
-    let doc = benilla_ui::framexml::parse(&xml).expect("parse");
-
-    // The one element whose OnUpdate calls it, found by walking rather than by name.
-    fn driver<'a>(el: &'a benilla_ui::framexml::Element, out: &mut Vec<&'a str>) {
-        if el.tag == "OnUpdate" && el.body.contains("FCF_OnUpdate") {
-            out.push("hit");
-        }
-        for c in &el.children {
-            driver(c, out);
-        }
-    }
-    let mut hosts = Vec::new();
-    for item in &doc.items {
-        let el = match item {
-            benilla_ui::framexml::TopLevel::Instance(el)
-            | benilla_ui::framexml::TopLevel::Template(el) => el,
-            _ => continue,
-        };
-        let mut hits = Vec::new();
-        driver(el, &mut hits);
-        if !hits.is_empty() {
-            hosts.push(el.attr("name").unwrap_or("<unnamed>"));
-        }
-    }
-    assert_eq!(
-        hosts,
-        ["BenillaChatDockDriver"],
-        "FCF_OnUpdate is dock-global — it must ride the one frame the dock cannot hide"
-    );
-}
-
-/// **No docked chat window may appear in `UIParent.xml`'s managed-position table.**
-///
-/// The structural guard on the root cause. That pass owns a frame's whole seat — it
-/// `ClearAllPoints()` first, by design (decision 1499) — so a row naming a *docked* window wipes
-/// the anchors that tie it to the dock and re-seats it with a single point and no size: an
-/// unresolvable rect. The reference's own ChatFrame2 row is for an UNDOCKED window, which is chat
-/// settings and not built (0288 §2); carrying it here cost B297 a visible fix.
-///
-/// A string check because that is the level the bug lives at — the row's mere presence is the
-/// defect, whatever it contains.
-#[test]
-fn no_docked_chat_window_is_managed_by_uiparent() {
-    let _data = benilla_formats::wow_data_or_skip!();
-    let xml = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ui/UIParent.xml"),
-    )
-    .expect("UIParent.xml");
-    for line in xml.lines() {
-        let code = line.trim_start();
-        if code.starts_with("--") {
-            continue; // the comment explaining why the row is gone names it, deliberately
-        }
-        assert!(
-            !code.starts_with("ChatFrame2 ="),
-            "ChatFrame2 is DOCKED — a managed row clears its dock anchors: {code}"
-        );
-    }
-    assert!(
-        xml.contains("ChatFrame1 = {baseY = 85"),
-        "ChatFrame1 IS managed (it is the dock's own seat) — this test must not pass vacuously"
-    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
 /// **What does NOT gate a `/sit` underwater** — the negative that sends B155's refusal to the
@@ -2318,9 +2497,317 @@ fn the_posture_emotes_carry_no_swim_suppression_flag() {
         }
         // …so the emote gate lets it through mid-swim. (`stand_state` here is the performer's
         // CURRENT state; a standing swimmer pressing `/sit` is the reported case.)
-        assert!(
-            super::input::emote_send_eligible(flags, 0, true),
+        assert_eq!(
+            super::input::emote_send_eligible(flags, 0, true, 0),
+            super::input::EmoteGate::Send,
             "posture emote {id} passes the emote gate while swimming"
         );
     }
+}
+
+/// **The ding's gains reach `PLAYER_LEVEL_UP` matched BY LEVEL, and a miss is zeros, not absence.**
+///
+/// The net layer has no `UiScript`, so `SMSG_LEVELUP_INFO`'s tuple is parked on `ChatLog` and the
+/// feed that owns the level edge picks it up (decision 1884). Matching on the level is what keeps
+/// a stale entry from attaching to a later ding — the trigger is a descriptor diff and the gains
+/// are packet-borne, so the two are only coincidentally in step.
+///
+/// The miss case is the load-bearing half: a GM demotion writes the descriptor with no packet, and
+/// the event must still carry nine arguments. `ChatFrame.lua` guards every one with
+/// `if ( argN > 0 )`, so a zero reads as "no line" while a nil raises.
+#[test]
+fn level_up_gains_are_matched_by_level_and_a_miss_is_not_an_absence() {
+    use benilla_protocol::messages::LevelUpInfo;
+
+    let mut log = super::feed::ChatLog::default();
+    let ding = LevelUpInfo {
+        level: 10,
+        health: 22,
+        powers: [15, 0, 0, 0, 0],
+        stats: [0, 1, 2, 3, 0],
+    };
+    log.push_level_up_gains(&ding, 1);
+
+    // A level edge that is not this ding's leaves the entry parked...
+    assert!(log.take_level_up_gains(11).is_none(), "wrong level matched");
+    // ...and the right one takes it, exactly once.
+    let (got, talent_points) = log.take_level_up_gains(10).expect("parked for level 10");
+    assert_eq!(got, ding);
+    assert_eq!(talent_points, 1);
+    assert!(
+        log.take_level_up_gains(10).is_none(),
+        "the entry was taken, not copied"
+    );
+}
+
+/// **The ding block is printed once, by the reference's own window.**
+///
+/// `benilla.toc` sources `Interface\FrameXML\ChatFrame.xml` off the player's chain, and stock
+/// `ChatFrame_OnEvent` composes the whole five-line level-up block itself from `PLAYER_LEVEL_UP`
+/// (`ChatFrame.lua` l.1283-1324) — `LEVEL_UP`, the health/mana pair, `LEVEL_UP_CHAR_POINTS`, and a
+/// `LEVEL_UP_STAT` per positive gain. benilla fires that event with the reference's nine arguments
+/// (decision 1884), and for a while it *also* routed its own Rust copy of the same five lines,
+/// under a comment saying they would stay "until that window migrates". The window migrated; the
+/// copy did not go. Every ding printed twice, and nothing could see it: both halves were correct
+/// on their own, and the composer's own tests only ever checked the text it produced.
+///
+/// So this counts what lands in the real window. The event is the whole of the ding now — which
+/// also means the count below is the reference's own composition, not ours.
+#[test]
+fn the_ding_block_is_printed_once() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    use benilla_protocol::messages::LevelUpInfo;
+    let mut s = chat_vm();
+    let mut log = super::ChatLog::default();
+
+    let info = LevelUpInfo {
+        level: 10,
+        health: 22,
+        powers: [15, 0, 0, 0, 0],
+        stats: [1, 0, 0, 0, 0],
+    };
+    // The whole of what the packet's apply does now: park the gains, print nothing.
+    log.push_level_up_gains(&info, 1);
+    let before = lines_in_window(&s);
+    assert_eq!(
+        lines_in_window(&s) - before,
+        0,
+        "the app composes no ding line of its own"
+    );
+
+    // Tap the window's own `AddMessage` so the assertion can be about the BLOCK and not just its
+    // length — this is where the deleted Rust composer's test went. The subject moved to the
+    // reference's Lua; the knowledge did not.
+    s.run(
+        r#"
+        DingLines = {}
+        local add = ChatFrame1.AddMessage
+        ChatFrame1.AddMessage = function(self, text, ...)
+            table.insert(DingLines, text)
+            return add(self, text, unpack(arg))
+        end
+        "#,
+    )
+    .unwrap();
+
+    // The event `ui_unit` fires, with the reference's nine arguments.
+    let args: Vec<benilla_ui::script::ScriptValue> = [10i64, 22, 15, 1, 1, 0, 0, 0, 0]
+        .into_iter()
+        .map(benilla_ui::script::ScriptValue::Int)
+        .collect();
+    s.fire_event("PLAYER_LEVEL_UP", args);
+    assert!(s.errors().is_empty(), "handler errors: {:?}", s.errors());
+    assert_eq!(
+        lines_in_window(&s) - before,
+        4,
+        "LEVEL_UP, the health/mana pair, CHAR_POINTS, and one STAT — once each"
+    );
+
+    // `ChatFrame.lua` l.1283-1324's exact order and forms, off the shipped GlobalStrings: the
+    // singular `LEVEL_UP_CHAR_POINTS` at one point (`GetText`'s plural pick), and one
+    // `LEVEL_UP_STAT` for the single positive gain, named through `SPELL_STAT0_NAME`.
+    let lines: Vec<String> = (1..=4)
+        .map(|i| s.eval::<String>(&format!("return DingLines[{i}]")).unwrap())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "Congratulations, you have reached level 10!",
+            "You have gained 22 hit points and 15 mana.",
+            "You have gained 1 talent point.",
+            "Your Strength increases by 1.",
+        ]
+    );
+}
+
+/// **The free-professions line, same question as the ding.** Stock `ChatFrame_OnEvent` handles
+/// `CHARACTER_POINTS_CHANGED` too (`ChatFrame.lua` l.1324-1334): on `arg2 > 0` it reads
+/// `UnitCharacterPoints("player")` and prints `GetText("LEVEL_UP_SKILL_POINTS", nil, cp2)`.
+/// `ui_talent` fires that event *and* composes the same line. This asks the window which of them
+/// lands.
+#[test]
+fn the_free_professions_line_is_printed_once() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = chat_vm();
+    s.set_talents(benilla_ui::script::TalentUiState {
+        points: (0, 2),
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        SkillLines = {}
+        local add = ChatFrame1.AddMessage
+        ChatFrame1.AddMessage = function(self, text, ...)
+            table.insert(SkillLines, text)
+            return add(self, text, unpack(arg))
+        end
+        "#,
+    )
+    .unwrap();
+    let before = lines_in_window(&s);
+    // `ui_talent`'s fire: arg1 = the talent delta, arg2 = the profession delta.
+    s.fire_event(
+        "CHARACTER_POINTS_CHANGED",
+        vec![
+            benilla_ui::script::ScriptValue::Int(0),
+            benilla_ui::script::ScriptValue::Int(1),
+        ],
+    );
+    assert!(s.errors().is_empty(), "handler errors: {:?}", s.errors());
+    assert_eq!(
+        lines_in_window(&s) - before,
+        1,
+        "the stock frame prints the professions line from the event"
+    );
+    assert_eq!(
+        s.eval::<String>("return SkillLines[1]").unwrap(),
+        "You now have 2 free professions.",
+        "LEVEL_UP_SKILL_POINTS_P1, plural-picked by GetText on cp2"
+    );
+}
+
+// ───────────── The chat cache restores INSIDE the login, not after it (decision 2119) ─────────
+
+/// **The login order, asserted at the two places that broke.**
+///
+/// `UPDATE_CHAT_WINDOWS` is the only thing that registers a chat frame for any `CHAT_MSG_*`
+/// (`ChatFrame_OnEvent`'s arm calls `ChatFrame_RegisterForMessages(GetChatWindowMessages(id))`),
+/// and the `UPDATE_CHAT_COLOR` burst mirrors `WHISPER` into `ChatTypeInfo["REPLY"]`, whose `.id`
+/// is 0 — the same id every `AddMessage` with no explicit colour carries — so the burst repaints
+/// them. Both events come from the chat-cache restore, so the restore has to be finished before
+/// `PLAYER_LOGIN`: before it, an addon's `Print` gets repainted whisper-pink, and any chat routed
+/// in that window lands on a frame registered for nothing and is dropped in silence (1784).
+///
+/// Pre-2119 the restore was an `Update` system and this probe saw `windows = nil`,
+/// `colors = nil`, `registered = ""` at `PLAYER_LOGIN`.
+///
+/// The probe is planted as a real loose ADDON, the way `world_entry_tests` plants its own. It
+/// cannot be a frame created on the boot VM beforehand: since 2226 the entry load BUILDS the VM it
+/// runs on, so anything seated on the character screen's VM is gone before the first event fires.
+/// An addon's file scope runs inside the load — after the XML, before `VARIABLES_LOADED` — which
+/// is exactly the vantage point this probe wants, and the one the reference gives an addon too.
+#[test]
+fn the_chat_cache_restore_is_finished_before_player_login() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let _l = crate::local_state::test_env::ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tmp = std::env::temp_dir().join(format!("benilla-chat-order-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let home = tmp.join("benilla-config");
+    let probe = home.join("AddOns").join("ChatOrderProbe");
+    std::fs::create_dir_all(&probe).expect("hermetic home + probe addon dir");
+    std::fs::write(
+        probe.join("ChatOrderProbe.toc"),
+        "## Interface: 11200\nChatOrderProbe.lua\n",
+    )
+    .expect("probe toc");
+    std::fs::write(
+        probe.join("ChatOrderProbe.lua"),
+        r#"
+        ChatOrderProbe = { order = "" }
+        local f = CreateFrame("Frame")
+        f:RegisterEvent("VARIABLES_LOADED")
+        f:RegisterEvent("UPDATE_CHAT_WINDOWS")
+        f:RegisterEvent("UPDATE_CHAT_COLOR")
+        f:RegisterEvent("PLAYER_LOGIN")
+        f:SetScript("OnEvent", function()
+            -- The burst is 100+ events; record it once so the order string stays readable.
+            if not string.find(ChatOrderProbe.order, event, 1, 1) then
+                ChatOrderProbe.order = ChatOrderProbe.order .. event .. " "
+            end
+            if event == "UPDATE_CHAT_WINDOWS" then
+                ChatOrderProbe.windows = (ChatOrderProbe.windows or 0) + 1
+            elseif event == "UPDATE_CHAT_COLOR" then
+                ChatOrderProbe.colors = (ChatOrderProbe.colors or 0) + 1
+            elseif event == "PLAYER_LOGIN" then
+                ChatOrderProbe.loginWindows = ChatOrderProbe.windows or 0
+                ChatOrderProbe.loginColors = ChatOrderProbe.colors or 0
+                ChatOrderProbe.loginRegistered =
+                    (ChatFrame1 and ChatFrame1.messageTypeList
+                        and table.concat(ChatFrame1.messageTypeList, ",")) or ""
+            end
+        end)
+        "#,
+    )
+    .expect("probe lua");
+    let _capture = crate::local_state::test_env::EnvGuard::unset("WOW_CAPTURE");
+    let _home =
+        crate::local_state::test_env::EnvGuard::set("BENILLA_HOME", home.to_str().expect("utf-8"));
+
+    let mut world = bevy::prelude::World::new();
+    world.init_resource::<crate::ui_script::AddOnIdentity>();
+    world.init_resource::<crate::minimap::MinimapZoom>();
+    world.init_resource::<crate::ui_script::ReloadUiPending>();
+    world.init_resource::<super::edit::ChannelState>();
+    world.init_resource::<super::settings::ChatWindowFile>();
+    crate::ui_script::setup_script(&mut world);
+
+    world.insert_resource(crate::char_select::Roster::with_pending_pick(
+        vec![benilla_protocol::Character {
+            guid: 1,
+            name: "Probeorder".into(),
+            race: 1,  // Human → Alliance
+            class: 1, // Warrior
+            gender: 0,
+            level: 60,
+            skin: 0,
+            face: 0,
+            hair_style: 0,
+            hair_color: 0,
+            facial_hair: 0,
+            zone: 0,
+            map: 0,
+            position: benilla_protocol::wire::Vector3d {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            flags: 0,
+            equipment: [benilla_protocol::CharEnumItem::default(); 19],
+            pet_display_id: 0,
+            pet_level: 0,
+            pet_family: 0,
+        }],
+        1,
+    ));
+    crate::ui_script::load_ingame_ui_on_world_entry(&mut world);
+
+    let read = |expr: &str| -> String {
+        world
+            .non_send_resource::<benilla_ui::script::UiScript>()
+            .eval::<Option<String>>(&format!("return tostring({expr})"))
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        read("ChatOrderProbe.loginWindows"),
+        "1",
+        "UPDATE_CHAT_WINDOWS must have fired before PLAYER_LOGIN — it is the only thing that \
+         registers a chat frame for CHAT_MSG_*, so a line routed before it is dropped in silence"
+    );
+    assert_ne!(
+        read("ChatOrderProbe.loginColors"),
+        "0",
+        "the UPDATE_CHAT_COLOR burst must precede PLAYER_LOGIN — after it, its WHISPER→REPLY \
+         mirror repaints every already-printed AceConsole line whisper-pink"
+    );
+    assert!(
+        read("ChatOrderProbe.loginRegistered").contains("SYSTEM"),
+        "ChatFrame1 must carry the SYSTEM message group at PLAYER_LOGIN, not {:?}",
+        read("ChatOrderProbe.loginRegistered")
+    );
+    // The reference's own login order, byte-derived (wow-re `login-chat-colour-pipeline.md`;
+    // decision 2125): addons and their `ADDON_LOADED` (`0x4900a3`), then `VARIABLES_LOADED`
+    // (`0x4900b2`), then the chat-cache reader's burst (`0x4900d6`), then `PLAYER_LOGIN`
+    // (`0x490959`). 2119 put the burst ahead of `VARIABLES_LOADED`, one step too early.
+    assert_eq!(
+        read("ChatOrderProbe.order"),
+        "VARIABLES_LOADED UPDATE_CHAT_WINDOWS UPDATE_CHAT_COLOR PLAYER_LOGIN ",
+        "the reference fires the chat-cache burst BETWEEN VARIABLES_LOADED and PLAYER_LOGIN"
+    );
+
+    drop(world);
+    let _ = std::fs::remove_dir_all(&tmp);
 }

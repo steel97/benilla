@@ -2,7 +2,7 @@
     <!--
         The GAME MENU — the frame ESC opens (decision 0674). The last hole in the game shell's
         outermost layer: until now ESC's chain ran out of things to close and did nothing, and the
-        Main Menu micro button was drawn but dead (MicroMenu.xml's SCOPE note).
+        Main Menu micro button was drawn but dead (our since-retired MicroMenu.xml's SCOPE note).
 
         PROVENANCE (0985 — the three-source split, stated the same way in every era-shaped
         window; OptionsFrame.xml carries the sibling block):
@@ -30,22 +30,22 @@
           Options", SOUNDOPTIONS_MENU "Sound Options", UIOPTIONS_MENU "Interface Options",
           MACROS "Macros", LOGOUT "Logout", EXIT_GAME "Exit Game",
           RETURN_TO_GAME "Return to Game", MAIN_MENU "Main Menu". Declared as the real globals
-          (they are addon-visible API, decision 0068) and read back into each button's label in its
-          OnLoad — the ref's `text="LOGOUT"` attribute IS a global lookup, which this engine's
-          literal `text=` is not.
+          (they are addon-visible API, decision 0068) and carried on each button's own
+          `text=` attribute — which this engine resolves as a global-string lookup exactly as
+          the reference does (decision 0995, `loader/widgets.rs`'s `resolve_text`).
         · **The sounds** — the ref's own OnClick lines: igMainMenuOption (the five option buttons),
           igMainMenuLogout, igMainMenuQuit, igMainMenuContinue. All four kits verified present in
           SoundEntries.dbc (patch-2.MPQ) alongside the igMainMenuOpen/Close pair already in use.
         · **The two logout dialogs** — ref `StaticPopup.lua` l.564-600 (CAMP + QUIT) is the
           SPECIFICATION for them: the two dialog keys, the field names, the 20 s timeout and the
           asymmetric button sets are contract, and the entries carrying them are written here in
-          our own shape on the shared popup engine (UiPanels.xml), whose countdown-text branch
+          our own shape on the shared popup engine (the stock StaticPopup), whose countdown-text branch
           already lists both `which` names. Their driver events are the reference's own
           (`re/events/event-catalog.tsv`: 276 PLAYER_CAMPING, 277 PLAYER_QUITING,
           278 LOGOUT_CANCEL), fired by `crate::ui_logout` off `SMSG_LOGOUT_RESPONSE`.
 
         NAMES are the reference's, unprefixed (`GameMenuFrame`, `GameMenuButton*`) — the same call
-        MicroMenu.xml made for its straight transcriptions, and required here besides: `ToggleGameMenu`
+        our retired MicroMenu.xml made for its straight transcriptions, and required here besides: `ToggleGameMenu`
         and `GameMenuFrame` are Era API surface an addon addresses by name.
 
         SCOPE / divergences (noted, not bugs):
@@ -94,14 +94,13 @@
           scripts, so it never actually moves).
           `frameStrata="DIALOG"` is what puts it over the world UI, and that is kept.
           **The "no frame-level raise" half of that reason is gone**: the raise law is built
-          (`script::object::toplevel`, wow-re `ui/scratch/toplevel-raise.md`) and the loader honours
-          `toplevel="true"`. Re-adding it here is a one-word change and would make the Esc menu come
-          to the front over any other DIALOG-strata frame it overlaps; left off pending the
-          director's call on the look, not on the mechanism.
+          (`script::object::toplevel`, wow-re `ui/scratch/toplevel-raise.md`), the loader honours
+          `toplevel="true"`, and the frame below carries it — so the Esc menu does come to the
+          front over any other DIALOG-strata frame it overlaps.
     -->
     <Script><![CDATA[
         -- The reference GlobalStrings (patch-2.MPQ Interface\FrameXML\GlobalStrings.lua), quoted
-        -- verbatim. `X = X or "..."` so a later real strings table wins, the MicroMenu.xml idiom.
+        -- verbatim. `X = X or "..."` so a later real strings table wins, the retired MicroMenu.xml's idiom.
         MAIN_MENU = MAIN_MENU or "Main Menu"
         HUD_EDIT_MODE_MENU = HUD_EDIT_MODE_MENU or "Edit Mode"
         GAMEMENU_SUPPORT = GAMEMENU_SUPPORT or "Support"
@@ -119,7 +118,99 @@
             button:Disable()
         end
 
-        -- The CAMP/QUIT dialogs and the three-event driver MOVED OUT, to UiPanels.xml — the
+        -- ══ THE THREE STOCK CONSUMERS THAT ASK "IS AN OPTIONS WINDOW OPEN?" (decision 2177) ══
+        -- All three are the reference's own, off the chain, and all three name the reference's
+        -- three windows literally. Two of those names are now REAL hidden stock frames
+        -- (`SoundOptionsFrame` since 2147, `UIOptionsFrame` since 2115) and the third,
+        -- `OptionsFrame`, became one when the stock VIDEO window joined the manifest — so the
+        -- whole chain now reads "no", always, while the window the player actually opens is up.
+        -- Until then `OptionsFrame` WAS our window and every one of them answered by accident.
+        --
+        -- **Wrappers, not replacements.** Each stock function keeps running and keeps deciding;
+        -- ours adds the one term the reference could not know about. A rewrite would be thirty
+        -- lines of the reference's ladder copied into our tree to drift.
+        --
+        -- **HERE, not in `OptionsFrame.xml`, because of load order.** `UpdateMicroButtons` is
+        -- defined by `MainMenuBarMicroButtons.xml`, manifest l.576 — AFTER our options window at
+        -- l.522, where a wrapper would capture a nil. This file is the manifest's LAST row
+        -- (l.1273), so all three exist. It is also the right home on the merits: this is the ESC
+        -- menu, and these three are exactly "the ESC ladder and the micro button know about our
+        -- options window".
+        local Ref_IsOptionFrameOpen = IsOptionFrameOpen
+        local Ref_ToggleGameMenu = ToggleGameMenu
+        local Ref_UpdateMicroButtons = UpdateMicroButtons
+
+        -- The one term all three add. Existence-guarded because these three wrappers stand in a
+        -- file that can be seated without the options window: in the client `BenillaOptionsFrame`
+        -- is manifest row 38 and this file is the last row, so it is always real — but a test kit
+        -- that seats the game menu alone must get "no options window is open", not a raise inside
+        -- the ESC handler.
+        local function BenillaOptions_IsOpen()
+            return BenillaOptionsFrame and BenillaOptionsFrame:IsVisible()
+        end
+
+        -- `UIParent.lua:996`. One caller: `CloseAllWindows_WithExceptions`, which passes
+        -- `ignoreCenter = 1` when an options window is up so the ESC sweep does not close the
+        -- centre panel out from under it. Ours IS the centre panel (`UIPanelWindows` row,
+        -- `area = "center"`), so answering "no" would have ESC close it through the sweep instead
+        -- of through its own rung, discarding pending edits with no Cancel semantics.
+        function IsOptionFrameOpen()
+            if BenillaOptions_IsOpen() then
+                return 1
+            end
+            return Ref_IsOptionFrameOpen()
+        end
+
+        -- `UIParent.lua:1465-1497`. The ESC ladder, and the rung matters as much as the answer:
+        -- the reference tries the static popup FIRST, then an open options window, then the game
+        -- menu. So this runs that first rung itself and returns if it fired — `StaticPopup_Escape        -- Pressed` is a pure scan when nothing is shown (`StaticPopup.lua:1879-1893`), so the
+        -- delegate below re-running it costs nothing and changes nothing — then takes the options
+        -- rung, then hands the rest of the ladder back untouched.
+        --
+        -- The close is our own Close button's click, which is the same discard-and-hide the
+        -- reference reaches through `OptionsFrameCancel:Click()`: our `<OnHide>` drops the pending
+        -- page. (That alias is retired — `OptionsFrameCancel` is the stock video window's own
+        -- button now, and ours loading later would have clobbered it.)
+        function ToggleGameMenu(clicked)
+            if clicked then
+                -- The reference's `clicked` arm closes an open options window and then goes on to
+                -- toggle the game menu, rather than returning. Same here.
+                if BenillaOptions_IsOpen() then
+                    BenillaOptionsFrameCloseButton:Click()
+                end
+                return Ref_ToggleGameMenu(clicked)
+            end
+            if StaticPopup_EscapePressed() then
+                return
+            end
+            if BenillaOptions_IsOpen() then
+                BenillaOptionsFrameCloseButton:Click()
+                return
+            end
+            return Ref_ToggleGameMenu(clicked)
+        end
+
+        -- `MainMenuBarMicroButtons.lua:47-58`. A POST-hook that can only ever push the button, never
+        -- release it: the reference has already decided from the six frames it knows, and this adds
+        -- the seventh. Written this way round so it cannot fight that decision — a wrapper that also
+        -- set NORMAL would be a second copy of the reference's whole `or` chain.
+        --
+        -- **Existence-guarded, and only here.** The shipped manifest always carries
+        -- `MainMenuBarMicroButtons.xml`, so in the client `Ref_UpdateMicroButtons` and
+        -- `MainMenuMicroButton` are always real. A partial test kit that seats this file and not
+        -- the micro bar is the case the guards are for, and a guard is the honest answer there:
+        -- there is no micro button to push, so there is nothing to do — as against a raise inside
+        -- an unrelated window's OnShow, which is what an unguarded wrapper turns that into.
+        function UpdateMicroButtons()
+            if Ref_UpdateMicroButtons then
+                Ref_UpdateMicroButtons()
+            end
+            if MainMenuMicroButton and BenillaOptions_IsOpen() then
+                MainMenuMicroButton:SetButtonState("PUSHED", 1)
+            end
+        end
+
+        -- The CAMP/QUIT dialogs and the three-event driver MOVED OUT, to our UIParent.lua counterpart (the stock UIParent.lua since 1988) — the
         -- reference's own homes for both (StaticPopup.lua l.564/586; UIParent.lua l.304-315).
         -- They were here only because this is where they were first needed, and 1751 moving them
         -- is one less thing to carry when this window follows them onto the chain.
@@ -164,7 +255,7 @@
                 <!-- Era swaps the header text to 13px (MainMenuFrameMixin:OnLoad →
                      SetHeaderFont(GameFontNormalMed1)); the seat is the 1.12 one (within half a
                      unit of era's — header SCOPE note). -->
-                <FontString name="GameMenuFrameTitle" inherits="GameFontNormalMed1">
+                <FontString name="GameMenuFrameTitle" inherits="GameFontNormalMed1" text="MAIN_MENU">
                     <Anchors>
                         <Anchor point="TOP" relativeTo="GameMenuFrameHeader"><Offset><AbsDimension x="0" y="-14"/></Offset></Anchor>
                     </Anchors>
@@ -180,20 +271,19 @@
                  something exists behind them. -->
 
             <!-- Options — live: the era GameMenuFrame.lua l.88 entry (ShowUIPanel(SettingsPanel)
-                 there, OptionsFrame here) plus an explicit HideUIPanel first. The ref leans on
+                 there, BenillaOptionsFrame here) plus an explicit HideUIPanel first. The ref leans on
                  the center-replacement rule for the swap (ShowUIPanel l.697-702: native-center
                  frames replace each other); hiding the menu explicitly says the same thing
                  without relying on the eviction path. -->
-            <Button name="GameMenuButtonOptions" inherits="GameMenuButtonTemplate">
+            <Button name="GameMenuButtonOptions" inherits="GameMenuButtonTemplate" text="Options">
                 <Anchors>
                     <Anchor point="TOPLEFT"><Offset><AbsDimension x="28" y="-32"/></Offset></Anchor>
                 </Anchors>
                 <Scripts>
-                    <OnLoad>self:SetText("Options")</OnLoad>
                     <OnClick>
                         PlaySound("igMainMenuOption")
                         HideUIPanel(GameMenuFrame)
-                        ShowUIPanel(OptionsFrame)
+                        ShowUIPanel(BenillaOptionsFrame)
                     </OnClick>
                 </Scripts>
             </Button>
@@ -210,14 +300,13 @@
                 </Anchors>
                 <Scripts><OnLoad>GameMenuButton_Pending(self, GAMEMENU_SUPPORT)</OnLoad></Scripts>
             </Button>
-            <Button name="GameMenuButtonMacros" inherits="GameMenuButtonTemplate">
+            <Button name="GameMenuButtonMacros" inherits="GameMenuButtonTemplate" text="MACROS">
                 <Anchors>
                     <Anchor point="TOPLEFT" relativeTo="GameMenuButtonSupport" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="0"/></Offset></Anchor>
                 </Anchors>
                 <!-- LIVE since decision 0983 (MacroFrame.xml). The ref's own body
                      (GameMenuFrame.xml l.118-122): hide the menu, then ShowMacroFrame(). -->
                 <Scripts>
-                    <OnLoad>self:SetText(MACROS)</OnLoad>
                     <OnClick>
                         PlaySound("igMainMenuOption")
                         HideUIPanel(getglobal("GameMenuFrame"))
@@ -230,12 +319,11 @@
                  button while either logout dialog is already up (you cannot re-arm a running
                  countdown); it runs on the menu's own show, which is when a re-opened menu has to
                  re-read that state. -->
-            <Button name="GameMenuButtonLogout" inherits="GameMenuButtonTemplate">
+            <Button name="GameMenuButtonLogout" inherits="GameMenuButtonTemplate" text="LOGOUT">
                 <Anchors>
                     <Anchor point="TOPLEFT" relativeTo="GameMenuButtonMacros" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-20"/></Offset></Anchor>
                 </Anchors>
                 <Scripts>
-                    <OnLoad>self:SetText(LOGOUT)</OnLoad>
                     <OnShow>
                         if not StaticPopup_Visible("CAMP") and not StaticPopup_Visible("QUIT") then
                             self:Enable()
@@ -250,12 +338,11 @@
                     </OnClick>
                 </Scripts>
             </Button>
-            <Button name="GameMenuButtonQuit" inherits="GameMenuButtonTemplate">
+            <Button name="GameMenuButtonQuit" inherits="GameMenuButtonTemplate" text="EXIT_GAME">
                 <Anchors>
                     <Anchor point="TOPLEFT" relativeTo="GameMenuButtonLogout" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="0"/></Offset></Anchor>
                 </Anchors>
                 <Scripts>
-                    <OnLoad>self:SetText(EXIT_GAME)</OnLoad>
                     <OnShow>
                         if not StaticPopup_Visible("CAMP") and not StaticPopup_Visible("QUIT") then
                             self:Enable()
@@ -270,12 +357,11 @@
                     </OnClick>
                 </Scripts>
             </Button>
-            <Button name="GameMenuButtonContinue" inherits="GameMenuButtonTemplate">
+            <Button name="GameMenuButtonContinue" inherits="GameMenuButtonTemplate" text="RETURN_TO_GAME">
                 <Anchors>
                     <Anchor point="TOPLEFT" relativeTo="GameMenuButtonQuit" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-20"/></Offset></Anchor>
                 </Anchors>
                 <Scripts>
-                    <OnLoad>self:SetText(RETURN_TO_GAME)</OnLoad>
                     <OnClick>
                         PlaySound("igMainMenuContinue")
                         HideUIPanel(GameMenuFrame)
@@ -286,11 +372,10 @@
         <!-- ref GameMenuFrame OnShow/OnHide, verbatim: the micro row's Main Menu button pushes in
              while the menu is up, and the bag bar greys out under it (you cannot open bags from
              behind the menu — ShowUIPanel's center gate would refuse the window anyway, so the
-             greying is the visible half of a rule the panel manager already enforces). Guarded, the
-             UiPanels.xml `CloseMenus and CloseMenus()` posture: a headless test loads this file
-             without the action bar behind it. -->
+             greying is the visible half of a rule the panel manager already enforces). Guarded, in
+             the `CloseMenus and CloseMenus()` posture our retired panel file used: a headless test
+             loads this file without the action bar behind it. -->
         <Scripts>
-            <OnLoad>GameMenuFrameTitle:SetText(MAIN_MENU)</OnLoad>
             <OnShow>
                 -- The shared era-window scale first (ERA_WINDOW_SCALE, OptionsFrame.xml — loaded
                 -- before this file): the era menu has no scale of its own (GameMenuFrame.xml +

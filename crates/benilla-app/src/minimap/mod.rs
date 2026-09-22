@@ -1,7 +1,7 @@
 //! The HUD minimap renderer (decision 0203 phase 1) — the app half of the `<Minimap>` widget.
 //!
 //! The engine side (benilla-ui) carries the widget's rect + zoom and emits a
-//! `QuadContent::Minimap` hole at the frame's own draw slot; `ui_script::extract::drive_script` parks that
+//! `QuadContent::Minimap` hole at the frame's own draw slot; `ui_script::extract::paint_script` parks that
 //! in [`MinimapWidget`], and [`emit_minimap`] (in the [`UiQuadAppend`] window) fills it: the
 //! streamed tile window around the player, clipped to the widget rect and masked to the
 //! `MinimapMask.blp` circle at present time, with the player arrow rotating on top. Children of
@@ -27,7 +27,7 @@
 //! stem; [`blips`] — the phase-3 blip layer (AreaPOI landmark arrows, quest-giver dots, the
 //! hover tooltip).
 
-mod blips;
+pub(crate) mod blips;
 /// The party blip's position law, shared with the world map (report B320): one function decides
 /// where a member is, so the two surfaces can never disagree about it.
 pub(crate) use blips::party_member_pos;
@@ -129,7 +129,7 @@ fn texel_stretch(extent_yd: f32) -> f32 {
 /// above `224/255` (wow-re `system/minimap/scratch/wmo-interior-minimap-composite.md`, VERIFIED).
 /// Written as the exact f32 the client computes rather than the ratio, because that ULP is the
 /// value fragments are compared against.
-const INTERIOR_TILE_ALPHA_REF: f32 = f32::from_bits(0x3F60_E0E2);
+pub(crate) const INTERIOR_TILE_ALPHA_REF: f32 = f32::from_bits(0x3F60_E0E2);
 
 /// The corpse blip's edge as a fraction of the widget side (the POIIcons cell is authored 16px on
 /// a 140px minimap ≈ 0.11; INTERIM eyeball beside [`ARROW_FRACTION`]'s).
@@ -210,7 +210,7 @@ fn probe_minimap_widget(mut widget: ResMut<MinimapWidget>, windows: Query<&Windo
     });
 }
 
-/// This frame's extracted `<Minimap>` widget slot, written by `ui_script::extract::drive_script` (the
+/// This frame's extracted `<Minimap>` widget slot, written by `ui_script::extract::paint_script` (the
 /// `QuadContent::Minimap` arm) — `None` when no Minimap widget is visible (cluster hidden, no XML).
 #[derive(Resource, Default)]
 pub(crate) struct MinimapWidget(pub(crate) Option<MinimapSlot>);
@@ -236,6 +236,23 @@ pub(crate) struct MinimapZoom {
     /// `minimapInsideZoom` — the indoor index (the radius table's), persisted separately so zooming
     /// indoors never disturbs the outdoor level.
     pub(crate) inside: u8,
+}
+
+/// The two zoom indices' change callback (1131, 2303): each index lands on its own field,
+/// clamped exactly like the client's `set_zoom` (`0x6daa10`: clamp at 5) — the widget clamps
+/// again on the way in, so a hand-edited level lands in range whichever path it takes.
+pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut zoom: ResMut<MinimapZoom>) {
+    match ev.key().as_str() {
+        "minimapzoom" => zoom.outdoor = zoom_index(ev.num()),
+        "minimapinsidezoom" => zoom.inside = zoom_index(ev.num()),
+        _ => {}
+    }
+}
+
+/// A stored minimap zoom level → a valid index: truncate to int and clamp into
+/// `[0, MINIMAP_ZOOM_LEVELS)`, the client's own `set_zoom` clamp.
+fn zoom_index(v: f32) -> u8 {
+    v.clamp(0.0, f32::from(benilla_ui::widget::MINIMAP_ZOOM_LEVELS - 1)) as u8
 }
 
 impl Default for MinimapZoom {
@@ -274,10 +291,6 @@ struct MinimapAssets {
     /// (`Rotating-MinimapArrow.mdx`) the reference re-animates per blip source. See
     /// [`blips::RimArrow`] for the sequence→layer table and why there are four of them.
     rim_arrows: blips::RimArrowArt,
-    /// The ping marker's three drawn layers — the flat re-expression of `MinimapPing.mdx`'s
-    /// coincident additive quads, at the model's own byte-measured sizes and animation
-    /// ([`ping::PingArt`], decisions 1596/1599).
-    ping: ping::PingArt,
     /// The unit-blip atlas (`Interface\Minimap\ObjectIcons`, five 32-px dot cells) — the
     /// quest-giver dots.
     object_icons: Option<Handle<Image>>,
@@ -315,7 +328,7 @@ fn setup_minimap(
         Ok(translate) => {
             info!("minimap: md5translate.trs — {} tiles", translate.len());
             let mask = assets.mask_texture("Textures\\MinimapMask", &mut images);
-            let arrow = assets.sprite_texture("Interface\\Minimap\\MinimapArrow", &mut images);
+            let arrow = assets.sprite_texture(blips::PLAYER_ARROW_TEXTURE, &mut images);
             let poi = assets.sprite_texture("Interface\\Minimap\\POIIcons", &mut images);
             let mut rim_arrows = blips::RimArrowArt::default();
             for kind in blips::RimArrow::ALL {
@@ -323,29 +336,6 @@ fn setup_minimap(
             }
             let object_icons =
                 assets.sprite_texture("Interface\\Minimap\\ObjectIcons", &mut images);
-            // `ping6` is deliberately absent: the model carries it on two quads whose weight
-            // track is a single key of 0, so the client culls those batches before it reads their
-            // blend mode. Loading it would be loading art that never draws.
-            let ping = ping::PingArt {
-                ping5: assets.sprite_texture("Interface\\Minimap\\Ping\\ping5", &mut images),
-                ping2: assets.sprite_texture("Interface\\Minimap\\Ping\\ping2", &mut images),
-                ping4: assets.sprite_texture("Interface\\Minimap\\Ping\\ping4", &mut images),
-            };
-            // Per layer, not just "none of them": the three do different jobs, and a silently
-            // absent `ping4` would cost the ring — the one thing the eye actually reads — while
-            // the marker still looked plausible (1203's rule, applied to art).
-            for (name, present) in [
-                ("ping5", ping.ping5.is_some()),
-                ("ping2", ping.ping2.is_some()),
-                ("ping4", ping.ping4.is_some()),
-            ] {
-                if !present {
-                    warn!(
-                        "minimap: Interface\\Minimap\\Ping\\{name} missing — the ping marker \
-                           will draw without that layer"
-                    );
-                }
-            }
             if mask.is_none() {
                 warn!("minimap: MinimapMask.blp missing — the map will draw square");
             }
@@ -366,7 +356,6 @@ fn setup_minimap(
                 poi,
                 rim_arrows,
                 object_icons,
-                ping,
                 forms,
             });
         }
@@ -428,7 +417,6 @@ fn minimap_interior<'a>(
 /// Fills the extracted widget hole: the visible tile quads (clipped to the widget, masked to the
 /// circle) and the player arrow, appended at the widget's own z (stable sort keeps append order
 /// within a key, so the arrow rides above the tiles and below the widget's children).
-#[allow(clippy::too_many_arguments)]
 fn emit_minimap(
     widget: Res<MinimapWidget>,
     assets: Option<Res<MinimapAssets>>,
@@ -490,9 +478,12 @@ fn emit_minimap(
     // `WOW_MM_ZOOM=0..5` forces the zoom level of whichever map is showing — a capture instrument
     // (pairs with the `WOW_MM_PROBE` interior probe). Indoors and outdoors each carry their own
     // persisted index, so the override stands in for both.
-    let zoom_override = std::env::var("WOW_MM_ZOOM")
-        .ok()
-        .and_then(|s| s.parse::<u8>().ok());
+    static ZOOM_OVERRIDE: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    let zoom_override = *ZOOM_OVERRIDE.get_or_init(|| {
+        std::env::var("WOW_MM_ZOOM")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+    });
     let zoom = zoom_override.unwrap_or(slot.zoom);
     let inside_zoom = zoom_override.unwrap_or(slot.inside_zoom);
     let center = (slot.rect.min + slot.rect.max) * 0.5;
@@ -662,7 +653,8 @@ fn emit_minimap(
         // how many groups the flood-fill kept out of how many, and how many tiles that came to. The
         // reference's own Stormwind capture emitted 57 tiles at indoor zoom 3, which is the number
         // this is here to be compared against (wow-re `wmo-interior-no-adt-underlay.md`).
-        if std::env::var("WOW_MM_STATS").is_ok() {
+        static MM_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *MM_STATS.get_or_init(|| std::env::var_os("WOW_MM_STATS").is_some()) {
             eprintln!(
                 "MM-STATS: radius {radius} yd, groups {}/{} selected, {} tiles composited",
                 drawable.iter().filter(|d| **d).count(),
@@ -751,17 +743,20 @@ fn emit_minimap(
     // draw under the player arrow; the quest dots draw LAST — above it (the client's own draw
     // order). Hover lands in [`blips::MinimapBlipHover`] for the tooltip drive.
     // Our own descriptor's tracking state (PRIVATE fields — only ever on the self entity).
-    let tracking = self_store
-        .iter()
-        .next()
-        .map(|s| blips::SelfTracking {
+    let me = self_store.iter().next();
+    // Our own guid — the classifier compares a candidate's charm/summon owner against it, so our
+    // own pet and minions never take a dot (§W15 Q2d).
+    let self_guid = me.map(|(_, g)| g.0);
+    let tracking = me
+        .map(|(s, _)| blips::SelfTracking {
             creatures: s.0.player_track_creatures(),
             resources: s.0.player_track_resources(),
             stealthed: s.0.player_track_stealthed(),
         })
         .unwrap_or_default();
     let blip_ctx = (blip_px_per_yd > 0.0).then(|| {
-        if std::env::var("WOW_MM_BLIP_PROBE").is_ok() {
+        static BLIP_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *BLIP_PROBE.get_or_init(|| std::env::var_os("WOW_MM_BLIP_PROBE").is_some()) {
             eprintln!(
                 "BLIP-PROBE: arrow_art={} pois={} map={} wx={wx:.0} wy={wy:.0} px_per_yd={blip_px_per_yd:.3} track_c={:#x} track_r={:#x} track_s={}",
                 blips::RimArrow::ALL
@@ -872,6 +867,7 @@ fn emit_minimap(
                 tracking,
                 &tracked,
                 quest.statuses(),
+                self_guid,
                 &names,
                 &go_templates,
                 locks.as_deref().map(|l| &l.0),
@@ -885,8 +881,8 @@ fn emit_minimap(
             blips::emit_quest_dots(
                 ctx,
                 quest.statuses(),
-                &guids,
-                &unit_pos,
+                &tracked,
+                self_guid,
                 icons,
                 player_indoors,
                 // A dot NPC's own containment — the same faces-only down-ray the entity light
@@ -929,14 +925,12 @@ fn emit_minimap(
         }
     }
 
-    // The ping draws LAST — above the dots and the player arrow. In the reference `MiniMapPing` is
-    // a Lua Frame child of the Minimap, so it composites over everything the engine drew into the
-    // widget's hole; ours is engine-drawn but keeps that place in the order.
-    //
-    // This is also where a `Minimap:PingLocation` click is drained: the geometry it must resolve
-    // against is the geometry standing right here, this frame (decision 1596).
+    // A `Minimap:PingLocation` click is seated here, against the geometry standing right here,
+    // this frame (decision 1596). The marker itself is the stock `MiniMapPing` `<Model>`, a Lua
+    // child of the Minimap that composites over everything the engine drew into the widget's
+    // hole — rendered by `crate::ui_models` since decision 2008.
     if let Some(ctx) = &blip_ctx {
-        ping::emit_ping(ctx, &mut ping, click, map.0, &assets.ping, &mut quads);
+        ping::seat_click(ctx, &mut ping, click);
     }
 }
 
@@ -957,7 +951,6 @@ fn emit_minimap(
 /// — the client's own signal for "the effective zoom changed" (FrameXML `Minimap_OnEvent`). Without it
 /// the buttons keep the level you left (e.g. `ZoomIn` greyed from an outdoor max-zoom, still greyed
 /// indoors at level 3), which is the director's report (2026-07-09).
-#[allow(clippy::too_many_arguments)] // one Bevy system's full input set
 fn feed_minimap_inside(
     script: Option<bevy::ecs::system::NonSendMut<benilla_ui::script::UiScript>>,
     world: benilla_world::world_point::WorldPoint,
@@ -1082,6 +1075,8 @@ pub(crate) struct MinimapPlugin;
 
 impl Plugin for MinimapPlugin {
     fn build(&self, app: &mut App) {
+        ping::register(app);
+        app.add_observer(on_cvar);
         app.init_resource::<MinimapWidget>()
             .init_resource::<MinimapZoom>()
             .init_resource::<MinimapTileCache>()
@@ -1098,6 +1093,11 @@ impl Plugin for MinimapPlugin {
                     probe_minimap_widget
                         .in_set(UiQuadAppend)
                         .before(emit_minimap),
+                    // Deliberately NOT on the lighting resolve's read side, though it reads
+                    // `WowLighting` (decision 2032): joining `LightingConsumeSet` would put a
+                    // 178th engine item through the world API wall, and what it buys is one
+                    // frame of the right day-night tint on a 140 px map — invisible even on a
+                    // submersion crossing, which is the one moment that value jumps.
                     emit_minimap.in_set(UiQuadAppend),
                     // After the emit that fills it: the composite camera draws what THIS frame's
                     // interior branch asked for, so the target the blit quad samples is never a
@@ -1105,27 +1105,36 @@ impl Plugin for MinimapPlugin {
                     composite::drive_composite.after(UiQuadAppend),
                     // Before the script tick, so a zoom button pressed this frame routes to the
                     // indoor/outdoor index that matches where the player actually is.
-                    feed_minimap_inside.before(crate::ui_script::UiInput),
+                    feed_minimap_inside.in_set(crate::ui_script::UiFeed),
                     // Before the script tick, so an addon's OnUpdate steers off this frame's
                     // heading rather than last frame's.
-                    feed_minimap_player_facing.before(crate::ui_script::UiInput),
-                    // Before the emit that reads `MinimapAssets::mask`, so a mask set this frame
-                    // is the one this frame draws with.
-                    feed_minimap_mask.before(UiQuadAppend),
+                    feed_minimap_player_facing.in_set(crate::ui_script::UiFeed),
+                    // After the tick that can call `Minimap:SetMaskTexture`, before the emit that
+                    // reads `MinimapAssets::mask`: a mask set this frame is the one this frame
+                    // draws with.
+                    feed_minimap_mask
+                        .after(crate::ui_script::UiInput)
+                        .before(UiQuadAppend),
                     // Before the script tick, and after the containment verdict it reads: the
                     // `MINIMAP_PING` event and `Minimap:GetPingPosition()`'s value land in the
                     // same tick, on a ping the renderer already drew at the end of last frame.
+                    // Gated on the interface being up (decision 2279): a group member's
+                    // `MSG_MINIMAP_PING` can land in the same drain as the login burst, and the
+                    // `fresh` latch it sets is spent by this system's take — on the boot VM, with
+                    // no `MiniMapPing` frame to show it, if this ran in 2214's one-frame window.
+                    // Gated, the latch simply waits for the first frame with an interface.
                     ping::drive_minimap_ping
                         .after(feed_minimap_inside)
-                        .before(crate::ui_script::UiInput),
+                        .in_set(crate::ui_script::UiFeed)
+                        .run_if(crate::ui_script::ingame_ui_up),
                     // Before the script tick, so GameTimeFrame's OnUpdate reads this frame's
                     // minute, not last frame's.
-                    feed_game_time.before(crate::ui_script::UiInput),
+                    feed_game_time.in_set(crate::ui_script::UiFeed),
                     // After the world-mouseover drive (UnitFeed): a same-frame world-hover→blip
                     // transition must end with the blip tooltip shown, not the fade.
                     blips::drive_blip_tooltip
                         .after(crate::ui_unit::UnitFeed)
-                        .before(crate::ui_script::UiInput),
+                        .in_set(crate::ui_script::UiFeed),
                 ),
             );
     }

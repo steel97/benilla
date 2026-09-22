@@ -49,7 +49,8 @@ use super::char_skin::{
     build_char_skin_materials, equip_geosets, resolve_char_look, resolve_worn_equip,
     CharSkinMaterials,
 };
-use super::dress::{part_materials, spawn_part, DressedPart, PartDress};
+use super::dress::{part_materials, spawn_group, DressedPart, PartDress};
+use super::merge::{self, DressedGroup, MergedFormsCache};
 
 /// The per-part write surface of a re-dress: the displayed material and the three records that
 /// decide what a part draws when something *else* owns that channel — the interior classifier's law
@@ -67,7 +68,7 @@ type PartWrites<'a> = (
 /// creature's look never changes this way, and a character-model NPC wears its display's columns —
 /// a *display* change is a different model and stays a teardown
 /// ([`super::super::live_display::refresh_live_display`]).
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub(in crate::entities) fn redress_player_looks(
     mut commands: Commands,
     mut players: Query<
@@ -90,6 +91,7 @@ pub(in crate::entities) fn redress_player_looks(
     // The parts already standing under those players — found again by the batch index each carries.
     mut standing: Query<(
         &DressedPart,
+        Option<&DressedGroup>,
         Option<&mut MeshMaterial3d<WowModelMaterial>>,
         Option<&mut InteriorLit>,
         Option<&mut FadeMaterials>,
@@ -110,11 +112,30 @@ pub(in crate::entities) fn redress_player_looks(
         ResMut<SkinComposites>,
         Res<AssetServer>,
         benilla_world::model_render::M2BatchMaterials,
+        ResMut<Assets<Mesh>>,
+        ResMut<MergedFormsCache>,
+    ),
+    // The animated-material lane a re-dressed part may need a material of its own on (2295).
+    // Plumbing here rather than a live case: a re-dress is a PLAYER's gear change, and no
+    // character batch in the corpus carries a per-sequence loop — but the dressing law is one law,
+    // and a path that could not express it would be a place for the two to drift.
+    mut own_lane: (
+        ResMut<benilla_world::doodad_anim::UvAnimMaterials>,
+        ResMut<benilla_world::doodad_anim::TintAnimMaterials>,
+        ResMut<benilla_world::mat_anim_table::MatAnimTable>,
     ),
     time: Res<Time>,
 ) {
-    let (sections, world_assets, mut images, mut skin_composites, asset_server, mut mats) =
-        skin_build;
+    let (
+        sections,
+        world_assets,
+        mut images,
+        mut skin_composites,
+        asset_server,
+        mut mats,
+        mut meshes,
+        mut merged,
+    ) = skin_build;
     let now = time.elapsed_secs();
     for (entity, net, live, mut applied, children, rig, bones, mut pose, bake_center, unit_fade) in
         &mut players
@@ -141,7 +162,13 @@ pub(in crate::entities) fn redress_player_looks(
         // The dressing inputs, re-resolved exactly as the first build resolved them.
         let worn = resolve_worn_equip(net, Some(live), Some(dm));
         let look = resolve_char_look(net, Some(dm), entity, &stores);
-        let eg = equip_geosets(displays.as_deref(), &worn.bodyslots, worn.cloak, worn.helm);
+        let eg = equip_geosets(
+            displays.as_deref(),
+            &worn.bodyslots,
+            worn.cloak,
+            worn.helm,
+            worn.tabard_preview,
+        );
         let visible: Option<Vec<u16>> = look.as_ref().and_then(|l| {
             let cg = characters.as_deref()?;
             Some(cg.0.visible_geosets(l.race, l.sex, l.hair_style, l.facial_hair, &eg))
@@ -154,6 +181,7 @@ pub(in crate::entities) fn redress_player_looks(
                 worn.bodyslots,
                 worn.cloak,
                 worn.emblem,
+                worn.tabard_preview,
                 displays.as_deref(),
                 sections.as_deref(),
                 world_assets.as_deref(),
@@ -168,12 +196,24 @@ pub(in crate::entities) fn redress_player_looks(
         // No look (a druid form, a GM morph — a Player-kind entity on a beast display) means no
         // geoset filter, exactly as at build: every batch the model authors draws.
         let shows = |geoset: u16| visible.as_ref().is_none_or(|v| v.contains(&geoset));
+        // The grouping the new gear asks for (`merge`): a standing group survives exactly when
+        // the new grouping contains its member set unchanged — then it re-points in place like
+        // any part; otherwise it is torn down and the new group spawns whole. Keyed by first
+        // member, which is what a standing entity's `DressedPart::index` carries.
+        let groups = merge::guard_groups(
+            merge::group_parts(parts, |p| shows(p.geoset_id)),
+            parts,
+            &char_mats,
+        );
+        let group_of: std::collections::HashMap<u32, &merge::BodyGroup> =
+            groups.iter().map(|g| (g.first(), g)).collect();
 
         // Pass 1 — the parts already standing: hide-by-despawn, or re-point.
         let mut present = vec![false; parts.len()];
         let (mut hidden, mut repointed) = (0usize, 0usize);
         for child in children.iter() {
-            let Ok((dp, mat, lit, fade_mats, portrait, ramping, pending)) = standing.get_mut(child)
+            let Ok((dp, group, mat, lit, fade_mats, portrait, ramping, pending)) =
+                standing.get_mut(child)
             else {
                 continue;
             };
@@ -181,7 +221,14 @@ pub(in crate::entities) fn redress_player_looks(
             let Some(part) = parts.get(dp.index as usize) else {
                 continue; // a stale index (the model rebuilt under us) — leave it to the teardown
             };
-            if !shows(part.geoset_id) {
+            let standing_members: &[u32] = match group {
+                Some(g) => &g.0,
+                None => std::slice::from_ref(&dp.index),
+            };
+            let still_grouped = group_of
+                .get(&dp.index)
+                .is_some_and(|g| g.members == standing_members);
+            if !shows(part.geoset_id) || !still_grouped {
                 // A billboard batch's card is a world ROOT following this anchor's joint, so it does
                 // not cascade — reap it by name (decision 0153's lifecycle, [`DressedPart::card`]).
                 if let Some(card) = dp.card {
@@ -193,7 +240,9 @@ pub(in crate::entities) fn redress_player_looks(
                 hidden += 1;
                 continue;
             }
-            present[dp.index as usize] = true;
+            for &m in standing_members {
+                present[m as usize] = true;
+            }
             // A card's material is the model's own batch material — never a character slot — so a
             // billboard part has nothing to re-point.
             if part.billboard.is_none() {
@@ -242,11 +291,24 @@ pub(in crate::entities) fn redress_player_looks(
             fade: join_unit_appear_fade(unit_fade.copied()),
         };
         let mut shown = 0usize;
-        for (i, part) in parts.iter().enumerate() {
-            if present[i] || !shows(part.geoset_id) {
+        for group in &groups {
+            if present[group.first() as usize] {
                 continue;
             }
-            spawn_part(&mut commands, part, i, &dress);
+            let forms = merged.forms(parts, group, &mut meshes);
+            let part = merge::group_part(parts, group, forms);
+            spawn_group(
+                &mut commands,
+                &part,
+                group,
+                &dress,
+                &mut super::dress::OwnMats {
+                    store: mats.materials(),
+                    uv: &mut own_lane.0,
+                    tint: &mut own_lane.1,
+                    table: &mut own_lane.2,
+                },
+            );
             shown += 1;
         }
         // One line per re-dress — a handful per session, and the only readout of a mechanism whose
@@ -328,13 +390,21 @@ mod tests {
 
     /// One synthetic body batch at `geoset`.
     fn part(geoset: u16) -> EntityPart {
+        // A DISTINCT material per stub batch: every real batch of a model has its own built
+        // material unless it shares a texture, and a fixture whose batches all bound the one
+        // default handle would merge into a single group (`merge`) and stop being the
+        // per-batch hide/show/re-point walk these tests are about.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         EntityPart {
             mesh: Handle::default(),
             geometry: std::sync::Arc::new(benilla_formats::RenderSubmesh::default()),
             aabb: None,
             skinned_mesh: None,
             welded_billboard: false,
-            material: Handle::default(),
+            material: Handle::from(bevy::asset::uuid::Uuid::from_u128(
+                0xd0d0_0000 + u128::from(n),
+            )),
             material_interior: None,
             material_interior_bake: None,
             material_interior_bake_blend: None,
@@ -348,6 +418,11 @@ mod tests {
             billboard: None,
             alpha_anim: None,
             rgb_anim: None,
+            rgb_seq: None,
+            uv_anim: None,
+            uv_seq: None,
+            uv_rot_seq: None,
+            uv_scale_seq: None,
             ground_quad: None,
         }
     }
@@ -372,9 +447,15 @@ mod tests {
             .init_asset::<Image>()
             .init_asset::<WowModelMaterial>()
             .init_resource::<SkinComposites>()
+            .init_resource::<MergedFormsCache>()
             // The engine's material cache — normally `model_render::plugin`'s, which this bare
             // harness does not install.
-            .init_resource::<benilla_world::model_render::ModelMaterials>();
+            .init_resource::<benilla_world::model_render::ModelMaterials>()
+            // The animated-material lane the dressing path now takes (2295) — never exercised by
+            // a re-dress, which is a player's gear change, but the system asks for it.
+            .init_resource::<benilla_world::doodad_anim::UvAnimMaterials>()
+            .init_resource::<benilla_world::doodad_anim::TintAnimMaterials>()
+            .init_resource::<benilla_world::mat_anim_table::MatAnimTable>();
 
         let mut dm = empty_display();
         dm.parts = Some(geosets.iter().map(|g| part(*g)).collect());

@@ -88,20 +88,22 @@ pub(crate) fn rig_origin_region_bytes() -> u64 {
 
 /// Byte offset of the palette rows themselves — after the slot table, the per-instance tint table
 /// that shares this slot index ([`crate::instance_tint`], decision 0812), the origin table, and
-/// the mat-anim delta table ([`crate::mat_anim_table`], decision 1381). The rows stay last
-/// because `wow_model.wgsl` declares them as the struct's one runtime-sized array.
+/// the mat-anim delta table ([`crate::mat_anim_table`], decision 1381), and the straddle clip
+/// table ([`crate::straddle`], decision 2188). The rows stay last because `wow_model.wgsl`
+/// declares them as the struct's one runtime-sized array.
 pub(crate) fn palette_region_offset() -> u64 {
-    crate::mat_anim_table::region_offset() + crate::mat_anim_table::region_bytes()
+    crate::straddle::region_offset() + crate::straddle::region_bytes()
 }
 
 /// Total bytes the slot-indexed regions add to every `wow_light`-layout buffer
 /// (`lighting::light_blob_bytes`): the rig slot table, the instance-tint table, the origin table,
-/// the palette rows.
+/// the mat-anim table, the straddle clip table, the palette rows.
 pub(crate) fn palette_regions_bytes() -> u64 {
     (MAX_RIG_SLOTS * 4) as u64
         + crate::instance_tint::region_bytes()
         + rig_origin_region_bytes()
         + crate::mat_anim_table::region_bytes()
+        + crate::straddle::region_bytes()
         + MAX_PALETTE_BONES as u64 * BONE_BYTES
 }
 
@@ -111,6 +113,8 @@ pub(crate) fn palette_regions_bytes() -> u64 {
 pub struct RigPalettes {
     /// `3 × MAX_PALETTE_BONES` vec4 rows — the CPU mirror (the mouseover picker reads it).
     rows: Arc<Vec<[f32; 4]>>,
+    /// The row buffer retired by the last clone (`rows_make_mut`), reused once unshared.
+    spare: Option<Arc<Vec<[f32; 4]>>>,
     /// Slot → base bone index. Slot 0 is the tag's "no rig" sentinel and never allocated.
     table: Arc<Vec<u32>>,
     /// Slot → the world position this rig's rows are measured from (decision 0974); `w` unused.
@@ -142,6 +146,10 @@ pub struct RigPalettes {
     /// Allocations refused since the last census line (`WOW_RIG_CENSUS`) — the exhaustion
     /// diagnosis's live denial rate (decision 0863). Read-and-reset by [`census_rig_palettes`].
     denied: u32,
+    /// Has the exhaustion warn already been logged this session? A latch, not a counter, and
+    /// deliberately never reset: [`Self::denied`] is `mem::take`n by the census, so gating the
+    /// warn on it would re-fire once per census window instead of once per session (2264).
+    denied_warned: bool,
     /// `WOW_RIG_COST` meters (decision 0736 premise check): whole-vec deep copies this frame
     /// (`Arc::make_mut` clones when the extract still holds last publish's reference), the µs
     /// they took, and the rows (bones) written. Printed + reset by [`publish_rig_palettes`].
@@ -154,6 +162,7 @@ impl Default for RigPalettes {
     fn default() -> Self {
         Self {
             rows: Arc::new(vec![[0.0; 4]; 3 * MAX_PALETTE_BONES]),
+            spare: None,
             table: Arc::new(vec![0; MAX_RIG_SLOTS]),
             origins: Arc::new(vec![[0.0; 4]; MAX_RIG_SLOTS]),
             origin_generation: 0,
@@ -169,6 +178,7 @@ impl Default for RigPalettes {
             peak_bones: 0,
             live_bones: 0,
             denied: 0,
+            denied_warned: false,
             cost_copies: 0,
             cost_copy_us: 0.0,
             cost_rows: 0,
@@ -196,6 +206,7 @@ pub fn rig_cost_enabled() -> bool {
 /// invariant (see [`RigPalettes::bone_watermark`]), so the prefix IS the whole content.
 fn rows_make_mut<'a>(
     rows: &'a mut Arc<Vec<[f32; 4]>>,
+    spare: &mut Option<Arc<Vec<[f32; 4]>>>,
     watermark_bones: u32,
     copies: &mut u32,
     copy_us: &mut f32,
@@ -203,19 +214,24 @@ fn rows_make_mut<'a>(
     if Arc::strong_count(rows) > 1 || Arc::weak_count(rows) > 0 {
         let t = std::time::Instant::now();
         let live = 3 * watermark_bones as usize;
-        let mut new = vec![[0.0f32; 4]; rows.len()];
+        // The retired buffer from two publishes ago, once the render world has let go of it:
+        // copy the live prefix in and take it back. Its tail is stale — and never read: the GPU
+        // only ever receives dirty ranges, so what the CPU vector holds past the watermark
+        // reaches nothing (the calloc'd zeros it replaced were never uploaded either). A fresh
+        // allocation only while the render world still holds both.
+        let mut new = match spare.take().and_then(|a| Arc::try_unwrap(a).ok()) {
+            Some(v) if v.len() == rows.len() => v,
+            _ => vec![[0.0f32; 4]; rows.len()],
+        };
         new[..live].copy_from_slice(&rows[..live]);
-        *rows = Arc::new(new);
+        *spare = Some(std::mem::replace(rows, Arc::new(new)));
         *copy_us += t.elapsed().as_secs_f32() * 1e6;
         *copies += 1;
     }
-    // Sole owner here either way: no clone left to happen.
+    // Uniquely owned now — `make_mut` is a plain borrow.
     Arc::make_mut(rows)
 }
 
-/// Move a world affine into the rig's own frame (decision 0974): same 3×3, translation measured
-/// from `origin`. The subtraction is where the ~9 k-yard magnitude leaves the number — everything
-/// downstream of it is a rig-sized quantity.
 fn rebase(mut world: Affine3A, origin: Vec3) -> Affine3A {
     world.translation -= bevy::math::Vec3A::from(origin);
     world
@@ -287,6 +303,21 @@ impl RigPalettes {
         } else {
             self.free_ranges[i] = (base + bones, len - bones);
         }
+        // A fresh range starts at zero rows: the spare-buffer reuse (`rows_make_mut`) means the
+        // CPU mirror above the watermark is a previous occupant's pose, and three readers
+        // (`write_rig`'s torn-joint keep, `write_rider`'s unchanged compare, the computed-rig
+        // readbacks) assume an unallocated row is zero (review 2026-09-04).
+        let (r0, r1) = (3 * base as usize, 3 * (base + bones) as usize);
+        let wm = self.bone_watermark();
+        let rows = rows_make_mut(
+            &mut self.rows,
+            &mut self.spare,
+            wm,
+            &mut self.cost_copies,
+            &mut self.cost_copy_us,
+        );
+        let r1 = r1.min(rows.len());
+        rows[r0..r1].fill([0.0; 4]);
         Arc::make_mut(&mut self.table)[slot as usize] = base;
         self.slot_len[slot as usize] = bones;
         self.mirrored[slot as usize] = false;
@@ -317,6 +348,7 @@ impl RigPalettes {
         let wm = self.bone_watermark();
         let rows = rows_make_mut(
             &mut self.rows,
+            &mut self.spare,
             wm,
             &mut self.cost_copies,
             &mut self.cost_copy_us,
@@ -385,6 +417,7 @@ impl RigPalettes {
         let wm = self.bone_watermark();
         let rows = rows_make_mut(
             &mut self.rows,
+            &mut self.spare,
             wm,
             &mut self.cost_copies,
             &mut self.cost_copy_us,
@@ -429,6 +462,7 @@ impl RigPalettes {
         let wm = self.bone_watermark();
         let rows = rows_make_mut(
             &mut self.rows,
+            &mut self.spare,
             wm,
             &mut self.cost_copies,
             &mut self.cost_copy_us,
@@ -487,6 +521,7 @@ impl RigPalettes {
         let wm = self.bone_watermark();
         let rows = rows_make_mut(
             &mut self.rows,
+            &mut self.spare,
             wm,
             &mut self.cost_copies,
             &mut self.cost_copy_us,
@@ -573,11 +608,19 @@ impl RigPalettes {
     /// why this returns the pair and [`Self::world_palette`] (a picker read, not a precision one)
     /// does not.
     pub fn rider_placement(&self, slot: u16) -> Option<(Vec3, Vec3)> {
+        self.row_placement(slot, 0)
+    }
+
+    /// The same pair for an arbitrary bone of a slot. A bind-pose rider repeats one frame across
+    /// every row, so row 0 answers for the model; a **posed** one (decision 2281 — the flexing
+    /// ranged prop) does not, and asking which bone is the only way to see that its rows differ at
+    /// all. `None` for an unallocated slot or a bone past its length.
+    pub fn row_placement(&self, slot: u16, bone: u32) -> Option<(Vec3, Vec3)> {
         let s = slot as usize;
-        if *self.slot_len.get(s)? == 0 {
+        if bone >= *self.slot_len.get(s)? {
             return None;
         }
-        let r = 3 * *self.table.get(s)? as usize;
+        let r = 3 * (*self.table.get(s)? + bone) as usize;
         let o = self.origins.get(s)?;
         Some((
             Vec3::new(o[0], o[1], o[2]),
@@ -667,7 +710,8 @@ impl RigSkin {
 
     /// Allocate a palette rig over live joint entities (the effect/booth/equipment lane — the
     /// change sweep computes its rows; doodads moved to [`Self::allocate_bones`], decision 1365).
-    /// `None` (with one loud warn per session) when the table is full — the caller renders the
+    /// `None` (with one loud warn per session — a promise this doc made for a long time before
+    /// the code kept it, 2264) when the table is full — the caller renders the
     /// static bind-pose mesh instead.
     pub fn allocate(
         palettes: &mut RigPalettes,
@@ -694,11 +738,22 @@ impl RigSkin {
             }),
             None => {
                 palettes.denied += 1;
-                let (s, b, ps, pb) = palettes.occupancy();
-                warn!(
-                    "rig palette exhausted ({bones} bones wanted; live {s} slots / {b} bones, \
-                     peak {ps}/{pb}) — rig renders at bind pose"
-                );
+                // **Once per session, as this function's doc has always promised.** It did not
+                // keep that promise: the denial path warned on every call, and the lazy-doodad
+                // caller retries *every frame while the host is drawn*
+                // (`doodad_anim::lazy` — "table full — the warn fired; the gate retries while
+                // drawn"), so a crowded scene turned one fact into a per-frame flood that buries
+                // every other warning in the log. The repeats were never the signal anyway:
+                // `denied` is already counted here and already reported by the palette census.
+                if !palettes.denied_warned {
+                    palettes.denied_warned = true;
+                    let (s, b, ps, pb) = palettes.occupancy();
+                    warn!(
+                        "rig palette exhausted ({bones} bones wanted; live {s} slots / {b} bones, \
+                         peak {ps}/{pb}) — rig renders at bind pose. Further denials are counted \
+                         in `denied`, not logged; run with WOW_RIG_CENSUS for the running tally."
+                    );
+                }
                 None
             }
         }
@@ -717,6 +772,11 @@ fn free_rig_skin(mut world: DeferredWorld, ctx: HookContext) {
     // that allocates the slot, and no tinted-unit teardown path has to remember to.
     if let Some(mut tints) = world.get_resource_mut::<crate::instance_tint::InstanceTints>() {
         tints.clear(slot);
+    }
+    // …and the straddle split's waterline (decision 2188), on the same index for the same reason:
+    // a recycled slot must not clip the next unit at the last one's water.
+    if let Some(mut clips) = world.get_resource_mut::<crate::straddle::WaterClips>() {
+        clips.clear(slot);
     }
 }
 
@@ -874,6 +934,8 @@ fn upload_rig_palettes(
     // Coalesce the per-rig dirty ranges before touching the queue: rigs allocate contiguously,
     // so a steady frame's ~750 one-rig ranges merge into a handful of runs — the 0724 ledger
     // measured the per-range `write_buffer` loop at 2.7 ms/frame, almost all call overhead.
+    // Small gaps (a parked body between two live ones) are bridged for the same reason
+    // (`COALESCE_GAP_BONES`).
     let all = coalesce_ranges(data.dirty.iter().map(|&(b, l, _)| (b, l)).collect());
     let mirrored_only = coalesce_ranges(
         data.dirty
@@ -932,13 +994,30 @@ fn upload_rig_palettes(
     }
 }
 
-/// Sort + merge overlapping/adjacent `(base, len)` bone ranges into maximal runs.
-fn coalesce_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+/// The gap (in bones) two dirty runs may leave between them and still upload as ONE
+/// `write_buffer`. A `queue.write_buffer` is not a memcpy: wgpu allocates a staging buffer per
+/// call, registers it, records the copy and releases it — a few microseconds of fixed cost
+/// against ~10 GB/s of copying, so re-sending up to this many *unchanged* rows (they are the
+/// live rows, straight out of `rows`; nothing stale can be written) is cheaper than a second
+/// call. Sized so the whole tolerance costs about what one call does. The case that needed it:
+/// a 40-man raid at the Stormwind auction house uploaded ~310 KB of rows in ~93 calls a frame
+/// (1929's `[rig-upload]` census), because parked bodies and idle props sit between the live
+/// rigs in the slab and a strictly-adjacent merge stops at every one of them.
+const COALESCE_GAP_BONES: u32 = 256;
+
+/// Sort + merge overlapping, adjacent, and *nearly* adjacent (gap ≤ [`COALESCE_GAP_BONES`])
+/// `(base, len)` bone ranges into maximal runs. Rows inside a bridged gap are written with their
+/// current contents.
+fn coalesce_ranges(ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    coalesce_ranges_with_gap(ranges, COALESCE_GAP_BONES)
+}
+
+fn coalesce_ranges_with_gap(mut ranges: Vec<(u32, u32)>, gap: u32) -> Vec<(u32, u32)> {
     ranges.sort_unstable_by_key(|r| r.0);
     let mut out: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
     for (base, len) in ranges {
         if let Some(last) = out.last_mut() {
-            if base <= last.0 + last.1 {
+            if base <= last.0 + last.1 + gap {
                 last.1 = (base + len).max(last.0 + last.1) - last.0;
                 continue;
             }
@@ -1169,7 +1248,13 @@ mod tests {
         // The extract's held reference — the shared state every first-write-of-a-frame sees.
         let held = p.rows.clone();
         let wm = p.bone_watermark();
-        let rows = rows_make_mut(&mut p.rows, wm, &mut p.cost_copies, &mut p.cost_copy_us);
+        let rows = rows_make_mut(
+            &mut p.rows,
+            &mut p.spare,
+            wm,
+            &mut p.cost_copies,
+            &mut p.cost_copy_us,
+        );
         rows[0] = [9.0; 4];
         assert_eq!(p.cost_copies, 1, "the shared write copied");
         assert_eq!(
@@ -1199,7 +1284,13 @@ mod tests {
         // A fresh shared write after the shrink still carries the survivor whole.
         let _held3 = p.rows.clone();
         let wm = p.bone_watermark();
-        let rows = rows_make_mut(&mut p.rows, wm, &mut p.cost_copies, &mut p.cost_copy_us);
+        let rows = rows_make_mut(
+            &mut p.rows,
+            &mut p.spare,
+            wm,
+            &mut p.cost_copies,
+            &mut p.cost_copy_us,
+        );
         rows[1] = [7.0; 4];
         assert_eq!(
             p.rows[0], [9.0; 4],
@@ -1326,10 +1417,30 @@ mod tests {
     fn dirty_ranges_coalesce_into_runs() {
         // Adjacent + overlapping merge; a hole splits. Order-independent (upload sorts).
         assert_eq!(
-            coalesce_ranges(vec![(70, 5), (0, 10), (10, 20), (25, 10), (40, 5)]),
+            coalesce_ranges_with_gap(vec![(70, 5), (0, 10), (10, 20), (25, 10), (40, 5)], 0),
             vec![(0, 35), (40, 5), (70, 5)]
         );
         assert_eq!(coalesce_ranges(Vec::new()), Vec::new());
+    }
+
+    #[test]
+    fn dirty_ranges_bridge_small_gaps_but_not_large_ones() {
+        // A parked rig's rows between two live ones (the raid's ~93-call frame): bridged, so
+        // the run is one call. A gap wider than the tolerance still splits.
+        assert_eq!(
+            coalesce_ranges_with_gap(vec![(0, 10), (14, 6), (30, 5)], 4),
+            vec![(0, 20), (30, 5)]
+        );
+        // The shipped tolerance bridges a gap of exactly its size and no more.
+        let g = COALESCE_GAP_BONES;
+        assert_eq!(
+            coalesce_ranges(vec![(0, 10), (10 + g, 5)]),
+            vec![(0, 15 + g)]
+        );
+        assert_eq!(
+            coalesce_ranges(vec![(0, 10), (11 + g, 5)]),
+            vec![(0, 10), (11 + g, 5)]
+        );
     }
 
     #[test]
@@ -1356,9 +1467,14 @@ mod tests {
             "the mat-anim table follows the origin table (decision 1381)"
         );
         assert_eq!(
-            palette_region_offset() - crate::mat_anim_table::region_offset(),
+            crate::straddle::region_offset() - crate::mat_anim_table::region_offset(),
             crate::mat_anim_table::region_bytes(),
-            "the palette rows follow the mat-anim table"
+            "the straddle clip table follows the mat-anim table (decision 2188)"
+        );
+        assert_eq!(
+            palette_region_offset() - crate::straddle::region_offset(),
+            crate::straddle::region_bytes(),
+            "the palette rows follow the straddle clip table"
         );
         assert_eq!(
             palette_regions_bytes(),
@@ -1366,6 +1482,7 @@ mod tests {
                 + crate::instance_tint::region_bytes()
                 + rig_origin_region_bytes()
                 + crate::mat_anim_table::region_bytes()
+                + crate::straddle::region_bytes()
                 + (MAX_PALETTE_BONES as u64) * BONE_BYTES
         );
         // One `vec4` per addressable slot — the shader declares `array<vec4<f32>, 2048>`.

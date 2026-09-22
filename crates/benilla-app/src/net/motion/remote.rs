@@ -127,7 +127,15 @@ pub(in crate::net) fn trace_relay(
         return;
     }
     let lead = chain.lead_ms(now_ms);
-    let kind = if mv.heartbeat { "hb" } else { "tr" };
+    // One tag per verb, `tp` and `rt` included: a mover that appears in the wrong place, or keeps
+    // sliding through a root, is the report where "did that packet arrive?" is the whole question,
+    // and the trace has to answer it without a second run (decisions 2061/2064).
+    let kind = match mv.verb {
+        benilla_protocol::RelayVerb::Heartbeat => "hb",
+        benilla_protocol::RelayVerb::Teleport => "tp",
+        benilla_protocol::RelayVerb::Root(_) => "rt",
+        benilla_protocol::RelayVerb::Pose => "tr",
+    };
     benilla_assets::trace::line(
         "rly",
         &format!(
@@ -205,9 +213,11 @@ fn rendered_pitch(rm: &RemoteMotion) -> f32 {
 /// - **`dz`** — the height the mover gained or lost **this frame**, *excluding* the packet applied
 ///   this frame (the drain runs first, so the anchor already carries it). A grounded mover riding the
 ///   surface moves in Z on every sloped frame; before 0626 the only thing that could move it was the
-///   pre-fire reconcile lerp, which skips heartbeats — so a mover running *straight* read `+0.000`
-///   sample after sample and took its height as a 2 Hz snap, which is the "delayed terrain snap"
-///   report. Read it against `age`: a nonzero `dz` at a large `age` is the ground, not the server.
+///   pre-fire reconcile lerp, which *this client* then wrongly skipped for heartbeats (decision
+///   2064: tag `0x26` is the teleport's, not the heartbeat's) — so a mover running *straight* read
+///   `+0.000` sample after sample and took its height as a 2 Hz snap, which is the "delayed terrain
+///   snap" report. Read it against `age`: a nonzero `dz` at a large `age` is the ground, not the
+///   server.
 /// - **`held`** — how much of this frame's intended horizontal travel the world took away. Sustained
 ///   nonzero is a mover being *held* against a wall by our colliders (right); a flat zero for a mover
 ///   whose own client is stopped dead is the dead-reckon marching into the geometry (wrong), and it
@@ -384,7 +394,24 @@ pub(in crate::net) fn apply_move(
     }
     rm.wow_pos = ev.position;
     rm.orientation = ev.orientation;
-    rm.flags = ev.flags;
+    // **A merge, not an assignment** (decision 2064): the reference folds a relayed word through
+    // `0x75a07dff` at `0x618de7`, keeping the client-owned bits outside it — `ON_TRANSPORT` above
+    // all, which is why a relayed pose relocates a rider without deboarding them. Today every bit
+    // benilla holds on a watched mover comes from the wire and lands inside the mask, so this
+    // changes no behaviour; it stops the next bit added from silently being the one that does.
+    rm.flags = move_flags::merge_server_authored(rm.flags, ev.flags);
+    // …and then the ONE verb whose opcode outranks the word it arrived with. `SetRoot 0x7c7340`
+    // sets `0x1000` and wipes the motion bits once (`& 0xffe07f00` — this is what stops a rooted
+    // body coasting); `ClearRoot 0x7c7370` only clears the bit and invents no movement. Both run
+    // unconditionally after the merge, so a root holds whether or not the server was careful to
+    // send an already-wiped word.
+    match ev.verb {
+        benilla_protocol::RelayVerb::Root(true) => {
+            rm.flags = (rm.flags | move_flags::ROOT) & super::modes::ROOT_APPLY_WIPE;
+        }
+        benilla_protocol::RelayVerb::Root(false) => rm.flags &= !move_flags::ROOT,
+        _ => {}
+    }
     rm.pitch = ev.pitch;
     rm.vertical_velocity = vertical_velocity;
     rm.jump_xy_vel = jump_xy_vel;
@@ -445,10 +472,13 @@ pub(in crate::net) fn drain_pending_moves(
 /// Without it the extrapolation ran in a vacuum, and the two symptoms that follow are the ones the
 /// director reported. **Height:** [`RemoteMotion::advance`] never moves a grounded mover's Z, so Z
 /// changed only where a *packet* put it — at the apply, or dragged there by the pre-fire reconcile
-/// lerp. The lerp skips heartbeats, and a mover running **straight** sends nothing else that carries
-/// position (0617's frame-cadence stream is `SET_FACING`, sent only while turning) — so a straight run
-/// gave a 2 Hz height staircase under a continuous XY, which sinks a watched player into ground that
-/// rises under them and floats them over ground that falls away, at the same rate. **Geometry:** a
+/// lerp. The lerp skipped heartbeats *in this client* — a mis-attribution corrected by 2064, where
+/// the reference skips the teleport instead — and a mover running **straight** sends nothing else
+/// that carries position (0617's frame-cadence stream is `SET_FACING`, sent only while turning), so
+/// a straight run gave a 2 Hz height staircase under a continuous XY, which sinks a watched player
+/// into ground that rises under them and floats them over ground that falls away, at the same rate.
+/// (The clamp is still the answer — our floor and the server's differ, which no blend can fix — but
+/// that particular staircase had a second cause, and it was ours.) **Geometry:** a
 /// mover held against a wall by its own client keeps reporting `FORWARD` with an unchanged position —
 /// there is no "I am blocked" bit on the wire, and there needn't be, because the watching client is
 /// meant to be stopped by the same wall. Ours wasn't: it advanced into the geometry for the whole
@@ -462,7 +492,6 @@ pub(in crate::net) fn drain_pending_moves(
 /// ([`drain_pending_moves`]); a dead-reckon that advanced on a different (virtual, clamped) clock
 /// than the fire-times it converges toward would never land on them.
 #[allow(clippy::type_complexity)]
-#[allow(clippy::too_many_arguments)] // a Bevy system signature: one param per resource/query
 pub(in crate::net) fn extrapolate_remote_units(
     time: Res<Time<Real>>,
     mut commands: Commands,
@@ -638,6 +667,9 @@ pub(in crate::net) fn extrapolate_remote_units(
                     vel,
                     time.delta(),
                     crate::player::mover::Support {
+                        // A watched player is a player body: `0x5fa550` is TRUE for an
+                        // uncharmed player object, so its `H` is the player's own 1.0.
+                        rise: crate::player::STEP_UP_HEIGHT,
                         offset: if modes & move_flags::HOVER != 0 {
                             crate::player::HOVER_HEIGHT
                         } else {
@@ -647,7 +679,17 @@ pub(in crate::net) fn extrapolate_remote_units(
                         steep: false,
                     },
                 );
-                g.center
+                // **The no-floor drop is declined here too** (decision 2174, closing 1545's own
+                // residual). 1545 named this exact defect — *"`grounded_step`'s no-hit branch
+                // spends that whole reach descending — right for the local mover, whose next frame
+                // elects a real fall, and open-loop for a remote, which has no fall election at
+                // all"* — and closed only the flag-still case with the `INTEGRATED` gate; a mover
+                // that is *moving* kept ratcheting. A miss means our world could not answer, so the
+                // frame keeps the height the last packet gave and takes only the horizontal.
+                match g.unsupported {
+                    Some(_) => Vec3::new(g.center.x, from.y, g.center.z),
+                    None => g.center,
+                }
             };
             let resolved = bevy_to_wow(resolved_center - half_h);
             held = (pos[0] - resolved[0]).hypot(pos[1] - resolved[1]);
@@ -661,16 +703,15 @@ pub(in crate::net) fn extrapolate_remote_units(
         // - **Position** (the 0x619090 arm + 0x6191c0 lerp): while a NON-heartbeat event waits and
         //   the prediction at its fire-time would miss its position by ≥ the 0.0278-yd tolerance,
         //   blend the SIMULATED pose so it lands on the event position at the fire-time.
-        // A heartbeat is excluded from both arms (`0x619030 @0x61904b` / `0x619090 @0x6190bb`
-        // skip tag 0x26) — it snaps at fire, and by then the scheduled dead-reckon has
-        // structurally converged.
+        // **Exactly ONE relay is excluded from both arms, and it is the TELEPORT** — the queued
+        // node's tag `0x26` that `0x619030 @0x61904b` and `0x619090 @0x6190bb` bail on. Decision
+        // 2064 corrects 0601/0603, which had that tag down as the heartbeat's: a blink is the one
+        // pose smoothing cannot help, because blending toward a discontinuity walks the mover —
+        // swept capsule and all — across the gap the teleport exists to skip. A deferred heartbeat
+        // blends like anything else.
         if let Some(ev) = rm.pending.front() {
             let remaining_s = ((ev.fire_ms - now_ms) / 1000.0) as f32;
-            // A heartbeat is excluded from BOTH pre-fire blends — the reference's facing arm
-            // `0x619030` skips tag 0x26 exactly as the position arm `0x619090` does (wow-re
-            // `remote-air-facing.md`, decision 0603) — so it applies as an outright snap at
-            // fire; the smoothed facings are the transition/SET_FACING family's.
-            if remaining_s > 0.0 && !ev.mv.heartbeat {
+            if remaining_s > 0.0 && ev.mv.reconciles() {
                 orientation = facing_lerp(orientation, ev.mv.orientation, dt, remaining_s);
                 // Predict from the pre-frame state to the fire-time (this frame's dt + what's left).
                 let (predicted, ..) = rm.advance(s, dt + remaining_s);
@@ -730,7 +771,16 @@ pub(in crate::net) fn extrapolate_remote_units(
                 now_ms,
             );
         }
-        t.translation = wow_to_bevy(pos);
+        // Compare-then-write, all three (1362's no-op-write law, as `spline.rs`'s clamp and the
+        // camera seat already do): the loop visits every remote mover, and a flag-still one —
+        // the whole idle population of a city — reproduces last frame's pose bit for bit. Writing
+        // it anyway marked every such body's `Transform` changed on every frame: its whole model
+        // subtree re-propagated, the visibility walk's per-part skip (1979) missed on every one
+        // of its parts, and the swim-mark and splash gates re-asked the water for it.
+        let translation = wow_to_bevy(pos);
+        if t.translation != translation {
+            t.translation = translation;
+        }
         // The strafe body pose, same as our own avatar's (the client's display-facing blend): a
         // strafing remote player renders its body at `orientation ± 90°/45°`, eased in aim-relative
         // offset space (a left↔right flip swings around the front, never the 180°-tie back path),
@@ -752,9 +802,15 @@ pub(in crate::net) fn extrapolate_remote_units(
         // The swim body pitch — [`crate::creature_anim::swim_body_rotation`], the same law our own
         // avatar's pose owner calls, on the pitch this mover reported. TU-A is explicit that the
         // observed mover takes the *reported* pitch here, exactly as the local one takes its own.
-        t.rotation = crate::creature_anim::swim_body_rotation(yaw, rm.flags, rm.pitch);
+        let rotation = crate::creature_anim::swim_body_rotation(yaw, rm.flags, rm.pitch);
+        if t.rotation != rotation {
+            t.rotation = rotation;
+        }
         if let Some(mut twist) = twist {
-            twist.yaw_gap = wrap_pi(orientation - yaw);
+            let gap = wrap_pi(orientation - yaw);
+            if twist.yaw_gap != gap {
+                twist.yaw_gap = gap;
+            }
         }
     }
 }
@@ -1103,14 +1159,62 @@ mod under_floor {
         );
     }
 
-    /// The control: 0626's resolve is untouched for a mover the reference *does* integrate.
+    /// The control: 0626's resolve is untouched for a mover the reference *does* integrate — the
+    /// `INTEGRATED` gate lets it through and it is stepped through the world.
+    ///
+    /// **Its Z assertion is 2174's, and it is the opposite of the one 1545 wrote here.** 1545
+    /// proved "integrated and resolved" by watching this mover *descend*, which works because four
+    /// seconds of FORWARD walk it clean off the 10x10 terrain quad — so what it was actually
+    /// pinning, past the edge, was `grounded_step`'s no-floor drop running open-loop, the very
+    /// ratchet 1545's own comment called out two screens up and closed only for a flag-still mover.
+    /// Past the edge our world has nothing to answer with, so the wire's height is the answer.
     #[test]
     fn a_moving_mover_still_meets_the_world() {
         let (mut app, e) = half_arrived_world(move_flags::FORWARD);
         frames(&mut app, 240);
+        assert_eq!(
+            z_of(&app, e),
+            WIRE_Y,
+            "the terrain 2.10 yd down is outside any walking frame's election reach, so there is \
+             no floor of ours to find and the wire's height stands — instead of a per-frame \
+             descent that nothing here would ever end (2174)"
+        );
+    }
+
+    /// …and the **vertical** half of that resolve still runs, which is what 2174 must not have
+    /// taken away with the drop: a moving mover with ground actually inside the election's reach is
+    /// put on it. Without this the test above would be satisfied by an extrapolator that had
+    /// stopped meeting the world at all.
+    #[test]
+    fn a_moving_mover_is_still_settled_onto_ground_it_can_see() {
+        let (mut app, e) = half_arrived_world(move_flags::FORWARD);
+        // This harness's mover carries no speeds, so a direction bit alone travels nowhere and the
+        // election's reach collapses to its slack. Give it a walk speed: now the frame travels
+        // 0.033 yd and reaches `·1.8494 + 1/36` = 0.089 below the feet.
+        app.world_mut().entity_mut(e).insert(crate::net::UnitSpeeds(
+            benilla_protocol::events::MoveSpeeds {
+                walk: 2.0,
+                run: 2.0,
+                run_back: 2.0,
+                swim: 2.0,
+                swim_back: 2.0,
+                turn_rate: 0.0,
+            },
+        ));
+        // A floor 0.06 under the wire Z: past the standing slack (0.028), inside the moving reach.
+        floor_at(&mut app, WIRE_Y - 0.06);
+        app.world_mut().resource_mut::<ColliderEpoch>().bump();
+        app.update();
+        frames(&mut app, 4);
+        let z = z_of(&app, e);
         assert!(
-            z_of(&app, e) < WIRE_Y,
-            "a mover carrying a direction bit is integrated and resolved, as it was before 1545"
+            z < WIRE_Y,
+            "the floor is inside a moving frame's reach, so the election still settles the body \
+             onto it — 2174 declines the no-FLOOR drop, never the resolve (z={z:.3})"
+        );
+        assert!(
+            z > WIRE_Y - 0.5,
+            "…and it settles ONTO that floor rather than carrying on down (z={z:.3})"
         );
     }
 

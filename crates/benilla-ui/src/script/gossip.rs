@@ -16,9 +16,11 @@
 //! predicate the XML uses to grey password-gated options (decision 0081 v1: coded options are
 //! parsed and greyed, never selected; the real client pops a password box, out of scope here).
 //! `GetGossipText()` returns the greeting body (`SMSG_NPC_TEXT_UPDATE`), `nil` when no menu is
-//! open. There is no "menu open, text pending" state: the app holds the menu closed until the
-//! greeting resolves, as the reference does (its greeting write and `GOSSIP_SHOW` are adjacent and
-//! unconditional on one success path — wow-re `gossip-npctext-law.md` §4; B292), which is why
+//! open. There is no "menu open, text pending" state: while a greeting is in flight the app
+//! pushes nothing and fires nothing — the VM keeps its last menu (or none), exactly as the
+//! reference's frame keeps its last paint (its handler returns on a cache miss without an event,
+//! and its greeting write and `GOSSIP_SHOW` are adjacent and unconditional on one success path —
+//! wow-re `gossip-npctext-law.md` §1/§4; B292, benilla decisions 1508/1994), which is why
 //! [`GossipMenu::greeting`] is a plain `String`.
 
 use mlua::{Lua, MultiValue, Value};
@@ -291,11 +293,7 @@ mod tests {
         let mut s = UiScript::new().unwrap();
         // No menu: text nil, no options.
         assert!(s.eval::<bool>("return GetGossipText() == nil").unwrap());
-        assert_eq!(
-            s.eval::<i64>("return select('#', GetGossipOptions())")
-                .unwrap(),
-            0
-        );
+        assert_eq!(s.arity("GetGossipOptions()").unwrap(), 0);
 
         s.set_gossip(Some(menu()));
         assert_eq!(
@@ -303,13 +301,13 @@ mod tests {
             "Greetings, traveler."
         );
         // Flat (label, type) pairs: 2 options → 4 return values.
-        let (n, l1, t1, l2, t2) = s
-            .eval::<(i64, String, String, String, String)>(
+        let (l1, t1, l2, t2) = s
+            .eval::<(String, String, String, String)>(
                 "local a,b,c,d = GetGossipOptions()\n\
-                 return select('#', GetGossipOptions()), a, b, c, d",
+                 return a, b, c, d",
             )
             .unwrap();
-        assert_eq!(n, 4);
+        assert_eq!(s.arity("GetGossipOptions()").unwrap(), 4);
         assert_eq!(
             (l1.as_str(), t1.as_str()),
             ("Let me browse your goods.", "vendor")
@@ -349,16 +347,8 @@ mod tests {
         use super::GossipQuestRow;
         let mut s = UiScript::new().unwrap();
         // No menu → both lists are empty, and that is `arg.n == 0`, not a nil.
-        assert_eq!(
-            s.eval::<i64>("return select('#', GetGossipAvailableQuests())")
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            s.eval::<i64>("return select('#', GetGossipActiveQuests())")
-                .unwrap(),
-            0
-        );
+        assert_eq!(s.arity("GetGossipAvailableQuests()").unwrap(), 0);
+        assert_eq!(s.arity("GetGossipActiveQuests()").unwrap(), 0);
 
         let mut m = menu();
         m.quests = vec![
@@ -420,10 +410,6 @@ mod tests {
         s.set_gossip(Some(menu()));
         s.set_gossip(None);
         assert!(s.eval::<bool>("return GetGossipText() == nil").unwrap());
-        assert_eq!(
-            s.eval::<i64>("return select('#', GetGossipOptions())")
-                .unwrap(),
-            0
-        );
+        assert_eq!(s.arity("GetGossipOptions()").unwrap(), 0);
     }
 }

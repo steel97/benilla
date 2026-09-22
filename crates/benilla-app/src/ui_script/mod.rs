@@ -126,7 +126,7 @@ pub(crate) struct InspectMode {
     pub(crate) enabled: bool,
 }
 
-/// One frame's UI-pass phase split, in μs — written by [`extract::drive_script`] under the same
+/// One frame's UI-pass phase split, in μs — written by [`extract::tick_script`] and [`extract::paint_script`] under the same
 /// marks the `[ui-cost]` line prints. **Owned by the producer** (decision 1174): the split is a
 /// fact this pass publishes about itself, so it must exist whether or not the recorder that reads
 /// it (`hover_log`) is compiled in. Its consumers are instruments; its writer is not.
@@ -178,16 +178,33 @@ pub(crate) struct UiCostWanted(pub(crate) bool);
 #[derive(Resource, Default)]
 pub(crate) struct PlayerUiHover(pub(crate) Option<u32>);
 
-/// Set each frame by [`feed_ui_input`] to [`UiScript::has_keyboard_focus`]: true while an EditBox owns
-/// keyboard focus and is eating every key. The gameplay/dev keyboard readers (movement, the Z sheath,
-/// the HUD/panel/inspect toggles, chat-open, target-clear) gate on it so a key typed into a focused box
-/// never also drives the world — the app-side twin of the client's `DAT_00cf4dc8 != 0` gate (RF-0082
-/// §1). One mechanism, written once here; every reader is ordered after `UiInput` so it sees this
-/// frame's value, not last frame's.
+/// **Who owns this frame's keys** — written by [`feed_ui_input`], read by the binding dispatch and the
+/// dev keyboard readers, all of which are ordered after `UiInput` so they see this frame's value and
+/// not last frame's. The app-side twin of the client's `DAT_00cf4dc8 != 0` gate (RF-0082 §1).
+///
+/// **Two fields because the reference has two mechanisms, and collapsing them into one boolean was
+/// bug 2196.** A focused EditBox swallows *every* key for as long as it holds focus
+/// ([`typing`](Self::typing)); a shown keyboard-enabled *frame* swallows *the one key* its
+/// existence gate ate this frame ([`consumed`](Self::consumed)). Both suppress the key's binding —
+/// and nothing more. Neither releases anything already held: the only things that clear the
+/// reference's direction bits are the OS **window deactivate** (`0x514490`, whose sole caller
+/// `0x493058` hangs off the WM_ACTIVATE callback slot) and the world-enter cascade (`0x5144c0`).
+/// A UI focus change clears nothing — wow-re `rf79-autorun-cancel-set.md`, and the reason holding
+/// W keeps you running while you type or read the map. See `decisions/2196`.
 #[derive(Resource, Default)]
 pub(crate) struct UiKeyboardCapture {
-    /// True while a focused EditBox is eating every key.
+    /// True while a focused EditBox is eating every key (`0x77b35e` returns 1 on every path but
+    /// the alt-arrow one below). Whole-frame, because there is at most one focused box.
     pub(crate) typing: bool,
+    /// The keys a shown keyboard-enabled **frame** consumed this frame (decision 1319's existence
+    /// gate, wow-re `frame-key-script-delivery.md` §3) — `WorldMapFrame`'s fullscreen `OnKeyDown`,
+    /// `CinematicFrame`, the stack-split spinner. **Per key, not per frame**: the map eating its
+    /// own `M` must not also suppress an unrelated binding, and — the bug this list exists for —
+    /// must not be mistaken for a text box taking focus.
+    ///
+    /// Raw [`bevy::input::keyboard::KeyCode`]s, as the message carried them (the binding dispatch
+    /// normalizes for chord lookup, but matches this list on the raw code it read).
+    pub(crate) consumed: Vec<bevy::input::keyboard::KeyCode>,
     /// **The four arrow keys are exempt this frame** — the focused box is in alt-arrow mode
     /// (`ignoreArrows` / `SetAltArrowKeyMode`) and ALT is not held, so the reference's own key
     /// handler declines LEFT/UP/RIGHT/DOWN at `0x77b1c4` and the strata walk carries them down to
@@ -218,15 +235,84 @@ pub(crate) struct PlayerUiClickConsumed(pub(crate) bool);
 #[derive(Resource, Default)]
 pub(crate) struct CursorPayloadHeld(pub(crate) bool);
 
-/// The player-UI input pass — hit-testing + handler firing. Ordered before [`WorldStage::Input`] so
-/// the [`PlayerUiHover`] it produces is folded into `PointerOverUi` before `player::control` reads it.
+/// What [`extract::tick_script`] hands [`extract::paint_script`] — the UI pass is two systems, and
+/// this is the frame they agree on (decision 2168).
+///
+/// `live` is the load-bearing field: the tick half returns early with no VM or no window, and the
+/// paint half must then do nothing at all rather than re-derive a seam for a frame the VM never
+/// had. Everything else is a value the two halves must not compute twice, because computing it
+/// twice is how they would come to disagree.
+#[derive(Resource, Default)]
+pub(crate) struct UiPassState {
+    /// The tick half ran to completion this frame.
+    pub(crate) live: bool,
+    /// The 768-virtual seam scale (decision 0582/0584) this frame was ticked under.
+    pub(crate) seam: f32,
+    /// The window's device scale factor.
+    pub(crate) dpi: f32,
+    /// The meter's first three phases, so one `[ui-cost]` row still describes one frame.
+    pub(crate) us_tick: u128,
+    pub(crate) us_resolve: u128,
+    pub(crate) us_measure: u128,
+    /// The layout counters as they stood before the tick, so the row's `solves`/`derives` cover
+    /// BOTH halves' resolves.
+    pub(crate) solves_before: u64,
+    pub(crate) derives_before: u64,
+}
+
+/// **The pointer is over UI CHROME** — [`PointerOverUi`] minus the nameplates.
+///
+/// A plate is real mouse-enabled UI (2148/2159): it takes the hover, fires an addon's `OnEnter`,
+/// and a click on it selects. It is not a *panel*, though, and the two consumers that mean "the
+/// player is working in the interface, keep the world's hands off the mouse" have to say so:
+///
+/// - the camera's world-mouse latch — a right-drag that starts on a plate must still turn the view
+///   (decision 2159 §2, which argued it from the reference's own `0x60f830`);
+/// - the WHEEL — scrolling with the cursor on a plate must still zoom.
+///
+/// Both were regressions of the day a plate became a widget, and both are the same mistake, so
+/// they are one named concept rather than two `&& plate_hover.is_none()`s.
+///
+/// **This is a narrowing of a coarse flag, not a fidelity claim.** The reference has no
+/// "pointer over UI" boolean at all: it walks the strata for a frame that handles the message, and
+/// a notch over any frame with no `OnMouseWheel` falls through to `CGWorldFrame` — an action button
+/// included. Ours is one bit for the whole interface, and the plate is where that bit is visibly
+/// wrong. Widening it to the reference's per-frame dispatch is its own arc.
+#[derive(Resource, Default)]
+pub(crate) struct PointerOverUiPanel(pub(crate) bool);
+
+/// The player-UI FEED phase — every push into the VM that this frame's tick must see: the
+/// snapshot feeds, the one-shot drains that `fire_event`, the per-VM seeds. Chained
+/// `UiFeed` → [`UiInput`] → [`UiPaint`] and ordered after [`WorldStage::Net`] (decision 2304), so
+/// a feed reads what this frame's packets did, and a handler its event fires reads what every
+/// other feed pushed — the reference's own frame, where packet dispatch precedes every
+/// `FrameScript_SignalEvent` and both precede `OnUpdate`. The failure the order closes was found
+/// in the unit feed first ([`crate::ui_unit::UnitFeed`]'s doc): unordered, `apply_net_updates`
+/// could land between two feeds, and a synchronous handler fired by the later one re-read the
+/// earlier one's pre-mutation push. **No run condition on the set** — whether a feed may run
+/// before the in-game interface exists is a judgement per feed (2232), and the ones that may not
+/// ride `UnitFeed`, a gated sub-phase of this one. Every system holding the VM in `Update`
+/// declares its side of the tick — this set, or `.after(UiInput)` — and
+/// `game_plugins::schedule_tests` holds it on the built schedule.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UiFeed;
+
+/// The player-UI PAINT pass — the quad walk ([`extract::paint_script`]), ordered after the world's
+/// camera update so that world-anchored widgets are drawn from this frame's camera (decision 2168).
+/// The last of the three UI phases (see [`UiFeed`]).
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UiPaint;
+
+/// The player-UI input pass — the tick, hit-testing + handler firing. Ordered before
+/// [`WorldStage::Input`] so the [`PlayerUiHover`] it produces is folded into `PointerOverUi` before
+/// `player::control` reads it; the middle of the three UI phases (see [`UiFeed`]).
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiInput;
 
 /// The frame's atomic (`Instant`, `GetTime`) clock pair — the ONE lawful base for mapping a
 /// store-side `Instant` onto the VM's `GetTime` clock (`CooldownInfo::ui_triple` and kin).
 ///
-/// Written at the single `script.tick` site ([`extract::drive_script`]): `ui_now` is the value the
+/// Written at the single `script.tick` site ([`extract::tick_script`]): `ui_now` is the value the
 /// VM clock just advanced to, `anchor` is `Time<Real>`'s own `last_update()` — the exact instant
 /// whose frame-to-frame differences ARE the deltas the VM clock accumulates. Because both legs
 /// advance in lockstep by construction, a conversion `ui_now - (anchor - start)` yields the SAME
@@ -235,14 +321,23 @@ pub(crate) struct UiInput;
 /// shape) re-measures the tick→feed scheduling gap every frame and wobbles the derived start by
 /// that jitter (±12 ms observed live), turning every running cooldown into a per-frame "changed"
 /// triple — the diff churn 0375 existed to kill.
+///
+/// **Both legs run on the PROCESS's clock and neither restarts with the VM** (decision 2116). A
+/// rebuilt VM (any logout/login, any `ReloadUI`) is handed the running clock by
+/// [`lifecycle::seed_vm_clock`], which writes this pair in the same breath — the reference's
+/// `GetTime` is `KERNEL32!GetTickCount`, an OS clock, and stock `Cooldown.lua` gates on
+/// `start > 0`, so a clock that went back to zero at the character screen pushed every already-
+/// running cooldown into the past and hid its sweep.
 #[derive(Resource)]
 pub(crate) struct UiClock {
     /// The `Instant` leg: `Time<Real>::last_update()` at the tick that produced [`Self::ui_now`].
     pub(crate) anchor: std::time::Instant,
-    /// The `GetTime` leg: the VM clock's value after that tick (seconds).
+    /// The `GetTime` leg: the clock's value after that tick (seconds since this process started).
     pub(crate) ui_now: f64,
 }
 
+/// The pre-boot pair, replaced by [`lifecycle::seed_vm_clock`] the moment the first VM exists —
+/// `init_resource` needs it, nothing else should build one.
 impl Default for UiClock {
     fn default() -> Self {
         Self {
@@ -326,8 +421,31 @@ pub(crate) fn seam_scale(window_h: f32, ui_scale: f32) -> f32 {
 /// tick → resolve → extract pipeline into [`UiQuads`], plus the input pass ([`feed_ui_input`]).
 pub(crate) struct UiScriptPlugin;
 
+/// `uiScale`'s change callback (decision 2303): the dial's own `[0.5, 1.5]` clamp.
+pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut scale: ResMut<UiScaleCvar>) {
+    if ev.is("uiScale") {
+        scale.0 = ev.num().clamp(0.5, 1.5);
+    }
+}
+
+/// `/console reloadUI` — the reference's own console command, and the same deferred rebuild
+/// `ReloadUI()` and `/reload` queue (decision 1291): through the session seam, run by
+/// [`run_pending_reload`] at the top of the next frame.
+fn console_reload_ui(world: &mut World, _args: &str) -> Vec<String> {
+    match world.get_non_send_resource_mut::<UiScript>() {
+        Some(mut script) => {
+            script.queue_session_request(benilla_ui::script::SessionRequest::ReloadUi);
+            Vec::new()
+        }
+        None => vec!["reloadUI: no interface to reload".to_string()],
+    }
+}
+
 impl Plugin for UiScriptPlugin {
     fn build(&self, app: &mut App) {
+        use crate::console::ConsoleCommandApp;
+        app.add_observer(on_cvar);
+        app.console_command("reloadUI", "Reload the interface.", console_reload_ui);
         // **The quit root of the shutdown tail, on the exit edge** (decision 1528). It was
         // `.add_systems(Update, shutdown_on_exit)` below, which cannot see the `AppExit` a player
         // produces — the close button's is written in `PostUpdate` — so quitting from in-world
@@ -337,7 +455,7 @@ impl Plugin for UiScriptPlugin {
         app.insert_resource(UiScaleCvar(default_ui_scale()))
             // The UI pass publishes its per-frame phase split here every frame the cost meter or
             // the hover recorder is armed; the producer owns the resource so any minimal app that
-            // runs `drive_script` (the extract tests) has it.
+            // runs the UI pass (the extract tests) has it.
             .init_resource::<UiFrameCost>()
             .init_resource::<UiCostWanted>()
             .init_resource::<PointerOverUi>()
@@ -377,6 +495,11 @@ impl Plugin for UiScriptPlugin {
                 OnExit(crate::char_select::ClientState::InWorld),
                 end_ui_session,
             )
+            // The world latch (2239) and its create-side arm. The resource is `init_` rather than
+            // `insert_` here and in [`crate::ui_unit::UiUnitPlugin`], because both of that law's
+            // producers live in different plugins and either may be built alone in a test.
+            .init_resource::<LeavingWorldArmed>()
+            .add_systems(Update, lifecycle::arm_leaving_world_on_self_create)
             // A queued `ReloadUI()` runs in `PreUpdate` — one whole frame after the drain that
             // queued it (the reference's own deferral, `0x495590`), and BEFORE every `Update`
             // system, so no per-VM seed or feed can run against the dying VM in the reload frame
@@ -392,27 +515,53 @@ impl Plugin for UiScriptPlugin {
                 PreUpdate,
                 (run_pending_reload, lifecycle::run_pending_entry_load).chain(),
             )
-            // `GetFramerate()`'s host half (decision 1195), before the VM ticks so an `OnUpdate`
+            // **The three UI phases, in order** (decision 2304): every push after the net
+            // drain, then the tick, then the paint. `UiFeed`'s own doc has the why; `UiInput`
+            // sits before the world's input stage so the hover it produces reaches the pointer
+            // arbiter in time (its doc).
+            .configure_sets(
+                Update,
+                (
+                    UiFeed.after(WorldStage::Net),
+                    UiInput.before(WorldStage::Input),
+                    UiPaint,
+                )
+                    .chain(),
+            )
+            // `GetFramerate()`'s host half (decision 1195), in the feed phase so an `OnUpdate`
             // handler reads this frame's number rather than the previous one's.
-            .add_systems(Update, feed_framerate.before(UiInput))
-            // `drive_script` resolves layout; `feed_ui_input` hit-tests against those rects, so they
-            // chain (also required because both take the single `NonSend` VM). The pair runs before
-            // `WorldStage::Input` so the hover result reaches the pointer arbiter in time. The input
-            // pass is in-world only (decision 0193): the character-select glue screen owns the
-            // pointer + keyboard there (its exit edge resets the latches this pass normally drives).
+            .add_systems(Update, feed_framerate.in_set(UiFeed))
+            // `tick_script` resolves layout; `feed_ui_input` hit-tests against those rects, so they
+            // chain (also required because both take the single `NonSend` VM). The input pass is
+            // in-world only (decision 0193): the character-select glue screen owns the pointer +
+            // keyboard there (its exit edge resets the latches this pass normally drives).
+            .init_resource::<UiPassState>()
+            .init_resource::<PointerOverUiPanel>()
             .add_systems(
                 Update,
                 (
-                    extract::drive_script,
-                    input::feed_ui_input.run_if(in_state(crate::char_select::ClientState::InWorld)),
+                    extract::tick_script,
+                    input::feed_ui_input.in_set(crate::char_select::InWorldGated),
                 )
                     .chain()
                     .in_set(UiInput)
                     // The binding dispatch (0997) runs in this same set, after the feed: it
                     // reads the capture gate the feed just wrote, so a key a focused box
                     // consumed this frame never also fires a binding.
-                    .before(crate::bindings::BindingSet)
-                    .before(WorldStage::Input),
+                    .before(crate::bindings::BindingSet),
+            )
+            // **The paint half, after the camera** (decision 2168): the quad walk runs once the
+            // world's own update has happened, so a widget anchored to the world — the nameplates,
+            // which since 2148 are real `WorldFrame` children seated by `vplates::drive_vplates`
+            // out of THIS frame's camera — is drawn where it belongs instead of a frame behind.
+            // Bounded on both sides: after the plate driver that writes those anchors, and before
+            // the append lane, whose minimap producer fills the widget slot this pass parks.
+            .add_systems(
+                Update,
+                extract::paint_script
+                    .in_set(UiPaint)
+                    .after(crate::vplates::VPlateSet)
+                    .before(crate::ui_pass::UiQuadAppend),
             )
             // Combine the two pointer contributions (dev overlay + player UI) into the single
             // `PointerOverUi` source of truth, after the hover is known and before gameplay reads it.
@@ -430,8 +579,8 @@ impl Plugin for UiScriptPlugin {
         app.add_systems(
             Update,
             demo_unit_feed
+                .in_set(UiFeed)
                 .after(UnitFeed)
-                .before(UiInput)
                 .run_if(capture_ui_active),
         );
     }
@@ -439,9 +588,11 @@ impl Plugin for UiScriptPlugin {
 
 /// Should this CAPTURE include the player UI (+ the synthetic unit snapshot)? The visual harness's
 /// baselines must stay UI-free (they regression-test the WORLD render), so captures skip the UI
-/// unless `WOW_CAPTURE_UI=1` opts in. Normal runs always load the UI and never take synthetic data.
+/// unless it is opted in — [`crate::run_mode::capture_ui_opted_in`], the SAME predicate the UI load and the
+/// window sizing use, because the three disagreeing is how `ui-unitframes` ends up photographing
+/// empty frames. Normal runs always load the UI and never take synthetic data.
 fn capture_ui_active(capture: Option<Res<crate::run_mode::CaptureMode>>) -> bool {
-    capture.is_some() && std::env::var("WOW_CAPTURE_UI").as_deref() == Ok("1")
+    capture.is_some() && crate::run_mode::capture_ui_opted_in()
 }
 
 /// The pointer arbiter (decision 0026): `PointerOverUi = egui dev overlay ∨ player-UI hover`. Runs
@@ -451,7 +602,9 @@ fn capture_ui_active(capture: Option<Res<crate::run_mode::CaptureMode>>) -> bool
 fn arbitrate_pointer_over_ui(
     egui: Option<Res<EguiPointerOver>>,
     hover: Res<PlayerUiHover>,
+    plate_hover: Res<crate::vplates::PlateHover>,
     mut over: ResMut<PointerOverUi>,
+    mut panel: ResMut<PointerOverUiPanel>,
 ) {
     // A cinematic used to need a third term here, and no longer does — the deletion is the point
     // of decision 1734. `CinematicFrame` is `setAllPoints` + `enableMouse="true"`, so while it is
@@ -459,19 +612,23 @@ fn arbitrate_pointer_over_ui(
     // every other frame out of it. The hit test now arrives at that on its own, so
     // [`PlayerUiHover`] carries it and the special case is gone.
     over.0 = egui.is_some_and(|e| e.0) || hover.0.is_some();
+    // A nameplate is mouse-enabled UI and it is not CHROME — see [`PointerOverUiPanel`]. The plate
+    // hover is last frame's (the plate driver runs after the camera), which is the same vintage the
+    // camera's own plate exception has always used.
+    panel.0 = over.0 && plate_hover.0.is_none();
 }
 
 /// The session lifecycle — the VM's birth, identity, death, and the reload. Every edge function
 /// lives there; this module keeps the per-frame bridge. See its header.
 mod lifecycle;
 pub(crate) use lifecycle::{
-    end_ui_session, ingame_ui_pending, run_pending_reload, setup_script, AddOnIdentity,
-    PendingEntryUiLoad, ReloadUiPending,
+    end_ui_session, ingame_ui_up, run_pending_reload, setup_script, AddOnIdentity,
+    LeavingWorldArmed, PendingEntryUiLoad, ReloadUiPending,
 };
 // Consumed only from other modules' test code (the emote-table checks, the harness's UI-init
 // tail, the quit-once pin) — a plain re-export would warn unused in a non-test build.
 #[cfg(test)]
-use lifecycle::load_ingame_ui_on_world_entry;
+pub(crate) use lifecycle::load_ingame_ui_on_world_entry;
 use lifecycle::shutdown_on_exit;
 #[cfg(test)]
 pub(crate) use lifecycle::{
@@ -486,7 +643,7 @@ pub(crate) use lifecycle::{
 /// that nobody can take a value off. The pole is a one-second time constant — fast enough that a
 /// real stall is visible within a frame or two, slow enough to read.
 ///
-/// `Time<Real>` deliberately, the same choice `drive_script` documents: this is a *frame rate*, and
+/// `Time<Real>` deliberately, the same choice `tick_script` documents: this is a *frame rate*, and
 /// a virtual clock that clamps its delta would report a rate the machine is not achieving.
 fn feed_framerate(
     script: Option<NonSendMut<UiScript>>,
@@ -649,7 +806,7 @@ fn demo_unit_feed(script: Option<NonSendMut<UiScript>>, mut fired: Local<VmMemo<
             ),
             (80, "Interface\\Icons\\INV_Misc_Food_16", 0x80, 117, 5),
             (84, "Interface\\Icons\\Spell_Holy_SealOfMight", 0x00, 103, 0),
-            // The always-on multibars (MultiBars.xml): BottomLeft = actions 61..72, BottomRight
+            // The always-on multibars (stock MultiActionBars.xml): BottomLeft = actions 61..72, BottomRight
             // = 49..60. A few occupied wells on each so the capture shows both rows seated
             // (empty multibar wells hide — the ref's own default — so without these the rows
             // would be invisible).
@@ -694,7 +851,7 @@ fn demo_unit_feed(script: Option<NonSendMut<UiScript>>, mut fired: Local<VmMemo<
                 }),
             );
         }
-        // The stance bar (StanceBar.xml): the synthetic warrior's three stances, battle active —
+        // The stance bar (stock BonusActionBarFrame.xml): the synthetic warrior's three stances, battle active —
         // matches the bonus offset 1 above (battle stance page). Defensive shows the not-castable
         // grey; berserker a running cooldown swipe.
         script.set_shapeshift_forms(vec![
@@ -735,10 +892,16 @@ fn demo_unit_feed(script: Option<NonSendMut<UiScript>>, mut fired: Local<VmMemo<
         // choice about what to photograph, not a default: `MultiActionBar_Update` is the same
         // function the row calls, so nothing here is a private door into the bars. Guarded because
         // this feed also runs with `WOW_CAPTURE_UI` unset, where no interface has been loaded.
-        let _ = script.run(
-            "SHOW_MULTI_ACTIONBAR_1 = 1 SHOW_MULTI_ACTIONBAR_2 = 1 \
-             if MultiActionBar_Update then MultiActionBar_Update() end",
-        );
+        // `WOW_DEMO_BOTTOM_BARS=0` leaves them down — the shipped default a player logs in to
+        // (1500), and the only state in which the stance SHELF draws at all: the manage pass
+        // hides the shelf art whenever the bottom-left bar is up, so a capture of the shelf
+        // (decision 2000's hairline lived on it) needs the bars where the player has them.
+        if std::env::var("WOW_DEMO_BOTTOM_BARS").as_deref() != Ok("0") {
+            let _ = script.run(
+                "SHOW_MULTI_ACTIONBAR_1 = 1 SHOW_MULTI_ACTIONBAR_2 = 1 \
+                 if MultiActionBar_Update then MultiActionBar_Update() end",
+            );
+        }
         script.fire_event("PLAYER_XP_UPDATE", vec![]);
         for token in ["player", "target"] {
             script.fire_event("UNIT_HEALTH", vec![ScriptValue::Str(token.into())]);
@@ -767,7 +930,54 @@ impl benilla_ui::script::TextMeasure for FixedWidthFont {
 }
 
 #[cfg(test)]
-mod test_ui;
+pub(crate) mod test_ui;
+
+/// The chat loader's two login events (wow-re chat-cache-grammar.md §8; `ui_chat::settings`):
+/// `UPDATE_CHAT_WINDOWS` once, then `UPDATE_CHAT_COLOR` for every registry entry. The reference's
+/// `FloatingChatFrame_Update` docks, hides and colours the windows on the first and
+/// `ChatFrame_OnEvent` fills `ChatTypeInfo` from the second, so a test VM that loads the
+/// reference's chat files needs both before the windows look or route like a client's.
+#[cfg(test)]
+pub(crate) fn fire_chat_login(s: &mut benilla_ui::script::UiScript) {
+    // `FCF_OnUpdate` reads `UIOptionsFrame:IsShown()` every frame — the reference's options
+    // window, which OptionsFrame.xml aliases and a chat test VM does not load. A hidden stand-in
+    // is what a closed options window answers.
+    s.run("if not UIOptionsFrame then UIOptionsFrame = CreateFrame('Frame') UIOptionsFrame:Hide() end")
+        .expect("the options stand-in");
+    s.fire_event("UPDATE_CHAT_WINDOWS", vec![]);
+    let renorm = |b: u8| f64::from(b as f32 * (1.0f32 / 255.0f32));
+    for entry in s.chat_colors() {
+        s.fire_event(
+            "UPDATE_CHAT_COLOR",
+            vec![
+                benilla_ui::script::ScriptValue::Str(entry.name),
+                benilla_ui::script::ScriptValue::Number(renorm(entry.rgb[0])),
+                benilla_ui::script::ScriptValue::Number(renorm(entry.rgb[1])),
+                benilla_ui::script::ScriptValue::Number(renorm(entry.rgb[2])),
+            ],
+        );
+    }
+}
+
+/// The `benilla_formats::TokenContext::text` seam (decision 2045): resolve a `GlobalStrings` key
+/// out of the VM and fill its `%d` holes through the one shared filler.
+///
+/// The split it implements is deliberate. `benilla-formats` walks the spell's columns and knows
+/// which key and which numbers a `$d` or `$s` token wants; it has no business knowing about a
+/// script VM or carrying a printf-family formatter, and it depends on neither crate that has one.
+/// So it names the key, and this renders it.
+pub(crate) fn token_text(
+    script: &benilla_ui::script::UiScript,
+) -> impl Fn(&str, &[i64]) -> Option<String> + '_ {
+    |key: &str, args: &[i64]| {
+        let template = benilla_ui::strings::global(script.lua(), key)?;
+        let args: Vec<_> = args
+            .iter()
+            .map(|n| benilla_ui::strings::Arg::D(*n))
+            .collect();
+        Some(benilla_ui::strings::fill(&template, &args))
+    }
+}
 
 /// [`test_ui::load_ui`] for a test module OUTSIDE `ui_script` — `ui_action::feed_tests` drives the
 /// real `UIErrorsFrame` end to end and needs the same both-stores reader everything else uses.
@@ -819,6 +1029,9 @@ mod pet_bar_tests;
 mod pet_frame_tests;
 
 #[cfg(test)]
+mod pet_stable_tests;
+
+#[cfg(test)]
 mod tot_frame_tests;
 
 #[cfg(test)]
@@ -853,6 +1066,17 @@ mod panel_template_tests;
 #[cfg(test)]
 mod shape_gate;
 
+/// The event ARGUMENT-shape gate (decision 2140) — the same question one API over: the two event
+/// gates in `reference_ui` compare names, and nothing compared what a fire site pushes.
+#[cfg(test)]
+mod event_shape_gate;
+
+/// The VERB-FIRED event gate (decision 2251) — the third question on the same seam: 1883/1889
+/// compare names and 2140 compares arguments; this asks WHO fires it, because a stock file that
+/// calls a verb for its side effect of an event repaints nothing when the verb fires nothing.
+#[cfg(test)]
+mod verb_event_gate;
+
 /// The reference's BasicControls.xml — TEXT/message/_ERRORMESSAGE and the ScriptErrors dialog,
 /// none of which benilla itself calls: every test enters from Lua the way an addon does.
 #[cfg(test)]
@@ -883,6 +1107,11 @@ mod group_loot_tests;
 
 #[cfg(test)]
 mod chat_tests;
+
+/// The chat bubble's `UIMenu` kit driven as a menu — the rows' label/shortcut anchoring
+/// (decision 1996), kept apart from `chat_tests` because it is the kit under test, not the window.
+#[cfg(test)]
+mod ui_menu_tests;
 
 /// The chat tab's options menu, end to end (decision 1589 / B246) — its own file because it needs
 /// the whole dropdown + colour-picker stack under `ChatFrame.xml`, where `chat_tests` deliberately
@@ -995,6 +1224,17 @@ mod quest_tests;
 mod quest_timer_tests;
 
 #[cfg(test)]
+mod battlefield_tests;
+
+/// The battle map — the reference's `Blizzard_BattlefieldMinimap` addon, demand-loaded the way
+/// SHIFT-M loads it, over the overlay/POI/position/arrow verbs it shares with the world map.
+#[cfg(test)]
+mod battlefield_minimap_tests;
+
+#[cfg(test)]
+mod tutorial_tests;
+
+#[cfg(test)]
 mod durability_tests;
 // `pub(crate)` for its `harness`/`push`/`row` helpers: `perf::hud`'s own test drives the readout
 // through them rather than keeping a second copy of the XML-loading boilerplate.
@@ -1065,6 +1305,9 @@ mod quiver_tests;
 #[cfg(test)]
 mod world_entry_tests;
 
+/// The guild tabard designer — the stock `TabardFrame.xml` off the chain (decision 1977).
+#[cfg(test)]
+mod tabard_tests;
 /// The world map's POI pool — the guard's directions marker today, the AreaPOI landmarks later.
 #[cfg(test)]
 mod world_map_tests;
@@ -1084,5 +1327,92 @@ mod seam_scale_tests {
         assert!((seam_scale(1080.0, 768.0 / 1080.0) - 1.0).abs() < 1e-6);
         // A degenerate (pre-winit) window is identity, never a division blow-up.
         assert_eq!(seam_scale(0.0, 0.9), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod pointer_arbiter_tests {
+    use super::*;
+
+    /// A world it can run the arbiter in: the three inputs and the two outputs, nothing else.
+    fn app() -> App {
+        let mut app = App::new();
+        app.init_resource::<PlayerUiHover>()
+            .init_resource::<crate::vplates::PlateHover>()
+            .init_resource::<PointerOverUi>()
+            .init_resource::<PointerOverUiPanel>()
+            .add_systems(Update, arbitrate_pointer_over_ui);
+        app
+    }
+
+    /// **A plate is UI, and it is not chrome.** The camera's world-mouse latch and the wheel's zoom
+    /// binding both read the second bit; both were dead over a plate until they did (2168).
+    #[test]
+    fn a_hovered_plate_is_ui_but_not_chrome() {
+        let mut app = app();
+        let plate = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_mut::<PlayerUiHover>().0 = Some(7);
+        app.world_mut()
+            .resource_mut::<crate::vplates::PlateHover>()
+            .0 = Some(plate);
+        app.update();
+        assert!(
+            app.world().resource::<PointerOverUi>().0,
+            "the plate takes the pointer"
+        );
+        assert!(
+            !app.world().resource::<PointerOverUiPanel>().0,
+            "…and the WHEEL looks straight through it"
+        );
+    }
+
+    /// …and what each of the two bits is now FOR, which is the half 2233 moved.
+    ///
+    /// The camera reads the raw flag: a press landing on a plate is the plate's, because
+    /// `0x7662c0` delivers a mouse-down to exactly one frame and stops the bus walk, so the
+    /// binding that starts mouselook is never reached. The wheel reads the chrome flag: it is the
+    /// one genuine fall-through in the frame system and walks **past** a frame that merely takes
+    /// the mouse, so scroll-zoom still works with the cursor on a plate. Two different reference
+    /// laws, which is why there are two bits and not one — and 2159 had the camera on the wrong
+    /// one for two days.
+    #[test]
+    fn the_camera_yields_to_a_plate_and_the_wheel_does_not() {
+        let mut app = app();
+        let plate = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_mut::<PlayerUiHover>().0 = Some(7);
+        app.world_mut()
+            .resource_mut::<crate::vplates::PlateHover>()
+            .0 = Some(plate);
+        app.update();
+        // `latch_world_mouse` reads this one; `world_press` is `!over_ui`, so the press never
+        // becomes the world's and no look session starts.
+        assert!(
+            app.world().resource::<PointerOverUi>().0,
+            "the camera must yield the press to the plate"
+        );
+        // …and `bindings`' wheel branch reads this one.
+        assert!(
+            !app.world().resource::<PointerOverUiPanel>().0,
+            "the wheel must still reach the world over a plate"
+        );
+    }
+
+    /// An ordinary frame is both, which is the whole point of keeping two bits rather than one.
+    #[test]
+    fn a_hovered_panel_is_both() {
+        let mut app = app();
+        app.world_mut().resource_mut::<PlayerUiHover>().0 = Some(7);
+        app.update();
+        assert!(app.world().resource::<PointerOverUi>().0);
+        assert!(app.world().resource::<PointerOverUiPanel>().0);
+    }
+
+    /// And empty world under the pointer is neither.
+    #[test]
+    fn no_hover_is_neither() {
+        let mut app = app();
+        app.update();
+        assert!(!app.world().resource::<PointerOverUi>().0);
+        assert!(!app.world().resource::<PointerOverUiPanel>().0);
     }
 }

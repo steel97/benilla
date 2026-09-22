@@ -64,7 +64,12 @@ fn player() -> UnitState {
         name: Some("Benilla".into()),
         sex: 3, // female
         is_player: true,
+        // Both, because a real Alliance player has both — and they are not the same field.
+        // `faction_group` is `UnitFactionGroup`'s live faction template; `pvp_team` is
+        // `0x5efe00`'s race walk, which is what every rank title is keyed by. The GM-mode test
+        // below is the one that drives them apart.
         faction_group: Some("Alliance".into()),
+        pvp_team: 1,
         pvp_rank: 9,
         ..Default::default()
     }
@@ -168,7 +173,7 @@ fn the_reference_destructuring_lands_every_value_in_the_right_slot() {
 fn a_lifetime_rank_below_five_is_reported_as_zero() {
     let mut s = seated();
     let third = |s: &UiScript| {
-        s.eval::<i64>("return (select(3, GetPVPLifetimeStats()))")
+        s.eval::<i64>("local _, _, highest = GetPVPLifetimeStats() return highest")
             .unwrap()
     };
     for (highest, reported) in [(0u8, 0i64), (1, 0), (4, 0), (5, 5), (6, 6), (18, 18)] {
@@ -185,18 +190,16 @@ fn a_lifetime_rank_below_five_is_reported_as_zero() {
         highest_rank: 3,
         ..honor_state()
     }));
-    assert_eq!(
-        s.eval::<i64>(r##"return select("#", GetPVPLifetimeStats())"##)
-            .unwrap(),
-        3
-    );
+    assert_eq!(s.arity("GetPVPLifetimeStats()").unwrap(), 3);
     assert!(s
-        .eval::<bool>("return type((select(3, GetPVPLifetimeStats()))) == 'number'")
+        .eval::<bool>(
+            "local _, _, highest = GetPVPLifetimeStats() return type(highest) == 'number'"
+        )
         .unwrap());
 }
 
-/// Arity, measured the way Lua itself measures it. A getter that returned one value too many
-/// would still pass the destructuring test above; `select("#", …)` is what catches it.
+/// Arity, measured at the host boundary ([`UiScript::arity`]). A getter that returned one value
+/// too many would still pass the destructuring test above; the count is what catches it.
 #[test]
 fn every_getter_returns_exactly_the_reference_arity() {
     let s = seated();
@@ -211,12 +214,7 @@ fn every_getter_returns_exactly_the_reference_arity() {
         ("GetPVPRankInfo(0)", 2),
         ("UnitPVPRank('player')", 1),
     ] {
-        assert_eq!(
-            s.eval::<i64>(&format!(r##"return select("#", {call})"##))
-                .unwrap(),
-            width,
-            "{call} arity"
-        );
+        assert_eq!(s.arity(call).unwrap(), width, "{call} arity");
     }
 }
 
@@ -344,6 +342,7 @@ fn the_pane_title_is_keyed_by_team_and_is_never_gendered() {
         Some(UnitState {
             sex: 2,
             faction_group: Some("Horde".into()),
+            pvp_team: 0,
             ..player()
         }),
     );
@@ -424,12 +423,65 @@ fn a_missing_rank_global_reads_nil_not_empty() {
     s.set_unit(
         "player",
         Some(UnitState {
-            faction_group: None,
+            pvp_team: -1,
             ..player()
         }),
     );
     seat_rank_globals(&s);
     assert!(s.eval::<bool>("return GetPVPRankInfo(9) == nil").unwrap());
+}
+
+/// **The team digit is NOT the faction group** — report B378 at the binding level (decision 2227).
+///
+/// `UnitFactionGroup` reads the unit's live `UNIT_FIELD_FACTIONTEMPLATE` (`0x516630`) and the rank
+/// title's team digit reads the unit's RACE (`0x5efe00`), so a vmangos GM — template 35, group
+/// mask 0 — has no side and keeps his rank. Both `0x5efe00` surfaces are asserted here: the
+/// binding's key and `UnitPVPName`'s decoration (`0x5efe60`, the same walk).
+#[test]
+fn a_sideless_player_still_has_a_team_digit_because_his_race_has_one() {
+    let mut s = seated();
+    seat_rank_globals(&s);
+    s.lua()
+        .globals()
+        .set("UNIT_PVP_NAME", "%s %s")
+        .expect("global");
+    s.set_unit(
+        "player",
+        Some(UnitState {
+            // `.gm on` — the template names nothing …
+            faction_group: None,
+            faction_group_localized: None,
+            // … and the race still names Alliance.
+            pvp_team: 1,
+            sex: 2,
+            pvp_rank: 18,
+            ..player()
+        }),
+    );
+    assert_eq!(
+        s.eval::<String>("return (GetPVPRankInfo(18))").unwrap(),
+        "Grand Marshal",
+        "the sideless template must not reach the key"
+    );
+    assert_eq!(
+        s.eval::<String>(r#"return UnitPVPName("player")"#).unwrap(),
+        "Grand Marshal Benilla",
+        "and the name decoration reads the same digit"
+    );
+    // The control: a unit whose RACE resolves to nothing is still −1, and −1 still misses.
+    s.set_unit(
+        "player",
+        Some(UnitState {
+            faction_group: Some("Alliance".into()),
+            pvp_team: -1,
+            pvp_rank: 18,
+            ..player()
+        }),
+    );
+    assert!(
+        s.eval::<bool>("return GetPVPRankInfo(18) == nil").unwrap(),
+        "a side on the template cannot stand in for a missing team digit either"
+    );
 }
 
 /// The internal→visual conversion across its whole range — **and the negative half runs the
@@ -468,8 +520,10 @@ fn the_visual_rank_arithmetic_runs_backwards_through_the_dishonorable_ranks() {
     seat_rank_globals(&s);
     for (internal, visual) in [(1i64, -4i64), (4, -1), (5, 1), (18, 14)] {
         assert_eq!(
-            s.eval::<i64>(&format!("return (select(2, GetPVPRankInfo({internal})))"))
-                .unwrap(),
+            s.eval::<i64>(&format!(
+                "local _, number = GetPVPRankInfo({internal}) return number"
+            ))
+            .unwrap(),
             visual,
             "GetPVPRankInfo({internal})"
         );
@@ -498,8 +552,7 @@ fn the_range_gate_refuses_rank_zero_and_rank_nineteen_alike() {
         assert_eq!(name, None, "rank {rank} names nothing");
         assert_eq!(number, 0, "rank {rank} numbers 0");
         assert_eq!(
-            s.eval::<i64>(&format!(r##"return select("#", GetPVPRankInfo({rank}))"##))
-                .unwrap(),
+            s.arity(&format!("GetPVPRankInfo({rank})")).unwrap(),
             2,
             "rank {rank} still answers two values"
         );
@@ -526,6 +579,7 @@ fn get_pvp_rank_info_takes_a_second_argument_three_different_ways() {
             name: Some("Thrall".into()),
             is_player: true,
             faction_group: Some("Horde".into()),
+            pvp_team: 0,
             pvp_rank: 14,
             ..Default::default()
         }),
@@ -581,7 +635,7 @@ fn get_pvp_rank_info_takes_a_second_argument_three_different_ways() {
         Some(UnitState {
             exists: true,
             name: Some("Timber Wolf".into()),
-            faction_group: Some("Alliance".into()),
+            pvp_team: 1,
             ..Default::default()
         }),
     );
@@ -599,7 +653,7 @@ fn get_pvp_rank_info_takes_a_second_argument_three_different_ways() {
         Some(UnitState {
             exists: true,
             is_player: true,
-            faction_group: None,
+            pvp_team: -1,
             ..Default::default()
         }),
     );
@@ -649,6 +703,7 @@ fn unit_pvp_rank_answers_for_a_foreign_unit() {
             name: Some("Thrall".into()),
             is_player: true,
             faction_group: Some("Horde".into()),
+            pvp_team: 0,
             pvp_rank: 14,
             ..Default::default()
         }),
@@ -904,11 +959,7 @@ fn get_inspect_honor_data_returns_the_twelve_in_the_reference_order() {
     let mut s = seated();
     s.set_inspect_honor(Some(inspect_state()));
 
-    assert_eq!(
-        s.eval::<i64>(r##"return select("#", GetInspectHonorData())"##)
-            .unwrap(),
-        12
-    );
+    assert_eq!(s.arity("GetInspectHonorData()").unwrap(), 12);
     let got = s
         .eval::<Vec<i64>>(
             "local sessionHK, sessionDK, yesterdayHK, yesterdayHonor, thisweekHK, \
@@ -936,8 +987,7 @@ fn get_inspect_honor_data_returns_the_twelve_in_the_reference_order() {
 fn get_inspect_honor_data_answers_twelve_zeros_when_no_reply_is_held() {
     let mut s = seated();
     assert_eq!(
-        s.eval::<i64>(r##"return select("#", GetInspectHonorData())"##)
-            .unwrap(),
+        s.arity("GetInspectHonorData()").unwrap(),
         12,
         "ungated: twelve on every path"
     );
@@ -998,11 +1048,7 @@ fn the_intent_queues_drain_and_the_honor_query_refuses_to_double_up() {
     assert_eq!(s.take_inspect_honor_requests(), 1);
 
     // The binding answers zero Lua values on every one of those paths (`0x4c9610`).
-    assert_eq!(
-        s.eval::<i64>(r##"return select("#", RequestInspectHonorData())"##)
-            .unwrap(),
-        0
-    );
+    assert_eq!(s.arity("RequestInspectHonorData()").unwrap(), 0);
 
     s.eval::<()>("TogglePVP() TogglePVP()").unwrap();
     assert_eq!(s.take_pvp_toggles(), 2, "no latch here — two packets");

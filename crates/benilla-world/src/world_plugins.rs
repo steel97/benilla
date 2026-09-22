@@ -146,6 +146,11 @@ impl PluginGroup for WorldPlugins {
             .add(crate::model_fade::plugin)
             .add(crate::model_render::plugin)
             .add(crate::zfill::plugin)
+            // The straddle split (decision 2188): a translucent model crossing its water plane draws
+            // on both sides of the water pass, each half clipped at the waterline — the band
+            // verdict, the per-slot clip region and the far-side twins, beside the two lanes
+            // (water-side twins, depth primes) it composes with.
+            .add(crate::straddle::plugin)
             // Within-map art residency (decision 0793): the dedup caches expire by DISTANCE, so a
             // long flight inside one map stops ratcheting. Before `AssetPlugin` only so the census
             // resource exists for anything that reads it at startup; it needs no ordering.
@@ -261,6 +266,7 @@ impl Plugin for WorldFoundation {
             // read, whose defaults ARE the player behaviour. The debug panel is only its editor
             // and may not be installed at all.
             .init_resource::<crate::dev_state::DebugState>()
+            .add_systems(Last, crate::dev_state::count_still_inputs)
             // The collider-set stamp every cached collision answer is dated against
             // (`collision::ColliderEpoch`). Tracked in `First` so a removal is stamped before any
             // consumer runs; the attach half is stamped by the streamer's own attach loop.

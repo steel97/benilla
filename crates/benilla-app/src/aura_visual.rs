@@ -233,6 +233,16 @@ impl AuraNodes {
     pub(crate) fn head_anim_rate(&self) -> Option<f32> {
         self.rate.first().map(|(_, r)| *r)
     }
+
+    /// A node list holding one proc-11 rate node — the state a freeze aura leaves on a unit, for
+    /// the driver's wound-refusal tenant (decision 2063) without running the aura-slot watcher.
+    #[cfg(test)]
+    pub(crate) fn with_rate_node_for_tests(spell_id: u32, rate: f32) -> Self {
+        Self {
+            rate: vec![(spell_id, rate)],
+            ..Default::default()
+        }
+    }
 }
 
 /// Publish every rig's body tint to the per-instance channel ([`benilla_world::instance_tint`], decision
@@ -732,7 +742,6 @@ type AuraParts<'w, 's> = Query<
 /// Note the swap keys on the *instance* alpha only: a batch whose own animated colour alpha dips is
 /// a per-batch quantity the reference combines separately, and forcing those onto a blend pass would
 /// change every existing unit's look.
-#[allow(clippy::too_many_arguments)] // one Bevy system's full input set
 pub(crate) fn apply_aura_alpha(
     time: Res<Time>,
     mut commands: Commands,
@@ -832,7 +841,6 @@ fn author_cards(
 /// property that its attached models render off (the same reason
 /// [`benilla_world::model_fade::apply_despawn_fade`] and the self feather both walk descendants, not
 /// children).
-#[allow(clippy::too_many_arguments)] // the author's full channel set, threaded down the walk
 fn author_descendants(
     entity: Entity,
     alpha: f32,

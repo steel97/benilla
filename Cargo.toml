@@ -12,9 +12,39 @@ authors = ["sam <samuv.eth@gmail.com>"]
 # since day one, enacted at the 0530 debt sweep). Per-crate feature additions stay in the crate.
 # `image` deliberately stays per-crate: its default-features/feature sets differ per consumer,
 # and a workspace default-features choice can't be subtracted from downstream.
+# **Lint policy** (decision 2266 §C4). `too_many_arguments` is a readability lint for plain
+# functions; on a Bevy system the parameter list IS the scheduler's dependency declaration, and
+# a system that reads eight resources has eight parameters by construction. The lint had fired
+# 364 times in this workspace and been allowed 364 times, 281 of them on systems — a lint whose
+# every verdict is overridden is not a gate, it is a tax on adding a system. Allowed once here;
+# the per-site attributes are gone. `type_complexity` stays on: it fires on shapes a type alias
+# or a `SystemParam` bundle genuinely fixes.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+
 [workspace.dependencies]
 anyhow = "1.0.102"
-bevy = { version = "0.18.1", features = ["android-game-activity"] }
+# bevy's `default` is `["2d", "3d", "ui"]`, and every one of those three pulls `audio`
+# (= `bevy_audio` + `vorbis`) — so a default bevy compiles rodio, a second cpal, a second ALSA
+# binding and an ogg/vorbis decoder into a client that mixes through kira and has had bevy's
+# `AudioPlugin` disabled at boot since 0530. This spells the same `default` out with `audio`
+# taken away: `2d`/`3d`/`ui` decomposed into the parts they are made of, which is the whole
+# union of the three minus that one entry (decision 1932 has the expansion, verified against a
+# before/after feature tree). Nothing else in the graph asks for it — avian3d, bevy_egui and
+# bevy_transform_interpolation all take bevy with `default-features = false`.
+#
+# If a future bevy needs another member, add it here by name; do not reach back for `2d`/`3d`/
+# `ui`, which would quietly bring the audio stack with it.
+bevy = { version = "0.18.1", default-features = false, features = [
+    "default_app",
+    "default_platform",
+    "2d_bevy_render",
+    "3d_bevy_render",
+    "ui_api",
+    "ui_bevy_render",
+    "scene",
+    "picking",
+] }
 # The render app's raw GPU handles (the WOW_GPU_MS meter's query set): bevy 0.18 does not wrap
 # wgpu's QuerySet family, so the meter reaches for the same wgpu the workspace already builds.
 wgpu = "27"
@@ -26,18 +56,24 @@ sha1 = "0.10.6"
 # section stood empty for the project's whole life.
 #
 # The one entry below is not a fork of a WoW crate at all. `lua-src` compiles the Lua the client's
-# addon VM runs on, and the 1.12 corpus needs one opcode that Lua 5.1 deleted — the iterator-less
-# generic-for (`for k, v in someTable do`), which 183 of 218 corpus addons are reached by and which
-# is the first session-start error for 60 of them. It is an OPCODE, so no layer above the VM can
-# reach it: not a library function, not a global, not a metamethod.
+# addon VM runs on, and benilla's Lua has to accept EXACTLY the grammar the 1.12.1 client's Lua
+# accepts — no more and no less. Six hunks, all byte-read out of the client's own parser and VM:
+# three restore what 5.1 removed (the iterator-less generic-for `for k, v in someTable do`, which
+# 183 of 218 corpus addons are reached by; nesting long strings; the constructor's compat
+# semicolon), three delete what 5.1 added (`...` as an expression, `#`, `%`). Both directions are
+# below the reach of any layer above the VM — an opcode and a grammar are not a library function,
+# a global, or a metamethod — and the corpus ASKS about the second direction directly: 170
+# `loadstring` sites compile a vararg expression purely to find out which interpreter they are on.
 #
-# The fork is currently BYTE-IDENTICAL to upstream's 5.1.5 sources, and is landed that way on
-# purpose: the pipeline is proven transparent before the behavioural payload goes into it, so that
-# when the suite moves, the patch is the only thing that could have moved it. The payload waits on
-# an RE answer about what the real client's own Lua does — stock Lua 5.0 is corroboration, not the
-# authority. `third_party/lua-src/BENILLA.md` has the current state and the verifying command.
+# The fork landed BYTE-IDENTICAL to upstream's 5.1.5 sources on purpose: the pipeline was proven
+# transparent before any behavioural payload went into it, so when the suite moved, the patch was
+# the only thing that could have moved it. `third_party/lua-src/BENILLA.md` has the current state,
+# the per-hunk byte evidence and the verifying command (decisions 1215, 1315, 2101).
 [patch.crates-io]
 lua-src = { path = "third_party/lua-src" }
+# kira 0.12.1 with one patch: spatial gains and the volume tween evaluated per CHUNK and
+# interpolated, not per frame (decision 1945; `third_party/kira/BENILLA.md`).
+kira = { path = "third_party/kira" }
 
 # Optimize *dependencies* even in dev builds. avian/parry collision math (and wgpu/bevy render) is
 # unusably slow at opt-level 0 — a plain `cargo run` crawls to <1 fps once physics is doing real work.

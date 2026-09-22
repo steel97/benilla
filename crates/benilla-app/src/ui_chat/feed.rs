@@ -200,6 +200,14 @@ pub(super) fn text_emote_event(
 pub(crate) struct ChatLog {
     pending: Vec<Pending>,
     broadcasts: Vec<super::broadcast::Broadcast>,
+    /// The ding's gain tuple, parked for `ui_unit`'s `PLAYER_LEVEL_UP` fire (decision 1884).
+    ///
+    /// The net layer has no `UiScript` — deliberately — so the gains arrive here, on the same
+    /// net-to-UI channel `broadcasts` uses, and the feed that owns the level edge picks them up.
+    /// They are matched BY LEVEL rather than just drained, because the trigger is a descriptor
+    /// diff and the gains are packet-borne: the two land together today, and matching means a
+    /// stale entry can never attach itself to a later ding if they ever stop doing so.
+    level_up_gains: Vec<(LevelUpInfo, u32)>,
 }
 
 impl ChatLog {
@@ -216,6 +224,22 @@ impl ChatLog {
     /// Take the parked broadcasts, leaving the queue empty.
     pub(crate) fn take_broadcasts(&mut self) -> Vec<super::broadcast::Broadcast> {
         std::mem::take(&mut self.broadcasts)
+    }
+
+    /// Park the ding's gains for the `PLAYER_LEVEL_UP` fire (see [`ChatLog::level_up_gains`]).
+    pub(crate) fn push_level_up_gains(&mut self, info: &LevelUpInfo, talent_points: u32) {
+        self.level_up_gains.push((*info, talent_points));
+    }
+
+    /// The parked gains for `level`, removed from the queue. `None` when the level edge came from
+    /// somewhere the packet did not — a GM demotion's descriptor write, or a first observation —
+    /// in which case the caller fires zeros, which is what those gains actually are.
+    pub(crate) fn take_level_up_gains(&mut self, level: u32) -> Option<(LevelUpInfo, u32)> {
+        let i = self
+            .level_up_gains
+            .iter()
+            .position(|(l, _)| l.level == level)?;
+        Some(self.level_up_gains.remove(i))
     }
 }
 
@@ -263,12 +287,9 @@ impl ChatLog {
                 tries: 0,
             });
         } else {
-            self.pending.push(Pending::Event(notice_event(
-                notice_byte,
-                channel,
-                name,
-                None,
-            )));
+            if let Some(event) = notice_event(notice_byte, channel, name, None) {
+                self.pending.push(Pending::Event(event));
+            }
         }
     }
 
@@ -333,38 +354,34 @@ impl ChatLog {
     /// 0304). A named kill waits on the victim's name; everything else composes immediately
     /// (COMBATLOG_XPGAIN_FIRSTPERSON_UNNAMED "You gain %d experience.").
     pub(crate) fn push_xp_gain(&mut self, x: &XpGain) {
-        if x.kill && x.victim != 0 {
-            self.pending.push(Pending::XpGain {
-                victim: x.victim,
-                total: x.total,
-                bonus: x.total.saturating_sub(x.base),
-                tries: 0,
-            });
-        } else {
-            self.pending.push(Pending::Event(ChatEvent::text_only(
-                ChatEventKind::CombatXpGain,
-                xp_gain_line(None, x.total, 0),
-            )));
-        }
+        // Both forks park. The unnamed one has no name to wait for — `victim: 0` is what says so
+        // at the drain — but it still has a template to resolve, and the string table is the VM's
+        // (decision 2045). One node, one composer, one place the wording can be wrong.
+        let named = x.kill && x.victim != 0;
+        self.pending.push(Pending::XpGain {
+            victim: if named { x.victim } else { 0 },
+            total: x.total,
+            bonus: if named {
+                x.total.saturating_sub(x.base)
+            } else {
+                0
+            },
+            tries: 0,
+        });
     }
 
     /// Queue an honor award's chat line (`SMSG_PVP_CREDIT` → CHAT_MSG_COMBAT_HONOR_GAIN;
     /// decision 1512). A credit with **no victim guid** is the bonus/objective form and needs no
     /// resolve at all, so it composes here and now — the same fork [`Self::push_xp_gain`] takes.
     pub(crate) fn push_pvp_credit(&mut self, honor: i32, victim: u64, rank: u8) {
-        if victim != 0 {
-            self.pending.push(Pending::HonorGain {
-                victim,
-                honor,
-                rank,
-                tries: 0,
-            });
-        } else {
-            self.pending.push(Pending::Event(ChatEvent::text_only(
-                ChatEventKind::CombatHonorGain,
-                honor_gain_line(None, None, honor),
-            )));
-        }
+        // Both forks park, for [`Self::push_xp_gain`]'s reason: `victim: 0` is the award form and
+        // waits for nothing, but its template still has to be resolved where the VM is.
+        self.pending.push(Pending::HonorGain {
+            victim,
+            honor,
+            rank,
+            tries: 0,
+        });
     }
 
     /// Queue a text emote's chat line (`SMSG_TEXT_EMOTE` → CHAT_MSG_TEXT_EMOTE; decision 1274) for
@@ -390,18 +407,6 @@ impl ChatLog {
         });
     }
 
-    /// Queue our ding's chat lines (`SMSG_LEVELUP_INFO` → the reference PLAYER_LEVEL_UP handler;
-    /// decision 0304). `talent_points` is the handler's arg4, client-derived (the packet
-    /// carries none).
-    pub(crate) fn push_level_up(&mut self, l: &LevelUpInfo, talent_points: u32) {
-        for text in level_up_lines(l, talent_points) {
-            self.pending.push(Pending::Event(ChatEvent::text_only(
-                ChatEventKind::System,
-                text,
-            )));
-        }
-    }
-
     /// Disconnect: drop every pending item (mirrors the merchant/gossip/loot session clears).
     pub(crate) fn clear_session(&mut self) {
         self.pending.clear();
@@ -425,21 +430,6 @@ impl ChatLog {
             .collect()
     }
 
-    /// The text of every parked line headed for a chat window, in order — test-only, the
-    /// text-shaped twin of [`Self::pending_len`]. A count proves a line was queued; only the text
-    /// proves it is the *right* line, which is the whole question for a composed one (decision
-    /// 1764's `ERR_TRADE_BLOCKED_S`, whose `%s` has to name the right player).
-    #[cfg(test)]
-    pub(crate) fn pending_texts(&self) -> Vec<String> {
-        self.pending
-            .iter()
-            .filter_map(|p| match p {
-                Pending::Event(e) => Some(e.text.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// How many parked items are headed for a CHAT WINDOW.
     ///
     /// Addon lines are excluded on purpose. They park in the same queue for the same ask-once name
@@ -453,57 +443,85 @@ impl ChatLog {
             .filter(|p| !matches!(p, Pending::Addon { .. }))
             .count()
     }
+
+    /// The text of every already-composed line waiting to render, in order — the queue's
+    /// [`Pending::Event`] entries, which is what everything that pushes a finished sentence
+    /// ([`Self::push_event`]) lands as. The `Wire`/`Notice`/`Roll` shapes are deliberately absent:
+    /// those have no text yet, and a caller asserting on a sentence wants only the ones that do.
+    #[cfg(test)]
+    pub(crate) fn pending_lines(&self) -> Vec<String> {
+        self.pending
+            .iter()
+            .filter_map(|p| match p {
+                Pending::Event(e) => Some(e.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
-/// The ding's chat lines — the reference PLAYER_LEVEL_UP handler transcribed
-/// (ChatFrame.lua:1283-1324, GlobalStrings LEVEL_UP / LEVEL_UP_HEALTH[_MANA] /
-/// LEVEL_UP_CHAR_POINTS[_P1] / LEVEL_UP_STAT × SPELL_STAT0..4), in its exact order. Decision 0304.
-pub(super) fn level_up_lines(l: &LevelUpInfo, talent_points: u32) -> Vec<String> {
-    let mut lines = vec![format!(
-        "Congratulations, you have reached level {}!",
-        l.level
-    )];
-    // LEVEL_UP_HEALTH_MANA when mana gained, else LEVEL_UP_HEALTH — unconditional.
-    let mana = l.powers[0];
-    if mana > 0 {
-        lines.push(format!(
-            "You have gained {} hit points and {} mana.",
-            l.health, mana
-        ));
-    } else {
-        lines.push(format!("You have gained {} hit points.", l.health));
-    }
-    // LEVEL_UP_CHAR_POINTS[_P1] — the GetText singular/plural pick.
-    if talent_points == 1 {
-        lines.push("You have gained 1 talent point.".to_string());
-    } else if talent_points > 1 {
-        lines.push(format!("You have gained {talent_points} talent points."));
-    }
-    // LEVEL_UP_STAT × each positive gain, SPELL_STAT0..4 order.
-    for (name, gain) in ["Strength", "Agility", "Stamina", "Intellect", "Spirit"]
-        .into_iter()
-        .zip(l.stats)
-    {
-        if gain > 0 {
-            lines.push(format!("Your {name} increases by {gain}."));
-        }
-    }
-    lines
+/// The VM's own string table as a lookup — `getglobal(key)`, which is where every sentence this
+/// feed shows comes from (decision 2045). Taken for exactly as long as one composition needs it,
+/// so the `route` that follows can take the VM mutably.
+fn globals(script: &benilla_ui::script::UiScript) -> impl Fn(&str) -> Option<String> + '_ {
+    |key: &str| script.lua().globals().get::<String>(key).ok()
 }
 
-/// The XP award's chat line: COMBATLOG_XPGAIN_FIRSTPERSON ("%s dies, you gain %d experience."),
-/// its EXHAUSTION1 rested form, or the UNNAMED form (no victim). INTERIM: the rested state word
-/// is "Rested" — the only state the live server produces (the beta tired/exhausted penalties are
-/// dead data); the client's state-word table is the in-flight 0304 §5's to pin.
-pub(super) fn xp_gain_line(victim: Option<&str>, total: u32, bonus: u32) -> String {
+/// Fill a key's template, or nothing at all if the chain has no string for it — the reference's
+/// data-suppression face, and the reason nothing here carries a fallback sentence.
+fn keyed(
+    get: &dyn Fn(&str) -> Option<String>,
+    key: &str,
+    args: &[benilla_ui::strings::Arg<'_>],
+) -> Option<String> {
+    let text = benilla_ui::strings::fill(&get(key)?, args);
+    (!text.is_empty()).then_some(text)
+}
+
+/// The XP award's chat line: `COMBATLOG_XPGAIN_FIRSTPERSON`, its `_EXHAUSTION1` rested form, or
+/// the `_UNNAMED` form (no victim).
+///
+/// **The rested template takes four arguments, not two** —
+/// `"%s dies, you gain %d experience. (%s exp %s bonus)"` — and the last two are the bonus
+/// *rendered with its sign* and the state WORD. That word is the one thing on this line the
+/// reference does not keep in GlobalStrings: 1.12 ships no `EXHAUSTION_STATE*` key, so it comes
+/// out of the client's own table and stays a literal here, with the same INTERIM it always had.
+/// "Rested" is the only state the live server produces (the beta tired/exhausted penalties are
+/// dead data); the client's table is the in-flight 0304 §5's to pin.
+pub(super) fn xp_gain_line(
+    victim: Option<&str>,
+    total: u32,
+    bonus: u32,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    use benilla_ui::strings::Arg;
     match victim {
-        Some(name) if bonus > 0 => {
-            format!("{name} dies, you gain {total} experience. (+{bonus} exp Rested bonus)")
-        }
-        Some(name) => format!("{name} dies, you gain {total} experience."),
-        None => format!("You gain {total} experience."),
+        Some(name) if bonus > 0 => keyed(
+            get,
+            "COMBATLOG_XPGAIN_EXHAUSTION1",
+            &[
+                Arg::S(name),
+                Arg::D(i64::from(total)),
+                Arg::S(&format!("+{bonus}")),
+                Arg::S(RESTED_STATE),
+            ],
+        ),
+        Some(name) => keyed(
+            get,
+            "COMBATLOG_XPGAIN_FIRSTPERSON",
+            &[Arg::S(name), Arg::D(i64::from(total))],
+        ),
+        None => keyed(
+            get,
+            "COMBATLOG_XPGAIN_FIRSTPERSON_UNNAMED",
+            &[Arg::D(i64::from(total))],
+        ),
     }
 }
+
+/// The rest-state word the `_EXHAUSTION1` template's fourth argument takes. Not a GlobalString in
+/// 1.12 — see [`xp_gain_line`].
+const RESTED_STATE: &str = "Rested";
 
 /// The honor line an `SMSG_PVP_CREDIT` becomes — the three GlobalStrings forms (COMBATLOG_HONORAWARD
 /// :786, COMBATLOG_HONORGAIN :787, COMBATLOG_DISHONORGAIN :785), decision 1512.
@@ -513,7 +531,7 @@ pub(super) fn xp_gain_line(victim: Option<&str>, total: u32, bonus: u32) -> Stri
 /// GAIN; victim and **`honor <= 0`** → DISHONOR. The boundary is `<=`, not `<` — a zero-honor kill
 /// takes the dishonorable arm, which the pre-verdict reading had on the honorable side.
 ///
-/// An absent `rank_title` formats an EMPTY rank slot rather than dropping the clause. That is the
+/// An absent `rank_title` fills an EMPTY rank slot rather than dropping the clause. That is the
 /// reference's own shape — it is precisely the emptiness vmangos floors a rankless victim's rank at
 /// 5 to avoid showing (1512), and compensating for it a second time on our side would hide what the
 /// server is actually sending.
@@ -521,53 +539,111 @@ pub(super) fn honor_gain_line(
     victim: Option<&str>,
     rank_title: Option<&str>,
     honor: i32,
-) -> String {
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    use benilla_ui::strings::Arg;
     match victim {
-        None => format!("You have been awarded {honor} honor points."),
-        Some(name) if honor <= 0 => format!("{name} dies, dishonorable kill."),
-        Some(name) => format!(
-            "{name} dies, honorable kill Rank: {} (Estimated Honor Points: {honor})",
-            rank_title.unwrap_or_default()
+        None => keyed(get, "COMBATLOG_HONORAWARD", &[Arg::D(i64::from(honor))]),
+        Some(name) if honor <= 0 => keyed(get, "COMBATLOG_DISHONORGAIN", &[Arg::S(name)]),
+        Some(name) => keyed(
+            get,
+            "COMBATLOG_HONORGAIN",
+            &[
+                Arg::S(name),
+                Arg::S(rank_title.unwrap_or_default()),
+                Arg::D(i64::from(honor)),
+            ],
         ),
     }
 }
 
-/// The discovery toast — GlobalStrings ERR_ZONE_EXPLORED ("Discovered: %s"), fired on every
-/// exploration packet to the UIErrorsFrame (byte-verified: error-table route 1 →
-/// `AddErrorMessage 0x4945b0` → UI_INFO_MESSAGE; decisions 0828/0829).
-pub(super) fn exploration_toast(area_name: &str) -> String {
-    format!("Discovered: {area_name}")
+/// The discovery toast — `ERR_ZONE_EXPLORED` ("Discovered: %s"), fired on every exploration packet
+/// to the UIErrorsFrame (byte-verified: error-table route 1 → `AddErrorMessage 0x4945b0` →
+/// UI_INFO_MESSAGE; decisions 0828/0829).
+pub(super) fn exploration_toast(
+    area_name: &str,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    keyed(
+        get,
+        "ERR_ZONE_EXPLORED",
+        &[benilla_ui::strings::Arg::S(area_name)],
+    )
 }
 
-/// The discovery chat line — GlobalStrings ERR_ZONE_EXPLORED_XP ("Discovered %s: %d experience
-/// gained"), fired **in addition to** the toast iff the packet carried XP (byte-verified: the
-/// signed `jle` skip at `0x5e422f`; route 0 → CHAT_MSG_SYSTEM; decisions 0828/0829).
-pub(super) fn exploration_line(area_name: &str, xp: u32) -> String {
-    format!("Discovered {area_name}: {xp} experience gained")
+/// The discovery chat line — `ERR_ZONE_EXPLORED_XP` ("Discovered %s: %d experience gained"), fired
+/// **in addition to** the toast iff the packet carried XP (byte-verified: the signed `jle` skip at
+/// `0x5e422f`; route 0 → CHAT_MSG_SYSTEM; decisions 0828/0829).
+pub(super) fn exploration_line(
+    area_name: &str,
+    xp: u32,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    use benilla_ui::strings::Arg;
+    keyed(
+        get,
+        "ERR_ZONE_EXPLORED_XP",
+        &[Arg::S(area_name), Arg::D(i64::from(xp))],
+    )
 }
 
 /// Build the event a channel notice becomes: JOINED/LEFT → the member-line kinds; the rest →
 /// CHANNEL_NOTICE (composed by [`super::frames::compose_notice`], the notice byte riding the
 /// event's `notice` field).
-fn notice_event(
+pub(super) fn notice_event(
     notice_byte: u8,
     channel: String,
     a: Option<String>,
     b: Option<String>,
-) -> ChatEvent {
+) -> Option<ChatEvent> {
+    // The display type per notice byte — wow-re `chat-msg-event-args.md`'s notice table, read
+    // off each arm's `mov edi`: 0x00/0x01 are the join/leave lines, MODE_CHANGE (0x0c) fires no
+    // chat event at all, a byte past THROTTLED fires SYSTEM with an empty token, and the rest
+    // split between CHANNEL_NOTICE (0x12) and CHANNEL_NOTICE_USER (0x13) exactly as listed.
+    use channel_notice as n;
     let kind = match notice_byte {
-        channel_notice::JOINED => ChatEventKind::ChannelJoin,
-        channel_notice::LEFT => ChatEventKind::ChannelLeave,
-        _ => ChatEventKind::ChannelNotice,
+        n::JOINED => ChatEventKind::ChannelJoin,
+        n::LEFT => ChatEventKind::ChannelLeave,
+        n::MODE_CHANGE => return None,
+        n::YOU_JOINED
+        | n::YOU_LEFT
+        | n::WRONG_PASSWORD
+        | n::NOT_MEMBER
+        | n::NOT_MODERATOR
+        | n::NOT_OWNER
+        | n::MUTED
+        | n::BANNED
+        | n::THROTTLED => ChatEventKind::ChannelNotice,
+        n::PASSWORD_CHANGED
+        | n::OWNER_CHANGED
+        | n::PLAYER_NOT_FOUND
+        | n::CHANNEL_OWNER
+        | n::ANNOUNCEMENTS_ON
+        | n::ANNOUNCEMENTS_OFF
+        | n::MODERATION_ON
+        | n::MODERATION_OFF
+        | n::PLAYER_KICKED
+        | n::PLAYER_BANNED
+        | n::PLAYER_UNBANNED
+        | n::PLAYER_NOT_BANNED
+        | n::PLAYER_ALREADY_MEMBER
+        | n::INVITE
+        | n::INVITE_WRONG_FACTION
+        | n::WRONG_FACTION
+        | n::INVALID_NAME
+        | n::NOT_MODERATED
+        | n::PLAYER_INVITED
+        | n::PLAYER_INVITE_BANNED => ChatEventKind::ChannelNoticeUser,
+        _ => ChatEventKind::System,
     };
-    ChatEvent {
+    Some(ChatEvent {
         kind: Some(kind),
         sender: a.unwrap_or_default(),
         target: b.unwrap_or_default(),
         channel,
         notice: notice_byte.to_string(),
         ..Default::default()
-    }
+    })
 }
 
 /// Deliver one built event: the joined-list upkeep on **both sides** of the render, with the
@@ -577,7 +653,8 @@ fn notice_event(
 /// **YOU_JOINED lands before, YOU_LEFT lands after.** The notice's arg4/arg7/arg8/arg9 are read off
 /// the client's channel record ([`ChannelState::stamp_channel`] is our leg of that), so a record
 /// torn down before the line is composed costs it the slot number — and, since the color resolves
-/// through `ChatTypeInfo["CHANNEL"..arg8]` ([`super::event::resolved_color`]), its color with it.
+/// through `ChatTypeInfo["CHANNEL"..arg8]` — the stock window's own Lua since 1948 — its color
+/// with it.
 /// The reference's YOU_LEFT arm only *flags* the teardown (`0x49c115 mov dword [ebp-0xc],1`); the
 /// event fires first (`0x49c5b0 call 0x49a870`) and only then does `0x49c5b5 test` /
 /// `0x49c5c2 call 0x49bbd0` destroy the record — VERIFIED by disassembly at those addresses (1275).
@@ -606,6 +683,32 @@ pub(super) fn deliver(
     let notice = event
         .notice_byte()
         .filter(|_| event.kind == Some(ChatEventKind::ChannelNotice));
+    // **First, before anything below moves it.** The reference's notice arms read `slot+0x9c` to
+    // choose the token and only then write it (`0x49c0c2` reads, `0x49bb20` writes), and the two
+    // alternates are what keep a renamed or suspended channel registered with the window
+    // ([`super::event::notice_token`], decision 2130).
+    event.slot_state = channels.slot_state(&event.channel);
+    if let Some(byte) = notice {
+        // The one trace of the server's half of every join and leave — a probe log's only way to
+        // tell "we asked" from "the server agreed" (decision 2144's live runs read it).
+        debug!(
+            "chat: channel notice {byte:#04x} for {:?} (slot {:?}, {:?})",
+            event.channel,
+            channels.number_of(&event.channel),
+            event.slot_state
+        );
+    }
+    if notice == Some(channel_notice::YOU_JOINED) {
+        // The reference's `0x49bbaf`: the confirmed join is what sets the channel's
+        // `ZONECHANNELS` bit, and it is the ONLY thing that grows that mask at runtime
+        // (decision 2120). Outside the slot claim below because it is not about slots — a
+        // re-confirmation of a channel we already number still owns the bit.
+        channels.note_zone_channel_joined(&event.channel);
+        // …and the slot the walk RENAMED is already numbered, so the claim below skips it — but
+        // its state still has to come back to `Joined`, or the next notice on that row reads as
+        // another rename. A no-op for a channel we hold no slot for, which is the claim's case.
+        channels.confirm_slot(&event.channel);
+    }
     if notice == Some(channel_notice::YOU_JOINED) && channels.number_of(&event.channel).is_none() {
         match channels.claim_slot(&event.channel) {
             Some(slot) => {
@@ -613,7 +716,7 @@ pub(super) fn deliver(
                     "chat: server confirms channel {:?} joined (slot {slot})",
                     event.channel
                 );
-                script.set_joined_channels(channels.joined.clone());
+                script.set_joined_channels(channels.names());
             }
             // The reference's own ceiling, reached: ten slots, all taken. It answers with a chat
             // error and no record, so the channel stays unnumbered here too.
@@ -631,11 +734,19 @@ pub(super) fn deliver(
     channels.stamp_channel(event);
     route(script, windows, event);
     if let Some(name) = leaving {
-        // Cleared in place, never compacted: slot 2 going empty must not make slot 3 into 2
-        // ([`ChannelState`], 1286).
-        let freed = channels.free_slot(&name);
-        debug!("chat: server confirms channel {name:?} left (slot {freed:?} now free)");
-        script.set_joined_channels(channels.joined.clone());
+        // **A suspended slot survives its own leave** (`0x49c0e0`, decision 2130). The reference's
+        // `0x03` arm jumps past the teardown (`0x49c115`) when the record is in state 3, so walking
+        // out of a capital keeps `Trade`'s record AND its number — which is what lets walking back
+        // in re-join through the state-3 bypass, and what stops the stock handler deregistering it.
+        if event.slot_state == Some(super::edit::SlotState::Suspended) {
+            debug!("chat: channel {name:?} suspended — the record and its number stay");
+        } else {
+            // Cleared in place, never compacted: slot 2 going empty must not make slot 3 into 2
+            // ([`ChannelState`], 1286).
+            let freed = channels.free_slot(&name);
+            debug!("chat: server confirms channel {name:?} left (slot {freed:?} now free)");
+            script.set_joined_channels(channels.names());
+        }
     }
 }
 
@@ -654,17 +765,14 @@ pub(super) struct SpeakerEffects<'w> {
 
 /// Drain [`ChatLog`]: resolve names (ask-once, bounded), build events, [`route`] them. Also ticks
 /// the whisper-chime throttle.
-#[allow(clippy::too_many_arguments)] // a Bevy system's param list IS its dependency set
 pub(super) fn feed_chat(
     script: Option<NonSendMut<benilla_ui::script::UiScript>>,
     mut log: ResMut<ChatLog>,
     mut windows: ResMut<ChatWindows>,
-    mut edit: ResMut<super::edit::ChatEditState>,
     mut channels: ResMut<ChannelState>,
-    mut names: ResMut<NameCache>,
+    names: Res<NameCache>,
     mut speaker: SpeakerEffects,
     commands: Res<NetCommands>,
-    time: Res<Time>,
     // The text-emote sentence seam (decision 1274): the tables, plus the guid the composer's
     // "are you the performer?" test compares against.
     emote_texts: Option<Res<EmoteTexts>>,
@@ -679,12 +787,15 @@ pub(super) fn feed_chat(
     // The combat log's item-name seam (1703): the four families whose sentence names an ITEM
     // (`TRADESKILL_LOG`, `FEEDPET_LOG`, `ITEMENCHANTMENT*`, `SPELLDURABILITYDAMAGE`) resolve it
     // here, through the same ask-once cache the reference's own deferred queue re-runs against.
-    mut items: ResMut<crate::items::Items>,
+    items: Res<crate::items::Items>,
+    // The two 1.12 text filters (decision 2077), bundled for the same reason `SpeakerEffects` is:
+    // this list is at the sixteen-parameter ceiling. This IS the reference's `0x49a870`, so both
+    // arms belong here and nowhere else.
+    mut text_filter: crate::text_filter::ChatTextFilter,
 ) {
     let Some(mut script) = script else {
         return;
     };
-    windows.tell_alert_left = (windows.tell_alert_left - time.delta_secs()).max(0.0);
     if log.pending.is_empty() {
         return;
     }
@@ -751,7 +862,7 @@ pub(super) fn feed_chat(
                         subject_guid,
                         &guids,
                         &stores,
-                        &mut names,
+                        &names,
                         &commands,
                     );
                     let (text, clean) = crate::npc_text::substitute_checked(
@@ -793,7 +904,38 @@ pub(super) fn feed_chat(
                 // again, so an addon receiving a foreign-language line cannot recover the
                 // plaintext. Ours cannot either, deliberately.
                 let language = langs.effective_language(msg.chat_type, msg.language);
-                let text = langs.garble(language, &plain);
+                let mut text = langs.garble(language, &plain);
+
+                // ── The two text filters, in the reference's own order (decision 2077) ─────────
+                //
+                // They run HERE, on the one buffer the garble just filled, because that is where
+                // `0x49a870` runs them: it fills `[ebp-0xd0c]` once (plain copy or garble) and
+                // both arms operate on that buffer, so a filtered line is filtered in the language
+                // the viewer actually reads.
+                //
+                // **Spam first, mask second, fire third**, and the order is not cosmetic: a line
+                // the spam filter drops is never masked, so its characters must not consume mask
+                // indices — the mask phase is a process-global that carries across every message
+                // and subsystem, and masking before deciding to drop would drift it.
+                if text_filter.should_drop(msg.chat_type, msg.chat_tag, langs.is_gm(), &text) {
+                    // **Nothing is shown in its place.** `0x49ab33`'s not-a-whisper leg jumps to
+                    // `0x49afd7`, the bare epilogue — no event, no substitute text, no chat line.
+                    //
+                    // NOT built, and named rather than faked: the whisper leg. A dropped
+                    // `CHAT_MSG_WHISPER` with a non-zero report guid also sends `CMSG_CHAT_FILTERED`
+                    // (`0x331`) before returning — still firing no event, so the player sees the
+                    // same nothing either way. The packet's BODY is not settled (wow-re parked
+                    // `0x508680`'s send-path verdict as a DEFERRED), vmangos has no handler for the
+                    // opcode, and inventing a body to send a server that ignores it would be worse
+                    // than the honest gap.
+                    debug!(
+                        "chat: spam filter dropped [{:#04x}] {:?}",
+                        msg.chat_type, text
+                    );
+                    continue;
+                }
+                text_filter.mask_chat(msg.chat_type, &mut text);
+                let text = text;
                 let mut event = ChatEvent {
                     kind,
                     text: text.clone(),
@@ -814,11 +956,6 @@ pub(super) fn feed_chat(
                     ..Default::default()
                 };
                 channels.stamp_channel(&mut event);
-                // A received whisper remembers its sender (`ChatEdit_SetLastTellTarget`,
-                // ChatFrame_OnEvent l.1471) — the `/r` + Tab-cycle ring.
-                if event.kind == Some(ChatEventKind::Whisper) && !event.sender.is_empty() {
-                    edit.remember_tell(&event.sender);
-                }
                 route(&mut script, &mut windows, &event);
                 // The speech bubble spawns the moment the line routes — the reference's
                 // `0x49acd9` sits in the same SMSG display path ([`crate::chat_bubble`]).
@@ -894,13 +1031,14 @@ pub(super) fn feed_chat(
                 // changes what the player sees, which this pass is not allowed to do. Left for the
                 // director's call; the cost of leaving it is that arg7/arg8/arg9 are 0/0/empty on
                 // these events alone.
-                let event = notice_event(
+                if let Some(event) = notice_event(
                     notice,
                     channel,
                     Some(a.unwrap_or_else(|| "Unknown".into())),
                     b,
-                );
-                route(&mut script, &mut windows, &event);
+                ) {
+                    route(&mut script, &mut windows, &event);
+                }
             }
             Pending::Addon {
                 prefix,
@@ -947,15 +1085,27 @@ pub(super) fn feed_chat(
                     continue;
                 }
                 // RANDOM_ROLL_RESULT = "%s rolls %d (%d-%d)" (GlobalStrings:3290).
-                let line = format!(
-                    "{} rolls {roll} ({min}-{max})",
-                    name.unwrap_or_else(|| "Unknown".into())
-                );
-                route(
-                    &mut script,
-                    &mut windows,
-                    &ChatEvent::text_only(ChatEventKind::System, line),
-                );
+                let name = name.unwrap_or_else(|| "Unknown".into());
+                let line = {
+                    use benilla_ui::strings::Arg;
+                    keyed(
+                        &globals(&script),
+                        "RANDOM_ROLL_RESULT",
+                        &[
+                            Arg::S(&name),
+                            Arg::D(i64::from(roll)),
+                            Arg::D(i64::from(min)),
+                            Arg::D(i64::from(max)),
+                        ],
+                    )
+                };
+                if let Some(text) = line {
+                    route(
+                        &mut script,
+                        &mut windows,
+                        &ChatEvent::text_only(ChatEventKind::System, text),
+                    );
+                }
             }
             Pending::XpGain {
                 victim,
@@ -963,25 +1113,30 @@ pub(super) fn feed_chat(
                 bonus,
                 tries,
             } => {
-                let name = names.resolve(victim, &commands).map(str::to_string);
-                if name.is_none() && tries < NAME_MAX_TRIES {
-                    still.push(Pending::XpGain {
-                        victim,
-                        total,
-                        bonus,
-                        tries: tries + 1,
-                    });
-                    continue;
+                // `victim == 0` is the UNNAMED form — nothing to resolve, straight to the fill.
+                let name = if victim == 0 {
+                    None
+                } else {
+                    let resolved = names.resolve(victim, &commands).map(str::to_string);
+                    if resolved.is_none() && tries < NAME_MAX_TRIES {
+                        still.push(Pending::XpGain {
+                            victim,
+                            total,
+                            bonus,
+                            tries: tries + 1,
+                        });
+                        continue;
+                    }
+                    Some(resolved.unwrap_or_else(|| "Unknown".into()))
+                };
+                let line = xp_gain_line(name.as_deref(), total, bonus, &globals(&script));
+                if let Some(text) = line {
+                    route(
+                        &mut script,
+                        &mut windows,
+                        &ChatEvent::text_only(ChatEventKind::CombatXpGain, text),
+                    );
                 }
-                let name = name.unwrap_or_else(|| "Unknown".into());
-                route(
-                    &mut script,
-                    &mut windows,
-                    &ChatEvent::text_only(
-                        ChatEventKind::CombatXpGain,
-                        xp_gain_line(Some(&name), total, bonus),
-                    ),
-                );
             }
             Pending::HonorGain {
                 victim,
@@ -989,16 +1144,22 @@ pub(super) fn feed_chat(
                 rank,
                 tries,
             } => {
-                let name = names.resolve(victim, &commands).map(str::to_string);
-                if name.is_none() && tries < NAME_MAX_TRIES {
-                    still.push(Pending::HonorGain {
-                        victim,
-                        honor,
-                        rank,
-                        tries: tries + 1,
-                    });
-                    continue;
-                }
+                // `victim == 0` is the AWARD form — no name, no rank title, nothing to wait for.
+                let name = if victim == 0 {
+                    None
+                } else {
+                    let resolved = names.resolve(victim, &commands).map(str::to_string);
+                    if resolved.is_none() && tries < NAME_MAX_TRIES {
+                        still.push(Pending::HonorGain {
+                            victim,
+                            honor,
+                            rank,
+                            tries: tries + 1,
+                        });
+                        continue;
+                    }
+                    resolved
+                };
                 // **The side is the VICTIM's and the gender is OURS**, and that asymmetry is the
                 // reference's own (`0x625270`): the team digit is computed inline over the victim's
                 // faction template, while the gendered GlobalString resolve runs against the local
@@ -1017,16 +1178,21 @@ pub(super) fn feed_chat(
                     .0
                     .and_then(|g| names.player_traits(g))
                     .is_some_and(|(_, _, gender)| gender == 1);
-                let title = script.pvp_rank_title(rank, team, female);
-                let name = name.unwrap_or_else(|| "Unknown".into());
-                route(
-                    &mut script,
-                    &mut windows,
-                    &ChatEvent::text_only(
-                        ChatEventKind::CombatHonorGain,
-                        honor_gain_line(Some(&name), title.as_deref(), honor),
-                    ),
+                let title = (victim != 0).then(|| script.pvp_rank_title(rank, team, female));
+                let name = (victim != 0).then(|| name.unwrap_or_else(|| "Unknown".into()));
+                let line = honor_gain_line(
+                    name.as_deref(),
+                    title.flatten().as_deref(),
+                    honor,
+                    &globals(&script),
                 );
+                if let Some(text) = line {
+                    route(
+                        &mut script,
+                        &mut windows,
+                        &ChatEvent::text_only(ChatEventKind::CombatHonorGain, text),
+                    );
+                }
             }
             Pending::TextEmote {
                 performer,
@@ -1091,7 +1257,7 @@ pub(super) fn feed_chat(
                     if guid == 0 {
                         continue;
                     }
-                    match super::combat::object_name(guid, &mut names, &commands) {
+                    match super::combat::object_name(guid, &names, &commands) {
                         Some(name) if slot == 0 => line.fills.attacker = name,
                         Some(name) => line.fills.victim = name,
                         None => wait = true,
@@ -1112,7 +1278,7 @@ pub(super) fn feed_chat(
                         }
                     }
                     super::combat::Named::Unit(guid) => {
-                        match super::combat::object_name(guid, &mut names, &commands) {
+                        match super::combat::object_name(guid, &names, &commands) {
                             Some(name) => line.fills.named = name,
                             None => wait = true,
                         }
@@ -1137,17 +1303,26 @@ pub(super) fn feed_chat(
             }
             Pending::Discovery { area, xp } => {
                 // The toast fires every time; the chat line only rides XP (decisions 0828/0829).
-                script.fire_event(
-                    "UI_INFO_MESSAGE",
-                    vec![benilla_ui::script::ScriptValue::Str(exploration_toast(
-                        &area,
-                    ))],
-                );
-                if xp > 0 {
+                let (toast, line) = {
+                    let get = globals(&script);
+                    (
+                        exploration_toast(&area, &get),
+                        (xp > 0)
+                            .then(|| exploration_line(&area, xp, &get))
+                            .flatten(),
+                    )
+                };
+                if let Some(toast) = toast {
+                    script.fire_event(
+                        "UI_INFO_MESSAGE",
+                        vec![benilla_ui::script::ScriptValue::Str(toast)],
+                    );
+                }
+                if let Some(text) = line {
                     route(
                         &mut script,
                         &mut windows,
-                        &ChatEvent::text_only(ChatEventKind::System, exploration_line(&area, xp)),
+                        &ChatEvent::text_only(ChatEventKind::System, text),
                     );
                 }
             }

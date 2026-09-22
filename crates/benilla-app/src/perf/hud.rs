@@ -58,17 +58,21 @@ const PILL_YIELD_GAP: f32 = 4.0;
 /// quads are reused byte-identical (see [`pill_quads`]).
 const HUD_REFRESH_SECS: f32 = 0.25;
 
-/// HUD state. The **dev chord + `P`** toggles `visible` (default on — it's a standing dev
-/// surface). `visible` is `pub(crate)` so the capture harness ([`crate::capture`]) can force the
-/// overlay off for pristine, UI-free screenshots.
+/// HUD state. The **dev chord + `P`** (Ctrl+Shift+P) toggles `visible`, and it starts **hidden**
+/// — the director's call, 2026-09-08: the pill sits over the game for the whole session and the
+/// game is what a dev build is for looking at. It is an instrument you reach for, not furniture.
+/// `visible` is `pub(crate)` so the capture harness ([`crate::capture`]) can force the overlay off
+/// for pristine, UI-free screenshots.
 ///
-/// **`WOW_PERF_HUD=0` starts it hidden**, which is how the HUD gets priced. 1370 records the open
-/// gap: every campaign anchor is measured on a binary that is drawing this overlay, at a cost
-/// booked as "est 0.4–1.2 ms CPU + unquantified GPU" — an estimate, never a measurement, because
-/// nothing could turn the fixture off without also changing the binary. One env var makes it an
-/// interleaved A/B on *one* binary instead (`scripts/leg.sh`), so the constant baked into every
-/// anchor becomes a number. The meters keep sampling either way: only the drawing stops, which is
-/// the half being priced.
+/// **`WOW_PERF_HUD=1` starts it shown**, which is how the HUD gets priced — the knob kept its
+/// meaning in both spellings when the default flipped, so `0` and unset are both hidden. 1370
+/// records the open gap: every campaign anchor was measured on a binary that draws this overlay,
+/// at a cost booked as "est 0.4–1.2 ms CPU + unquantified GPU" — an estimate, never a measurement,
+/// because nothing could turn the fixture off without also changing the binary. One env var makes
+/// it an interleaved A/B on *one* binary instead (`scripts/leg.sh`), so the constant baked into
+/// every anchor becomes a number. The meters keep sampling either way: only the drawing stops,
+/// which is the half being priced — and with the default flipped, the *unmeasured* leg is now the
+/// one nobody is running.
 #[derive(Resource)]
 pub(crate) struct PerfHud {
     pub(crate) visible: bool,
@@ -88,7 +92,7 @@ pub(crate) struct PerfHud {
 impl Default for PerfHud {
     fn default() -> Self {
         Self {
-            visible: std::env::var("WOW_PERF_HUD").as_deref() != Ok("0"),
+            visible: std::env::var("WOW_PERF_HUD").as_deref() == Ok("1"),
             snap: FrameStats::default(),
             // −∞, so the very first frame refreshes rather than drawing an empty snapshot.
             snap_at: f32::NEG_INFINITY,
@@ -162,7 +166,7 @@ pub(super) fn refresh_hud_snapshot(
 /// right, the action bar the bottom, the chat dock the bottom left).
 ///
 /// **Asked of the frame, not recomputed from its numbers.** Its row pitch and anchor live in
-/// `assets/ui/WorldStateFrame.xml`; mirroring them here would be two copies to keep in step, so
+/// the stock `WorldStateFrame.xml` (1972); mirroring them here would be two copies to keep in step, so
 /// this reads the resolved edge the layout actually produced (`GetBottom`, y-up). One tiny chunk
 /// at 4 Hz, only while the HUD is drawing — the same shape as [`crate::hover_log`]'s tooltip
 /// probe.
@@ -181,12 +185,25 @@ pub(super) fn refresh_hud_snapshot(
 /// (~47 µs on a 200-frame tree — `layout_methods::settle`'s own measurement), four times a second.
 /// Every other frame it is a chunk load and a table lookup.
 pub(crate) fn top_centre_claimed(script: &UiScript, win_h: f32) -> f32 {
+    // The stock `WorldStateAlwaysUpFrame` is a permanently shown container (1972); what the
+    // readout actually occupies is its ROWS — `AlwaysUpFrame<n>`, built on demand and hidden when
+    // the scope admits nothing — so the claim is the lowest shown row's bottom, or nothing.
     const CHUNK: &str = r#"
         local f = WorldStateAlwaysUpFrame
         if not (f and f:IsVisible()) then return -1 end
-        local bottom, screen = f:GetBottom(), GetScreenHeight()
-        if not bottom or not screen or screen <= 0 then return -1 end
-        return (screen - bottom) / screen
+        local lowest, i = nil, 1
+        while true do
+            local r = getglobal("AlwaysUpFrame" .. i)
+            if not r then break end
+            if r:IsShown() then
+                local b = r:GetBottom()
+                if b and (not lowest or b < lowest) then lowest = b end
+            end
+            i = i + 1
+        end
+        local screen = GetScreenHeight()
+        if not lowest or not screen or screen <= 0 then return -1 end
+        return (screen - lowest) / screen
     "#;
     let frac: f32 = script.eval::<f64>(CHUNK).unwrap_or(-1.0) as f32;
     if !(0.0..=1.0).contains(&frac) {
@@ -204,6 +221,7 @@ pub(super) fn pill_quads(
     atlas: Option<Res<UiFontAtlas>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut quads: ResMut<UiQuads>,
+    mismatch: Option<Res<super::BlendMismatchShared>>,
     mut cache: Local<Option<PillCache>>,
 ) {
     if !hud.visible {
@@ -214,16 +232,33 @@ pub(super) fn pill_quads(
     };
     let win_w = win.width();
     let top = hud.pill_top();
-    let stale =
-        !matches!(&*cache, Some(c) if c.snap_at == hud.snap_at && c.win_w == win_w && c.top == top);
+    // Draws this frame that bound a blend state contradicting their material (the additive
+    // check, `perf::blend_check`): shown red the frame it happens, so a wrong halo on screen
+    // and a non-zero count here are seen together.
+    let mismatch = mismatch.map_or(0, |m| m.0.load(std::sync::atomic::Ordering::Relaxed));
+    let stale = !matches!(
+        &*cache,
+        Some(c) if c.snap_at == hud.snap_at && c.win_w == win_w && c.top == top && c.mismatch == mismatch
+    );
     if stale {
         let cpu = hud.snap.cpu.mean();
+        let main = hud.snap.main.mean();
         let fps = hud.snap.fps();
-        // One string, the dim run via markup: "59 fps  8.5 ms" — fps dim, cost in full text.
-        let text = match cpu {
-            Some(cpu) => format!("{Q_DIM_MARKUP}{fps:.0} fps|r  {cpu:.1} ms"),
-            None => format!("{Q_DIM_MARKUP}-- ms"),
+        // One string, the dim runs via markup: "59 fps  7.0 ms  17.3 cpu" — fps dim, the MAIN
+        // thread's ms in full text (the part of the frame the player feels), and the process-wide
+        // sum dim at the end (every thread, the number a CPU % agrees with — decision 1954: a
+        // raid read 17 on it at a solid 60 with the main thread at 7, and the sum was taken for
+        // a frame time by everyone who looked at it).
+        let mut text = match (main, cpu) {
+            (Some(main), Some(cpu)) => {
+                format!("{Q_DIM_MARKUP}{fps:.0} fps|r  {main:.1} ms  {Q_DIM_MARKUP}{cpu:.1} cpu|r")
+            }
+            (None, Some(cpu)) => format!("{Q_DIM_MARKUP}{fps:.0} fps|r  {cpu:.1} cpu"),
+            _ => format!("{Q_DIM_MARKUP}-- ms"),
         };
+        if mismatch > 0 {
+            text.push_str(&format!("  |cffff5050blend x{mismatch}|r"));
+        }
         let center = Vec2::new(win_w * 0.5, 0.0); // measured first, then shifted under PILL_TOP
         let mut e = atlas.lock();
         let glyphs = layout_text_quads(
@@ -242,6 +277,8 @@ pub(super) fn pill_quads(
                 outline: Outline::None,
                 alpha_gradient: None,
             },
+            // Our own dev overlay: measured off a degenerate rect, then shifted into the pill.
+            crate::ui_text::TextSeat::Exact,
         );
         drop(e);
         let bounds = glyphs
@@ -273,6 +310,7 @@ pub(super) fn pill_quads(
             snap_at: hud.snap_at,
             win_w,
             top,
+            mismatch,
             quads: out,
         });
     }
@@ -286,6 +324,8 @@ pub(super) struct PillCache {
     snap_at: f32,
     win_w: f32,
     top: f32,
+    /// The blend-mismatch count the text was laid out with (`perf::blend_check`).
+    mismatch: u64,
     quads: Vec<UiQuad>,
 }
 
@@ -349,10 +389,12 @@ mod tests {
             claimed > 8.0,
             "two rows reach past the pill's own seat, so the pill must move: {claimed}"
         );
-        // The frame's own geometry, read back the way the probe reads it: the container's top offset
-        // plus one row per pushed row. Asserted against the XML rather than restated as constants.
+        // The frame's own geometry, read back the way the probe reads it: the second (lowest)
+        // row's resolved bottom. Asserted against the stock XML rather than restated as constants.
         let expected: f32 = s
-            .eval::<f64>("return (20 + WORLD_STATE_ROW_HEIGHT * 2 + 15) / GetScreenHeight()")
+            .eval::<f64>(
+                "return (GetScreenHeight() - AlwaysUpFrame2:GetBottom()) / GetScreenHeight()",
+            )
             .expect("the frame's own numbers") as f32
             * SCREEN_H;
         assert!(

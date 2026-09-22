@@ -94,6 +94,13 @@ pub struct WorldSession {
     /// was too short for the billing group. Read by [`Self::billing_time_rested`]; see decision
     /// 1820 for why `0` rather than the client's own uninitialised-global behaviour.
     billing_time_rested: u32,
+    /// `SMSG_TUTORIAL_FLAGS` if it landed during the login handshake rather than in the world
+    /// stream (decision 1976) — handed to the world entry the way the billing minutes are.
+    tutorial_flags: Option<Vec<u8>>,
+    /// `SMSG_ADDON_INFO`'s per-record `status` bytes, in arrival order — `None` until the server
+    /// answers our addon block, which is the state that keeps the Lua index space empty
+    /// (decision 2175). Read by [`Self::take_addon_info`].
+    addon_info: Option<Vec<u8>>,
 }
 
 impl WorldSession {
@@ -183,6 +190,8 @@ impl WorldSession {
             roster_races: Default::default(),
             chat_language: messages::LANGUAGE_COMMON,
             billing_time_rested: 0,
+            tutorial_flags: None,
+            addon_info: None,
         };
 
         // 4. Wait for SMSG_AUTH_RESPONSE. Usually the first encrypted packet, but not always first
@@ -257,6 +266,11 @@ impl WorldSession {
         self.billing_time_rested
     }
 
+    /// The tutorial bank captured during the login handshake, if any (decision 1976).
+    pub fn take_tutorial_flags(&mut self) -> Option<Vec<u8>> {
+        self.tutorial_flags.take()
+    }
+
     /// Set a read timeout on the underlying socket (e.g. so a debug read-loop can stop when the
     /// world goes quiet). `None` clears it (blocking reads).
     pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> Result<()> {
@@ -267,7 +281,23 @@ impl WorldSession {
 
     /// Read + decrypt + parse one server packet.
     pub fn recv(&mut self) -> Result<ServerPacket> {
-        recv_packet(&mut self.stream, Some(self.crypto.decrypter()))
+        let packet = recv_packet(&mut self.stream, Some(self.crypto.decrypter()))?;
+        // **Captured here rather than in a loop arm**, because it is not one loop's business:
+        // `SMSG_ADDON_INFO` lands somewhere between `CMSG_AUTH_SESSION` and the roster, and which
+        // of the handshake's three read loops sees it is the server's timing, not our contract.
+        // `recv` is the one place all of them go through (decision 2175).
+        if let ServerPacket::AddonInfo { statuses } = &packet {
+            self.addon_info = Some(statuses.clone());
+        }
+        Ok(packet)
+    }
+
+    /// The `SMSG_ADDON_INFO` verdict, taken once — `None` when the server never answered our addon
+    /// block, which is a real state and not a failure: vmangos only replies when
+    /// `BuildAddonPacket` accepts the block, and a rejection leaves the session alive and silent
+    /// (`WorldSocket.cpp:447`). The reference behaves the same way — no reply, no Lua index space.
+    pub fn take_addon_info(&mut self) -> Option<Vec<u8>> {
+        self.addon_info.take()
     }
 
     /// Send a client packet (encrypted header + plaintext body).
@@ -295,7 +325,13 @@ impl WorldSession {
                 ServerPacket::Other {
                     opcode: opcode::SMSG_WARDEN_DATA,
                 } => return Err(WardenRequired.into()),
-                // The server interleaves account-data / tutorial / cache packets here; skip them.
+                // The tutorial bank, if the server sends it this early (1976): kept for the world
+                // entry — skipped here it would be lost to the roster loop.
+                ServerPacket::TutorialFlags(flags) => {
+                    self.tutorial_flags = Some(flags.bytes);
+                    continue;
+                }
+                // The server interleaves account-data / cache packets here; skip them.
                 _ => continue,
             }
         }
@@ -935,6 +971,7 @@ impl WorldSession {
                 stream: self.stream,
                 encrypter,
                 chat_language: self.chat_language,
+                sent: None,
             },
         ))
     }

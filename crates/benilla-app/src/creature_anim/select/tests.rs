@@ -835,36 +835,6 @@ fn wound_weight_decays_smoothstep_to_zero() {
 }
 
 #[test]
-fn msvc_rand_is_the_crt_lcg() {
-    // srand(1)'s canonical first outputs: 41, 18467, 6334 — the exact MSVCRT stream the client's
-    // variation roll consumes (wow-re rf36-rand-stub.md).
-    let mut state = 1u32;
-    assert_eq!(msvc_rand(&mut state), 41);
-    assert_eq!(msvc_rand(&mut state), 18467);
-    assert_eq!(msvc_rand(&mut state), 6334);
-    // Output stays in the client's 0..0x7fff roll domain.
-    let mut state = 0xdead_beefu32;
-    for _ in 0..100 {
-        assert!(msvc_rand(&mut state) <= 0x7fff);
-    }
-}
-
-#[test]
-fn replay_count_rolls_the_window_multiplier() {
-    // (0,0) — the overwhelming majority — always 1.
-    assert_eq!(replay_count((0, 0), 0), 1);
-    assert_eq!(replay_count((0, 0), 0x7fff), 1);
-    // A fixed authored count passes through (clamped ≥ 1).
-    assert_eq!(replay_count((3, 3), 0x7fff), 3);
-    // A range: R = min + ⌊roll·(max−min)/32768⌋ — max is approached, never exceeded.
-    assert_eq!(replay_count((2, 4), 0), 2);
-    assert_eq!(replay_count((2, 4), 16384), 3);
-    assert_eq!(replay_count((2, 4), 0x7fff), 3); // ⌊32767·2/32768⌋ = 1
-                                                 // Malformed (max < min) degrades to min.
-    assert_eq!(replay_count((5, 2), 0x7fff), 5);
-}
-
-#[test]
 fn defense_anim_matches_the_byte_lut() {
     // Decision 0279: the `0x60ec98` LUT read off WoW.exe — dagger parries 1H (unlike its swing),
     // fist parries UNARMED (unlike its Ready), ranged/none bail; dodge/deflect/block are fixed.
@@ -917,6 +887,7 @@ fn a_flying_spline_is_fly_before_backward_and_speed() {
 fn unify_stamps_flying_from_the_live_spline_on_every_leg() {
     use std::time::{Duration, Instant};
     let spline = |grounded| crate::net::Spline {
+        deck: None,
         points: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
         start: Instant::now(),
         duration: Duration::from_secs(10),
@@ -958,6 +929,7 @@ fn the_granted_modes_fold_into_the_flags_word_on_every_leg_but_our_own() {
 
     // Creature leg on a path: the granted bit rides alongside the spline's own FORWARD.
     let spline = crate::net::Spline {
+        deck: None,
         points: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
         start: Instant::now(),
         duration: Duration::from_secs(10),

@@ -106,7 +106,7 @@ fn control_verdict(mover: u64, allow_move: bool, self_guid: Option<u64>) -> Cont
 /// snap target).
 // One system phase's full input set (the spawner precedent); the transports query type is
 // `control`'s own param shape passed through.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 pub(super) fn apply_server_moves(
     time: &Time,
     commands: &mut Commands,
@@ -529,7 +529,7 @@ pub(super) fn apply_server_moves(
 /// a server-authored pose can relocate a rider but never board or deboard them. See
 /// [`move_flags::SERVER_AUTHORED`].
 pub(super) fn merge_server_flags(local: u32, wire: u32) -> u32 {
-    (local & !move_flags::SERVER_AUTHORED) | (wire & move_flags::SERVER_AUTHORED)
+    move_flags::merge_server_authored(local, wire)
 }
 
 /// Apply one bare self-addressed `MSG_MOVE_*` — a pose the *server* wrote for our own mover, with
@@ -608,12 +608,34 @@ fn apply_self_move(
     player.mover_pitch = m.pitch;
 
     // Riding a deck: `ON_TRANSPORT` is outside the merge mask, so this packet did not deboard us —
-    // it moved us **within** the platform frame. Re-anchor the local pose from the boat's live
-    // transform, or next frame's carry recomposes the stale one and undoes the snap.
+    // it moved us **within** the platform frame. Re-anchor the local pose, then let the carry
+    // recompose from it; without the re-anchor the next frame's carry reinstates the stale one and
+    // undoes the snap.
+    //
+    // **Take the wire's own deck-local pose when the packet carried one** (decision 2026). The
+    // subtraction below is only the server's answer while client and server agree about where the
+    // boat is, and at a cross-map seam they provably do not: our path clock has not crossed yet, so
+    // [`crate::transport::tick_transports`] is holding the boat's transform frozen at the *source*
+    // continent's pose while this packet's `position` is a world position on the *destination*. The
+    // difference is then not a deck offset but the distance between two continents — stable while
+    // the boat stays frozen (the carry just reproduces the server's own position, so nothing looks
+    // wrong), and a ~13 000 yd fling off the deck the instant the boat writes an honest pose again.
+    // The server sent us the right number in the same packet; use it.
     if let Some(ride) = player.ride.as_mut() {
         if let Ok((boat, _, _)) = transports.get(ride.entity) {
-            ride.local_pos = boat.rotation.inverse() * (player.pos - boat.translation);
-            ride.boat_yaw = boat.rotation.to_euler(EulerRot::YXZ).0;
+            match m.transport.filter(|t| t.guid == ride.guid) {
+                Some(t) => {
+                    ride.local_pos = wow_to_bevy([t.pos.x, t.pos.y, t.pos.z]);
+                    // World facing = local + boat yaw (the GetAbsoluteFacing law), so the carried
+                    // aim stays right even when the boat's own heading is the frozen one.
+                    ride.boat_yaw = boat.rotation.to_euler(EulerRot::YXZ).0;
+                    player.pos = boat.translation + boat.rotation * ride.local_pos;
+                }
+                None => {
+                    ride.local_pos = boat.rotation.inverse() * (player.pos - boat.translation);
+                    ride.boat_yaw = boat.rotation.to_euler(EulerRot::YXZ).0;
+                }
+            }
         }
     }
 

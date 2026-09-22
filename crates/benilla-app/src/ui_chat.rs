@@ -10,10 +10,13 @@
 
 use bevy::prelude::*;
 
-use crate::ui_script::UiInput;
+use crate::ui_script::{UiFeed, UiInput};
 
 #[cfg(test)]
 mod ace_gate_tests;
+/// `/afk` and `/dnd` — the two commands' asymmetric law, the optimistic AFK mirror `[0xb6e5cc]`,
+/// and the implicit clear every other chat send and every movement press carries (2088).
+mod away;
 /// The world broadcasts (`SMSG_ZONE_UNDER_ATTACK`/`_DEFENSE_MESSAGE`/`_SERVER_MESSAGE`) — the
 /// AreaTable/ServerMessages resolve and the joined-defense-channel walk they land on.
 mod broadcast;
@@ -22,20 +25,36 @@ mod channels;
 /// combat packet's sentence is built from.
 pub(crate) mod combat;
 pub(crate) mod commands;
-mod edit;
+/// The chat edit box's send path — `SendType`, the chat-type TOKEN an addon or the stock
+/// `SlashCmdList` passes to `SendChatMessage`, and its map to a wire kind. `pub(crate)` because
+/// that token→wire seam is what `ui_script::chat_tests` spans: the stock file emitting the token
+/// and this module resolving it are two halves that each pass alone while the join is cut (2082).
+pub(crate) mod edit;
 mod event;
 mod feed;
 mod frames;
+/// The idle handler — the 5-minute auto-sit / auto-AFK and the 30-minute camp.
+pub(crate) mod idle;
 mod input;
 /// The language gate — the exemptions and the fluency lookup behind the chat garble (B262).
 mod language;
+/// `LoggingChat`/`LoggingCombat` — the two log files `/chatlog` and `/combatlog` toggle.
+mod logging;
+/// The `AUTO_JOIN_GUILD_CHANNEL` cascade (decision 2144) — the one place the client joins or
+/// leaves `GuildRecruitment - City` on its own.
+mod recruitment;
 /// The chat windows' saved look (B246, decision 1589) — where the tab menu's tint/alpha/font-size
 /// picks are read from at login and written back at logout.
-mod settings;
+pub(crate) mod settings;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use away::AfkMirror;
 pub(crate) use broadcast::Broadcast;
+/// The zone-channel catalog's seed. Called from the world-entry UI load, like the restore below
+/// and for the neighbouring reason: the verbs that read it are read at addon file scope, and an
+/// `Update` push lands after the whole burst — decision 2241.
+pub(crate) use channels::seed_zone_channel_catalog;
 /// The joined-channel roster + the `ChatChannels.dbc` catalog. Read outside this module by the
 /// world-state readout ([`crate::world_state_ui`]), whose `Type == 1` gate is "has the player
 /// joined a zone-dependent defense channel".
@@ -47,17 +66,33 @@ pub(crate) use edit::ChannelState;
 pub(crate) use event::event_name;
 pub(crate) use event::{default_color, ChatEvent, ChatEventKind};
 pub(crate) use feed::ChatLog;
+/// The per-character chat cache's restore. Called from the world-entry UI load rather than from a
+/// system, because the two events it fires have to precede the session's first chat line and
+/// `PLAYER_LOGIN` — see [`settings::restore_chat_looks`] and decision 2119.
+pub(crate) use settings::restore_chat_looks;
 
 pub(crate) struct UiChatPlugin;
 
 impl Plugin for UiChatPlugin {
     fn build(&self, app: &mut App) {
+        app.add_observer(combat::on_cvar);
         app.init_resource::<ChatLog>()
+            .init_resource::<away::AfkMirror>()
+            .init_resource::<away::AfkMirrorMemo>()
+            .init_resource::<idle::LastInput>()
             .init_resource::<frames::ChatWindows>()
-            .init_resource::<edit::ChatEditState>()
             .init_resource::<edit::ChannelState>()
             .init_resource::<channels::ZoneChannelWalk>()
+            .init_resource::<recruitment::GuildRecruitmentCascade>()
             .init_resource::<language::ChatLanguages>()
+            .init_resource::<combat::CombatLogRanges>()
+            // `CombatLogPeriodicSpells`' knob, beside its sibling range set — both are what
+            // `combat::on_cvar` writes, so a missing one is not a dormant default but a
+            // PANIC on the first write of either row (2303; before that, at startup).
+            // 947ba585f registered it only in the `cvar_app()` test helper, and the client
+            // stopped booting; the unit suites never noticed because each builds its own
+            // world. `scripts/smoke.sh` is the gate that sees this class.
+            .init_resource::<combat::LogPeriodicSpells>()
             // `ChatChannels.dbc` — six rows, read once; the auto-join walk and every chat event's
             // arg7 both come out of it. **`.after(AssetSet::Open)` is load-bearing**: without it
             // this runs before the patch chain exists, takes its `assets: Option<Res<_>>` `None`
@@ -111,15 +146,70 @@ impl Plugin for UiChatPlugin {
             // The world broadcasts' resolve pass — before the drain that renders what it produces,
             // so an alarm or a shutdown countdown lands on the frame it decodes like every other
             // chat source.
-            .add_systems(Update, broadcast::feed_broadcasts.before(feed::feed_chat))
-            .add_systems(Update, feed::feed_chat.before(UiInput))
+            .add_systems(
+                Update,
+                broadcast::feed_broadcasts
+                    .in_set(crate::ui_script::UiFeed)
+                    .before(feed::feed_chat),
+            )
+            // **Never against the boot VM** (B376's second half). `feed_chat` takes the whole
+            // queue with `mem::take` and fires each line as a real `CHAT_MSG_*` — so a drain
+            // against a VM with no ChatFrame does not defer the lines, it DESTROYS them, with no
+            // memo and no error. The window is the one frame `not(ingame_ui_pending)` cannot see
+            // (`ui_script::ingame_ui_up`): `apply_net_updates` drains `Connected` and the login
+            // burst behind it in one `try_iter` while the state — and with it 1978's park — is
+            // still a frame away. Measured: one login in six drained the burst there and ate a
+            // line of the realm's own welcome. The early return above `mem::take` is what holds
+            // the queue for the frames after it, and this is what holds it for that one.
+            //
+            // **…and after the world-enter cascade, because that is the reference's own order**
+            // (decision 2221, carved in wow-5875-re for this — their `ca5f7d38`). The real client does not print
+            // login chat when it arrives either: `[0x8435fc]` is a latch that ships statically
+            // `1`, so every `SMSG_MESSAGECHAT` in the login burst is queued into
+            // `__AUPENDINGCHAT__` (`0x49db5c`/`0x49db62` → `0x49cae0`) instead of displayed. It is
+            // cleared in exactly one place — `0x490974`, INSIDE the world-enter cascade, after
+            // `PLAYER_LOGIN` (`0x490959`) and `PLAYER_ENTERING_WORLD` (`0x49096a`) — and the same
+            // call drains the queue. `SMSG_GUILD_EVENT` 0x02 has no such latch: it fires
+            // `GUILD_MOTD` synchronously in its own handler (`0x5e7288`). So the reference paints
+            // the guild line FIRST and the realm's welcome lines after it, inverting the wire
+            // order — and that is what the report asked for ("before server messages").
+            //
+            // Our held `ChatLog` queue IS that latch: the early return above `mem::take` is what
+            // keeps the login burst waiting. This says when it drains. Without these two edges
+            // the order was whatever the scheduler picked between two systems that declared
+            // nothing about each other — right today, by luck, exactly as the drain above was
+            // safe by luck until it wasn't.
+            //
+            // The edges are on the two feeds that fire the cascade's events, because that is
+            // where `0x490974` sits — DOWNSTREAM of both `0x703e50` calls, not merely inside the
+            // cascade. `UnitFeed` carries `PLAYER_ENTERING_WORLD`, `GuildFeed` carries
+            // `GUILD_MOTD`. (The reference's drain is one contiguous walk — `0x49d230`, every
+            // entry through the live path's own composer `0x49a870` — so the welcome lines land
+            // as a block, after those events and before the rest of the cascade.)
+            .add_systems(
+                Update,
+                feed::feed_chat
+                    .in_set(UiFeed)
+                    .after(crate::ui_unit::UnitFeed)
+                    .after(crate::ui_guild::GuildFeed)
+                    .run_if(crate::ui_script::ingame_ui_up),
+            )
+            // The last-input stamp `[0xcf0bc8]`. Deliberately NOT in-world-gated and
+            // deliberately ahead of the UI pass: the reference stores it on the raw input bus,
+            // before dispatch, so a keystroke the chat box swallows still counts as input.
+            .add_systems(Update, idle::stamp_input.before(UiInput))
             // A fresh VM gets the joined-channel mirror re-pushed once (decision 1291) — before
             // the feed, so the reload frame's first routed line already renders numbered.
-            .add_systems(Update, channels::seed_channels.before(feed::feed_chat))
+            .add_systems(
+                Update,
+                channels::seed_channels
+                    .in_set(crate::ui_script::UiFeed)
+                    .before(feed::feed_chat),
+            )
             // RequestTimePlayed() -> CMSG_PLAYED_TIME, and SMSG_PLAYED_TIME -> TIME_PLAYED_MSG.
             // Beside the chat feed because /played is a chat command and the answer prints there
             // too; before the input pass for the same reason feed_chat is.
-            .add_systems(Update, feed::played_time_bridge.before(UiInput))
+            .add_systems(Update, feed::played_time_bridge.in_set(UiFeed))
             // The input: open on ENTER (after the UI input pass has set UiKeyboardCapture, so we
             // don't reopen the box that's already eating keys), then drain any submitted line. Both
             // touch the single NonSend VM, so they chain. In-world only (decision 0193): at the
@@ -127,14 +217,15 @@ impl Plugin for UiChatPlugin {
             .add_systems(
                 Update,
                 (
-                    edit::open_chat_keys,
-                    edit::open_tell_requests,
-                    // An addon's `ChatFrame_OpenChat` — before the live parse in the same chain,
-                    // so a box opened prefilled `/w Bob ` has its type switched on the very next
-                    // frame rather than showing the raw slash to the user first.
-                    edit::open_chat_requests,
-                    edit::chat_edit_live,
-                    edit::chat_tab_cycle,
+                    // The AFK mirror's reconcile runs FIRST in the chain, so a `/afk` typed this
+                    // frame reads the descriptor's settled state rather than racing it (2088).
+                    away::reconcile_afk_mirror,
+                    // …and the four movement clears, which share the CVar and the mirror.
+                    away::movement_clears_afk,
+                    // The idle handler (2092) — one timer, three legs. After the clears, so a
+                    // press that both stamps the clock and drops the flag is settled before the
+                    // timer that would otherwise re-raise it is read.
+                    idle::idle_handler,
                     input::drain_chat_input,
                     // An addon's own line into the wire (decision 1199). AFTER the box's drain
                     // and in the same chain, so a `SendChatMessage` fired from a slash handler
@@ -147,7 +238,7 @@ impl Plugin for UiChatPlugin {
                 )
                     .chain()
                     .after(UiInput)
-                    .run_if(in_state(crate::char_select::ClientState::InWorld)),
+                    .in_set(crate::char_select::InWorldGated),
             )
             // The zone-channel auto-join (0288 P6): the client half of a handshake vmangos
             // deliberately leaves to us. In-world only, and it early-outs on an unchanged zone.
@@ -156,14 +247,25 @@ impl Plugin for UiChatPlugin {
             // drop that stays in-world for the reconnect. The disconnect twin is chained BEFORE the
             // walk so a drop and a walk landing on the same frame cannot re-diff against membership
             // the drop just invalidated.
+            //
+            // **After `AreaAuthoritySet`** (decision 2130), like the zone-text feed and the breath
+            // classifier — the other two systems that act on the leaf area. The walk turns the zone
+            // into packets, so reading last frame's answer is not a cosmetic lag: it joined the
+            // previous character's capital at login and then left it again, and the leave took the
+            // stock `ChatFrame_OnEvent`'s channel registration with it.
+            //
+            // The guild-recruitment cascade (decision 2144) runs **after the walk**, where the
+            // reference runs it — the tail of `ZoneChannelRefresh` — and reads the zone the walk
+            // just published.
             .add_systems(
                 Update,
                 (
                     channels::end_session_channels_on_disconnect,
-                    channels::auto_join_zone_channels
-                        .run_if(in_state(crate::char_select::ClientState::InWorld)),
+                    channels::auto_join_zone_channels.in_set(crate::char_select::InWorldGated),
+                    recruitment::guild_recruitment_cascade.in_set(crate::char_select::InWorldGated),
                 )
-                    .chain(),
+                    .chain()
+                    .after(benilla_world::terrain_stream::AreaAuthoritySet),
             )
             .add_systems(
                 OnExit(crate::char_select::ClientState::InWorld),
@@ -171,6 +273,7 @@ impl Plugin for UiChatPlugin {
             );
         // The per-character saved look (B246) — its own load/watch/save edges.
         settings::plugin(app);
+        logging::plugin(app);
     }
 }
 
@@ -179,7 +282,7 @@ impl Plugin for UiChatPlugin {
 ///
 /// `shutdown_ui_state`'s own doc carves the reference's logout tail: `PLAYER_LEAVING_WORLD` →
 /// `PLAYER_LOGOUT` → the saved files → **destroy the Lua state**. That last step is the one
-/// [`crate::ui_script::IngameUiLoaded`] exists to stand in for; while it does, every window in the
+/// `crate::ui_script::IngameUiLoaded` exists to stand in for; while it does, every window in the
 /// VM keeps its contents across a character switch. The director saw it as the previous
 /// character's `Joined Channel:` lines still sitting under the new character's — chat scrollback
 /// is simply the most visible tenant of a VM that should have been rebuilt.
@@ -196,31 +299,18 @@ impl Plugin for UiChatPlugin {
 /// its scrollback is the whole point.
 fn end_session_chat(
     script: Option<NonSendMut<benilla_ui::script::UiScript>>,
-    mut windows: ResMut<frames::ChatWindows>,
-    mut edit: ResMut<edit::ChatEditState>,
     mut log: ResMut<ChatLog>,
 ) {
-    end_chat_session(
-        script.map(NonSendMut::into_inner),
-        &mut windows,
-        &mut edit,
-        &mut log,
-    );
+    end_chat_session(script.map(NonSendMut::into_inner), &mut log);
 }
 
 /// [`end_session_chat`]'s body, callable without a `World` — the clear is the law, the system is
 /// the wiring.
 pub(crate) fn end_chat_session(
     script: Option<&mut benilla_ui::script::UiScript>,
-    windows: &mut frames::ChatWindows,
-    edit: &mut edit::ChatEditState,
     log: &mut ChatLog,
 ) {
     *log = ChatLog::default();
-    windows.tell_alert_left = 0.0;
-    // The channel target/number are [`channels::end_session_channels`]'s (1284); everything else
-    // the box remembers across an open is this session's too.
-    *edit = edit::ChatEditState::default();
     if let Some(script) = script {
         for frame in ["ChatFrame1", "ChatFrame2"] {
             crate::ui_script::run_or_warn(script, &format!("{frame}:Clear()"));

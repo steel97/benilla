@@ -6,7 +6,7 @@
 use bevy::prelude::*;
 
 use benilla_protocol::messages::BAG_PLAYER_INVENTORY;
-use benilla_ui::script::{ScriptValue, UiScript, EQUIPMENT_BAG};
+use benilla_ui::script::{UiScript, EQUIPMENT_BAG};
 
 use crate::items::Items;
 use crate::net::{ClientCommand, NetCommands, ObjectStore, SelfPlayer};
@@ -30,11 +30,10 @@ use super::{slot_guid, slot_guid_count, wire_pos, INVTYPE_AMMO};
 ///   `bonding == 2` item raises `AUTOEQUIP_BIND_CONFIRM` and sends NOTHING. `suppress` is the
 ///   reference's own parameter, set on the re-issue `EquipPendingItem` drives — which is what stops
 ///   the accept from asking the same question again forever.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn send_auto_equip(
     script: &mut UiScript,
     gate: &mut crate::ui_bind_confirm::BindGate,
-    items: &mut Items,
+    items: &Items,
     commands: &NetCommands,
     bag_index: u8,
     slot: u8,
@@ -90,7 +89,7 @@ pub(crate) fn send_auto_equip(
 /// visibly dimmed), pre-existing and out of this slice's scope to fix.
 pub(super) fn drain_container_autoequips(
     script: Option<NonSendMut<UiScript>>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     commands: Res<NetCommands>,
     mut gate: crate::ui_bind_confirm::BindGate,
@@ -114,7 +113,7 @@ pub(super) fn drain_container_autoequips(
         send_auto_equip(
             &mut script,
             &mut gate,
-            &mut items,
+            &items,
             &commands,
             bag_index,
             wire_slot,
@@ -189,7 +188,7 @@ pub(super) fn drain_bag_autostores(
 /// Drain the inventory-slot ids `UseInventoryItem` queued (decision 0208 phase 1b: the doll
 /// slot's right-click) and route the equipped position (bag 255 plus the 0-based wire slot —
 /// `HandleUseItemOpcode` takes equipped positions the same as bag ones, vmangos `ItemHandler.cpp`)
-/// through the shared use fork ([`super::item_use_command`]): the reference's doll click lands in
+/// through the shared use fork (`super::item_use_command`): the reference's doll click lands in
 /// the same `CGItem::Use` a bag click does (`0x4c7af0`), quest fork included — one of the five
 /// equippable quest-starters, worn and right-clicked, offers its quest instead of casting nothing.
 /// Ids outside 1..=19 (ammo, the bag icons) are a no-op — the engine's own queue never receives
@@ -200,6 +199,7 @@ pub(super) fn drain_inventory_uses(
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     targeting: crate::ui_action::cast_target::CastTargeting,
     mut ladder: crate::ui_action::CastLadder,
+    mut ui_errors: ResMut<crate::ui_action::UiErrorKeys>,
     mut gate: crate::ui_bind_confirm::BindGate,
 ) {
     let Some(mut script) = script else {
@@ -250,11 +250,11 @@ pub(super) fn drain_inventory_uses(
             &mut script,
             &mut gate,
             false,
+            &mut ui_errors,
         );
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn drain_container_uses(
     script: Option<NonSendMut<UiScript>>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
@@ -269,6 +269,7 @@ pub(super) fn drain_container_uses(
     // that lets `SMSG_LOOT_RESPONSE`'s admission gate recognise an item loot (decision 1531).
     mut loot_latch: ResMut<crate::ui_loot::LootLatch>,
     mut ladder: crate::ui_action::CastLadder,
+    mut ui_errors: ResMut<crate::ui_action::UiErrorKeys>,
     mut gate: crate::ui_bind_confirm::BindGate,
 ) {
     let Some(mut script) = script else {
@@ -298,6 +299,17 @@ pub(super) fn drain_container_uses(
         }
     }
     for (bag, slot) in script.take_container_uses() {
+        // **A right-click cancels an armed gift wrap, whatever it then does** (decision 1934):
+        // only a LEFT-click on a container slot spends the paper, and the reference's use path
+        // clears the cursor on its way. Above every affordance below, because a sell or a
+        // deposit is still a right-click. Re-arming is not a special case: a right-click on a
+        // second piece of paper cancels the first here and arms itself in the dispatcher.
+        if let Some(w) = script.cancel_gift_wrap() {
+            debug!(
+                "ui_items: right-click cancels the armed gift wrap on bag {} slot {}",
+                w.bag, w.slot
+            );
+        }
         // Lua (bagID, 1-based slot) → the wire's player-array addressing.
         let slot0 = u8::try_from(slot.saturating_sub(1)).ok();
         // Sell affordance (decision 0081 v1): while a merchant is open, a bag-slot click sells the
@@ -377,6 +389,7 @@ pub(super) fn drain_container_uses(
                     spell_index: t.use_spell_index().unwrap_or(0),
                     use_spell: t.use_spell.map(|u| u.spell_id),
                     unwraps_gift: t.unwraps_gift(inst_flags),
+                    begins_gift_wrap: t.begins_gift_wrap(inst_flags),
                     opens_loot: t.opens_loot(),
                     page_text: t.page_text,
                     is_charter: t.flags & benilla_protocol::messages::ITEM_FLAG_CHARTER != 0,
@@ -404,7 +417,7 @@ pub(super) fn drain_container_uses(
             if send_auto_equip(
                 &mut script,
                 &mut gate,
-                &mut ladder.items,
+                &ladder.items,
                 &ladder.commands,
                 bag_index,
                 wire_slot,
@@ -430,6 +443,21 @@ pub(super) fn drain_container_uses(
                 bag_index,
                 slot: wire_slot,
             });
+            continue;
+        }
+        // …and arm #2's OTHER side: a piece of wrapping paper (`0x5d8d9d`'s clear branch →
+        // `0x5edea0`). **Purely local — nothing is sent.** The paper's slot locks, the displayed
+        // cursor becomes mode 2, and the next LEFT-click on a container slot is what sends
+        // `CMSG_WRAP_ITEM` (`ui_items::feed`'s wrap drain, through the engine's
+        // `pickup_container_item`). Decision 1934.
+        if let Some(c) = clicked.filter(|c| c.begins_gift_wrap) {
+            debug!(
+                "ui_items: arm gift wrap with {:#x} (lua bag {bag} slot {slot})",
+                c.guid
+            );
+            // `arm_gift_wrap` queues the slot's own `ITEM_LOCK_CHANGED` — the paper dims from
+            // the lock the arm takes, exactly as a held item's source slot does.
+            script.arm_gift_wrap(bag, slot);
             continue;
         }
         // #3 — the quest-starter (`0x5d8dd2`, decision 0664): the item's own guid is the
@@ -459,6 +487,7 @@ pub(super) fn drain_container_uses(
                 &mut script,
                 &mut gate,
                 false,
+                &mut ui_errors,
             );
             continue;
         }
@@ -543,10 +572,7 @@ pub(super) fn drain_container_uses(
                 .map(|store| slot_guid_count(Some(store), bag, slot, &ladder.items))
                 .unwrap_or((0, 0));
             pending_items.add([(bag, slot, guid, count)]);
-            script.fire_event(
-                "ITEM_LOCK_CHANGED",
-                vec![ScriptValue::Int(bag), ScriptValue::Int(i64::from(slot))],
-            );
+            script.fire_event("ITEM_LOCK_CHANGED", Vec::new());
             let _ = ladder.commands.0.send(ClientCommand::OpenItem {
                 bag_index,
                 slot: wire_slot,
@@ -573,6 +599,7 @@ pub(super) fn drain_container_uses(
             &mut script,
             &mut gate,
             false,
+            &mut ui_errors,
         );
     }
 }
@@ -597,6 +624,9 @@ struct Clicked {
     use_spell: Option<u32>,
     /// `ItemInfo::unwraps_gift` for this instance — dispatcher arm #2.
     unwraps_gift: bool,
+    /// `ItemInfo::begins_gift_wrap` — arm #2's OTHER side: a piece of wrapping paper. Arms the
+    /// local wrap cursor and sends nothing (decision 1934).
+    begins_gift_wrap: bool,
     /// `ItemInfo::opens_loot` for this template — dispatcher arm #8.
     opens_loot: bool,
     /// The template's `PageText` — dispatcher arm #5's book gate (decision 1105); `0` = not a
@@ -632,7 +662,7 @@ pub(super) fn drain_container_moves(
     script: Option<NonSendMut<UiScript>>,
     commands: Res<NetCommands>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     mut pending: ResMut<PendingItemOps>,
     mut gate: crate::ui_bind_confirm::BindGate,
 ) {
@@ -640,11 +670,36 @@ pub(super) fn drain_container_moves(
         return;
     };
     let store = self_q.iter().next();
+    // **The completed gift wraps** (decision 1934): a left-click that spent an armed paper. Both
+    // pairs go out in the wire's own order — the paper first — and the whole eligibility question
+    // is the server's: it answers an ineligible target with one of the six `ERR_CANT_WRAP_*`
+    // reasons through the ordinary `SMSG_INVENTORY_CHANGE_FAILURE` line.
+    for (gift_bag, gift_slot, item_bag, item_slot) in script.take_container_wraps() {
+        let (Some((gift_bag_index, gift_wire_slot)), Some((item_bag_index, item_wire_slot))) =
+            (wire_pos(gift_bag, gift_slot), wire_pos(item_bag, item_slot))
+        else {
+            debug!(
+                "ui_items: WrapItem({gift_bag}/{gift_slot} → {item_bag}/{item_slot}) out of \
+                 range — ignored"
+            );
+            continue;
+        };
+        debug!(
+            "ui_items: wrap {item_bag}/{item_slot} with the paper at {gift_bag}/{gift_slot} \
+             (wire {gift_bag_index}/{gift_wire_slot} → {item_bag_index}/{item_wire_slot})"
+        );
+        let _ = commands.0.send(ClientCommand::WrapItem {
+            gift_bag: gift_bag_index,
+            gift_slot: gift_wire_slot,
+            item_bag: item_bag_index,
+            item_slot: item_wire_slot,
+        });
+    }
     for mv in script.take_container_moves() {
         send_container_move(
             &mut script,
             &mut gate,
-            &mut items,
+            &items,
             &commands,
             store,
             &mut pending,
@@ -669,11 +724,10 @@ fn is_equip_position(bag_index: u8, slot: u8) -> bool {
 /// same body with `suppress` set, rather than a second copy of it that has to be kept agreeing.
 ///
 /// Returns whether the move was sent (`false` = deferred behind `EQUIP_BIND_CONFIRM`).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn send_container_move(
     script: &mut UiScript,
     gate: &mut crate::ui_bind_confirm::BindGate,
-    items: &mut Items,
+    items: &Items,
     commands: &NetCommands,
     store: Option<&ObjectStore>,
     pending: &mut PendingItemOps,
@@ -771,11 +825,10 @@ pub(crate) fn send_container_move(
             (mv.src_bag, mv.src_slot, src_guid, src_count),
             (mv.dst_bag, mv.dst_slot, dst_guid, dst_count),
         ]);
-        for (bag, slot) in [(mv.src_bag, mv.src_slot), (mv.dst_bag, mv.dst_slot)] {
-            script.fire_event(
-                "ITEM_LOCK_CHANGED",
-                vec![ScriptValue::Int(bag), ScriptValue::Int(i64::from(slot))],
-            );
+        // One per locked end, as the reference's own per-slot unlock does — the slot travels in
+        // how many times it fires, never in an argument (see `feed`'s note).
+        for _ in 0..2 {
+            script.fire_event("ITEM_LOCK_CHANGED", Vec::new());
         }
     }
     true
@@ -813,10 +866,7 @@ pub(super) fn drain_container_destroys(
         });
         let (guid, stack) = slot_guid_count(store, bag, slot, &items);
         pending.add([(bag, slot, guid, stack)]);
-        script.fire_event(
-            "ITEM_LOCK_CHANGED",
-            vec![ScriptValue::Int(bag), ScriptValue::Int(i64::from(slot))],
-        );
+        script.fire_event("ITEM_LOCK_CHANGED", Vec::new());
     }
 }
 
@@ -856,7 +906,9 @@ mod tests {
             .init_resource::<crate::ui_cast::PendingCast>()
             .init_resource::<crate::ui_cast::QueuedMeleeSpell>()
             .init_resource::<crate::cooldowns::Cooldowns>()
+            .init_resource::<crate::spell_mods::SpellModifiers>()
             .init_resource::<crate::ui_action::CastErrors>()
+            .init_resource::<crate::ui_action::UiErrorKeys>()
             .init_resource::<crate::ui_action::AutoRepeatActive>()
             .init_resource::<crate::ui_tradeskill::TradeSkillOpens>()
             .init_resource::<crate::ui_action::targeting::SpellTargeting>()
@@ -926,6 +978,46 @@ mod tests {
             "the slot greys at the click"
         );
     }
+
+    /// **Right-clicking wrapping paper arms the wrap and sends NOTHING** (decision 1934) — the
+    /// same dispatcher arm the wrapped-gift unwrap takes, on its other side. This is the bug the
+    /// carve found: benilla fell through to `CMSG_USE_ITEM`, which casts a spell the paper does
+    /// not have.
+    #[test]
+    fn a_wrapper_right_click_arms_the_cursor_and_ships_no_packet() {
+        let (mut app, rx) = open_the_clam();
+        while rx.try_recv().is_ok() {} // drain the clam's own send
+                                       // Re-dress backpack slot 1 as a piece of wrapping paper: WRAPPER on the template, and no
+                                       // WRAPPED bit on the instance (that combination is the begin-wrap arm; with the bit set it
+                                       // would be a present, and would send `CMSG_OPEN_ITEM`).
+        let mut items = app.world_mut().resource_mut::<Items>();
+        items.insert_template(
+            CLAM_ENTRY,
+            Some(ItemInfo {
+                flags: benilla_protocol::messages::ITEM_FLAG_WRAPPER,
+                ..crate::items::test_template("Red Ribboned Wrapping Paper")
+            }),
+        );
+        {
+            let script = app.world().non_send_resource::<UiScript>();
+            script.run("UseContainerItem(0, 1)").unwrap();
+        }
+        app.world_mut()
+            .run_system_once(drain_container_uses)
+            .unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "the begin-wrap arm is purely local — nothing goes on the wire until a container \
+             click spends it"
+        );
+        let script = app.world().non_send_resource::<UiScript>();
+        assert_eq!(
+            script.gift_wrap_armed(),
+            Some(benilla_ui::script::PendingWrap { bag: 0, slot: 1 }),
+            "…and the paper is armed"
+        );
+    }
 }
 
 /// **The bind confirmations' answers** (decision 1750) — `EquipPendingItem`/`CancelPendingEquip`
@@ -949,7 +1041,7 @@ pub(super) fn drain_bind_confirm_answers(
     script: Option<NonSendMut<UiScript>>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     mut pending: ResMut<PendingItemOps>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     commands: Res<NetCommands>,
     mut gate: crate::ui_bind_confirm::BindGate,
 ) {
@@ -981,7 +1073,7 @@ pub(super) fn drain_bind_confirm_answers(
                 send_container_move(
                     &mut script,
                     &mut gate,
-                    &mut items,
+                    &items,
                     &commands,
                     store,
                     &mut pending,
@@ -1003,7 +1095,7 @@ pub(super) fn drain_bind_confirm_answers(
                 send_auto_equip(
                     &mut script,
                     &mut gate,
-                    &mut items,
+                    &items,
                     &commands,
                     bag_index,
                     slot,
@@ -1024,6 +1116,7 @@ pub(super) fn drain_bind_on_use_confirms(
     script: Option<NonSendMut<UiScript>>,
     targeting: crate::ui_action::cast_target::CastTargeting,
     mut ladder: crate::ui_action::CastLadder,
+    mut ui_errors: ResMut<crate::ui_action::UiErrorKeys>,
     mut gate: crate::ui_bind_confirm::BindGate,
 ) {
     let Some(mut script) = script else {
@@ -1046,6 +1139,7 @@ pub(super) fn drain_bind_on_use_confirms(
         &mut script,
         &mut gate,
         true,
+        &mut ui_errors,
     );
 }
 
@@ -1067,16 +1161,19 @@ mod bind_confirm_tests {
     const F_OBJECT_ENTRY: u16 = 3;
 
     fn load_ui(s: &UiScript) {
-        for file in ["Fonts.xml", "MoneyFrame.xml", "UiPanels.xml"] {
-            let text = std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("assets/ui")
-                    .join(file),
-            )
-            .unwrap();
-            let doc = benilla_ui::framexml::parse(&text).unwrap();
-            let report = benilla_ui::loader::load(s, &doc, &|_| None);
-            assert!(report.errors.is_empty(), "{file}: {:?}", report.errors);
+        // Through the chain-aware reader: this list names chain files now, and a
+        // reader that joins `assets/ui` cannot resolve one (1838, 1887, 1888).
+        for file in [
+            "Interface\\FrameXML\\Fonts.xml",
+            r"Interface\FrameXML\MoneyFrame.lua",
+            r"Interface\FrameXML\MoneyFrame.xml",
+            r"Interface\FrameXML\UIParent.xml",
+            "Interface\\FrameXML\\GlobalStrings.lua",
+            "Interface\\FrameXML\\BasicControls.xml",
+            "Interface\\FrameXML\\LocaleProperties.lua",
+            "Interface\\FrameXML\\StaticPopup.xml",
+        ] {
+            crate::ui_script::load_ui_for_test(s, file);
         }
     }
 
@@ -1085,6 +1182,7 @@ mod bind_confirm_tests {
         slots.insert(
             1,
             ContainerSlot {
+                duration_ms: None,
                 petition: None,
                 already_bound: false,
                 bar_placeable: true,
@@ -1557,7 +1655,9 @@ mod bind_confirm_tests {
             .init_resource::<crate::ui_cast::PendingCast>()
             .init_resource::<crate::ui_cast::QueuedMeleeSpell>()
             .init_resource::<crate::cooldowns::Cooldowns>()
+            .init_resource::<crate::spell_mods::SpellModifiers>()
             .init_resource::<crate::ui_action::CastErrors>()
+            .init_resource::<crate::ui_action::UiErrorKeys>()
             .init_resource::<crate::ui_action::AutoRepeatActive>()
             .init_resource::<crate::ui_tradeskill::TradeSkillOpens>()
             .init_resource::<crate::ui_action::targeting::SpellTargeting>()

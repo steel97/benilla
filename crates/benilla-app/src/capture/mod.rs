@@ -45,7 +45,7 @@
 //! ## Running one capture by hand
 //! **Run through Cargo — never the built binary directly:**
 //! ```text
-//! WOW_CAPTURE_UI=1 WOW_CAPTURE=ui-unitframes \
+//! WOW_CAPTURE=ui-unitframes \
 //!     WOW_CAPTURE_OUT=/tmp/shot.png cargo run -q -p benilla
 //! ```
 //! (`WOW_DATA` is only needed for a non-standard install — the client finds one in the project
@@ -60,8 +60,11 @@
 //! compile time, which fixed the capture and left a binary that worked only on the machine that
 //! built it. 1175 deleted the path instead: every shader is compiled into the binary and addressed
 //! `embedded://<crate>/shaders/…`, so there is no asset root left to resolve wrongly.
-//! `WOW_CAPTURE_UI=1` opts the player UI into the shot (off
-//! by default so world baselines stay UI-free; omit it for world-only scenes). `WOW_CAPTURE=list`
+//! A **`ui-*` scenario opts the player UI in on its own** — it declares a `ui:` fixture, which is
+//! this table saying the window is the subject ([`scenarios::ui_opted_in`], and read its doc
+//! for why that is a correctness fix and not a convenience). `WOW_CAPTURE_UI=1` remains, for what
+//! it was always actually for: painting the UI over a **world** scenario's shot. World baselines
+//! stay UI-free by default either way. `WOW_CAPTURE=list`
 //! prints the scenario names. `scripts/visual.sh` wraps all of this.
 
 use std::path::Path;
@@ -89,6 +92,8 @@ mod phase_probe;
 mod pick_probe;
 mod probe_auction;
 mod probe_bank;
+mod probe_bg;
+mod probe_bg_queue;
 mod probe_binder;
 mod probe_book;
 mod probe_castcancel;
@@ -97,13 +102,19 @@ mod probe_charter;
 mod probe_chest;
 mod probe_clam;
 mod probe_crossing;
+pub(crate) mod probe_env;
 mod probe_gm_ticket;
+mod probe_goquest;
 mod probe_guard_poi;
 mod probe_mail;
 mod probe_melee;
+mod probe_model_camera;
 mod probe_partner;
 mod probe_rig;
+mod probe_service;
+mod probe_stone;
 mod probe_taxi;
+mod probe_vendor_swap;
 mod probes;
 mod scenarios;
 use crate::run_mode::CaptureMode;
@@ -114,6 +125,8 @@ pub(crate) use phase_probe::PhaseProbePlugin;
 pub(crate) use pick_probe::PickProbePlugin;
 pub(crate) use probe_auction::ProbeAuctionPlugin;
 pub(crate) use probe_bank::ProbeBankPlugin;
+pub(crate) use probe_bg::ProbeBgPlugin;
+pub(crate) use probe_bg_queue::ProbeBgQueuePlugin;
 pub(crate) use probe_binder::ProbeBinderPlugin;
 pub(crate) use probe_book::ProbeBookPlugin;
 pub(crate) use probe_castcancel::ProbeCastCancelPlugin;
@@ -123,12 +136,17 @@ pub(crate) use probe_chest::ProbeChestPlugin;
 pub(crate) use probe_clam::ProbeClamPlugin;
 pub(crate) use probe_crossing::ProbeCrossingPlugin;
 pub(crate) use probe_gm_ticket::ProbeGmTicketPlugin;
+pub(crate) use probe_goquest::ProbeGoQuestPlugin;
 pub(crate) use probe_guard_poi::ProbeGuardPoiPlugin;
 pub(crate) use probe_mail::ProbeMailPlugin;
 pub(crate) use probe_melee::ProbeMeleePlugin;
+pub(crate) use probe_model_camera::ProbeModelCameraPlugin;
 pub(crate) use probe_partner::ProbePartnerPlugin;
 pub(crate) use probe_rig::ProbeRigPlugin;
+pub(crate) use probe_service::ProbeServicePlugin;
+pub(crate) use probe_stone::ProbeStonePlugin;
 pub(crate) use probe_taxi::ProbeTaxiPlugin;
+pub(crate) use probe_vendor_swap::ProbeVendorSwapPlugin;
 pub(crate) use probes::{
     fx_draw_census_plugin, DressCensusPlugin, EntityCensusPlugin, GroundCensusPlugin,
     JitterMeterPlugin, LiftCensusPlugin, LiveFpsPlugin, NodeProbePlugin, ParticleCensusPlugin,
@@ -136,6 +154,7 @@ pub(crate) use probes::{
     ProbeHoverPlugin, ProbeKeyPlugin, ProbeLuaPlugin, ProbeResizePlugin, RevealAuditPlugin,
     SchedCensusPlugin, StallPlugin, TrailCensusPlugin, UnitVisualsPlugin,
 };
+pub(crate) use scenarios::ui_opted_in;
 use scenarios::GlueScreen;
 use scenarios::{Scenario, SubjectKind, UiFixture, GLUE_SCENARIOS, GROUND_EYE, SCENARIOS};
 
@@ -545,9 +564,21 @@ fn resize_request() -> Option<(u32, u32)> {
 /// doesn't uncap" was the *power state* withholding the grant, not the mode — no present mode
 /// escapes that; `cpu_ms` on the probe line is the rail-proof metric. `WOW_PROBE_UNCAP=immediate`
 /// re-runs the losing arm when macOS/wgpu move.
+///
+/// `WOW_PROBE_UNCAP=vsync` does not uncap at all: the leg keeps the player's present mode and
+/// rails at the display's rate on purpose. It was built because the WindowServer's grant is not
+/// ours to schedule — one sitting on the M2 Air read 123.5, 60.0, 60.0 and 87.5 fps across four
+/// otherwise identical uncapped legs — and 1442's "railed-60.0 pairs only" rule discards every
+/// pair the grant split. **Measured the same day, it is not a neutral instrument:** two
+/// interleaved rounds at the Goldshire pin, no crowd, read `cpu_ms` 11.80 / 11.55 uncapped
+/// (both railed 60.0 by the WindowServer anyway) against 14.65 / 12.43 under this arm — the
+/// vsync wait costs the process CPU, and unevenly. So the default stays uncapped and a pair is
+/// still accepted only when both legs happened to rail; this arm is for a sitting whose legs
+/// refuse to rail at all, with the tax read against a same-arm baseline.
 pub(crate) fn probe_uncap_mode() -> bevy::window::PresentMode {
     match std::env::var("WOW_PROBE_UNCAP").as_deref() {
         Ok("immediate") => bevy::window::PresentMode::Immediate,
+        Ok("vsync") => bevy::window::PresentMode::AutoVsync,
         _ => bevy::window::PresentMode::AutoNoVsync,
     }
 }
@@ -766,6 +797,37 @@ impl Plugin for CapturePlugin {
                     minute: knob("WOW_VISTA_MIN", 720.0) as u32,
                     ui: None,
                 }
+            } else if name == "name-close" {
+                // The magnified overhead-name instrument (see `scenarios::NAME_CLOSE_AT`): the
+                // `name-water` wolf, orbited by knob and looked straight at, so the ONE variable
+                // is how many device pixels a glyph texel is drawn into. Not a golden scenario.
+                let knob = |k: &str, d: f32| {
+                    std::env::var(k)
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(d)
+                };
+                let at = scenarios::NAME_CLOSE_AT;
+                // The name hangs `h` above the unit's FEET (the posed PlayerName attachment plus
+                // the block's own line of rise) — that point is what the camera orbits and aims at.
+                let name_at = [at[0], at[1], at[2] + knob("WOW_NAME_H", 1.4)];
+                let (dist, az, el) = (
+                    knob("WOW_NAME_DIST", 4.0),
+                    knob("WOW_NAME_AZ", 124.0).to_radians(),
+                    knob("WOW_NAME_EL", 8.0).to_radians(),
+                );
+                Scenario {
+                    name: "name-close",
+                    map: Some(scenarios::MAP_AZEROTH),
+                    eye: [
+                        name_at[0] + dist * el.cos() * az.cos(),
+                        name_at[1] + dist * el.cos() * az.sin(),
+                        name_at[2] + dist * el.sin(),
+                    ],
+                    look: name_at,
+                    minute: 720,
+                    ui: Some(UiFixture::NameWater),
+                }
             // By name, EITHER table: the blessed six or an on-demand fixture. Only the sweep is
             // narrowed — every old viewpoint is still capturable by name (decision 0632).
             } else if let Some(&s) = SCENARIOS
@@ -782,7 +844,7 @@ impl Plugin for CapturePlugin {
                     .map(|s| s.name)
                     .collect();
                 eprintln!(
-                "WOW_CAPTURE={name:?} is not a known scenario; choose one of: {known:?}, {glue_known:?} (or fxview, waterfx)"
+                "WOW_CAPTURE={name:?} is not a known scenario; choose one of: {known:?}, {glue_known:?} (or fxview, waterfx, name-close)"
             );
                 std::process::exit(2);
             })
@@ -855,7 +917,6 @@ impl Plugin for CapturePlugin {
 /// Each frame, force the deterministic capture conditions: pinned time-of-day, no perf HUD, and the
 /// fixed camera pose. Runs in `WorldStage::Present` (after `control` is gated off and after terrain
 /// streaming reads the camera), so the harness is the sole, stable author of the view.
-#[allow(clippy::too_many_arguments)]
 fn pin_scene(
     ctx: Res<CaptureCtx>,
     mut debug: ResMut<DebugState>,
@@ -866,7 +927,8 @@ fn pin_scene(
     roots: Query<&Transform, Without<WorldCamera>>,
     mut cam: Query<&mut Transform, With<WorldCamera>>,
 ) {
-    perf.visible = false; // the perf HUD is default-on; suppress it for a pristine, UI-free shot
+    perf.visible = false; // hidden by default since 2099, but a session may have chorded it up —
+                          // a capture is pristine and UI-free whatever the run did
                           // A glue screen has no world to light, no clock to pin and no camera to place. The shutter
                           // above needs none of that — it is watching the framebuffer.
     let Some(scenario) = ctx.scenario else {
@@ -934,7 +996,8 @@ fn hold_clock(mut clock: ResMut<Time<Virtual>>) {
 
 /// The three scene-population queries the `FPS_PROBE` line prints — bundled because they are one
 /// concern (how much world is resident, and how much of it survived the cull) and because
-/// `drive_capture` sits against Bevy's 16-parameter ceiling, which `cvars::KnobParams` hit first.
+/// `drive_capture` sits against Bevy's 16-parameter ceiling, which the CVar host's old knob
+/// bundle hit first (retired by 2303).
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct ProbeCensus<'w, 's> {
     particles: Query<'w, 's, &'static benilla_world::particles::ParticleEmitter>,
@@ -943,7 +1006,6 @@ pub(crate) struct ProbeCensus<'w, 's> {
 }
 
 /// Drive the capture lifecycle: wait for streaming, settle, screenshot, exit.
-#[allow(clippy::too_many_arguments)]
 fn drive_capture(
     mut ctx: ResMut<CaptureCtx>,
     mut watch: ResMut<FrameWatch>,
@@ -1030,7 +1092,9 @@ fn drive_capture(
             if watch.stable >= stable_frames() || capped {
                 if let Some(px) = watch.prev.as_deref() {
                     if px
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
                     {
                         error!(

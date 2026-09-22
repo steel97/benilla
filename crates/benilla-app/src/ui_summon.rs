@@ -27,7 +27,7 @@
 //!    resolves the active player (`0x468550` → `0x468460` with typemask `0x10` = player) and, if
 //!    `0x605f30` says yes, returns without latching *or* firing (`5e6194: jne`). So the request
 //!    does not merely fail to show a dialog: it does not disturb a previously latched one either,
-//!    which is why [`apply::request`] is the gate and the popup engine's `whileDead` rule is not.
+//!    which is why [`net::request`] is the gate and the popup engine's `whileDead` rule is not.
 //!
 //!    **`0x605f30` is not "is dead"** — that reading cost a wrong first cut here. It is
 //!    `[values+0x40] <= 0` (signed, `605f3b: jle`) **OR** (typemask bit `0x10` **AND** the
@@ -47,7 +47,7 @@
 //!    **send a name query** (`0x55f1fa`), whose arrival signals nothing. So the real name surfaces
 //!    only because the popup engine re-reads all three getters every OnUpdate frame — *a client
 //!    that formats the text once shows an empty summoner forever.* That is what makes
-//!    `UiPanels.xml`'s `CONFIRM_SUMMON` countdown arm the mechanism rather than a transcription,
+//!    `UIParent.lua`'s `CONFIRM_SUMMON` countdown arm the mechanism rather than a transcription,
 //!    and it is why the event is not held back for the name the way `DUEL_REQUESTED` (0633) is:
 //!    that event carries its name as `arg1`, and this one has no argument to hold.
 //!
@@ -75,10 +75,10 @@ use bevy::prelude::*;
 use crate::area::AreaTableRes;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, NetCommands};
-use crate::ui_script::UiInput;
+use crate::ui_script::{UiFeed, UiInput};
 
 /// The pending summon question — the reference's four-global bank (module doc, pin 1). Written by
-/// the net drain's `SummonRequest` arm through [`apply::request`], read by [`feed_summon`] (which
+/// the net drain's `SummonRequest` arm through [`net::request`], read by [`feed_summon`] (which
 /// pushes the three getters' answers and fires `CONFIRM_SUMMON`) and by [`drain_summon`] (which
 /// turns the dialog's Accept into the response).
 #[derive(Resource, Default)]
@@ -130,7 +130,7 @@ impl SummonState {
 fn feed_summon(
     script: Option<NonSendMut<UiScript>>,
     mut summon: ResMut<SummonState>,
-    mut names: ResMut<NameCache>,
+    names: Res<NameCache>,
     commands: Res<NetCommands>,
     areas: Option<Res<AreaTableRes>>,
     // Real, not virtual: the deadline was stamped on this clock by the net drain, and the server's
@@ -246,12 +246,58 @@ fn end_session_summon(
     }
 }
 
-/// The net drain's `SessionEvent::SummonRequest` arm, factored here so the wire law lives beside
-/// the state it drives.
-pub(crate) mod apply {
-    use bevy::prelude::debug;
+/// The summon's packet handler (decision 1747; in the net handler table since 2312), beside the
+/// state it drives.
+pub(crate) mod net {
+    use bevy::prelude::*;
 
     use super::SummonState;
+    use benilla_protocol::{SessionEvent, SessionEventKind};
+
+    use crate::net::NetHandlerApp;
+    use crate::net::{GuidIndex, ObjectStore, SelfGuid};
+
+    /// Register the handler — called from [`super::UiSummonPlugin`].
+    pub(super) fn register(app: &mut App) {
+        app.net_handler(SessionEventKind::SummonRequest, on_request);
+    }
+
+    /// Someone is asking to pull us to them. The reference gates this in the HANDLER, not the
+    /// dialog: a dead or ghost player's request is dropped before the latch, so it cannot
+    /// disturb a live question either (`0x5e6194`). The predicate is `0x605f30` — **health ≤ 0
+    /// OR (is-player AND `PLAYER_FLAGS` ghost bit)**, which is both of these accessors and not
+    /// the one `unit_is_dead` alone would give (a ghost's wire health is 1). A self object we
+    /// have not streamed yet reads as alive: the reference's own default (`0x5e6189` sends a
+    /// NULL object through to the latch).
+    fn on_request(
+        In(ev): In<SessionEvent>,
+        mut summon: ResMut<SummonState>,
+        self_guid: Res<SelfGuid>,
+        index: Res<GuidIndex>,
+        stores: Query<&ObjectStore>,
+        real_clock: Res<Time<Real>>,
+    ) {
+        if let SessionEvent::SummonRequest {
+            summoner,
+            zone,
+            delay_ms,
+        } = ev
+        {
+            let dead_or_ghost = self_guid
+                .0
+                .and_then(|g| index.0.get(&g))
+                .and_then(|e| stores.get(*e).ok())
+                .is_some_and(|s| s.0.unit_is_dead() || s.0.player_is_ghost());
+            request(
+                summoner,
+                zone,
+                delay_ms,
+                dead_or_ghost,
+                real_clock.elapsed_secs_f64(),
+                &mut summon,
+            );
+        }
+    }
 
     /// `SMSG_SUMMON_REQUEST` — latch the offer and owe the UI a dialog, unless we are dead or a
     /// ghost.
@@ -295,13 +341,14 @@ pub(crate) struct UiSummonPlugin;
 
 impl Plugin for UiSummonPlugin {
     fn build(&self, app: &mut App) {
+        net::register(app);
         app.init_resource::<SummonState>().add_systems(
             Update,
             (
                 // Before the feed, so the frame a session ends is already a frame the feed sees no
                 // memory of the last one ([`crate::death`]'s ordering, for the same reason).
                 end_session_summon.before(feed_summon),
-                feed_summon.before(UiInput),
+                feed_summon.in_set(UiFeed),
                 drain_summon.after(UiInput),
             ),
         );
@@ -349,15 +396,15 @@ mod tests {
     #[test]
     fn a_summon_that_arrives_while_refused_latches_nothing() {
         let mut summon = SummonState::default();
-        apply::request(0x2a, 1519, 120_000, true, 100.0, &mut summon);
+        net::request(0x2a, 1519, 120_000, true, 100.0, &mut summon);
         assert_eq!(summon.pending(), None);
         assert!(!summon.ask);
         assert_eq!(summon.time_left_ms(100.0), 0);
 
         // A live question, then a second request while refused: the first survives untouched.
-        apply::request(0x2a, 1519, 120_000, false, 100.0, &mut summon);
+        net::request(0x2a, 1519, 120_000, false, 100.0, &mut summon);
         summon.ask = false;
-        apply::request(0x99, 1, 120_000, true, 150.0, &mut summon);
+        net::request(0x99, 1, 120_000, true, 150.0, &mut summon);
         assert_eq!(
             summon.pending(),
             Some(0x2a),

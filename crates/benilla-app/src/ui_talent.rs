@@ -14,30 +14,37 @@
 //!   `talent-api.md`); the frame's gold/green/gray availability compose Lua-side from the
 //!   transcribed reference (tier gate, prereq triplets, meetsPrereq). The learn SEND gates on
 //!   not-at-max only (LearnTalent `0x4f36a0`) — the server enforces the rest.
-//! - **tooltip req lines** (red, shown while locked): `TOOLTIP_TALENT_TIER_POINTS` ("Requires
-//!   %d points in %s Talents") + `TOOLTIP_TALENT_PREREQ[_P1]` ("Requires %d point(s) in %s",
-//!   the prereq talent's name) — GlobalStrings:4260-4263. A `required_spell` gap has no
-//!   GlobalString and renders no line (the desaturation still communicates it).
+//! - **tooltip req lines** (red, shown while locked): `TOOLTIP_TALENT_TIER_POINTS` (`0x854a40`)
+//!   for a short tab total, `TOOLTIP_TALENT_PREREQ[_P1]` (`0x854a5c`) per unmet prereq slot, and
+//!   `ITEM_REQ_SKILL` (`0x84e338`, reused from the item tooltip) for an unmet `required_spell` —
+//!   the three keys `0x52b390` emits, in wow-re `talent-api.md`'s own order. **Keys, resolved off
+//!   the player's own `GlobalStrings.lua` at the feed** (decision 2045), never sentences written
+//!   here; a key the install does not carry renders no line, which is the reference's own
+//!   data-suppression face (the desaturation still communicates the lock).
 //! - The tooltip's spell parts (display + next rank) ride `ui_tooltip`'s spell channel, which
 //!   pre-feeds every rank spell of the class's pages at arrival — a `SetTalent` hover hits on
 //!   the FIRST enter (the reference's all-local instancy); its ask-once miss path stays as the
 //!   odd-case fallback.
 //!
-//! The free-professions chat line (`CHARACTER_POINTS_CHANGED` → "You now have %d free
-//! profession(s)." — LEVEL_UP_SKILL_POINTS[_P1], the reference ChatFrame.lua:1326-1337) is
-//! composed here on a cp2 rise: this feed owns the points diff, and the chat arc's own kinds
-//! carry it as a SYSTEM line.
+//! The free-professions chat line (`CHARACTER_POINTS_CHANGED` → `LEVEL_UP_SKILL_POINTS[_P1]`,
+//! the reference ChatFrame.lua:1326-1337) is composed here on a cp2 rise: this feed owns the
+//! points diff, and the chat arc's own kinds carry it as a SYSTEM line. The token is **not** a
+//! message-catalog row — the reference resolves it in Lua and calls `AddMessage` itself — so it
+//! rides no keyed queue and carries no surface or sound of its own (decision 2054's `/ginfo`
+//! shape); only the wording comes off the install.
 
 use std::collections::BTreeSet;
 
 use bevy::prelude::*;
 
 use benilla_formats::{Talent, TalentCatalog};
-use benilla_ui::script::{TalentPrereqView, TalentTabView, TalentUiState, TalentView, UiScript};
+use benilla_ui::script::{
+    ScriptValue, TalentPrereqView, TalentTabView, TalentUiState, TalentView, UiScript,
+};
+use benilla_ui::strings::{fill, Arg};
 
 use crate::net::{ClientCommand, NetCommands, ObjectStore, SelfPlayer};
 use crate::ui_action::{PlayerActions, Spells};
-use crate::ui_chat::{ChatEvent, ChatEventKind, ChatLog};
 use crate::ui_script::{gate, UiInput};
 use crate::ui_unit::UnitFeed;
 use benilla_assets::{AssetSet, LockRecover, WorldAssets};
@@ -59,7 +66,7 @@ impl Plugin for UiTalentPlugin {
                 (
                     // Feed before UiInput (an N-key open this frame sees a populated window);
                     // the learn drain after (a click's wire goes out the same frame).
-                    feed_talents.in_set(UnitFeed).before(UiInput),
+                    feed_talents.in_set(UnitFeed),
                     drain_talent_learns.after(UiInput),
                 ),
             );
@@ -90,7 +97,6 @@ struct FeedMemory {
     points: Option<(u32, u32)>,
 }
 
-#[allow(clippy::too_many_arguments)] // a Bevy system's param list IS its dependency set
 fn feed_talents(
     script: Option<NonSendMut<UiScript>>,
     talents: Option<Res<Talents>>,
@@ -98,7 +104,6 @@ fn feed_talents(
     spells: Option<Res<Spells>>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     changed_self: Query<(), (With<SelfPlayer>, Changed<ObjectStore>)>,
-    mut chat: ResMut<ChatLog>,
     mut memory: Local<crate::ui_script::VmMemo<FeedMemory>>,
 ) {
     let Some(mut script) = script else {
@@ -140,14 +145,27 @@ fn feed_talents(
         store.0.player_talent_points().unwrap_or(0),
         store.0.player_free_professions().unwrap_or(0),
     );
-    let fresh = build_pages(
-        &talents.catalog,
-        &actions.spells,
-        spells,
-        race,
-        class,
-        points,
-    );
+    // The reference strings the pages carry are read off the player's own `GlobalStrings.lua`
+    // (2045). Scoped, because the lookup borrows the VM and the push below needs it mutably.
+    let fresh = {
+        let get = |key: &str| {
+            script
+                .lua()
+                .globals()
+                .get::<String>(key)
+                .ok()
+                .filter(|t| !t.is_empty())
+        };
+        build_pages(
+            &talents.catalog,
+            &actions.spells,
+            &spells.catalog,
+            race,
+            class,
+            points,
+            &get,
+        )
+    };
     if fresh != memory.pushed {
         gate.audit("feed_talents", "the talent pages");
         debug!(
@@ -157,20 +175,34 @@ fn feed_talents(
         );
         script.set_talents(fresh.clone());
         memory.pushed = fresh;
-        script.fire_event("CHARACTER_POINTS_CHANGED", vec![]);
+        // `%d%d` — the talent-point and profession-point DELTAS, per the reference's own fire
+        // site (SignalEvent2, decision 1884). `ChatFrame.lua:1326` opens its branch with
+        // `if ( arg2 > 0 )`, unguarded, so an argless fire is not merely ignored there: it
+        // compares nil with a number and raises. `memory.points` still holds the previous pair
+        // here — it is updated at the end of this function — and a first observation seeds at
+        // zero, the same rule the professions line below uses.
+        let (talent_delta, profession_delta) = match memory.points {
+            Some((old_talent, old_professions)) => (
+                i64::from(points.0) - i64::from(old_talent),
+                i64::from(points.1) - i64::from(old_professions),
+            ),
+            None => (0, 0),
+        };
+        script.fire_event(
+            "CHARACTER_POINTS_CHANGED",
+            vec![
+                ScriptValue::Int(talent_delta),
+                ScriptValue::Int(profession_delta),
+            ],
+        );
     }
-    // The professions line rides the cp2 RISE only (a spend consumes, a rise frees — the
-    // reference prints on arg2 > 0); the first observation seeds silently.
-    if let Some((_, old_cp2)) = memory.points {
-        if points.1 > old_cp2 {
-            let text = if points.1 == 1 {
-                "You now have 1 free profession.".to_string()
-            } else {
-                format!("You now have {} free professions.", points.1)
-            };
-            chat.push_event(ChatEvent::text_only(ChatEventKind::System, text));
-        }
-    }
+    // **The professions line is not composed here, and must not be.** The event fired above IS
+    // the line: stock `ChatFrame_OnEvent`'s `CHARACTER_POINTS_CHANGED` arm (`ChatFrame.lua`
+    // l.1324-1334) reads `UnitCharacterPoints("player")` on `arg2 > 0` and prints
+    // `GetText("LEVEL_UP_SKILL_POINTS", nil, cp2)` itself, and `benilla.toc` sources that file
+    // off the player's own chain (1948). This feed used to print a second copy beside it —
+    // `ui_chat::tests::the_free_professions_line_is_printed_once` is what asks the window rather
+    // than reasoning about it, and it was the ding block's twin (see that test's neighbour).
     if memory.points != Some(points) {
         gate.audit("feed_talents", "the points memo");
         memory.points = Some(points);
@@ -189,13 +221,19 @@ fn rank_of(t: &Talent, known: &BTreeSet<u32>) -> u32 {
 }
 
 /// Build the pushed snapshot — the app's whole resolve (module doc).
-fn build_pages(
+pub(crate) fn build_pages(
     catalog: &TalentCatalog,
     known: &BTreeSet<u32>,
-    spells: &Spells,
+    // The DISPLAY catalog only — `Spell.dbc` for each talent's name and icon. Narrowed from the
+    // whole `Spells` resource (2167) so the addon-corpus survey can build the same snapshot off
+    // the player's chain without standing up five more DBCs it has no use for.
+    spells: &benilla_formats::SpellCatalog,
     race: u8,
     class: u8,
     points: (u32, u32),
+    // The VM's own `GlobalStrings.lua`, for the three red requirement lines — `None` for a key
+    // the install does not carry, which renders no line (decision 2045).
+    get: &dyn Fn(&str) -> Option<String>,
 ) -> TalentUiState {
     let mut tabs = Vec::new();
     let mut pages = Vec::new();
@@ -212,7 +250,7 @@ fn build_pages(
             } else {
                 0
             };
-            let d = spells.catalog.get(display_spell);
+            let d = spells.get(display_spell);
             // meetsPrereq is the requiredSpell known-check ONLY (byte-verified GetTalentInfo,
             // wow-re talent-api.md — the 0305 fold-back; talent prereqs live in the triplets).
             let meets_prereq = t.required_spell == 0 || known.contains(&t.required_spell);
@@ -220,17 +258,17 @@ fn build_pages(
             let tier_unlocked = t.row * 5 <= spent;
             let mut req_lines = Vec::new();
             if !tier_unlocked {
-                req_lines.push(format!(
-                    "Requires {} points in {} Talents",
-                    t.row * 5,
-                    tab.name
-                ));
+                req_lines.extend(
+                    get("TOOLTIP_TALENT_TIER_POINTS")
+                        .map(|f| fill(&f, &[Arg::D(i64::from(t.row * 5)), Arg::S(&tab.name)])),
+                );
             }
-            // The requiredSpell line rides ITEM_REQ_SKILL "Requires %s" (byte-verified in the
-            // SetTalent builder, wow-re talent-api.md).
+            // The requiredSpell line rides ITEM_REQ_SKILL (`0x84e338`, the item tooltip's own
+            // key reused) — byte-verified in the SetTalent builder, wow-re talent-api.md. It is
+            // NOT the `LOCKED_WITH_*`/`SPELL_FAILED_*` family, which reads identically in enUS.
             if !meets_prereq {
-                if let Some(req) = spells.catalog.get(t.required_spell) {
-                    req_lines.push(format!("Requires {}", req.name));
+                if let Some(req) = spells.get(t.required_spell) {
+                    req_lines.extend(get("ITEM_REQ_SKILL").map(|f| fill(&f, &[Arg::S(&req.name)])));
                 }
             }
             let mut prereqs = Vec::new();
@@ -245,15 +283,13 @@ fn build_pages(
                     });
                     if !learnable {
                         let p_name = spells
-                            .catalog
                             .get(p.ranks[0])
                             .map(|d| d.name.clone())
                             .unwrap_or_default();
-                        req_lines.push(if need == 1 {
-                            format!("Requires 1 point in {p_name}")
-                        } else {
-                            format!("Requires {need} points in {p_name}")
-                        });
+                        req_lines.extend(
+                            benilla_ui::strings::plural("TOOLTIP_TALENT_PREREQ", Some(need), get)
+                                .map(|f| fill(&f, &[Arg::D(i64::from(need)), Arg::S(&p_name)])),
+                        );
                     }
                 }
             }

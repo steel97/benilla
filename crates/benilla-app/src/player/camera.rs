@@ -8,10 +8,10 @@ use bevy::ecs::entity::EntityHashSet;
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::mesh::MeshTag;
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions};
+use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
-use avian3d::prelude::*;
-
+use super::camera_channel::{Arm, SmoothChannel};
+use super::camera_dynamics::{DynamicsInput, HeadBob, SmartPivot, TerrainTilt};
 use crate::creature_anim::wrap_pi;
 use crate::net::Embodied;
 use benilla_assets::materials::WowModelMaterial;
@@ -19,7 +19,6 @@ use benilla_world::interact::{WorldClick, WorldRightClick, WorldRightPress};
 use benilla_world::model_fade::{
     self_model_fade_alpha, FadeMaterials, PendingAppearFade, RenderFade, SELF_FADE_WINDOW,
 };
-use benilla_world::view::CAM_NEAR;
 
 /// The reference's up-edge click predicate, in **camera degrees and milliseconds** — the whole
 /// orbit-vs-select law (decision 1122; wow-re `world-click-drag-arbitration.md`, §5 fan-out
@@ -153,7 +152,9 @@ impl ZoomLimit {
         self.max = CAM_DIST_BASE_MAX * f;
     }
 
-    /// The live factor — what the CVar table and the config file carry.
+    /// The live factor — the inverse of [`Self::set_factor`], kept for the weld test (the
+    /// registry holds the string itself since 2303).
+    #[cfg(test)]
     pub(crate) fn factor(&self) -> f32 {
         self.max / CAM_DIST_BASE_MAX
     }
@@ -174,6 +175,97 @@ const LOOK_SENSITIVITY: f32 = 0.003;
 /// reproduces the shipped feel exactly.
 pub(crate) const MOUSE_SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.5..=1.5;
 
+/// The camera rows' change callback (decision 2303) — the look, zoom and follow knobs.
+pub(crate) fn on_cvar(
+    ev: On<crate::cvars::CvarChanged>,
+    mut look: ResMut<LookConfig>,
+    mut zoom: ResMut<ZoomLimit>,
+    mut follow: ResMut<FollowConfig>,
+) {
+    let v = ev.num();
+    match ev.key().as_str() {
+        "mouseinvertpitch" => look.invert_pitch = v != 0.0,
+        // The 1.12 slider's own range; an off-grid hand-edit rides between stops, like the others.
+        "mousespeed" => {
+            look.sensitivity = v.clamp(*MOUSE_SPEED_RANGE.start(), *MOUSE_SPEED_RANGE.end());
+        }
+        // The reference's `0x50b330` validator REJECTS an out-of-range value rather than clamping
+        // it: it prints `Value out of range (%f - %f)` and `CVar::Set` never stores, so the old
+        // value stands. That is a different posture from every clamping row, and it is the
+        // faithful one — a script writing 1e9 gets a refusal, not a silently pinned camera.
+        "camerayawmovespeed" | "camerapitchmovespeed" => {
+            if !CAMERA_SPEED_RANGE.contains(&v) {
+                warn!(
+                    "cvar {}: value out of range ({} - {}) — ignored",
+                    ev.name,
+                    CAMERA_SPEED_RANGE.start(),
+                    CAMERA_SPEED_RANGE.end()
+                );
+                return;
+            }
+            if ev.is("cameraYawMoveSpeed") {
+                look.yaw_speed = v;
+            } else {
+                look.pitch_speed = v;
+            }
+        }
+        "cameradistancemaxfactor" => zoom.set_factor(v),
+        // The three stops are 1 Smart / 2 Always / 3 Never; anything else reads as the registrar
+        // default rather than as a dead camera (`FollowStyle::from_cvar`).
+        "camerasmoothstyle" => follow.style = FollowStyle::from_cvar(v),
+        // Its sibling selector — the one the reference swaps in for the externally-driven states.
+        "camerasmoothtrackingstyle" => follow.tracking_style = FollowStyle::from_cvar(v),
+        // The auto-follow rate, clamped to 1.12's own AUTO_FOLLOW_SPEED slider range.
+        "camerayawsmoothspeed" => {
+            follow.yaw_speed = v.clamp(*FOLLOW_SPEED_RANGE.start(), *FOLLOW_SPEED_RANGE.end());
+        }
+        _ => {}
+    }
+}
+
+/// **The mouse-look rate law, and the one place benilla's units are not the reference's.**
+///
+/// The reference's own law is byte-VERIFIED (wow-re `world-click-drag-arbitration.md` §3.3):
+///
+/// ```text
+///   Δyaw_deg   = cameraYawMoveSpeed   × Δx / 800
+///   Δpitch_deg = cameraPitchMoveSpeed × Δy / 600
+/// ```
+///
+/// **800 × 600 is a screen, not a magic number** — the era's reference resolution. At the shipped
+/// `180`/`90` the law reads: a drag across the full screen width is a half-turn, and a drag up the
+/// full screen height is horizon-to-zenith. That is what makes the two divisors and the two
+/// defaults one design rather than four constants.
+///
+/// **What does NOT transfer is the unit.** The reference has *no DirectInput import at all*
+/// (wow-re `idle-timer-input-stamp-law.md`): it integrates `WM_MOUSEMOVE`, so its `Δ` is a
+/// **screen pixel after Windows pointer acceleration** — which is exactly why its `mousespeed`
+/// slider works by calling `SPI_SETMOUSESPEED` on the OS rather than scaling anything in-engine.
+/// benilla's `Δ` is `AccumulatedMouseMotion`, i.e. winit's `DeviceEvent::MouseMotion`: **raw,
+/// unaccelerated device units**. `deg per accelerated pixel` and `deg per raw unit` are different
+/// quantities, and the factor between them is a per-machine OS setting, not a fact about the
+/// client — so transplanting `180`/`90` as absolute numbers would be a confident guess on a
+/// load-bearing constant.
+///
+/// So we take the law's **shape** — per-axis, linear in the CVar — and anchor its **scale** to
+/// [`LOOK_SENSITIVITY`], the rate this client has shipped and the director has been looking at
+/// since 1140. The CVars therefore keep the reference's own defaults (1804: a setting's default is
+/// the reference's) and the divergence lands here, in a named constant, where it can be read.
+///
+/// **The one live divergence this leaves**, stated rather than buried: the reference is
+/// *anisotropic* at its defaults — `180/800 = 0.225` deg/px of yaw against `90/600 = 0.15` of
+/// pitch, so its yaw turns 1.5× faster than its pitch. Ours is isotropic, because
+/// [`LOOK_SENSITIVITY`] is one number. The **ratio** is unit-independent (both axes take the same
+/// acceleration curve), so unlike the absolute scale it *is* transferable — it is simply a feel
+/// change, and feel is the director's call, not a fidelity bug to fix quietly.
+const LOOK_YAW_PER_SPEED: f32 = LOOK_SENSITIVITY / 180.0;
+const LOOK_PITCH_PER_SPEED: f32 = LOOK_SENSITIVITY / 90.0;
+
+/// The reference's validator range for all four `camera*MoveSpeed`/`SmoothSpeed` CVars
+/// (`0x50c000` → `0x50b330`). It **rejects rather than clamps**: out of range prints
+/// `"Value out of range (%f - %f)"` and `CVar::Set` skips the store, so the old value stands.
+pub(crate) const CAMERA_SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.1..=360.0;
+
 /// The mouse-look player knobs (decision 0961): `mouseInvertPitch` is 1.12's own Interface
 /// Options checkbox (UIOptionsFrame.lua index 1, CVar-backed), settable from the Options
 /// window's Controls page through the CVar store (0954). Inverted, moving the mouse up pitches
@@ -188,6 +280,12 @@ pub(crate) const MOUSE_SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.5..=1.5;
 pub(crate) struct LookConfig {
     pub(crate) invert_pitch: bool,
     pub(crate) sensitivity: f32,
+    /// `cameraYawMoveSpeed` — the MOUSE_LOOK_SPEED slider (90…270 by 10). See
+    /// [`LOOK_YAW_PER_SPEED`] for why the number is the reference's and the scale is ours.
+    pub(crate) yaw_speed: f32,
+    /// `cameraPitchMoveSpeed` — no slider of its own; `UIOptionsFrame_Save` writes it as
+    /// `cameraYawMoveSpeed / 2` beside the yaw one, which is exactly the reference's 180/90 pair.
+    pub(crate) pitch_speed: f32,
 }
 
 impl Default for LookConfig {
@@ -195,6 +293,10 @@ impl Default for LookConfig {
         Self {
             invert_pitch: false,
             sensitivity: 1.0,
+            // The reference's registered defaults, and with them the shipped feel: at these two
+            // values both axes land on `LOOK_SENSITIVITY` exactly.
+            yaw_speed: 180.0,
+            pitch_speed: 90.0,
         }
     }
 }
@@ -204,8 +306,14 @@ impl LookConfig {
     /// both readers must agree: the look rotation itself and the click-vs-drag travel budget that
     /// decides whether a press was a click. Splitting them would let the slider move the drag
     /// threshold out from under the gesture (decision 1140).
-    pub(super) fn rate(self) -> f32 {
-        LOOK_SENSITIVITY * self.sensitivity
+    pub(super) fn yaw_rate(self) -> f32 {
+        self.yaw_speed * LOOK_YAW_PER_SPEED * self.sensitivity
+    }
+
+    /// The pitch axis's rate — its own CVar, because the reference's law has its own divisor for
+    /// it (600, the reference screen's height) and its own default (90).
+    pub(super) fn pitch_rate(self) -> f32 {
+        self.pitch_speed * LOOK_PITCH_PER_SPEED * self.sensitivity
     }
 }
 /// The auto-follow's angular rate — 1.12's `cameraYawSmoothSpeed`, registrar default **180 °/s**
@@ -272,7 +380,9 @@ impl FollowStyle {
         }
     }
 
-    /// The CVar string this style is — the value the table and `config.toml` carry.
+    /// The CVar string this style is — the inverse of [`Self::from_cvar`], kept for the
+    /// round-trip test (the registry holds the string itself since 2303).
+    #[cfg(test)]
     pub(crate) fn cvar(self) -> &'static str {
         match self {
             Self::Never => "0",
@@ -568,11 +678,6 @@ impl FollowRig {
 /// 1.5533430576 rad; the pitch integrate `FUN_00510120`, wow-re `follow-camera`). A single uniform
 /// clamp at every zoom level — the reference has **no** distinct first-person look-down limit.
 pub(super) const CAM_PITCH_LIMIT: f32 = 89.0 * std::f32::consts::PI / 180.0;
-/// Camera-collision probe radius (yd): a small sphere swept from the camera pivot toward the desired
-/// camera seat each frame. Its radius is the margin kept between the camera and the surface it stops
-/// at, so the near plane doesn't poke through the wall. Smaller than the player capsule — the camera
-/// threads gaps the body can't fit.
-pub(super) const CAM_COLLISION_RADIUS: f32 = 0.3;
 /// How fast the camera glides back out to the player's chosen zoom once an obstruction clears (1/s).
 /// Pull-*in* is instant (a wall must never sit between the camera and the character); only the
 /// push-*out* eases — the vanilla feel of the camera snapping close past an obstacle and easing back.
@@ -586,6 +691,13 @@ const CAM_RETURN_RATE: f32 = 6.0;
 /// floors. The collision sweep still starts from the *head* (not the pivot), so a jump in a low room
 /// stops the camera under the ceiling — see `control`.
 ///
+/// That height is one of the reference's **three** presets, rebuilt together by `0x50ca90` and
+/// chosen between per frame by `0x50f880`. benilla builds two of the three: the standing height
+/// above, and the **swim** preset `cam+0x124` — the same height less the model's
+/// [`CameraPivot::swim_drop_local`] — selected on MOVEFLAG_SWIMMING. The zoomed-in/zoomed-out pair
+/// (`cam+0x11c`/`cam+0x120`, split on `cam+0x198 < 1.8315`) is **not built**; see
+/// [`model_pivot_height`].
+///
 /// Floor (yd) on the world pivot height — VERIFIED `5/6` (`0x50ca90`'s per-preset clamp, and
 /// `0x50e570`'s corridor lower bound).
 pub(super) const CAM_PIVOT_FLOOR: f32 = 5.0 / 6.0;
@@ -597,10 +709,29 @@ pub(super) const CAM_PIVOT_CEIL: f32 = 15.0;
 /// model-derived value the moment the body attaches — as a **snap**, not a glide ([`PivotGlide`]).
 pub(super) const CAM_PIVOT_FALLBACK: f32 = 1.8;
 
-/// One modeled unit's world head height: its model-local [`CameraPivot`] × the given scale, clamped
-/// to `[CAM_PIVOT_FLOOR, CAM_PIVOT_CEIL]` — the reference's per-preset clamp in `0x50ca90`.
-pub(super) fn model_pivot_height(pivot: &CameraPivot, scale: f32) -> f32 {
-    (pivot.height_local * scale).clamp(CAM_PIVOT_FLOOR, CAM_PIVOT_CEIL)
+/// One modeled unit's world framing-pivot height: its model-local [`CameraPivot`] × the given scale,
+/// clamped to `[CAM_PIVOT_FLOOR, CAM_PIVOT_CEIL]` — the reference's per-preset clamp in `0x50ca90`.
+///
+/// **`swimming` selects the preset, per frame, the way `0x50f880` does**
+/// (`0x50f89e test [[unit+0x118]+0x40],0x200000` — MOVEFLAG_SWIMMING on the *camera target's*
+/// CMovement word): set, and the pivot drops by the model's own
+/// [`benilla_formats::M2Bounds::swim_pivot_drop`] before the clamp, which is the reference's
+/// `cam+0x124` preset. Clear, and it stays the standing height. The drop is a *model* constant
+/// (`StandSeq.max.z − SwimSeq.max.z`, `0x50ccf6`), so a body that authors no Swim sequence carries
+/// `0.0` and the two presets are the same number — correct for anything that cannot swim.
+///
+/// **What is deliberately not here:** the reference keeps a *third* preset. `0x50f880`'s non-swim
+/// leg picks `cam+0x11c` (zoomed-in) or `cam+0x120` (zoomed-out) on `cam+0x198 < 1.8315`
+/// (`[0x8089b0]`), and benilla builds neither — one standing height serves both zoom regimes. On a
+/// scale-1 human the reference computes those two presets *equal* (both 1.9002692), so nothing yet
+/// says what authors them apart; naming it beats stubbing a threshold we cannot justify (1203).
+pub(super) fn model_pivot_height(pivot: &CameraPivot, scale: f32, swimming: bool) -> f32 {
+    let local = if swimming {
+        pivot.height_local - pivot.swim_drop_local
+    } else {
+        pivot.height_local
+    };
+    (local * scale).clamp(CAM_PIVOT_FLOOR, CAM_PIVOT_CEIL)
 }
 
 /// World head height above a modeled unit's feet — [`model_pivot_height`], or the neck-height
@@ -617,8 +748,14 @@ pub(super) fn model_pivot_height(pivot: &CameraPivot, scale: f32) -> f32 {
 /// [`PivotGlide`] then walks; multiplying by the eased scale instead would stack a second, slower
 /// ease on top of the first and is what made a shapeshift snap *and* drift. The audio listener still
 /// passes the rendered scale — it tracks the drawn body, and nothing verified says otherwise.
+///
+/// **Always the standing preset.** Its two consumers are a *head*, not the camera's framing pivot:
+/// the 3D-audio listener sits at our own head, and the far-sight subject is a unit whose movement
+/// flags we do not carry. The swim preset is the framing pivot's alone — [`model_pivot_height`]
+/// with `swimming` — and the driven body's own target goes through
+/// [`super::body_pose::pivot_target`], not here.
 pub(crate) fn head_height(pivot: Option<&CameraPivot>, scale: f32) -> f32 {
-    pivot.map_or(CAM_PIVOT_FALLBACK, |p| model_pivot_height(p, scale))
+    pivot.map_or(CAM_PIVOT_FALLBACK, |p| model_pivot_height(p, scale, false))
 }
 
 /// `cameraHeightSmoothSpeed` (yd/s) — the pivot channel's rate, VERIFIED registrar default `"1.2"`.
@@ -626,15 +763,14 @@ pub(crate) fn head_height(pivot: Option<&CameraPivot>, scale: f32) -> f32 {
 /// cosine profile peaks at `π/2 ×` it in the middle and is zero at both ends. There is no duration
 /// clamp on this channel (unlike the yaw channel's `[0.1 s, 2.0 s]`).
 const CAM_PIVOT_SMOOTH_SPEED: f32 = 1.2;
-/// The pivot setter's "already there / already arming this" epsilon — VERIFIED `0.001` (`[0x801360]`,
-/// `0x5126b0`). It is what makes the per-frame re-arm a no-op in steady state.
-const CAM_PIVOT_EPS: f32 = 0.001;
-
-/// **The camera's pivot-height channel** — the height the framing pivot actually rides, chasing the
-/// model-derived target with a cosine smoothstep instead of taking it raw.
+/// **The camera's pivot-height channel** — the height the framing pivot actually rides, chasing
+/// the model-derived target with a cosine smoothstep instead of taking it raw.
 ///
 /// The reference's live `cam+0xfc` chasing target `cam+0x1c8`: armed by `0x5126b0` → `0x512790`,
-/// stepped by `0x50f160`'s `[0x50f36a, 0x50f417)` block (wow-re `pivot-height-glide.md`, §5 round).
+/// stepped by `0x50f160`'s `[0x50f36a, 0x50f417)` block (wow-re `pivot-height-glide.md`, §5 round)
+/// — the **fourth instantiation** of the channel template [`SmoothChannel`] holds (wow-re
+/// `camera-cvar-gates.md` §8), which is why nothing of the tween lives here any more. What is left
+/// is the two things this instantiation does that its three siblings do not.
 /// **This is why a druid shapeshift does not snap the reference's camera**, and it glides in *both*
 /// directions: the solver's `max(target, live)` (`0x50e5a9`) is only the collision-corridor seed, and
 /// the far chain clamps the result back down to the live value (`0x50e767`), so an unobstructed pivot
@@ -648,30 +784,14 @@ const CAM_PIVOT_EPS: f32 = 0.001;
 ///   skips the whole camera update while the preset is stale, `0x50e907`). Ours is the `None` target:
 ///   during the frames a swapped-in model is loading, the pivot stays where it is and one glide runs
 ///   when the new height lands.
+#[derive(Default)]
 pub(super) struct PivotGlide {
-    /// The live height — what the camera uses (`cam+0xfc`).
-    live: f32,
-    /// Where the move started (`cam+0x1cc`) and where it is going (`cam+0x1c8`).
-    from: f32,
-    to: f32,
-    /// Seconds since arming, and the move's total (`cam+0x1c0`/`+0x1c4`); `None` = nothing in
-    /// flight (the reference's armed bit `[cam+0x90] & 0x20000000`).
-    flight: Option<(f32, f32)>,
+    /// The channel itself — **linear**, not angular: its live value is yards, so the armer's `2π`
+    /// rewrap must not run on it.
+    channel: SmoothChannel,
     /// Has the channel ever been armed? The reference's latch bit `0x80` — false only until the
     /// first model-derived height arrives, which is therefore a snap.
     seeded: bool,
-}
-
-impl Default for PivotGlide {
-    fn default() -> Self {
-        Self {
-            live: CAM_PIVOT_FALLBACK,
-            from: CAM_PIVOT_FALLBACK,
-            to: CAM_PIVOT_FALLBACK,
-            flight: None,
-            seeded: false,
-        }
-    }
 }
 
 impl PivotGlide {
@@ -679,69 +799,29 @@ impl PivotGlide {
     /// model — hold), step whatever is in flight, and return the height to frame at.
     ///
     /// Called every frame, which is the reference's own cadence (`0x50f880` from the driver tail
-    /// `0x50f011`): the epsilon tests below turn a steady target into a no-op, so "arm per frame"
-    /// and "arm on change" are the same thing except at the instant the target actually moves.
+    /// `0x50f011`): the armer's own two epsilon refusals turn a steady target into a no-op, so
+    /// "arm per frame" and "arm on change" are the same thing except at the instant the target
+    /// actually moves.
     pub(super) fn advance(&mut self, target: Option<f32>, dt: f32) -> f32 {
         if let Some(target) = target {
-            self.arm(target);
-        }
-        if let Some((elapsed, dur)) = self.flight.as_mut() {
-            *elapsed += dt;
-            let s = *elapsed / *dur;
-            if s >= 1.0 {
-                self.live = self.to;
-                self.flight = None;
+            if self.seeded {
+                self.channel.arm(&Arm::at(target, CAM_PIVOT_SMOOTH_SPEED));
             } else {
-                // The reference's kernel `0x5b7bb0` — the same cosine smoothstep the yaw channel
-                // and the render-scale ease use: `a + (b − a)·(1 − cos(πs))/2`.
-                let e = (1.0 - (std::f32::consts::PI * s).cos()) * 0.5;
-                self.live = self.from + (self.to - self.from) * e;
+                // The latch: the first height a camera ever sees is established, not travelled to.
+                self.seeded = true;
+                self.channel.snap(target);
             }
         }
-        self.live
-    }
-
-    /// The arming half (`0x5126b0` → `0x512790`), in its own order: the re-arm memo, the
-    /// already-there test, then the duration — and the once-per-camera snap.
-    fn arm(&mut self, target: f32) {
-        if !self.seeded {
-            // The latch: the first height a camera ever sees is established, not travelled to.
-            self.seeded = true;
-            self.live = target;
-            self.to = target;
-            self.from = target;
-            self.flight = None;
-            return;
-        }
-        // Already arming exactly this — a no-op, so a per-frame re-arm cannot restart the move
-        // from its own midpoint (which would stretch it forever, asymptotically never arriving).
-        if self.flight.is_some() && (self.to - target).abs() < CAM_PIVOT_EPS {
-            return;
-        }
-        if (self.live - target).abs() < CAM_PIVOT_EPS {
-            // Already there: park the target and disarm. The steady-state path, every frame.
-            self.to = target;
-            self.flight = None;
-            return;
-        }
-        self.from = self.live;
-        self.to = target;
-        self.flight = Some((0.0, (target - self.live).abs() / CAM_PIVOT_SMOOTH_SPEED));
+        self.channel.advance(dt)
     }
 
     /// What the channel is doing, for `WOW_CAM_DUMP`: `(live, target)`. A pivot question is a
     /// *timing* question — "does it snap?" is answered by these two columns on a trace, never by
     /// watching a capture (method: timing is measured, never eyeballed).
     pub(super) fn probe(&self) -> (f32, f32) {
-        (self.live, self.to)
+        self.channel.probe()
     }
 }
-
-/// A small sphere swept from the camera pivot toward the desired camera seat each frame to keep walls
-/// from sliding between the camera and the character (camera collision). Built once at startup like
-/// [`PlayerCapsule`]; smaller than the body capsule so the camera can thread gaps the player can't.
-#[derive(Resource)]
-pub(super) struct CameraProbe(pub(super) Collider);
 
 /// Which mouse button is driving mouse-look, if any — the two vanilla look modes. While looking, the
 /// OS cursor is hidden + locked in place (relative motion drives the camera); `cursor_stash` is the
@@ -761,6 +841,16 @@ pub(crate) struct CameraControl {
     pub(super) collision_distance: f32,
     /// The button currently held for look, or `None`.
     pub(super) look: Option<LookButton>,
+    /// **Is the player in mouse-look right now?** — the reference's `[cam+0x90] & 1`, set at
+    /// `0x50fe41` and cleared at `0x50fddd`, identified at the bytes by the two mode strings
+    /// `"Camera FREELOOK"` / `"Camera NORMAL"`. Written by [`run_look_session`] and read the same
+    /// frame by [`seat_on_subject`], which is `cameraTerrainTilt`'s hand-off edge.
+    pub(super) freelook: bool,
+    /// **Which mouse buttons the world owns** this frame ([`WorldMouse`]) — the player side's one
+    /// answer to "did the UI eat that press?", written by [`latch_world_mouse`] before anything
+    /// reads a button. The look session, the camera's input command word and the both-button run
+    /// all read it instead of `ButtonInput`.
+    pub(super) world_mouse: WorldMouse,
     /// Logical cursor position captured when look began, to restore on release.
     pub(super) cursor_stash: Option<Vec2>,
     /// The self-avatar's render alpha for this frame, from the camera-to-pivot distance
@@ -777,6 +867,21 @@ pub(crate) struct CameraControl {
     /// body, which is why it glides *through* a change of subject (a shapeshift, a far-sight
     /// switch) instead of being reset by one.
     pub(super) pivot: PivotGlide,
+    /// `cameraPivot`'s pitch-bias channel ([`SmartPivot`], decision 2149) — pose, like the two
+    /// above it.
+    pub(super) smart_pivot: SmartPivot,
+    /// `cameraTerrainTilt`'s ground-pitch channel and its 100 ms probe throttle ([`TerrainTilt`],
+    /// decision 2149).
+    pub(super) terrain_tilt: TerrainTilt,
+    /// `cameraBobbing`'s session latch and eye offset ([`HeadBob`], decision 2149).
+    pub(super) head_bob: HeadBob,
+    /// **Did the collision sweep actually clip the camera on the frame just seated?** The
+    /// reference's `[cam+0x90] & 0x30000`, which nothing but the solver `0x50e570` writes and the
+    /// driver ORs in per frame — and which [`SmartPivot`]'s gate reads as its sixth conjunct, so
+    /// that an unobstructed camera never pivots. Written by [`seat_camera`]; read a frame later by
+    /// [`run_look_session`], exactly as the reference's input handler reads the flags the last
+    /// driver pass left (`0x50fee0`'s sole caller `0x514446` precedes the mover lookup).
+    pub(super) clipped: bool,
 }
 
 impl CameraControl {
@@ -824,6 +929,114 @@ impl LookButton {
     }
 }
 
+/// **The mouse buttons the world owns**, latched at the press — where the player side asks
+/// about a primary *press*, instead of `ButtonInput<MouseButton>` (ledger B364). The raw buttons
+/// stay readable for the hold and release of a gesture already claimed, which is
+/// [`run_look_session`]'s business and no one else's.
+///
+/// 1.12 never reads the mouse for any of this. It reads two *bindings* — `TurnOrAction` (right)
+/// and `CameraOrSelectOrMove` (left) — and a press a UI frame captured never dispatches them: it
+/// sets neither of `[InputControl+0x4]`'s mouse bits, engages no look session, and classifies as
+/// no [`FollowState`]. That is the observable rule, and it is why a right-click in a bag has never
+/// turned anyone. Only the look session applied it here; the command word and the both-button run
+/// read the raw buttons, so a right-click on a Who-list row was a `Turn`, whose Smart row is
+/// `(0.0, 1.0)` — an immediate return that ran to completion and swung the camera round to behind
+/// the character (B364). The same raw read had both primaries over a bag running the avatar
+/// forward, through [`super::state::forward_axis`]'s both-button term.
+///
+/// **Latched, not re-tested each frame**, because the reference latches: the down that reached the
+/// world sets the bit, and that button's *up* clears it. A level test would hand the button back
+/// to the UI mid-gesture the moment a frame appeared under the (stationary, locked) cursor — an
+/// edge on the command word from nothing the player did.
+#[derive(Default)]
+pub(super) struct WorldMouse {
+    /// Held by the world right now, indexed by [`LookButton`].
+    held: [bool; 2],
+    /// Took its DOWN edge from the world this frame, same index.
+    down: [bool; 2],
+}
+
+impl WorldMouse {
+    /// Is the world holding this button?
+    pub(super) fn held(&self, b: LookButton) -> bool {
+        self.held[b as usize]
+    }
+
+    /// Did the world take this button's DOWN edge this frame?
+    pub(super) fn down(&self, b: LookButton) -> bool {
+        self.down[b as usize]
+    }
+
+    /// Both primaries in the world's hand — vanilla's both-button run, minus the presses the UI ate.
+    pub(super) fn both(&self) -> bool {
+        self.held(LookButton::Right) && self.held(LookButton::Left)
+    }
+
+    /// Latch this frame. `world_press` says whether a DOWN edge *now* belongs to the world; the
+    /// held bits then ride to their own release, whatever the cursor is over by then — including
+    /// the release a cover synthesises by emptying the button planes, which is what keeps a
+    /// loading screen from stranding a latched bit.
+    fn update(&mut self, buttons: &ButtonInput<MouseButton>, world_press: bool) {
+        for b in [LookButton::Right, LookButton::Left] {
+            let i = b as usize;
+            self.down[i] = world_press && buttons.just_pressed(b.button());
+            self.held[i] = (self.held[i] || self.down[i]) && buttons.pressed(b.button());
+        }
+    }
+}
+
+/// Decide, once per frame, which mouse buttons the world owns — [`CameraControl::world_mouse`].
+///
+/// **Its own system**, ahead of every reader, rather than a call inside [`super::control`]: the
+/// readers are not all in the controller. The look session and the camera's command word are, but
+/// `/follow`'s both-button cancel ([`super::follow::steer_follow`]) is a system that runs *before*
+/// it — reading a latch the controller wrote would put that cancel a frame behind, and a frame
+/// late on an edge-driven cancel is the wrong frame entirely.
+///
+/// A press belongs to the world when it lands in the viewport off the UI — or whenever a look
+/// session already owns the (hidden, locked) cursor, because the second button of a chord joins a
+/// gesture the world already has.
+pub(super) fn latch_world_mouse(
+    buttons: Res<ButtonInput<MouseButton>>,
+    // **The raw flag — a press that lands on a V-plate is the PLATE's, not the camera's** (decision
+    // 2233, reversing 2159's exception).
+    //
+    // 2159 read it the other way and excepted plates here, on an inference from the other end:
+    // entering freelook disables plate mouse input (`0x60f830`, from `0x483e80`), "a toggle that
+    // would have nothing to do if a press on a plate could not reach freelook". The wow-re round
+    // this session dispatched refuted that: `0x60f830` has plenty to do for a press that starts on
+    // the **world** and then drags the pointer across a plate mid-turn. The press itself never gets
+    // there. `0x7662c0` delivers a mouse-down to exactly ONE frame — `[root+0x80]` else
+    // `[root+0x7c]` — sets the capture at `0x7663e9`, calls `[vt+0x68]`, and returns 0, stopping
+    // the bus walk; and `CBindings::ExecuteBinding 0x4b7990` has exactly six call sites image-wide,
+    // every one inside a `CGWorldFrame` vtable handler. So with a plate under the cursor the
+    // binding that would start mouselook is never reached, and the release goes to the plate's own
+    // click slot (`0x7792d0` → `0x7cb910` → `0x4949f0`, mask 1 select / mask 4 interact — the same
+    // two terminals the world right-click's object leg reaches).
+    //
+    // What it costs is real and is the reference's own cost: **you cannot swing the camera by
+    // dragging off a nameplate.** Plates are small dead patches for turning, exactly as in 1.12.
+    // The one exception is the plate's own `+0x3c` veto (`0x7cba30`) — while a ground-targeted
+    // spell is armed the plates refuse the hit test, the WorldFrame wins the press, and the gesture
+    // *does* enter mouselook. That is built where it belongs, in the hit test itself
+    // ([`benilla_ui::script::UiScript::set_nameplate_hit_test_veto`]), so it arrives here for free
+    // as `PointerOverUi` simply being false over a vetoing plate.
+    //
+    // `PointerOverUiPanel` keeps its other reader — the wheel still zooms with the cursor on a
+    // plate, which is a different law (the wheel walks PAST a frame that merely takes the mouse).
+    pointer_over_ui: Res<crate::ui_script::PointerOverUi>,
+    mut rig: ResMut<CameraControl>,
+    cameras: Query<&Camera, With<FlyCam>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+) {
+    let Ok(camera) = cameras.single() else {
+        return;
+    };
+    let over_ui = pointer_over_ui.0;
+    let world_press = rig.look.is_some() || (cursor_in_viewport(&window, camera) && !over_ui);
+    rig.world_mouse.update(&buttons, world_press);
+}
+
 #[derive(Component)]
 // `pub(crate)` on the TYPE only — the scripted camera park has to name it in a query. Its fields
 // stay `pub(super)`; [`FlyCam::park`] is the whole surface an instrument gets (decision 1174).
@@ -852,6 +1065,13 @@ impl FlyCam {
 #[derive(Component, Clone, Copy)]
 pub(crate) struct CameraPivot {
     pub height_local: f32,
+    /// How far that height drops while this body **swims**, model-local and pre-scale
+    /// ([`benilla_formats::M2Bounds::swim_pivot_drop`] — `StandSeq.max.z − SwimSeq.max.z`,
+    /// `0x50ccf6`). The reference builds the swim framing-pivot preset `cam+0x124` by subtracting
+    /// exactly this from the standing one before the shared clamp, and `0x50f880` picks it whenever
+    /// the camera target carries MOVEFLAG_SWIMMING. `0.0` for a model with no Swim sequence (every
+    /// non-character model) and for a bounds-less display — the two presets then coincide.
+    pub swim_drop_local: f32,
 }
 
 /// Mouse-look session state machine — start/stop/hand-off between the two look buttons, cursor
@@ -865,7 +1085,6 @@ pub(crate) struct CameraPivot {
 /// [`PressGesture::is_click`] alone. There is no "promotion" and nothing cancels the click for
 /// having moved — the pending click used to be destroyed the moment the cursor crossed a 4 px
 /// threshold, which is why a drag could never select (ledger B226).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn run_look_session(
     buttons: &ButtonInput<MouseButton>,
     mouse_motion: &AccumulatedMouseMotion,
@@ -875,8 +1094,6 @@ pub(super) fn run_look_session(
     face_yaw: &mut f32,
     window: &mut Window,
     cursor_opts: &mut CursorOptions,
-    camera: &Camera,
-    pointer_over_ui: bool,
     inspect_enabled: bool,
     // A left press this frame the UI already consumed as a cursor-payload world drop (0216 §3) —
     // the left click test must yield to it exactly as it yields to a UI hover, so dropping a held
@@ -888,23 +1105,27 @@ pub(super) fn run_look_session(
     left_click: &mut Option<PressGesture>,
     right_click: &mut Option<PressGesture>,
     look_cfg: LookConfig,
+    // The camera-option knobs + this frame's gate facts (decision 2149). `cameraPivot`'s routing
+    // lives in the look session because the reference's does: `0x50fee0` IS the mouse-motion
+    // handler, and the whole decision is "does THIS motion event go into the pitch or the bias".
+    dynamics: &DynamicsInput,
     // Seconds on the app clock — the press predicate's two time gates are measured against it.
     now: f32,
 ) {
     // The right button's DOWN edge, before any click-vs-drag classification — the reference's
-    // WorldFrame OnMouseDown fires at the press whether it becomes a click or a turn. It belongs
-    // to the world when the press lands in the viewport off the UI, or whenever a look session
-    // already owns the (hidden, locked) cursor — a right join into a left-orbit is still a world
-    // press. Ground-targeting's cancel reads this edge (decision 0792).
-    if buttons.just_pressed(MouseButton::Right)
-        && (rig.look.is_some() || (cursor_in_viewport(window, camera) && !pointer_over_ui))
-    {
+    // WorldFrame OnMouseDown fires at the press whether it becomes a click or a turn. Whether the
+    // press was the world's at all is [`latch_world_mouse`]'s single answer, shared with the
+    // camera's command word: the viewport off the UI, or a right join into a left-orbit, whose
+    // session already owns the cursor. Ground-targeting's cancel reads this edge (decision 0792).
+    if rig.world_mouse.down(LookButton::Right) {
         world_right_press.write(WorldRightPress);
     }
     // A chord — both primaries down — is a both-button run, never a select. The reference kills the
     // pending click on the *second* press and refuses to arm a new one while another primary is held
     // (`0x514ac1`, `0x51481a`), so neither release of a chord can dispatch. Cancel both tests.
-    if buttons.pressed(MouseButton::Left) && buttons.pressed(MouseButton::Right) {
+    // The world's pair, not the device's: what those two sites test is the *binding* state, so a
+    // primary a UI frame is holding has never been half of a chord (ledger B364).
+    if rig.world_mouse.both() {
         *left_click = None;
         *right_click = None;
     }
@@ -912,9 +1133,9 @@ pub(super) fn run_look_session(
     // the release decides. The travel is charged from the *input* delta, before the pitch clamp —
     // the reference accumulates raw device motion, so a drag pinned at the pitch limit still spends
     // its budget.
-    let rate = look_cfg.rate();
-    let dyaw = (mouse_motion.delta.x * rate).abs();
-    let dpitch = (mouse_motion.delta.y * rate).abs();
+    let (yaw_rate, pitch_rate) = (look_cfg.yaw_rate(), look_cfg.pitch_rate());
+    let dyaw = (mouse_motion.delta.x * yaw_rate).abs();
+    let dpitch = (mouse_motion.delta.y * pitch_rate).abs();
     for test in [&mut *left_click, &mut *right_click].into_iter().flatten() {
         test.yaw_travel += dyaw;
         test.pitch_travel += dpitch;
@@ -947,14 +1168,16 @@ pub(super) fn run_look_session(
                     }
                 }
             }
-            // The latched button went up. If the *other* look button is still held (both-button run
-            // → single-button), hand the look session off to it rather than ending it — vanilla keeps
-            // turning/orbiting seamlessly on the remaining button, cursor staying hidden throughout.
+            // The latched button went up. If the *other* look button is still held **by the
+            // world** (both-button run → single-button), hand the look session off to it rather
+            // than ending it — vanilla keeps turning/orbiting seamlessly on the remaining button,
+            // cursor staying hidden throughout. A primary the UI is holding is not a candidate:
+            // its binding never fired, so the reference has nothing to hand off to (B364).
             let other = match active {
                 LookButton::Right => LookButton::Left,
                 LookButton::Left => LookButton::Right,
             };
-            if buttons.pressed(other.button()) {
+            if rig.world_mouse.held(other) {
                 rig.look = Some(other);
             } else {
                 rig.look = None;
@@ -967,18 +1190,19 @@ pub(super) fn run_look_session(
             }
         }
     } else {
-        // A press over the egui dev UI (the overlaid debug panel, the perf pill) or outside the world
-        // viewport is not ours — this keeps a slider-drag from grabbing the cursor into mouse-look.
-        let world_press = cursor_in_viewport(window, camera) && !pointer_over_ui;
+        // A press over the egui dev UI (the overlaid debug panel, the perf pill), over a
+        // mouse-enabled player frame, or outside the world viewport is not ours — the whole content
+        // of [`WorldMouse`], and what keeps a slider-drag from grabbing the cursor into mouse-look.
         // Right-drag turn. Arms its context-click test too; not armed when left is already down (a
         // chord is never a click).
-        if buttons.just_pressed(MouseButton::Right) && world_press {
+        if rig.world_mouse.down(LookButton::Right) {
             rig.look = Some(LookButton::Right);
             rig.cursor_stash = window.cursor_position();
             cursor_opts.grab_mode = CursorGrabMode::Locked;
             cursor_opts.visible = false;
-            *right_click = (!buttons.pressed(MouseButton::Left)).then(|| PressGesture::new(now));
-        } else if buttons.just_pressed(MouseButton::Left) && world_press && !inspect_enabled {
+            *right_click =
+                (!rig.world_mouse.held(LookButton::Left)).then(|| PressGesture::new(now));
+        } else if rig.world_mouse.down(LookButton::Left) && !inspect_enabled {
             // Left-drag orbit — engaged on the press, exactly like right, because the reference
             // engages on the press (`0x51491f`). The select is not deferred behind it; it rides
             // along and settles at the release. While the inspector is armed left belongs to it
@@ -990,7 +1214,7 @@ pub(super) fn run_look_session(
             // A press the UI already consumed as a cursor-payload world drop (0216 §3) still orbits
             // — the reference's orbit is unconditional on the down edge — but must not also select.
             *right_click = None;
-            *left_click = (!click_consumed && !buttons.pressed(MouseButton::Right))
+            *left_click = (!click_consumed && !rig.world_mouse.held(LookButton::Right))
                 .then(|| PressGesture::new(now));
         }
     }
@@ -999,18 +1223,37 @@ pub(super) fn run_look_session(
     // turns the character (its facing tracks the camera yaw); left-drag leaves the character facing.
     if let Some(active) = rig.look {
         let delta = mouse_motion.delta;
-        cam.yaw -= delta.x * rate;
+        let d_yaw = -delta.x * yaw_rate;
+        cam.yaw += d_yaw;
         // `mouseInvertPitch` flips only the pitch axis (the 1.12 checkbox's whole meaning).
         let dy = if look_cfg.invert_pitch {
             -delta.y
         } else {
             delta.y
         };
-        cam.pitch = (cam.pitch - dy * rate).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
+        // **The pivot's fork** (`0x50fee0`, decision 2149): a pinned camera looking level-or-up,
+        // dragged mostly vertically, spends this delta on the view's pitch BIAS and leaves the
+        // arm alone. `None` is the reference's pure-pivot frame — the integrator does not run.
+        let d_pitch = -dy * pitch_rate;
+        if let Some(d_pitch) = rig.smart_pivot.route_pitch(
+            d_pitch,
+            d_yaw,
+            cam.pitch,
+            &dynamics.subject,
+            rig.clipped,
+            &dynamics.options,
+        ) {
+            cam.pitch = (cam.pitch + d_pitch).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
+        }
         if active == LookButton::Right || both_buttons {
             *face_yaw = cam.yaw;
         }
     }
+    // **The freelook latch.** Right-held is the reference's mouse-look; a left-drag is an orbit and
+    // is not freelook. A both-button run steers exactly as a right-drag does, which is the same
+    // "the world holds the right button" the `face_yaw` sync above tests — so it counts, and the
+    // two tests stay written the same way on purpose.
+    rig.freelook = rig.look == Some(LookButton::Right) || (rig.look.is_some() && both_buttons);
 }
 
 /// Wheel-zoom: the CAMERAZOOMIN/OUT bindings set a new target orbit distance, and the actual
@@ -1048,7 +1291,6 @@ pub(super) fn apply_zoom_scroll(scroll: f32, dt: f32, rig: &mut CameraControl, m
 /// `feet`/`head` are the caller's, because the head offset is the avatar capsule's and those
 /// constants are a movement concern; `body_pivot` is the target height read off the driven body
 /// this frame, used only when nothing else is being watched.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn seat_on_subject(
     dt: f32,
     turn_delta: f32,
@@ -1060,8 +1302,8 @@ pub(super) fn seat_on_subject(
     cam: &mut FlyCam,
     cam_t: &mut Mut<Transform>,
     collide: &benilla_world::collision::WorldCollision<'_, '_>,
-    cam_probe: &Collider,
     follow: &FollowInput,
+    dynamics: &DynamicsInput,
 ) {
     // The sweep origin moves with the subject too; rooting it at our own head would cast the boom
     // across the world and jam it on the first wall in between
@@ -1075,9 +1317,108 @@ pub(super) fn seat_on_subject(
     // switch move the camera smoothly instead of teleporting it ([`PivotGlide`]; wow-re
     // `pivot-height-glide.md`). A far-sight subject supplies the target the same way the body
     // does — one channel, whatever it is looking at.
-    let orbit_pivot = rig
+    let live_pivot = rig
         .pivot
         .advance(view.remote.map(|v| v.pivot_height).or(body_pivot), dt);
+    // **`cameraWaterCollision`'s corridor** — the half 2149 and 2170 each shipped without, and the
+    // reason the option is atomic. [`super::camera_water`] carries the block, the byte sites and
+    // the why; this is only the wiring.
+    //
+    // Classified against the channel's **target** (`[cam+0x1c8]`), never its live value — the
+    // polarity three of wow-re's seven cold workers inverted, arbitrated at the bytes. Banding
+    // against a continuously-eased quantity chatters on its own, independently of the corridor.
+    //
+    // `headroom` is `1.0`: the reference scales the reach by the hit fraction of a vertical
+    // head-room probe at `0x50e6bd` that this client has never had. Absent and named, not stubbed
+    // (1203) — a low ceiling over a swimmer keeps the full reach, which is a pre-existing gap in
+    // the pivot rather than something the corridor introduces.
+    let (_, pivot_target) = rig.pivot.probe();
+    let (band, depth) = super::camera_water::classify(
+        // Our own body's cached surface, and only when the camera is watching our own body:
+        // `0x511ad0` reads the camera TARGET's liquid object and far sight carries none.
+        view.remote
+            .is_none()
+            .then_some(dynamics.surface_y)
+            .flatten(),
+        orbit_pos.y,
+        pivot_target,
+    );
+    let corridor = if dynamics.options.water_collision {
+        super::camera_water::corridor(band, depth, live_pivot)
+    } else {
+        super::camera_water::corridor_off(live_pivot)
+    };
+    let orbit_pivot = super::camera_water::pivot_height(&corridor, pivot_target, live_pivot, 1.0);
+    // **And the corridor's floor lifts the SWEEP ORIGIN, which is the half that actually stops the
+    // pin.** The reference builds the boom's start from the clamped `*heightOut` itself
+    // (`0x50e786`), so in the surface band it sweeps from `surface + 2/9`; this client roots the
+    // boom at the capsule's top hemisphere centre instead, a pre-existing divergence that is
+    // harmless on land and decisive here. A surface-swimming human male's head sits
+    // `surface + 0.171`, and the camera probe has a `0.15` radius — so the probe starts **21 mm**
+    // clear of the water it is now allowed to hit, and a fraction of a degree of downward pitch
+    // collapses the arm from 15 yd to nothing.
+    //
+    // Measured, not reasoned: the end-to-end pitch sweep in `benilla_world::collision`
+    // (`a_surface_swimmers_arm_moves_smoothly_through_the_whole_pitch_range`) put that step at
+    // **6.65 yd** with the corridor applied to the framing pivot alone. Lifting the origin to the
+    // corridor floor takes it to a fraction of a yard. `max`, so this can only ever raise the
+    // origin: dry land and the submerge band are untouched, and nothing here can push the sweep
+    // start down into geometry.
+    let sweep_from = Vec3::new(
+        sweep_from.x,
+        sweep_from.y.max(orbit_pos.y + corridor.floor),
+        sweep_from.z,
+    );
+    // **`cameraTerrainTilt`'s probe and channel.** The probe looks at the ground AHEAD of the
+    // subject, not under it: a horizontal ray along its facing from `feet + 5/3`, its hit pulled
+    // back `5/18`, then a `64/9` drop — so the slope is the rise of the ground you are walking
+    // ONTO over the run to it. Rooted at the subject, which is what makes far sight tilt to the
+    // totem's hill rather than to ours.
+    let ground_probe = || {
+        let origin = orbit_pos + Vec3::Y * super::camera_dynamics::PROBE_LIFT;
+        let fwd = Quat::from_rotation_y(dynamics.subject.facing) * Vec3::NEG_Z;
+        let reach = Dir3::new(fwd)
+            .ok()
+            .and_then(|d| collide.ray_body(origin, d, super::camera_dynamics::PROBE_REACH))
+            .map_or(super::camera_dynamics::PROBE_REACH, |h| {
+                h.distance - super::camera_dynamics::PROBE_BACKOFF
+            });
+        let ahead = origin + fwd * reach;
+        let ground_y = collide
+            .ray_body(ahead, Dir3::NEG_Y, super::camera_dynamics::PROBE_DROP)
+            .map_or(ahead.y - super::camera_dynamics::PROBE_DROP, |h| {
+                ahead.y - h.distance
+            });
+        // `L = √(Δx² + Δy²)` is a length, so a hit closer than the backoff runs the probe
+        // *behind* the subject and still divides by a positive run — the reference's own
+        // arithmetic, not a guard added here.
+        (ground_y - orbit_pos.y) / reach.abs().max(1.0e-3)
+    };
+    rig.terrain_tilt.advance(
+        ground_probe,
+        dynamics.options.terrain_tilt,
+        &dynamics.subject,
+        dynamics.smooth_style,
+        &dynamics.options,
+        dt,
+    );
+    // **The mouse-look hand-off** (`0x50d500` push / `0x50d520` pop; wow-re's §5 re-audit, Q-C).
+    // Run after the channel has stepped, so an edge hands off the value this frame is about to
+    // compose. The reference fires it from the input handler instead; the two differ by at most one
+    // frame of channel motion, which at `cameraGroundSmoothSpeed` is a fortieth of a degree.
+    let handed = rig.terrain_tilt.hand_off(rig.freelook);
+    if handed != 0.0 {
+        cam.pitch = (cam.pitch + handed).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
+    }
+
+    // **`cameraBobbing`'s latch and kernel.** The session is armed off the input-command word, not
+    // off this gate, so it runs whatever the CVar says and only the OUTPUT is gated — which is what
+    // makes turning the CVar on mid-run start the bob at the phase the session has reached.
+    // `rig.distance` and not `collision_distance`: the reference's first conjunct is on the zoom
+    // (`[cam+0xec]`), so a camera squeezed against a wall is not thereby in first person.
+    rig.head_bob
+        .advance(rig.distance, &dynamics.subject, &dynamics.options, dt);
+
     seat_camera(
         dt,
         turn_delta,
@@ -1088,8 +1429,8 @@ pub(super) fn seat_on_subject(
         cam,
         cam_t,
         collide,
-        cam_probe,
         follow,
+        dynamics,
     );
 }
 
@@ -1106,7 +1447,6 @@ pub(super) fn seat_on_subject(
 /// `head`/`player_pos` are precomputed by [`super::control`] (which owns the avatar capsule
 /// constants); `cam_pivot_height` is the world pivot height it derived from [`CameraPivot`] this
 /// frame.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn seat_camera(
     dt: f32,
     turn_delta: f32,
@@ -1117,8 +1457,8 @@ pub(super) fn seat_camera(
     cam: &mut FlyCam,
     cam_t: &mut Mut<Transform>,
     collide: &benilla_world::collision::WorldCollision<'_, '_>,
-    cam_probe: &Collider,
     follow: &FollowInput,
+    dynamics: &DynamicsInput,
 ) {
     // A keyboard turn carries the camera RIGIDLY (char and camera rotate as one — the reference
     // look, director's call closing 0050's open "camera follow on turn"): an eased chase of a
@@ -1153,19 +1493,60 @@ pub(super) fn seat_camera(
     // instead of overshooting (the old min-distance floor used to force the camera *past* a too-close
     // hit — gone; collision wins outright). `cast_move` ignores origin penetration, so a head grazing
     // a surface still casts outward.
-    let rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0);
+    // **The seat is built from the UNBIASED pitch and the view from the biased one** — the whole
+    // of `cameraPivot` is that ordering (decision 2149). The reference computes the eye at
+    // `0x50edcc → 0x50de00` and stores it, and only *then* rotates the camera basis `[cam+0x14]`
+    // by `[cam+0x104]` at `0x50ee32`; so the arm never swings and the look direction does. The
+    // bias is zero at every default until a pinned camera is dragged, so `arm_rotation` and
+    // `rotation` are the same quaternion on almost every frame.
+    let bias = rig.smart_pivot.bias();
+    // **The ground tilt IS part of the arm's pitch**, unlike the bias: `0x50f710` composes
+    // `[cam+0xf4] + [cam+0x108]` and clamps the SUM to ±89° before the basis is built, and the eye
+    // is then seated from that basis. So a followed terrain moves the camera; a smart pivot does
+    // not (wow-re `camera-cvar-kernels.md` §1).
+    let arm_pitch = (cam.pitch + rig.terrain_tilt.pitch()).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
+    let arm_rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, arm_pitch, 0.0);
+    // **The composite is deliberately NOT re-clamped to ±89°.** The reference's clamp at
+    // `0x50f710` binds `[cam+0xf4] + [cam+0x108]` — the pitch channel plus the ground tilt — and
+    // the bias is composed **after** it, at `0x50ee58`, so the rendered pitch is not bounded by it
+    // (wow-re `camera-cvar-kernels.md` §1). The bound that does apply to the bias is the one-sided
+    // one on its own accumulate ([`SmartPivot::route_pitch`]), and the ±89° on the body hand-off
+    // (`0x5103e0`), which is where `mover_pitch` takes it.
+    let rotation = if bias == 0.0 {
+        arm_rotation
+    } else {
+        Quat::from_euler(EulerRot::YXZ, cam.yaw, arm_pitch + bias, 0.0)
+    };
     // `Transform::forward()` is exactly `rotation * -Z` (no renormalize), computed here from the
     // local so the write below can be gated.
-    let cam_fwd = rotation * Vec3::NEG_Z;
+    let cam_fwd = arm_rotation * Vec3::NEG_Z;
     let pivot = player_pos + Vec3::Y * cam_pivot_height;
     let seat = pivot - cam_fwd * rig.distance;
     let boom = seat - head;
     let boom_len = boom.length().max(1.0e-3);
     // The camera collides with the WMO *camera/LOS* faces (keeps DETAIL overhangs like forge pipes,
     // drops NOCAMCOLLIDE) + terrain/doodads/GameObjects — its own audience, not the walking mesh.
-    let open = collide
-        .cast_camera(cam_probe, head, Quat::IDENTITY, boom, 0.0)
-        .map_or(boom_len, |h| h.distance);
+    //
+    // **And the waterline, under `cameraWaterCollision`** — registered `"1"`, so this is on out of
+    // the box. `0x50e5ec` ORs the `0xf0000` ADT-liquid nibble into the word all three of
+    // `0x50e570`'s queries carry, and it reaches `0x69cc13` through four direct calls, where it
+    // gates a Möller–Trumbore intersection (`0x7c2c40`, hit distance written at `0x7c2e5f`) over
+    // the chunk's four MCLQ slots. Two-sided, and with no near floor — which is precisely why the
+    // pivot corridor above is not optional: nothing in the trace itself stops a boom that starts
+    // on the water plane, so the *origin* is what has to be lifted clear.
+    //
+    // **And that water leg is a RAY, not this probe sphere** (decision 2185): `0x7c2c40` is a
+    // ray/triangle test and `0x672170` carries no radius, so the `2/9` yd the corridor lifts the
+    // origin by is a clearance budgeted for a point. The probe is `0.3` — it does not fit, and a
+    // level boom behind a surface swimmer was coming back pinned at zero. The split lives in
+    // [`benilla_world::collision::WorldCollision::cast_camera`], which owns the probe now; the
+    // sphere still sweeps the solid world, which is what it was always for.
+    let hit = collide.cast_camera(head, boom, dynamics.options.water_collision);
+    // The solver's own clip verdict (`0x50e570`'s `0x30000` return, OR'd into `[cam+0x90]` by the
+    // driver) — [`SmartPivot`]'s sixth conjunct, and the reason an unobstructed camera never
+    // pivots. Written here because here is the only place that knows.
+    rig.clipped = hit.is_some();
+    let open = hit.unwrap_or(boom_len);
     // Snap in instantly when geometry intrudes (a wall must never sit between camera and character);
     // ease back out to the open arm length once it clears — the vanilla snap-close-then-glide-back.
     rig.collision_distance = if open < rig.collision_distance {
@@ -1175,7 +1556,13 @@ pub(super) fn seat_camera(
         rig.collision_distance + (open - rig.collision_distance) * t
     };
     let frac = (rig.collision_distance / boom_len).clamp(0.0, 1.0);
-    let translation = head + boom * frac;
+    let seated = head + boom * frac;
+    // **The head bob is a pure world-space translation of the eye**, added last, into the same
+    // slot [`crate::camera_shake`] writes — which is exactly what the reference does (`0x50eb0f`
+    // folds the bob into the shake's accumulator and `0x50de00` applies the pair once). Zero on
+    // every frame nothing is bobbing, so the no-op write gate below still holds a parked camera
+    // bit-stable.
+    let translation = seated + rig.head_bob.offset();
     // The no-op write gate (decision 1362 — 1355's clamp lesson, at the camera): a parked
     // camera's pose is bit-stable once the collision ease settles, but writing it anyway marked
     // the camera's transform changed every frame — which re-ran its propagation and told every
@@ -1193,10 +1580,11 @@ pub(super) fn seat_camera(
     // (verified negative, wow-re `water-frame-straddle` §4a: zero liquid-height queries in the
     // camera TU); the no-straddle experience is the *submersion probe's* — the frame flips
     // submerged the moment the lowest near-plane corner reaches the surface
-    // (`liquid::detect_submersion`, the corner-min probe), and with [`CAM_NEAR`] at the
-    // reference's 1/9 the whole crossing band is a few inches tall. 0905's eye snap — the local
-    // compensation for the old 1.0-yd near plane — is removed with its cause (its record is
-    // superseded; see the 0905-successor decision).
+    // (`liquid::detect_submersion`, the corner-min probe), and with the near plane at the
+    // `nearclip` CVar's registered 0.1 the whole crossing band is a few inches tall (2163 — it
+    // said "the reference's 1/9" until the per-frame re-stamp at `0x511bd4` was read). 0905's eye
+    // snap — the local compensation for the old 1.0-yd near plane — is removed with its cause
+    // (its record is superseded; see the 0905-successor decision).
     // `WOW_CAM_DUMP=frame`: the REALIZED pose, per frame, bit-exact — not the pose that was asked for.
     //
     // Every scripted probe sets `yaw`/`pitch`/`distance` and we then reason as though the camera is
@@ -1207,7 +1595,7 @@ pub(super) fn seat_camera(
     // camera-derived can be the cause" (0671) rests entirely on that being untrue, and it was never
     // measured. `open` is printed beside the eased arm so a hit/miss alternation in the CAST is
     // visible even on a frame where the ease has not yet moved the camera far enough to see.
-    if std::env::var_os("WOW_CAM_DUMP").is_some() {
+    if cam_dump_enabled() {
         // `follow=` is the auto-follow's own reading (1502): the offset the return is animating,
         // the state the input word classifies to, and — once armed — how far through the
         // transition this frame is. `off` moving while `arm` reads `-` means something other than
@@ -1238,11 +1626,31 @@ pub(super) fn seat_camera(
         );
     }
 
+    // The pivot bias's own per-frame half (`0x50ed77` → `0x5107f0`): with the gate no longer true
+    // the bias eases back to zero at `cameraTargetSmoothSpeed`; with it true an ease in flight is
+    // cancelled where it stands. Runs after the sweep, so `rig.clipped` is this frame's.
+    rig.smart_pivot.advance(
+        cam.pitch,
+        &dynamics.subject,
+        rig.clipped,
+        dynamics.tracking_style,
+        &dynamics.options,
+        dt,
+    );
+
     // Fade the avatar as the camera nears its pivot (zoom-in / a wall pulling the boom in): opaque
     // in third-person, ramping to invisible in first-person. Keyed off the *realized* camera→pivot
     // distance (collision-pulled), so backing into a wall also thins you — the faithful behavior.
-    rig.self_fade_alpha =
-        self_model_fade_alpha((translation - pivot).length(), CAM_NEAR, SELF_FADE_WINDOW);
+    // Off the SEATED eye, not the bobbed one: the fade is a statement about how far the boom was
+    // pulled in, and a 5 cm wobble is not that.
+    //
+    // The LIVE `nearclip`, not a constant (2163): the fade is defined as finishing where the near
+    // plane starts cutting, so a player who moves that plane has to move this with it.
+    rig.self_fade_alpha = self_model_fade_alpha(
+        (seated - pivot).length(),
+        dynamics.nearclip,
+        SELF_FADE_WINDOW,
+    );
 }
 
 /// Apply the self-avatar zoom-in fade ([`CameraControl::self_fade_alpha`], computed in [`control`]) to
@@ -1281,7 +1689,7 @@ pub(super) fn seat_camera(
 /// compose (`wow_model.wgsl`: `out_rgb *= faded_alpha`) takes the card to black, which for an ADD blend
 /// is gone. That deliberately avoids `Visibility`, which the card's own hidden-owner mirror authors every
 /// frame in a different system.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)] // one Bevy system's full input set
+#[allow(clippy::type_complexity)] // one Bevy system's full input set
 pub(crate) fn apply_self_model_fade(
     rig: Res<CameraControl>,
     self_player: Query<(Entity, Option<&crate::aura_visual::AuraNodes>), With<Embodied>>,
@@ -1553,8 +1961,16 @@ pub(super) fn fly_free(
     }
 }
 
+/// `$WOW_CAM_DUMP` — the per-frame camera/turn dump (this file's seat and the controller's turn
+/// line share it). One read for the process: both sites sit on the every-frame path.
+pub(crate) fn cam_dump_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WOW_CAM_DUMP").is_some())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::camera_channel::CHANNEL_EPS;
     use super::*;
     use benilla_assets::BillboardInfo;
     use benilla_formats::BillboardKind;
@@ -1593,10 +2009,10 @@ mod tests {
             let expected = (to - from).abs() / CAM_PIVOT_SMOOTH_SPEED;
             let frames = glide_run(&mut g, Some(to), expected * 2.0);
             // It arrives, and only at the end.
-            assert!((frames.last().copied().unwrap() - to).abs() < CAM_PIVOT_EPS);
+            assert!((frames.last().copied().unwrap() - to).abs() < CHANNEL_EPS);
             let arrived = frames
                 .iter()
-                .position(|h| (h - to).abs() < CAM_PIVOT_EPS)
+                .position(|h| (h - to).abs() < CHANNEL_EPS)
                 .unwrap();
             let took = arrived as f32 / 60.0;
             assert!(
@@ -1644,7 +2060,7 @@ mod tests {
         g.advance(Some(1.0), 1.0 / 60.0);
         let frames = glide_run(&mut g, Some(2.2), 2.0);
         assert!(
-            (frames.last().copied().unwrap() - 2.2).abs() < CAM_PIVOT_EPS,
+            (frames.last().copied().unwrap() - 2.2).abs() < CHANNEL_EPS,
             "a per-frame re-arm must still arrive"
         );
     }
@@ -1654,10 +2070,52 @@ mod tests {
     /// and a shrink cannot bury it in the floor.
     #[test]
     fn the_pivot_target_is_clamped_to_the_references_band() {
-        let p = CameraPivot { height_local: 2.0 };
-        assert_eq!(model_pivot_height(&p, 1.0), 2.0);
-        assert_eq!(model_pivot_height(&p, 0.01), CAM_PIVOT_FLOOR);
-        assert_eq!(model_pivot_height(&p, 100.0), CAM_PIVOT_CEIL);
+        let p = CameraPivot {
+            height_local: 2.0,
+            swim_drop_local: 0.0,
+        };
+        assert_eq!(model_pivot_height(&p, 1.0, false), 2.0);
+        assert_eq!(model_pivot_height(&p, 0.01, false), CAM_PIVOT_FLOOR);
+        assert_eq!(model_pivot_height(&p, 100.0, false), CAM_PIVOT_CEIL);
+    }
+
+    /// **The swim preset** — the reference's `cam+0x124`, selected by `0x50f880` on
+    /// MOVEFLAG_SWIMMING and built at `0x50ccf6` as the standing height less
+    /// `StandSeq.max.z − SwimSeq.max.z`. The numbers are the shipped Human Male's, as wow-re
+    /// measured them off the binary (`water-band-discontinuity.md` §7): standing 1.9002692,
+    /// swimming 1.5120120.
+    #[test]
+    fn swimming_takes_the_lower_pivot_preset() {
+        let human = CameraPivot {
+            height_local: 1.9002692,
+            swim_drop_local: 0.3882572,
+        };
+        assert!((model_pivot_height(&human, 1.0, false) - 1.9002692).abs() < 1e-5);
+        assert!((model_pivot_height(&human, 1.0, true) - 1.512_012).abs() < 1e-5);
+        // The preset multiplies the scale, then clamps — the swim leg shares the band with the
+        // standing one (`0x50ca90` clamps all three presets together).
+        assert!(
+            (model_pivot_height(&human, 2.0, true) - 2.0 * 1.512_012).abs() < 1e-5,
+            "the swim preset scales like its sibling"
+        );
+        assert_eq!(model_pivot_height(&human, 0.01, true), CAM_PIVOT_FLOOR);
+        assert_eq!(model_pivot_height(&human, 100.0, true), CAM_PIVOT_CEIL);
+    }
+
+    /// A model with **no Swim sequence** — every non-character model, and the reference's own
+    /// both-sequences-present guard (`0x711960` on ids 0 and 0x2a). Its drop is `0.0`, so the swim
+    /// preset degenerates to the standing one and a body that cannot swim never dips.
+    #[test]
+    fn a_model_that_cannot_swim_keeps_the_standing_preset() {
+        let chicken = CameraPivot {
+            height_local: 1.2,
+            swim_drop_local: 0.0,
+        };
+        assert_eq!(
+            model_pivot_height(&chicken, 1.0, true),
+            model_pivot_height(&chicken, 1.0, false),
+        );
+        assert_eq!(model_pivot_height(&chicken, 1.0, true), 1.2);
     }
 
     /// A press that has travelled `yaw`/`pitch` **degrees** of camera rotation.
@@ -1693,17 +2151,72 @@ mod tests {
     /// scales with the pointer instead of drifting away from it.
     #[test]
     fn the_sensitivity_slider_is_a_multiplier_over_the_shipped_rate() {
-        assert_eq!(LookConfig::default().rate(), LOOK_SENSITIVITY);
+        // **The shipped feel is unchanged by the two move-speed CVars landing**: at the
+        // reference's own defaults BOTH axes come out at exactly the rate this client has always
+        // used. That is the whole point of anchoring the scale to `LOOK_SENSITIVITY` rather than
+        // transplanting the reference's deg-per-accelerated-pixel onto our raw device delta.
+        let d = LookConfig::default();
+        assert_eq!(d.yaw_rate(), LOOK_SENSITIVITY);
+        assert_eq!(d.pitch_rate(), LOOK_SENSITIVITY);
+
         let fast = LookConfig {
             sensitivity: 1.5,
             ..Default::default()
         };
-        assert_eq!(fast.rate(), LOOK_SENSITIVITY * 1.5);
+        assert_eq!(fast.yaw_rate(), LOOK_SENSITIVITY * 1.5);
+        assert_eq!(fast.pitch_rate(), LOOK_SENSITIVITY * 1.5);
         let slow = LookConfig {
             sensitivity: *MOUSE_SPEED_RANGE.start(),
             ..Default::default()
         };
-        assert_eq!(slow.rate(), LOOK_SENSITIVITY * 0.5);
+        assert_eq!(slow.yaw_rate(), LOOK_SENSITIVITY * 0.5);
+        assert_eq!(slow.pitch_rate(), LOOK_SENSITIVITY * 0.5);
+    }
+
+    /// **Each move-speed CVar scales its own axis, linearly, and only its own** — the reference's
+    /// law shape (`Δyaw_deg = value × Δx / 800`, `Δpitch_deg = value × Δy / 600`).
+    ///
+    /// The slider's own stops are the check: `UIOptionsFrameSliders`' MOUSE_LOOK_SPEED row runs
+    /// 90…270, so its ends are half and one-and-a-half times the shipped rate.
+    #[test]
+    fn each_move_speed_cvar_scales_its_own_axis() {
+        let doubled_yaw = LookConfig {
+            yaw_speed: 360.0,
+            ..Default::default()
+        };
+        assert_eq!(doubled_yaw.yaw_rate(), LOOK_SENSITIVITY * 2.0);
+        assert_eq!(
+            doubled_yaw.pitch_rate(),
+            LOOK_SENSITIVITY,
+            "the yaw CVar must not move the pitch axis"
+        );
+
+        let doubled_pitch = LookConfig {
+            pitch_speed: 180.0,
+            ..Default::default()
+        };
+        assert_eq!(doubled_pitch.pitch_rate(), LOOK_SENSITIVITY * 2.0);
+        assert_eq!(doubled_pitch.yaw_rate(), LOOK_SENSITIVITY);
+
+        // The MOUSE_LOOK_SPEED slider's two ends. Approximate, because the two sides multiply
+        // the same three factors in a different order and f32 is not associative — the property
+        // under test is the ratio, not the last bit.
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-9;
+        for (speed, factor) in [(90.0_f32, 0.5_f32), (270.0, 1.5)] {
+            let at = LookConfig {
+                yaw_speed: speed,
+                ..Default::default()
+            };
+            assert!(near(at.yaw_rate(), LOOK_SENSITIVITY * factor));
+        }
+
+        // `mousespeed` still multiplies on top of both — the 1140 property, unchanged.
+        let both = LookConfig {
+            yaw_speed: 270.0,
+            sensitivity: 1.5,
+            ..Default::default()
+        };
+        assert!(near(both.yaw_rate(), LOOK_SENSITIVITY * 1.5 * 1.5));
     }
 
     /// **The auto-follow** (decisions 1493/1502) — 1.12's `cameraSmoothStyle`, the setting benilla
@@ -1865,6 +2378,109 @@ mod tests {
             run(&mut rig, c, follow_cmd::FORWARD, parked, 1.0).abs() < 1.0e-4,
             "the release edge arms a fresh return"
         );
+    }
+
+    /// **B364** (MarcusAga): right-clicking a row of the Who list swung the camera round to
+    /// behind the character — over ~180°, on a body that never turned. The click itself was the
+    /// UI's (1816's no-fall-through hit test opened the dropdown); only the camera's command word
+    /// saw it, because the word's two mouse bits were built from `ButtonInput` with no UI term.
+    /// `RIGHT_MOUSE` alone is a [`FollowState::Turn`], and Smart's Turn row is `(0.0, 1.0)` — no
+    /// delay, full factor — so the return armed on the press edge and ran to completion.
+    ///
+    /// The decode is pinned end to end, from the latch to the row the classifier picks, because
+    /// each half was individually right: the classifier is the reference's (the test below), and
+    /// the look session's own gate was already there. What was missing was the word reading the
+    /// same gate.
+    #[test]
+    fn a_press_the_ui_ate_never_reaches_the_camera_command_word() {
+        let word = |world_press: bool| {
+            let mut rig = CameraControl::default();
+            let mut buttons = ButtonInput::<MouseButton>::default();
+            buttons.press(MouseButton::Right);
+            rig.world_mouse.update(&buttons, world_press);
+            super::super::input::look_input(
+                &crate::bindings::BindingsState::default(),
+                &super::super::Player::default(),
+                &rig,
+            )
+            .follow_command
+        };
+        let classify = |command| {
+            FollowInput {
+                cfg: FollowConfig::default(),
+                face_yaw: 0.0,
+                command,
+            }
+            .state(false)
+        };
+
+        // The report: the press landed on a UI row.
+        assert_eq!(word(false), 0, "a captured press sets no mouse bit");
+        assert_eq!(classify(word(false)), FollowState::Idle);
+        assert_eq!(
+            FollowStyle::Smart.row(FollowState::Idle),
+            (0.0, 0.0),
+            "and Idle is the row that arms nothing — the swing has no source"
+        );
+
+        // The control that must not change: the same press in the world still turns.
+        assert_eq!(word(true), follow_cmd::RIGHT_MOUSE);
+        assert_eq!(classify(word(true)), FollowState::Turn);
+        assert_eq!(FollowStyle::Smart.row(FollowState::Turn), (0.0, 1.0));
+    }
+
+    /// The latch's own law: a button is claimed at the DOWN edge and held to its own release.
+    ///
+    /// Level-testing "is the cursor over UI *right now*" instead would drop the bit mid-drag the
+    /// moment a frame appeared under the (stationary, locked) cursor — a phantom edge on the
+    /// command word, which is exactly what arms a return. And the second button of a chord has to
+    /// join: the reference's both-button run is both bindings held, and the second press lands on
+    /// a cursor the first one already hid.
+    #[test]
+    fn the_world_holds_a_button_from_its_press_to_its_release() {
+        let mut rig = CameraControl::default();
+        let mut buttons = ButtonInput::<MouseButton>::default();
+
+        // Pressed over a UI row: never claimed, and no amount of later frames claims it.
+        buttons.press(MouseButton::Right);
+        rig.world_mouse.update(&buttons, false);
+        assert!(!rig.world_mouse.held(LookButton::Right));
+        buttons.clear();
+        rig.world_mouse.update(&buttons, true);
+        assert!(
+            !rig.world_mouse.held(LookButton::Right),
+            "a press the UI ate is never handed back mid-hold"
+        );
+        buttons.release(MouseButton::Right);
+        buttons.clear();
+
+        // Pressed in the world: claimed, and it survives the UI arriving under the locked cursor.
+        buttons.press(MouseButton::Right);
+        rig.world_mouse.update(&buttons, true);
+        assert!(rig.world_mouse.down(LookButton::Right));
+        buttons.clear();
+        rig.world_mouse.update(&buttons, false);
+        assert!(rig.world_mouse.held(LookButton::Right));
+        assert!(
+            !rig.world_mouse.down(LookButton::Right),
+            "the edge is one frame"
+        );
+
+        // The chord's second button joins the gesture the world already holds…
+        buttons.press(MouseButton::Left);
+        rig.world_mouse.update(&buttons, true);
+        assert!(
+            rig.world_mouse.both(),
+            "both primaries = the both-button run"
+        );
+
+        // …and the release is what ends it — including the synthetic one a cover produces by
+        // emptying the button planes, which is a release of both without a `just_released`.
+        buttons = ButtonInput::<MouseButton>::default();
+        rig.world_mouse.update(&buttons, false);
+        assert!(!rig.world_mouse.both());
+        assert!(!rig.world_mouse.held(LookButton::Right));
+        assert!(!rig.world_mouse.held(LookButton::Left));
     }
 
     /// The state classifier's three vanilla input rules (wow-re `camera-smooth-style.md` §6.2) —

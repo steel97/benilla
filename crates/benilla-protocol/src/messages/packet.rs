@@ -5,15 +5,15 @@
 use crate::wire::Vector3d;
 
 use super::{
-    ActionButton, AttackerState, AuctionBidderNotification, AuctionCommandTail, AuctionListEntry,
-    AuctionOwnerNotification, CastOutcome, ChannelNotify, Character, ChatMessage, CorpseLocation,
-    DamageShield, DispelFailed, EnchantmentLog, EnvironmentalDamageLog, ExplorationXp, FriendEntry,
-    FriendStatusUpdate, GameObjectQueryInfo, GmTicket, GossipOption, GossipPoi, GroupLootInfo,
-    GroupMemberEntry, GuildCommandResult, GuildEventNotice, GuildInfo, GuildQueryResponse,
-    GuildRoster, InitWorldStates, InspectHonorStats, ItemInfo, ItemPushResult, JumpInfo,
-    LevelUpInfo, LootAllPassed, LootItem, LootRoll, LootRollWon, LootStartRoll, MailListEntry,
-    MirrorTimerStart, MoveMode, Object, PartyKillLog, PartyMemberStatsInfo, PeriodicAuraLog,
-    PetMode, PetSpells, PetitionQueryResponse, PetitionRename, PetitionShowList,
+    ActionButton, AttackSwingError, AttackerState, AuctionBidderNotification, AuctionCommandTail,
+    AuctionListEntry, AuctionOwnerNotification, CastOutcome, ChannelNotify, Character, ChatMessage,
+    CorpseLocation, DamageShield, DispelFailed, EnchantmentLog, EnvironmentalDamageLog,
+    ExplorationXp, FriendEntry, FriendStatusUpdate, GameObjectQueryInfo, GmTicket, GossipOption,
+    GossipPoi, GroupLootInfo, GroupMemberEntry, GuildCommandResult, GuildEventNotice, GuildInfo,
+    GuildQueryResponse, GuildRoster, InitWorldStates, InspectHonorStats, ItemInfo, ItemPushResult,
+    JumpInfo, LevelUpInfo, LootAllPassed, LootItem, LootRoll, LootRollWon, LootStartRoll,
+    MailListEntry, MirrorTimerStart, MoveMode, Object, PartyKillLog, PartyMemberStatsInfo,
+    PeriodicAuraLog, PetMode, PetSpells, PetitionQueryResponse, PetitionRename, PetitionShowList,
     PetitionShowSignatures, PetitionSignResults, PvpCredit, QuestComplete, QuestConfirmAccept,
     QuestDetails, QuestGiverList, QuestOfferReward, QuestOption, QuestPushResult,
     QuestRequestItems, QuestTemplate, ResurrectRequestBody, SpeedKind, SpellChainTargets,
@@ -104,6 +104,21 @@ pub enum ServerPacket {
     CharDelete {
         result: u8,
     },
+    /// `SMSG_CHARACTER_LOGIN_FAILED` — the server refused the `CMSG_PLAYER_LOGIN` we just sent.
+    ///
+    /// The byte is a **1-based reason index**, not a `ResponseCodes` value: the client feeds it to
+    /// a six-entry jump table (`0x5aae08`, behind `dec eax; cmp eax,5; ja`) that maps it onto the
+    /// `CHAR_LOGIN_*` status codes, so `1` is "world server is down" and everything past `6` is
+    /// the default "login failed" (VERIFIED off `WoW.exe` — wow-5875-re
+    /// `system/net/scratch/char-login-failed-law.md`). Both emulators speak that dialect: vmangos
+    /// sends a bare `1`, and mangos-classic's live enum is `CharLoginFailReasons` 0x01–0x08 (its
+    /// `ResponseCodes` `CHAR_LOGIN_*` block is commented out).
+    ///
+    /// Kept raw here all the same — turning it into a player-facing string is the glue layer's
+    /// job, and it is the only place that holds the reference's table.
+    CharacterLoginFailed {
+        result: u8,
+    },
     UpdateObject {
         objects: Vec<Object>,
     },
@@ -135,8 +150,19 @@ pub enum ServerPacket {
     TriggerCinematic {
         cinematic_id: u32,
     },
+    /// `MSG_MOVE_TIME_SKIPPED` — an observed mover's own client skipped `lag_ms` of movement
+    /// simulation, so every watcher's copy of its wire clock must move with it (layout in
+    /// [`super::movement::read_move_time_skipped`]). Decision 1935.
+    MoveTimeSkipped {
+        guid: u64,
+        lag_ms: u32,
+    },
     MonsterMove {
         guid: u64,
+        /// `SMSG_MONSTER_MOVE_TRANSPORT` only: the transport whose frame `start` and every `path`
+        /// point are expressed in (deck-local offsets, not world coordinates). `None` = the plain
+        /// `SMSG_MONSTER_MOVE`, whose coordinates are absolute. Decision 1936.
+        transport: Option<u64>,
         start: Vector3d,
         /// The server's per-move spline counter — echoed back in `CMSG_MOVE_SPLINE_DONE` when the
         /// spline drives our own player (Charge/knockback/taxi); ignored for a creature's walk.
@@ -283,6 +309,54 @@ pub enum ServerPacket {
         trainer: u64,
         cost: u32,
     },
+    /// `SMSG_PET_UNLEARN_CONFIRM` — the pet trainer's question (decision 1963): the talent-wipe
+    /// twin for a pet, the same latch-and-confirm shape; nothing is unlearned until
+    /// `CMSG_PET_UNLEARN` goes back with the guid.
+    PetUnlearnConfirm {
+        trainer: u64,
+        cost: u32,
+    },
+    /// `SMSG_RAID_GROUP_ONLY` — the instance-boot clock (decision 1963): a positive delay arms
+    /// the boot, zero clears it and names the reason on screen.
+    RaidGroupOnly {
+        delay_ms: u32,
+        reason: u32,
+    },
+    /// `SMSG_AREA_SPIRIT_HEALER_TIME` — a battleground spirit healer's next wave (decision 1963).
+    AreaSpiritHealerTime {
+        healer: u64,
+        ms: u32,
+    },
+    /// `SMSG_BATTLEFIELD_STATUS` — one of the three queue slots (decision 1963).
+    BattlefieldStatus(crate::messages::BattlefieldStatus),
+    /// `MSG_PVP_LOG_DATA` inbound — the battleground scoreboard (decision 1972).
+    PvpLogData(crate::messages::PvpLogData),
+    /// `SMSG_BATTLEFIELD_LIST` — the battleground instance list (decision 1974).
+    BattlefieldList(crate::messages::BattlefieldList),
+    /// `MSG_BATTLEGROUND_PLAYER_POSITIONS` inbound — the teammates and the flag carrier (1980).
+    BattlefieldPositions(crate::messages::BattlefieldPositions),
+    /// `MSG_TABARDVENDOR_ACTIVATE` inbound — the vendor guid that opens the tabard designer (1977).
+    TabardVendorActivate(u64),
+    /// `MSG_SAVE_GUILD_EMBLEM` inbound — the save's result row (1977).
+    SaveGuildEmblemResult(u32),
+    /// `SMSG_GROUP_JOINED_BATTLEGROUND` — a group join's verdict (decision 1974).
+    GroupJoinedBattleground {
+        result: u32,
+    },
+    /// `SMSG_BATTLEGROUND_PLAYER_JOINED` / `_LEFT` — one guid each (decision 1974).
+    BattlegroundPlayer {
+        guid: u64,
+        joined: bool,
+    },
+    /// `SMSG 0x295` — the meeting-stone queue state (decision 1963).
+    MeetingStoneSetQueue {
+        area: u32,
+        status: u8,
+    },
+    /// `SMSG 0x297/0x298/0x299/0x2BB` — the meeting stone's display-only replies (decision 1974).
+    MeetingStoneNotice(crate::messages::MeetingStoneNotice),
+    /// `SMSG_TUTORIAL_FLAGS` — the account's tutorial bank (decision 1976).
+    TutorialFlags(crate::messages::TutorialFlags),
     /// `SMSG_SUMMON_REQUEST` — someone is *asking* to pull us to them (decision 1747): a
     /// warlock's ritual, a meeting stone, a GM. The twin of [`Self::BinderConfirm`] in shape —
     /// nothing moves until `CMSG_SUMMON_RESPONSE` goes back — and its opposite in teardown:
@@ -584,6 +658,27 @@ pub enum ServerPacket {
         spell_id: u32,
         outcome: CastOutcome,
     },
+    /// `SMSG_PET_TAME_FAILURE` — one `PetTameFailureReason` byte; the red line's text comes from
+    /// [`super::pet::pet_tame_failure_key`].
+    PetTameFailure {
+        reason: u8,
+    },
+    /// `SMSG_PET_NAME_INVALID` — the refused rename. Empty body: the opcode IS the message.
+    PetNameInvalid,
+    /// `SMSG_PET_BROKEN` — the pet's loyalty hit zero and it ran away. Empty body.
+    PetBroken,
+    /// `SMSG_PET_ACTION_SOUND` — the pet's voice: which unit, and which of the two talk
+    /// selectors ([`super::pet::PET_TALK_ORDER`] / [`super::pet::PET_TALK_ATTACK`]).
+    PetActionSound {
+        pet_guid: u64,
+        talk: u32,
+    },
+    /// `SMSG_PET_DISMISS_SOUND` — a `CreatureModelData` id and the point to play its column-29
+    /// kit at. No guid: the pet is already gone.
+    PetDismissSound {
+        model_id: u32,
+        position: Vector3d,
+    },
     /// `SMSG_ATTACKSTART` — a unit began melee auto-attack (including our own echo).
     AttackStart {
         attacker: u64,
@@ -597,6 +692,16 @@ pub enum ServerPacket {
     /// `SMSG_ATTACKERSTATEUPDATE` — one completed melee swing (decision 0073: the attacker's swing
     /// animation trigger).
     AttackerState(AttackerState),
+    /// The server refused our `CMSG_ATTACKSWING` — `SMSG_ATTACKSWING_NOTINRANGE` (`0x145`),
+    /// `_BADFACING` (`0x146`), `_DEADTARGET` (`0x148`) or `_CANT_ATTACK` (`0x149`), collapsed to
+    /// the three arms the reference actually wires (see [`AttackSwingError`]). Empty bodies.
+    AttackSwingError(AttackSwingError),
+    /// `SMSG_CANCEL_COMBAT` (`0x14e`) — the server forced our attack to stop. Empty body; the
+    /// reference's handler `0x5e7dd0` is arm 4's body verbatim (StopAttack, no message).
+    CancelCombat,
+    /// `SMSG_FEIGN_DEATH_RESISTED` (`0x2b4`) — the target resisted our Feign Death. Empty body;
+    /// the reference's handler `0x6e9800` is a bare `DisplayError(421)`.
+    FeignDeathResisted,
     /// `SMSG_AI_REACTION` — a creature flared aggro (2 HOSTILE) or a stealth pre-aggro alert
     /// (0 ALERT) at someone (layout in [`super::attack::read_ai_reaction`]; decision 0277).
     AiReaction {
@@ -626,7 +731,7 @@ pub enum ServerPacket {
     },
     /// `SMSG_CANCEL_AUTO_REPEAT` — stop our own ranged auto-repeat visual; self-only, empty body
     /// (vmangos `WorldPackets::Misc::CancelAutoRepeat`). Consumed by the local cancel funnel
-    /// (`net/apply/spells.rs::cancel_auto_repeat`, decision 0406). vmangos DOES send it —
+    /// (`net/apply/spells.rs::cancel_auto_repeat`, decision 2273). vmangos DOES send it —
     /// `SpellCaster::InterruptSpell` → `Player::SendAutoRepeatCancel`, on every player autorepeat
     /// interrupt, target death included (corrected 2026-08-05; the earlier "zero send sites" note
     /// here was wrong).
@@ -645,6 +750,12 @@ pub enum ServerPacket {
         item_guid: u64,
         spell_id: u32,
     },
+    /// `SMSG_ITEM_TIME_UPDATE` — how long one duration-limited item instance has left, in
+    /// **seconds** (layout in [`super::items::read_item_time`]). Decision 1933.
+    ItemTime {
+        item_guid: u64,
+        seconds: u32,
+    },
     /// `SMSG_ITEM_ENCHANT_TIME_UPDATE` — how long one item's TEMPORARY enchant has left (layout in
     /// [`super::items::read_item_enchant_time`]). The tooltip's countdown has no other source
     /// (decision 0920).
@@ -652,6 +763,26 @@ pub enum ServerPacket {
         item_guid: u64,
         slot: u32,
         seconds: u32,
+    },
+    /// `SMSG_SET_FLAT_SPELL_MODIFIER` / `SMSG_SET_PCT_SPELL_MODIFIER` — one cell of one of the two
+    /// talent spell-modifier tables, absolutely (layout + the index law in
+    /// [`super::spells::read_set_spell_modifier`]).
+    ///
+    /// One variant for both opcodes because the reference has one handler for both
+    /// (`0x6e9950`), reading the identical body and forking on the opcode alone to pick the table
+    /// — so `flat` IS the opcode, and nothing else differs.
+    SpellModifier {
+        /// `true` = `0x266`, the FLAT table (summed and added); `false` = `0x267`, the PCT table
+        /// (summed, then `+100`, clamped at 0, then used as a raw multiplier).
+        flat: bool,
+        /// The spell's `SpellFamilyFlags` **bit index**, 0..=63 — the table's row. The wire does
+        /// not bound it (the reference's own store overruns into the neighbouring global on a
+        /// 64); the consumer refuses it.
+        mask_bit: u8,
+        /// The SpellModOp, 0..=28 — the table's column. Likewise unbounded on the wire.
+        op: u8,
+        /// The cell's new value, **signed** and **absolute** — never a delta.
+        value: i32,
     },
     /// `SMSG_COOLDOWN_EVENT` — start an on-hold (`SPELL_ATTR_COOLDOWN_ON_EVENT`) cooldown's
     /// parked timers now (layout in [`super::spellbook::read_cooldown_event`]).
@@ -853,8 +984,8 @@ pub enum ServerPacket {
         blocks: Vec<super::gossip::NpcTextBlock>,
     },
     /// `SMSG_LIST_INVENTORY` — a vendor's stock, answering `CMSG_LIST_INVENTORY` (vmangos
-    /// `ItemHandler.cpp:741-810`). Empty stock sends `count = 0` plus a trailing error byte the
-    /// parser leaves unconsumed.
+    /// `ItemHandler.cpp:741-810`). Empty stock sends `count = 0` plus one error byte (always 0,
+    /// "Vendor has no inventory") that the parser consumes and drops.
     VendorList {
         vendor: u64,
         items: Vec<VendorItem>,
@@ -1478,6 +1609,19 @@ pub enum ServerPacket {
         id: u32,
         value: u32,
     },
+    /// `SMSG_ADDON_INFO` (`0x2ef`) — the server's per-addon verdict on the block we sent in
+    /// `CMSG_AUTH_SESSION` (decision 2175).
+    ///
+    /// **It carries no count and no names.** The client re-walks its own `## Secure:` list in the
+    /// same order it sent it and reads one record per addon, so record *i* is
+    /// `STOCK_SECURE_ADDONS[i]` (wow-re `system/net/scratch/cmsg-auth-session-addon-block.md` §6).
+    /// Only the `status` byte matters to us: **2** is what makes the client set `[rec+0x29] = 1`
+    /// and drop the addon from the Lua index space, which is why a stock install's AddOns list
+    /// shows the player's addons and none of Blizzard's.
+    AddonInfo {
+        /// One `status` per record, in the order the records arrived.
+        statuses: Vec<u8>,
+    },
     Other {
         opcode: u16,
     },
@@ -1492,11 +1636,19 @@ impl ServerPacket {
             ServerPacket::CharEnum { .. } => "SMSG_CHAR_ENUM".into(),
             ServerPacket::CharCreate { .. } => "SMSG_CHAR_CREATE".into(),
             ServerPacket::CharDelete { .. } => "SMSG_CHAR_DELETE".into(),
+            ServerPacket::CharacterLoginFailed { .. } => "SMSG_CHARACTER_LOGIN_FAILED".into(),
             ServerPacket::UpdateObject { .. } => "SMSG_UPDATE_OBJECT".into(),
             ServerPacket::CompressedMoves { .. } => "SMSG_COMPRESSED_MOVES".into(),
             ServerPacket::DestroyObject { .. } => "SMSG_DESTROY_OBJECT".into(),
             ServerPacket::TriggerCinematic { .. } => "SMSG_TRIGGER_CINEMATIC".into(),
-            ServerPacket::MonsterMove { .. } => "SMSG_MONSTER_MOVE".into(),
+            ServerPacket::MoveTimeSkipped { .. } => "MSG_MOVE_TIME_SKIPPED".into(),
+            ServerPacket::MonsterMove { transport, .. } => {
+                if transport.is_some() {
+                    "SMSG_MONSTER_MOVE_TRANSPORT".into()
+                } else {
+                    "SMSG_MONSTER_MOVE".into()
+                }
+            }
             ServerPacket::PlayerMove { opcode, .. } => format!("MSG_MOVE relay ({opcode:#06x})"),
             ServerPacket::Teleport { .. } => "MSG_MOVE_TELEPORT_ACK".into(),
             ServerPacket::NewWorld { .. } => "SMSG_NEW_WORLD".into(),
@@ -1516,6 +1668,36 @@ impl ServerPacket {
             ServerPacket::PlayerBound { .. } => "SMSG_PLAYERBOUND".into(),
             ServerPacket::SummonRequest { .. } => "SMSG_SUMMON_REQUEST".into(),
             ServerPacket::TalentWipeConfirm { .. } => "MSG_TALENT_WIPE_CONFIRM".into(),
+            ServerPacket::PetUnlearnConfirm { .. } => "SMSG_PET_UNLEARN_CONFIRM".into(),
+            ServerPacket::RaidGroupOnly { .. } => "SMSG_RAID_GROUP_ONLY".into(),
+            ServerPacket::AreaSpiritHealerTime { .. } => "SMSG_AREA_SPIRIT_HEALER_TIME".into(),
+            ServerPacket::BattlefieldStatus(_) => "SMSG_BATTLEFIELD_STATUS".into(),
+            ServerPacket::PvpLogData(_) => "MSG_PVP_LOG_DATA".into(),
+            ServerPacket::BattlefieldList(_) => "SMSG_BATTLEFIELD_LIST".into(),
+            ServerPacket::BattlefieldPositions(_) => "MSG_BATTLEGROUND_PLAYER_POSITIONS".into(),
+            ServerPacket::TabardVendorActivate(_) => "MSG_TABARDVENDOR_ACTIVATE".into(),
+            ServerPacket::SaveGuildEmblemResult(_) => "MSG_SAVE_GUILD_EMBLEM".into(),
+            ServerPacket::GroupJoinedBattleground { .. } => "SMSG_GROUP_JOINED_BATTLEGROUND".into(),
+            ServerPacket::BattlegroundPlayer { joined: true, .. } => {
+                "SMSG_BATTLEGROUND_PLAYER_JOINED".into()
+            }
+            ServerPacket::BattlegroundPlayer { joined: false, .. } => {
+                "SMSG_BATTLEGROUND_PLAYER_LEFT".into()
+            }
+            ServerPacket::MeetingStoneSetQueue { .. } => "SMSG_MEETINGSTONE_SETQUEUE".into(),
+            ServerPacket::MeetingStoneNotice(crate::messages::MeetingStoneNotice::Success) => {
+                "SMSG_MEETINGSTONE_SUCCESS".into()
+            }
+            ServerPacket::MeetingStoneNotice(crate::messages::MeetingStoneNotice::InProgress) => {
+                "SMSG_MEETINGSTONE_IN_PROGRESS".into()
+            }
+            ServerPacket::MeetingStoneNotice(
+                crate::messages::MeetingStoneNotice::MemberAdded { .. },
+            ) => "SMSG_MEETINGSTONE_MEMBER_ADDED".into(),
+            ServerPacket::MeetingStoneNotice(crate::messages::MeetingStoneNotice::JoinFailed {
+                ..
+            }) => "SMSG_MEETINGSTONE_JOIN_FAILED".into(),
+            ServerPacket::TutorialFlags(_) => "SMSG_TUTORIAL_FLAGS".into(),
             ServerPacket::SetProficiency { .. } => "SMSG_SET_PROFICIENCY".into(),
             ServerPacket::InitializeFactions { .. } => "SMSG_INITIALIZE_FACTIONS".into(),
             ServerPacket::SetFactionStanding { .. } => "SMSG_SET_FACTION_STANDING".into(),
@@ -1559,10 +1741,26 @@ impl ServerPacket {
             ServerPacket::PetSpells(_) => "SMSG_PET_SPELLS".into(),
             ServerPacket::PetMode(_) => "SMSG_PET_MODE".into(),
             ServerPacket::PetActionFeedback { .. } => "SMSG_PET_ACTION_FEEDBACK".into(),
+            ServerPacket::PetTameFailure { .. } => "SMSG_PET_TAME_FAILURE".into(),
+            ServerPacket::PetNameInvalid => "SMSG_PET_NAME_INVALID".into(),
+            ServerPacket::PetBroken => "SMSG_PET_BROKEN".into(),
+            ServerPacket::PetActionSound { .. } => "SMSG_PET_ACTION_SOUND".into(),
+            ServerPacket::PetDismissSound { .. } => "SMSG_PET_DISMISS_SOUND".into(),
             ServerPacket::PetCastFailed { .. } => "SMSG_PET_CAST_FAILED".into(),
             ServerPacket::AttackStart { .. } => "SMSG_ATTACKSTART".into(),
             ServerPacket::AttackStop { .. } => "SMSG_ATTACKSTOP".into(),
             ServerPacket::AttackerState(_) => "SMSG_ATTACKERSTATEUPDATE".into(),
+            // The wire opcode is not recoverable from the collapsed arm 4 — the client cannot tell
+            // DEADTARGET from CANT_ATTACK either, so the name says which arm ran.
+            ServerPacket::AttackSwingError(e) => match e {
+                AttackSwingError::NotInRange => "SMSG_ATTACKSWING_NOTINRANGE".into(),
+                AttackSwingError::BadFacing => "SMSG_ATTACKSWING_BADFACING".into(),
+                AttackSwingError::DeadOrUnattackable => {
+                    "SMSG_ATTACKSWING_DEADTARGET/CANT_ATTACK".into()
+                }
+            },
+            ServerPacket::CancelCombat => "SMSG_CANCEL_COMBAT".into(),
+            ServerPacket::FeignDeathResisted => "SMSG_FEIGN_DEATH_RESISTED".into(),
             ServerPacket::AiReaction { .. } => "SMSG_AI_REACTION".into(),
             ServerPacket::SpellStart(_) => "SMSG_SPELL_START".into(),
             ServerPacket::SpellGo(_) => "SMSG_SPELL_GO".into(),
@@ -1572,7 +1770,16 @@ impl ServerPacket {
             ServerPacket::CancelAutoRepeat => "SMSG_CANCEL_AUTO_REPEAT".into(),
             ServerPacket::SpellCooldownList { .. } => "SMSG_SPELL_COOLDOWN".into(),
             ServerPacket::ItemCooldown { .. } => "SMSG_ITEM_COOLDOWN".into(),
+            ServerPacket::ItemTime { .. } => "SMSG_ITEM_TIME_UPDATE".into(),
             ServerPacket::ItemEnchantTime { .. } => "SMSG_ITEM_ENCHANT_TIME_UPDATE".into(),
+            // The opcode IS the table, so the name recovers it — unlike the collapsed
+            // `AttackSwingError` arm above, nothing here is lost.
+            ServerPacket::SpellModifier { flat, .. } => if *flat {
+                "SMSG_SET_FLAT_SPELL_MODIFIER"
+            } else {
+                "SMSG_SET_PCT_SPELL_MODIFIER"
+            }
+            .into(),
             ServerPacket::CooldownEvent { .. } => "SMSG_COOLDOWN_EVENT".into(),
             ServerPacket::ClearCooldown { .. } => "SMSG_CLEAR_COOLDOWN".into(),
             ServerPacket::CooldownCheat { .. } => "SMSG_COOLDOWN_CHEAT".into(),
@@ -1768,6 +1975,7 @@ impl ServerPacket {
             ServerPacket::TradeStatusExtended { .. } => "SMSG_TRADE_STATUS_EXTENDED".into(),
             ServerPacket::InitWorldStates(_) => "SMSG_INIT_WORLD_STATES".into(),
             ServerPacket::UpdateWorldState { .. } => "SMSG_UPDATE_WORLD_STATE".into(),
+            ServerPacket::AddonInfo { .. } => "SMSG_ADDON_INFO".into(),
             ServerPacket::Other { opcode } => format!("opcode {opcode:#06x}"),
         }
     }

@@ -18,20 +18,23 @@ const UI_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui");
 /// The reader's dependency prefix, in the manifest's own order. `ScrollTemplates.xml` and
 /// `UIPanelTemplates.xml` joined it with decisions 1337/1338: the page sits in a real ScrollFrame
 /// now, whose template is in the second and whose `ScrollFrame_OnLoad` is in the first.
-const FILES: [&str; 9] = [
+const FILES: &[&str] = &[
     // `ITEM_TEXT_FROM`, which the reference's READY arm concatenates into the creator tail — and
     // `attempt to concatenate a nil value` kills the handler before it reaches its `ShowUIPanel`,
     // so the window simply never opens. Our deleted copy carried the string as a local fallback.
     "Interface\\FrameXML\\GlobalStrings.lua",
-    "Fonts.xml",
-    "MoneyFrame.xml",
-    "UiPanels.xml",
+    "Interface\\FrameXML\\Fonts.xml",
+    r"Interface\FrameXML\MoneyFrame.lua",
+    r"Interface\FrameXML\MoneyFrame.xml",
+    r"Interface\FrameXML\UIParent.xml",
     // `GetMaterialTextColors`, which the reference's own `ItemTextFrame_OnEvent` calls to pick the
     // page and title ink. 1.12 keeps it in UIParent.lua and ours does the same (1751 window 9).
-    "UIParent.xml",
     "ScrollTemplates.xml",
     r"Interface\FrameXML\UIPanelTemplates.lua",
     r"Interface\FrameXML\UIPanelTemplates.xml",
+    "Interface\\FrameXML\\BasicControls.xml",
+    "Interface\\FrameXML\\LocaleProperties.lua",
+    "Interface\\FrameXML\\StaticPopup.xml", // the dialog engine (1960)
     "Interface\\FrameXML\\ItemTextFrame.xml",
 ];
 
@@ -147,8 +150,14 @@ fn a_letter_reads_with_the_creator_tail() {
 /// The scrollbar track (the ref's black `$parentMiddle` strip) belongs in the scrollbar column,
 /// right of the page — regression for the black bar over the parchment: the ref declares the
 /// ARTWORK layer before BACKGROUND because `Middle` anchors to `Top` by name and anchors resolve
-/// at SetPoint time; a reordered transcription silently fell back to the parent. The warning
-/// check pins the tripwire that now catches any such unresolved named anchor at load.
+/// at SetPoint time; a reordered transcription silently fell back to the parent.
+///
+/// **The tripwire beside it is the whole stock chain's, and it moved with decision 2176.** An
+/// unresolvable `relativeTo` used to anchor to the parent and warn; a *Lua* one now raises
+/// (`0x87ccd4`) and an *XML* one is reported and skipped the way `0x767800` reports and skips it
+/// (`"Couldn't find relative frame: %s"`, `0x878440`). So the assertion is on the new spelling —
+/// zero of those over every file the player's own chain loads — and the raise's own tripwire is
+/// `take_errors()` at the end, which a raise inside any `OnLoad` would land in.
 #[test]
 fn the_scrollbar_track_sits_right_of_the_page() {
     let _data = benilla_formats::wow_data_or_skip!();
@@ -157,7 +166,7 @@ fn the_scrollbar_track_sits_right_of_the_page() {
     let unresolved: Vec<String> = s
         .warnings()
         .into_iter()
-        .filter(|w| w.contains("does not resolve"))
+        .filter(|w| w.contains("Couldn't find relative frame"))
         .collect();
     assert!(unresolved.is_empty(), "unresolved anchors: {unresolved:#?}");
 
@@ -328,7 +337,7 @@ fn the_reported_book_crest_draws_at_the_blps_own_size() {
     let chain = std::sync::Mutex::new(benilla_formats::open_chain(&data).expect("open chain"));
 
     let mut s = UiScript::new().unwrap();
-    // The host oracle, wired exactly as `ui_script::lifecycle::install_texture_resolvers` wires the
+    // The host oracle, wired exactly as `ui_script::lifecycle::install_addon_asset_resolvers` wires the
     // live one: the same decoder, so the size the layout resolves with is the size the screen shows.
     s.set_texture_size_probe(Box::new(move |path| {
         benilla_assets::sprite_dimensions(&chain, None, path)

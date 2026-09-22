@@ -26,13 +26,13 @@ use benilla_assets::m2_url;
 use benilla_assets::materials::WowModelMaterial;
 
 use super::framing::{
-    attachment_point, diag_to_vert, glue_scene_framing, ArtExtent, GLUE_AUTHORED_ASPECT,
-    PORTRAIT_ASPECT,
+    attachment_point, diag_to_vert, glue_box_aspect, glue_box_physical, glue_scene_framing,
+    ArtExtent, GLUE_AUTHORED_ASPECT, PORTRAIT_ASPECT,
 };
 use super::{
     aim, body_frame, new_target_image, spawn_booth_effects, spawn_booth_model, Booth,
     BoothBillboardSpec, BoothCam, BoothEffects, BoothInstance, BoothLight, BoothMotion, BoothPart,
-    BoothRider, BoothTwins, Booths, PortraitImages, PortraitSource, GLUE_LAYER,
+    BoothRider, BoothTwins, Booths, PortraitImages, PortraitSource, VariantLane, GLUE_LAYER,
 };
 
 /// The glue booth slot token (its key in [`super::PortraitImages`] / [`Booths`]).
@@ -198,11 +198,19 @@ pub(crate) struct CreateScene {
     cam: Option<benilla_assets::PortraitCamera>,
     /// How far the scene's art paints around that camera — the shipped scene's measured extent
     /// ([`benilla_formats::shipped_glue_art_extent`], decision 1619) — the ceiling on the framing
-    /// law's widening ([`glue_scene_framing`]). `None` with no scene.
+    /// law's opening UPWARD on a narrow window ([`glue_scene_framing`]). `None` with no scene.
+    /// The wide leg stopped reading it under 2187: one frame for every scene, so its width is
+    /// [`super::framing::GLUE_BOX_ASPECT`]'s, not this stage's. It is still what says the frame
+    /// is safe there (the spawn log below, and the test that pins the constant).
     art: Option<ArtExtent>,
-    /// `Some(aspect)` while the framing law pillarboxes the scene (the window is wider than the
-    /// art can fill at the zoom floor): the booth camera renders into a centred viewport of this
-    /// aspect, black either side ([`pillarbox_glue_scene`]). `None`: the whole window.
+    /// `Some(aspect)` while the frame pillarboxes the scene — the window is wider than
+    /// [`super::framing::GLUE_BOX_ASPECT`]: the booth camera renders into a centred viewport of
+    /// this aspect, black either side ([`pillarbox_glue_scene`]). `None`: the whole window.
+    ///
+    /// A property of the **window**, not of the scene (decision 2187) — set from the window while
+    /// any glue screen is up, cleared only when the booth is torn down. It is what the chrome's
+    /// canvas insets by (2091), and 1619's per-scene box is why that canvas used to jump as the
+    /// roster selection moved between races.
     viewport_aspect: Option<f32>,
     /// The character's stage spot — scene attachment 0 (Bevy model space), `ZERO` with no scene.
     /// (Verified for select too: the body seats on attachment **0**, `0x473039` — attachment 1 is
@@ -829,7 +837,7 @@ pub(super) fn sync_glue_ffx(
 /// seat the character on the stage spot, and hold the booth camera on the scene's authored camera 0
 /// — every frame, so the per-bake body framing from [`sync_glue_booth`] never wins while a scene
 /// shows. Leaving the screen (`look: None`) tears the scene down and restores the square target.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 pub(super) fn sync_glue_scene(
     mut commands: Commands,
     preview: Res<GluePreview>,
@@ -854,13 +862,30 @@ pub(super) fn sync_glue_scene(
         ResMut<benilla_world::model_forms::ModelForms>,
         ResMut<Assets<Mesh>>,
         ResMut<benilla_world::instance_tint::InstanceTintMirrors>,
+        // …and the scene's **material-animation lane**: the UV and tint registries and the shared
+        // delta table its samples land in (decisions 1381/2295). Here rather than beside, for the
+        // same ceiling — the param list is already full.
+        ResMut<benilla_world::doodad_anim::UvAnimMaterials>,
+        ResMut<benilla_world::doodad_anim::TintAnimMaterials>,
+        ResMut<benilla_world::mat_anim_table::MatAnimTable>,
+        ResMut<benilla_world::mat_anim_table::MatAnimMirrors>,
     ),
     // The swap gate's two inputs ([`PendingSwap`]) — the character assembly this stage must land
     // beside, and the real clock its bound is measured on. One tuple param: the 16-SystemParam
     // ceiling, same reason as `particle_assets` above.
     swap: (Res<GluePreviewBake>, Res<Time<bevy::time::Real>>),
 ) {
-    let (mut palettes, mut mirrors, mut forms, mut mesh_assets, mut tint_mirrors) = particle_assets;
+    let (
+        mut palettes,
+        mut mirrors,
+        mut forms,
+        mut mesh_assets,
+        mut tint_mirrors,
+        mut uv_reg,
+        mut tint_reg,
+        mut anim_table,
+        mut anim_mirrors,
+    ) = particle_assets;
     let (bake, real) = swap;
     let Some(booth) = booths.0.get(GLUE_SLOT) else {
         return;
@@ -890,6 +915,13 @@ pub(super) fn sync_glue_scene(
     // The booth target follows the window while the screen is up — the scene is a fullscreen
     // render, so the bake wants window-native resolution (the fallback character-only render
     // shares it; its projection is aspect-aware).
+    //
+    // …and so does the **frame** (decision 2187). One box for every scene means the box is a
+    // property of the window alone, so it is set here — from the window, before a token is even
+    // resolved — and not down in the camera block with the scene's own fov. Two consequences, and
+    // both are the point: the chrome's canvas ([`crate::glue::GlueCanvas`]) cannot move when the
+    // selected character's race changes the stage, and it cannot flicker out to the full window
+    // for the frames a stage swap is in flight.
     if let Ok(w) = window.single() {
         resize_target(
             &mut images,
@@ -897,6 +929,10 @@ pub(super) fn sync_glue_scene(
             w.physical_width().max(1),
             w.physical_height().max(1),
         );
+        let box_aspect = glue_box_aspect(w.width() / w.height().max(1.0));
+        if scene.viewport_aspect != box_aspect {
+            scene.viewport_aspect = box_aspect;
+        }
     }
 
     let token = scene_token(which);
@@ -961,7 +997,9 @@ pub(super) fn sync_glue_scene(
         scene.spawned = false;
         scene.cam = None;
         scene.art = None;
-        scene.viewport_aspect = None;
+        // `viewport_aspect` is deliberately NOT cleared: the frame is the window's, not this
+        // stage's (2187), and clearing it here is what made the chrome jump out to the full
+        // window for the frames between two stages.
         scene.char_spot = Vec3::ZERO;
         clear_pet(&mut commands, &mut scene);
         commands.entity(scene.root).despawn_related::<Children>();
@@ -1039,6 +1077,18 @@ pub(super) fn sync_glue_scene(
         // is the one off-world buffer that carries it — see
         // [`benilla_world::instance_tint::InstanceTintMirrors`] for why the portrait booths do not.
         tint_mirrors.0.insert("glue_scene", light.clone());
+        // …and the **mat-anim delta table** beside them (decisions 1381/2023): the scene's
+        // materials sample `matanim[slot]` out of THIS buffer, so registering a batch's loop is
+        // only half the act — without the mirror the rows are written every frame into a region
+        // only the world's materials ever read, and the scene samples its zero-initialised
+        // identity. That is verbatim 2023's cooldown-sweep failure, and it is what an A/B of this
+        // screen with the lane frozen against the lane running showed: byte-identical images,
+        // with 2 of UI_Human's 29 batches registered and marked.
+        //
+        // The portrait booths stay off this list on purpose ([`MatAnimMirrors`]'s own note): a
+        // bake photographs one instant, and its studio buffer's zeroed region IS that instant.
+        // The create screen is not a bake.
+        anim_mirrors.0.insert("glue_scene", light.clone());
         blob.write(&queue, &light);
         scene.fog = fog;
         scene.ghost = ghost;
@@ -1074,6 +1124,49 @@ pub(super) fn sync_glue_scene(
                 // and its street tied, and the tie re-broke every frame.
                 let order = u16::try_from(pi + 1).unwrap_or(u16::MAX);
                 let material = mats.off_world(s, s.texture.clone(), order, &light, true);
+                // **The scene's texture transforms and M2Color tint actually run** — the clouds
+                // drift, the water and lava creep, the fire sheets scroll. `off_world(rig: true)`
+                // has always *seeded* the UV at `sample(0.0)`, but seeding is not playing: nothing
+                // outside the world streamer, the entity dressing path and the effect lane had
+                // ever been registered, so every one of these froze on its first key while the
+                // comment above claimed they scrolled.
+                //
+                // Not a bake question, which is why it is decided here rather than deferred to
+                // 0130's bake law: a create/main-menu screen is a LIVE render, and the reference
+                // runs the texture transform inside the per-model-per-frame animate kernel
+                // (`0x715f25`-`0x7163bc` over the MD20 `+0x74` table, wow-re
+                // `modelframe-texanim-and-sequence-law.md` §3.1) — it is what an animated CM2Model
+                // does, not a lane a host opts into. The portrait and dressing-room bakes are the
+                // opposite case and stay still (`BoothPart::mat_anim`).
+                //
+                // **Shared lane only, and that is measured, not assumed** (`benilla-extract
+                // uvslotscan interface\glues`): 13 models, 261 batches, **15 live UV loops over 6
+                // models and 2 live RGB**, and PER-PLACEMENT is empty on both channels — every
+                // glue batch bakes one loop across its slots, so there is no sequence to key by
+                // and `host: None` is exact rather than a fallback.
+                let loops = benilla_world::doodad_anim::UvLoops::of(s);
+                let mut mat_anim = false;
+                if loops.animates() {
+                    benilla_world::doodad_anim::register_entity_uv(
+                        &mut uv_reg,
+                        &mut anim_table,
+                        mats.materials(),
+                        material.id(),
+                        &loops,
+                        None,
+                    );
+                    mat_anim = true;
+                }
+                if let Some(rgb) = s.rgb_anim.as_ref().filter(|a| a.period > 0.0) {
+                    benilla_world::doodad_anim::register_tint(
+                        &mut tint_reg,
+                        &mut anim_table,
+                        mats.materials(),
+                        material.id(),
+                        benilla_world::doodad_anim::TintLoop::Shared(rgb.clone()),
+                    );
+                    mat_anim = true;
+                }
                 BoothPart {
                     skinned: skin_forms.get(pi).cloned(),
                     static_mesh: stat_forms
@@ -1087,9 +1180,15 @@ pub(super) fn sync_glue_scene(
                     // corners — B121.
                     alpha_anim: s.alpha_anim.clone(),
                     twins: BoothTwins::default(),
+                    mat_anim,
                 }
             })
             .collect();
+        info!(
+            "create scene: UI_{token} material lane — {} of {} batches animate (UV/tint registered)",
+            scene_parts.iter().filter(|p| p.mat_anim).count(),
+            scene_parts.len(),
+        );
         let mut scene_rig = spawn_booth_model(
             &mut commands,
             &mut palettes,
@@ -1135,14 +1234,23 @@ pub(super) fn sync_glue_scene(
         scene.art = benilla_formats::shipped_glue_art_extent(token);
         if let (Some(art), Some(cam)) = (scene.art, model.camera0.as_ref()) {
             let t0 = benilla_formats::authored_half_height(cam.fov);
+            // Where the frame's edge lands on THIS stage's art (2187): the constant is derived
+            // from the seven shipped scenes, so on the shipped chain this reads "inside" for six
+            // of them and a hair past the night elves' 4:3 sky card. A patched or replaced scene
+            // that paints narrower would say so here.
+            let frame = super::framing::GLUE_BOX_ASPECT * super::framing::glue_zoom_floor(cam.fov);
             info!(
                 "create scene: UI_{token} art extent — half_w {:.4} (widens to {:.2}:1), half_h {:.4} \
-                 (opens to 1:{:.2}); boxes past {:.2}:1",
+                 (opens to 1:{:.2}); the frame ends at {frame:.4} — {}",
                 art.half_w,
                 art.half_w / t0,
                 art.half_h,
                 art.half_h / (t0 * GLUE_AUTHORED_ASPECT),
-                art.half_w.max(t0 * GLUE_AUTHORED_ASPECT) / super::framing::glue_zoom_floor(cam.fov),
+                if frame <= art.half_w.max(t0 * GLUE_AUTHORED_ASPECT) {
+                    "inside the art"
+                } else {
+                    "PAST the art (void at the frame's edges)"
+                },
             );
         }
         scene.char_spot = stage;
@@ -1198,14 +1306,11 @@ pub(super) fn sync_glue_scene(
         // a 1.55× zoom at 21:9 that crops head and feet (B242). [`glue_scene_framing`] pins the
         // authored 4:3 view box instead; its doc carries the law. Far kept generous: fog is not
         // rendered yet, so the authored far (27.8 on Orc) would slice unfogged geometry.
-        let framing = glue_scene_framing(cam.fov, aspect, scene.art);
-        if scene.viewport_aspect != framing.viewport_aspect {
-            scene.viewport_aspect = framing.viewport_aspect;
-        }
+        let vert_fov = glue_scene_framing(cam.fov, aspect, scene.art);
         let rig = (
             Transform::from_translation(cam.eye).looking_at(cam.target, up),
             Projection::from(PerspectiveProjection {
-                fov: framing.vert_fov,
+                fov: vert_fov,
                 near: cam.near,
                 far: cam.far.max(1000.0),
                 ..default()
@@ -1229,15 +1334,18 @@ pub(super) fn pillarbox_glue_scene(
     let Ok(w) = window.single() else {
         return;
     };
-    let (full_w, full_h) = (w.physical_width().max(1), w.physical_height().max(1));
-    let viewport = scene.viewport_aspect.map(|aspect| {
-        let box_w = ((full_h as f32 * aspect).round() as u32).clamp(1, full_w);
-        bevy::camera::Viewport {
-            physical_position: UVec2::new((full_w - box_w) / 2, 0),
-            physical_size: UVec2::new(box_w, full_h),
-            ..default()
-        }
-    });
+    let full_h = w.physical_height().max(1);
+    // The SAME arithmetic the chrome's canvas insets by ([`glue_box_physical`], decision 2091) —
+    // one function, so the frame the camera renders and the frame the chrome lays out in cannot
+    // round apart.
+    let viewport =
+        glue_box_physical(w.physical_width(), full_h, scene.viewport_aspect).map(|(x, box_w)| {
+            bevy::camera::Viewport {
+                physical_position: UVec2::new(x, 0),
+                physical_size: UVec2::new(box_w, full_h),
+                ..default()
+            }
+        });
     for (booth, mut cam) in cams.iter_mut() {
         if booth.0 != GLUE_SLOT {
             continue;
@@ -1288,7 +1396,6 @@ fn resize_target(images: &mut Assets<Image>, target: &Handle<Image>, w: u32, h: 
 /// the select screen's hardcoded weather-sun is the in-flight §5's to settle, decision 0465 §5),
 /// the studio buffer otherwise — pose a fresh Stand-**looping** instance with the riders on its
 /// joints, and frame it full-body.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn sync_glue_booth(
     mut commands: Commands,
     preview: Res<GluePreview>,
@@ -1378,10 +1485,14 @@ pub(super) fn sync_glue_booth(
                 // The glue screens keep the old fallback deliberately: the create/select scene has
                 // its own lifecycle (no map-scope teardown under it) and no parts-key retry to
                 // ride, so waiting here would leave the pane empty instead of merely mislit.
-                (Some(buf), Some(s)) => {
-                    super::material_variant(&mut s.variants, buf, material, materials, true)
-                        .unwrap_or_else(|| material.clone())
-                }
+                (Some(buf), Some(s)) => super::material_variant(
+                    &mut s.variants,
+                    buf,
+                    material,
+                    materials,
+                    VariantLane::RigUnfogged,
+                )
+                .unwrap_or_else(|| material.clone()),
                 _ => booth_light.studio.variant(material, materials),
             }
         };
@@ -1424,6 +1535,7 @@ pub(super) fn sync_glue_booth(
                 // previews at 1.0 here. Closing it means threading `alpha_anim` through the
                 // appearance-assembly layer — deliberately not folded into the B121 fix.
                 alpha_anim: None,
+                mat_anim: false,
             });
         }
         // The equipment riders (a Select look — helm/shoulders/sheathed weapons, decision 0465):
@@ -1609,7 +1721,6 @@ pub(super) fn sync_glue_booth(
 /// **Not yaw-driven.** Dragging the character spins the character: the reference's facing call
 /// (`0x4730e0`) writes the character component's model transform and nothing else, and both scene
 /// attachments are parentless unkeyed pivots, so the pet keeps the seat's own orientation.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn sync_glue_pet(
     mut commands: Commands,
     pet: Res<GluePetBake>,
@@ -1652,8 +1763,14 @@ pub(super) fn sync_glue_pet(
         AssetId<WowModelMaterial>,
         Handle<WowModelMaterial>,
     >| {
-        super::material_variant(variants, &light, material, &mut materials, true)
-            .unwrap_or_else(|| material.clone())
+        super::material_variant(
+            variants,
+            &light,
+            material,
+            &mut materials,
+            VariantLane::RigUnfogged,
+        )
+        .unwrap_or_else(|| material.clone())
     };
     let booth_parts: Vec<BoothPart> = pet
         .parts
@@ -1664,6 +1781,7 @@ pub(super) fn sync_glue_pet(
             material: relight(&p.material, &mut scene.variants),
             alpha_anim: p.alpha_anim.clone(),
             twins: BoothTwins::default(),
+            mat_anim: false,
         })
         .collect();
     let booth_billboards: Vec<BoothBillboardSpec> = pet

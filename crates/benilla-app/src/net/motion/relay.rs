@@ -26,7 +26,7 @@
 //! idle+empty gate `@0x618ce4`/`@0x618cf3`, re-base `@0x618cfc-d41`, clamps `@0x618d0d`/`@0x618d49`,
 //! fire store `@0x618dcc`, due test `@0x618dd2`) · `0x618b50` (the ring) · `0x615c30` (the drain).
 
-use benilla_protocol::{JumpInfo, TransportPose};
+use benilla_protocol::{JumpInfo, RelayVerb, TransportPose};
 
 /// One relayed move exactly as it came off the wire — the payload of
 /// [`benilla_protocol::SessionEvent::UnitMove`], before [`RelayChain`] decides *when* it applies.
@@ -44,9 +44,25 @@ pub(crate) struct RelayMove {
     pub(crate) fall_time: u32,
     pub(crate) jump: Option<JumpInfo>,
     pub(crate) transport: Option<TransportPose>,
-    /// `MSG_MOVE_HEARTBEAT` — excluded from the pre-fire reconcile lerp (the reference's `0x619090`
-    /// skips tag `0x26`); it applies as an outright snap.
-    pub(crate) heartbeat: bool,
+    /// **What this packet's opcode means on top of the pose** (decision 2064) — the receiver's
+    /// switch, and the only thing about a relay that is not in its `MovementInfo`.
+    pub(crate) verb: RelayVerb,
+}
+
+impl RelayMove {
+    /// **Does this queued move arm the pre-fire reconcile?** The two blends
+    /// ([`super::remote::facing_lerp`] and the position lerp) exist to land a queued move's pose
+    /// *smoothly* at its fire-time, and the reference arms them for every relay but **one**: the
+    /// queued node's tag `0x26`, which `0x619030` (facing) and `0x619090` (position) both skip.
+    ///
+    /// **That tag is the TELEPORT's, and this client believed for two years it was the
+    /// heartbeat's** (decision 2064, correcting 0601/0603). A teleport is the one move smoothing
+    /// cannot help — its position is a discontinuity, so blending toward it walks the mover, swept
+    /// capsule and all, across the gap the teleport exists to skip. A heartbeat has no such
+    /// problem and the reference blends it like anything else.
+    pub(crate) fn reconciles(&self) -> bool {
+        self.verb != RelayVerb::Teleport
+    }
 }
 
 /// One **scheduled** relayed move — the reference's queued move-event node (`0x617570`: fire-time at
@@ -156,6 +172,25 @@ impl RelayChain {
         fire_ms
     }
 
+    /// **The sender skipped time** (`MSG_MOVE_TIME_SKIPPED`, decision 1935): advance this chain's
+    /// copy of the mover's wire clock by `lag_ms`, without scheduling anything. The reference does
+    /// exactly this and nothing else — `0x603b40` resolves the unit and `0x61ab90` runs
+    /// `[CMovement+0xac] += lag`, which is this field.
+    ///
+    /// It has to be applied even though no pose moved, because [`Self::schedule`] pays the whole
+    /// chain off `last_wire_ms`: leave it short and the mover's next real packet reads as a `step`
+    /// `lag` ms larger than it was, buys that much extra `wire_delta`, and fires `lag` late — a
+    /// hitch on one unit that looks like packet loss and isn't. Wrapping, for
+    /// [`Self::schedule`]'s reason: the stamp is a `u32` ms clock that wraps every 49.7 days.
+    ///
+    /// A chain that has never seen a packet is left alone: there is no reference stamp to advance
+    /// yet, and the first real packet seeds both cells from itself.
+    pub(crate) fn skip_time(&mut self, lag_ms: u32) {
+        if self.seeded {
+            self.last_wire_ms = self.last_wire_ms.wrapping_add(lag_ms);
+        }
+    }
+
     /// Record this packet's lateness and return the window's worst (`0x618b50`): store
     /// `base + lateness` at the cursor, advance it mod 32, and return the max over all 32 slots (the
     /// entry just written included — the reference seeds its scan with it and walks the whole ring).
@@ -168,7 +203,7 @@ impl RelayChain {
 
     /// The scheduling lead this move got — `fire − arrival`, i.e. how long the dead-reckon has to
     /// cover before the pose lands. Negative means the move was already due and applies at arrival.
-    /// Trace/diagnostic only ([`super::remote::trace_schedule`]).
+    /// Trace/diagnostic only (`super::remote::trace_schedule`).
     pub(crate) fn lead_ms(&self, now_ms: f64) -> f64 {
         self.last_fire_ms - now_ms
     }

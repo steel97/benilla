@@ -29,6 +29,7 @@ use bevy::image::Image;
 use bevy::mesh::MeshVertexBufferLayoutRef;
 use bevy::pbr::{
     ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
+    MeshPipelineKey,
 };
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -112,13 +113,13 @@ pub struct WowModelKey {
     far_side: bool,
     /// The **WMO-skybox lane** (`clutter_fade.z` bit 13 — `model_render::SKY_DEPTH_MARKER`): the
     /// building-owned painted sky, drawn as the ordinary M2 it is. `specialize` compiles the
-    /// `WOW_SKY_DEPTH` fragment def, which emits `@builtin(frag_depth) = 0.0` — reverse-Z far, the
-    /// sky depth law every other sky shader already obeys (`benilla_world::sky_order`). It is a key
-    /// axis because writing `frag_depth` costs the whole pipeline its early-Z, and the model lane
-    /// draws every doodad and wall in the frame; only this one camera-anchored model may pay it.
-    /// Like [`Self::far_side`] it also zeroes the rasterizer bias constant: the lane's rung is a
-    /// SORT rung (`sky_order::WMO_SKYBOX_BIAS`, ~−6e4), and the depth it writes is a constant the
-    /// rasterizer must not be perturbing behind the shader's back.
+    /// `WOW_SKY_DEPTH` def into BOTH stages: the vertex pins clip z to 0 — reverse-Z far, the sky
+    /// depth law every other sky shader obeys (`benilla_world::sky_order`) — and the fragment
+    /// writes no depth at all (it did until 2016, at the cost of the pipeline's early-Z). It is a
+    /// key axis because the pin is one model's: every other draw on this lane keeps its real
+    /// depth. Like [`Self::far_side`] it also zeroes the rasterizer bias constant: the lane's rung
+    /// is a SORT rung (`sky_order::WMO_SKYBOX_BIAS`, ~−6e4), and the pinned depth is a constant
+    /// the rasterizer must not be perturbing behind the shader's back.
     sky_depth: bool,
     // NB: the WMO authored batch order is deliberately NOT a key axis. It used to be (a
     // per-batch-index `DepthBiasState` constant), which made every batch index its own pipeline —
@@ -205,7 +206,12 @@ pub struct WowModelExt {
     /// sampler; the per-frame samples live in the shared light buffer's `matanim` region, so an
     /// animating material is never mutated again (no per-frame `Modified`, no bind-group
     /// rebuild, no whole-population `AssetChanged` walks — B131's chain, severed at the root).
-    /// `zw` free.
+    /// `z` = the **affine** slot (decision 2019): its row is the texture transform's rotation
+    /// and scale as deltas from the identity, `[cos − 1, sin, sx − 1, sy − 1]`
+    /// (`mat_anim_table::affine_row`), composed about the pivot `(½, ½)` after the translation —
+    /// the reference's `uv' = R((uv + t − p) ⊙ s) + p`. Row 0 is the identity, so a material
+    /// with no rotation reads exactly the translated UV it always did. Written by the lanes that
+    /// own a material per instance (the UI model tiles); `w` free.
     #[uniform(100)]
     pub anim_slots: Vec4,
     /// **The shared global light** (`lighting::global_light`): one storage buffer every material reads,
@@ -326,11 +332,13 @@ impl MaterialExtension for WowModelExt {
                 ds.bias.constant = 0;
             }
         }
-        // The WMO-skybox lane: force the sky's far depth in the fragment, and — like the far-side
-        // twin above — keep its big negative rung sort-only. The rung (`sky_order::WMO_SKYBOX_BIAS`)
-        // exists to sink a camera-anchored backdrop under every world transparent; as a rasterizer
-        // constant it would be perturbing an interpolated depth this pipeline discards anyway.
+        // The WMO-skybox lane: pin the sky's far depth in the vertex stage (the def reaches the
+        // fragment too, for symmetry with the other lane defs — it reads nothing there), and —
+        // like the far-side twin above — keep its big negative rung sort-only. The rung
+        // (`sky_order::WMO_SKYBOX_BIAS`) exists to sink a camera-anchored backdrop under every
+        // world transparent; as a rasterizer constant it would be perturbing the pinned depth.
         if key.bind_group_data.sky_depth {
+            descriptor.vertex.shader_defs.push("WOW_SKY_DEPTH".into());
             if let Some(fragment) = descriptor.fragment.as_mut() {
                 fragment.shader_defs.push("WOW_SKY_DEPTH".into());
             }
@@ -414,6 +422,20 @@ impl MaterialExtension for WowModelExt {
             }
             if let Some(ds) = descriptor.depth_stencil.as_mut() {
                 ds.depth_write_enabled = true;
+            }
+        }
+        // The straddle split's waterline clip (decision 2188 — `benilla_world::straddle`): only a
+        // transparent-pass batch is ever classified against the water plane, so only its
+        // pipelines carry the clip. Keyed on the blend pass Bevy already specializes on, so it
+        // mints no pipeline of its own; the fragment clips nothing unless the instance's slot
+        // says it straddles.
+        if key
+            .mesh_key
+            .intersection(MeshPipelineKey::BLEND_RESERVED_BITS)
+            == MeshPipelineKey::BLEND_ALPHA
+        {
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("WOW_WATER_CLIP".into());
             }
         }
         let key = &key.bind_group_data;
@@ -633,27 +655,98 @@ impl MaterialExtension for TerrainExtension {
 mod tests {
     /// The sky depth law, for the one sky element that draws on the MODEL lane: the WMO skybox
     /// ([`WowModelKey::sky_depth`]). Every other sky shader is checked the same way, together, in
-    /// `benilla_world::sky_order::every_sky_shader_forces_the_far_depth` — this half lives here
-    /// because the shader does. Without it a skybox silently goes back to being occluded by its own
-    /// 94-yard shell radius instead of by world geometry (the regression decision 0588 fixed).
+    /// `benilla_world::sky_order::the_sky_depth_is_pinned_at_the_vertex_and_nowhere_else` — this
+    /// half lives here because the shader does. Without it a skybox silently goes back to being
+    /// occluded by its own 94-yard shell radius instead of by world geometry (the regression
+    /// decision 0588 fixed) — or, the other way, a `frag_depth` write comes back and every
+    /// doodad, creature and wall in the frame loses its early-Z with it (decision 2016).
     #[test]
-    fn the_sky_lane_forces_the_far_depth() {
+    fn the_sky_lane_pins_the_far_depth_at_the_vertex() {
         let src = include_str!("shaders/wow_model.wgsl");
+        // The pin, BEHIND its ifdef — matched with the guard attached, so ungating it (every model
+        // draw at the far plane) fails here rather than as a blank world.
+        let pin = src
+            .find("#ifdef WOW_SKY_DEPTH")
+            .expect("the sky-depth branch is gone");
+        let branch = &src[pin..src[pin..].find("#endif").map_or(src.len(), |e| pin + e)];
         assert!(
-            src.contains("#ifdef WOW_SKY_DEPTH\n    out.depth = 0.0;\n#endif"),
-            "the model lane's sky branch no longer forces the far depth — a WMO skybox's shell \
-             radius is deciding occlusion again (benilla_world::sky_order, \"The depth law\")"
+            branch.contains("out.position.z = 0.0;"),
+            "the model lane's sky branch no longer pins the far depth at the vertex — a WMO \
+             skybox's shell radius is deciding occlusion again (benilla_world::sky_order, \"The \
+             depth law\")"
         );
-        // The declaration must stay BEHIND the ifdef: writing `frag_depth` unconditionally costs
-        // every doodad, creature and wall in the frame its early-Z, and this lane draws all of
-        // them. Matched with its guard attached, so ungating it fails here rather than in a
-        // frame-time regression nobody attributes to this file. (Counting occurrences instead
-        // would trip over the prose above the struct, which names the builtin too.)
         assert!(
-            src.contains("#ifdef WOW_SKY_DEPTH\n    // Reverse-Z \"infinitely far\"",)
-                && src.contains("    @builtin(frag_depth) depth: f32,\n#endif"),
-            "the model lane's sky output no longer declares frag_depth behind WOW_SKY_DEPTH — \
-             either the sky writes no depth, or every model draw just lost its early-Z"
+            !src.contains("@builtin(frag_depth)"),
+            "the model lane writes a fragment depth again — the sky pin is the vertex stage's, \
+             and a fragment write costs every draw on this lane its early-Z (decision 2016)"
         );
+    }
+
+    /// The ADT depth swatch, pinned two ways: the WGSL still carries the reference's own row
+    /// arithmetic, and that arithmetic reproduces wow-re's published byte vectors.
+    ///
+    /// The mirror below is a **spec anchor**, not a second implementation — nothing else calls it.
+    /// It exists because WGSL has no unit-test harness here (Bevy's `#import`/`#ifdef` mean naga
+    /// cannot validate these files standalone), so the source-text pin above it is what ties the two
+    /// together: change the shader's formula and this fails, pointing at the numbers it has to keep
+    /// producing.
+    ///
+    /// The vectors are wow-re's, from `terrain/scratch/ocean-depth-ramp-law.md` — `Light.dbc` id 4,
+    /// map 0, t = 1440, the ocean pair `LightIntBand` sub-14 → sub-15.
+    #[test]
+    fn liquid_swatch_reproduces_the_reference_row_ramp() {
+        let src = include_str!("shaders/liquid.wgsl");
+        // The row accumulator: `c0 + floor(i*(c1 - c0)/64)`, NOT a lerp to the deep endpoint.
+        assert!(
+            src.contains("let row = c0 + floor(i * (c1 - c0) / 64.0);"),
+            "the swatch stopped building its rows the way FUN_0068a830 does — a plain lerp to the \
+             deep endpoint runs a 64th of a ramp that does not exist (decision 2074)"
+        );
+        // The ocean-only tail: floor(0.9*byte) on the LAST row, alpha forced opaque.
+        assert!(
+            src.contains("if ocean && i >= 63.0 {")
+                && src.contains("vec4<f32>(floor(row.rgb * 0.9), 255.0)"),
+            "the ocean's last-row darkening is gone — ~80% of the world's ocean vertices sample \
+             that row, so this is the open sea's colour (decision 2074)"
+        );
+        // LINEAR sampling across the two rows V falls between, at texel `V*64 - 0.5`.
+        assert!(
+            src.contains("let t = clamp(v * 64.0 - 0.5, 0.0, 63.0);"),
+            "the swatch stopped sampling as an 8x64 LINEAR/CLAMP texture — the ocean darkening \
+             would step instead of ramping across the final 1/64 of V (decision 2074)"
+        );
+
+        /// `row(i)` for one channel, mirroring `swatch_row`'s byte arithmetic exactly.
+        fn row(c0: i32, c1: i32, i: i32) -> i32 {
+            c0 + (i * (c1 - c0)).div_euclid(64)
+        }
+        /// The ocean tail's colour half.
+        fn tail(b: i32) -> i32 {
+            (f64::from(b) * 0.9).floor() as i32
+        }
+
+        // Ocean shallow (sub-14) 0x00457b63 and deep (sub-15) 0x000b2228, as R/G/B.
+        let (shallow, deep) = ([69, 123, 99], [11, 34, 40]);
+        let at = |i| [0, 1, 2].map(|k| row(shallow[k], deep[k], i));
+
+        // Row 63 is one short of the endpoint on G — the ramp never arrives.
+        assert_eq!(at(63), [11, 35, 40], "row 63 before the ocean tail");
+        assert_ne!(
+            at(63)[1],
+            deep[1],
+            "the ramp must NOT reach the deep endpoint"
+        );
+        assert_eq!(
+            at(62),
+            [12, 36, 41],
+            "row 62, the other half of the last blend"
+        );
+        assert_eq!(
+            at(63).map(tail),
+            [9, 31, 36],
+            "row 63 after the ocean tail (HSV V *= 0.9, which is floor(0.9*byte) per channel)"
+        );
+        // The shallow end is the endpoint exactly — the tail and the shortfall are deep-end only.
+        assert_eq!(at(0), shallow, "row 0 is the shallow endpoint verbatim");
     }
 }

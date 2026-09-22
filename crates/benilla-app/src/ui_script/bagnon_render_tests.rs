@@ -438,7 +438,7 @@ fn without_a_player_at_addon_load_bagnon_draws_an_empty_window() {
 }
 
 /// The **other** fault, pinned on its own so a later regression names itself: the reference's
-/// `SetItemButton*` family (`assets/ui/ItemButtonTemplate.xml`).
+/// `SetItemButton*` family (`Interface\FrameXML\ItemButtonTemplate.xml`).
 ///
 /// Bagnon ends every slot update with `SetItemButtonDesaturated` / `SetItemButtonTexture` /
 /// `SetItemButtonCount`. While those were nil the raise landed inside `BagnonFrame_AddBag`'s
@@ -534,7 +534,11 @@ fn the_item_button_helpers_paint_a_slots_icon_and_count() {
 fn the_roster_seat_names_the_character_the_addons_will_meet() {
     let seat = super::seat_from_roster(&roster()).expect("a pending pick seats a player");
     assert_eq!(seat.name.as_deref(), Some("Harness"));
-    assert_eq!(seat.level, 60);
+    // **0, not 60 — the reference's answer, byte-verified** (decision 2263). `UnitLevel 0x517fc0`
+    // carries no `"player"` fast path at all: it resolves the token, misses (no object, no roster
+    // record for a zero GUID) and reaches `0x51813e push 0; push 0` — the NUMBER 0, one return.
+    // The roster's real level arrives with the descriptor, within the second.
+    assert_eq!(seat.level, 0);
     assert_eq!(seat.race_file.as_deref(), Some("Human"));
     assert_eq!(seat.class_file.as_deref(), Some("WARRIOR"));
     assert_eq!(seat.sex, 2, "the wire's 0 is UnitSex's 2");
@@ -543,7 +547,17 @@ fn the_roster_seat_names_the_character_the_addons_will_meet() {
         Some("Alliance"),
         "nil here is 24 corpus addons stopping on AceDB-2.0's file-scope concatenation"
     );
-    assert!(seat.exists && seat.is_player);
+    // **`exists` is false, and that is the correction 2263 made** (it was `true` from 1230 until
+    // then). `UnitExists 0x515fb0` has no fast path either; its resolver reads the GUID out of the
+    // OBJECT (`0x515994`), so with none it holds `0:0`, and the roster fallback `0x491900` bails
+    // on a zero GUID at `0x4e80aa je` BEFORE fetching the active player — so the `0 == 0` that
+    // would answer "that's me" never runs, and `0x516001` pushes nil.
+    //
+    // Safe to correct only *because* of the record above: 1230 seated a whole unit in order to
+    // deliver a name at addon file scope, and the name no longer needs a unit to exist. The rest
+    // of the seat is untouched and still load-bearing — the faction side below above all.
+    assert!(!seat.exists);
+    assert!(seat.is_player);
     // Deliberately NOT invented — the descriptor says these, within the second.
     assert_eq!((seat.health, seat.max_health), (0, 0));
 
@@ -1133,16 +1147,16 @@ fn a_texture_gradient_tints_the_art_it_sits_on() {
 /// **The director's report: "when I first open the bags with bagnon the gold numbers are all
 /// cramped up; if I close and open again it looks good."**
 ///
-/// Bagnon's money display is `SmallMoneyFrameTemplate` — OUR `MoneyFrame.xml`. Its `ShowCoin` used
-/// to size each coin with `label:GetStringWidth()`, which is served from the measure round-trip and
-/// therefore reads **0 in the tick that set the text**: every coin came out at exactly one icon
-/// width and the digits overlapped. The second open looked right because the first open's measure
-/// had landed in the cache by then — the reopen was reading the previous open's numbers.
+/// Bagnon's money display is `SmallMoneyFrameTemplate`, off the chain's own `MoneyFrame.xml`. Its
+/// `ShowCoin` used to size each coin with `label:GetStringWidth()`, which is served from the
+/// measure round-trip and therefore reads **0 in the tick that set the text**: every coin came out
+/// at exactly one icon width and the digits overlapped. The second open looked right because the
+/// first open's measure had landed in the cache by then — the reopen was reading the previous open's numbers.
 ///
-/// The fix sums `BENILLA_DIGIT_W`, the app's per-digit advance feed
-/// ([`benilla_ui::script::UiScript::set_digit_advances`]) — data pushed ahead, so the answer exists
-/// *in* the tick. That feed's own doc names this frame as what it was built for; only the merchant
-/// price had ever used it.
+/// The fix is the engine's font measurer answering inside the Lua call that asked
+/// (`benilla_ui`'s `script::measure`): `GetStringWidth` returns a real number in the tick that set
+/// the text. A digits-only stand-in — a per-digit advance feed pushed ahead from the app — shipped
+/// first and was retired by the general answer (decision 1285).
 ///
 /// The assertion is the FIRST open, which is the half that was broken.
 #[test]
@@ -1395,7 +1409,13 @@ fn bagnon_forevers_records_survive_the_logout_boundary() {
     // The logout boundary: the despawn frame (no self store) and then the shutdown's own events.
     // The record the write persists must be the bags the player actually had.
     let mut memory = crate::ui_items::feed::FeedMemory::default();
-    crate::ui_items::feed::apply_container_source(&mut s, &mut memory, None, [0; 10], Vec::new());
+    crate::ui_items::feed::apply_container_source(
+        &mut s,
+        &mut memory,
+        None,
+        Default::default(),
+        Vec::new(),
+    );
     s.fire_event("PLAYER_LEAVING_WORLD", Vec::new());
     s.fire_event("PLAYER_LOGOUT", Vec::new());
     let (size, item) = s

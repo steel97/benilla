@@ -82,7 +82,7 @@ use crate::entities::StandBoxHeight;
 use crate::net::{Embodied, Guid, NetEntity, SelfGuid};
 use crate::ui_chat::{default_color, ChatEventKind};
 use crate::ui_pass::{overlay_z, UiQuad, UiQuadAppend, UiQuads, UvRect};
-use crate::ui_text::{layout_text_quads, measure_text, FontSpec, Justify, UiFontAtlas};
+use crate::ui_text::{layout_text_quads, measure_text, FontSpec, Justify, TextSeat, UiFontAtlas};
 use crate::vplates::{device_snap, gx_px, plate_basis, text_px, VPlateSet, VPlates};
 use benilla_assets::{AssetSet, WorldAssets};
 use benilla_world::view::WorldCamera;
@@ -376,7 +376,7 @@ fn load_bubble_art(
 /// pieces, tail, wrapped chatType-colored text — bottom-seated on the projected anchor.
 /// Runs after [`VPlateSet`] (the spawn gate reads this frame's plate verdict), inside the
 /// [`UiQuadAppend`] window.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)] // one Bevy system's full input set
+#[allow(clippy::type_complexity)] // one Bevy system's full input set
 fn drive_bubbles(
     mut queue: ResMut<BubbleQueue>,
     mut bubbles: ResMut<Bubbles>,
@@ -609,7 +609,6 @@ struct Pending {
 
 /// Append one bubble's draw list: the Backdrop pieces (bg fill inset by the border-unit +
 /// the 8-piece edge), the tail square, and the wrapped, centered, chatType-colored text.
-#[allow(clippy::too_many_arguments)] // the draw inputs + the jitter trace's decomposition
 fn draw_bubble(
     atlas: &mut UiFontAtlas,
     quads: &mut UiQuads,
@@ -745,6 +744,13 @@ fn draw_bubble(
         },
         z + Z_TEXT,
         spec,
+        // The bubble frame seats on the DEVICE pixel grid ([`device_snap`], 1398) and slides with
+        // the speaker; its text must be rigid against it. Snapping the block top on the UI's
+        // logical grid instead made the text pop a whole px every second step the frame took —
+        // the V-plate's defect at the sibling site, exactly as 1398 found the snap itself missing
+        // here. Unlike the plate this rect is real (a margin box), so the degenerate-rect
+        // carve-out never covered it.
+        TextSeat::Exact,
     );
     drop(e);
     if trace {
@@ -806,8 +812,18 @@ pub(crate) struct BubbleSet;
 
 pub(crate) struct ChatBubblePlugin;
 
+/// The two bubble switches' change callback (1139, 2303): flags, like every other pair.
+pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut bubbles: ResMut<BubbleConfig>) {
+    match ev.key().as_str() {
+        "chatbubbles" => bubbles.all = ev.flag(),
+        "chatbubblesparty" => bubbles.party = ev.flag(),
+        _ => {}
+    }
+}
+
 impl Plugin for ChatBubblePlugin {
     fn build(&self, app: &mut App) {
+        app.add_observer(on_cvar);
         app.init_resource::<BubbleQueue>()
             .init_resource::<BubbleConfig>()
             .init_resource::<Bubbles>()

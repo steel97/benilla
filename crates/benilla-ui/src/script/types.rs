@@ -85,24 +85,17 @@ pub enum QuadContent {
         /// `inside` flag it pushed down.
         inside_zoom: u8,
     },
-    /// A `Cooldown` widget's draw slot (decision 0137 phase 4): the engine-derived phase of the
-    /// reference machine (`Cooldown.lua`), for the app renderer's pie-wipe/flash draw. Emitted
-    /// only while the widget is shown; `tick` hides it once the flash ends.
-    Cooldown {
-        /// Sweep progress `0..1` (`(now-start)/duration`, the `Cooldown.lua` scrub); `>= 1` =
-        /// the sweep is over (the flash below runs) — no dark pie draws.
-        fraction: f32,
-        /// The finish flash's progress `0..1` over its authored 1.000 s (the model's sequence 1),
-        /// `None` while the sweep still runs. The alpha ramp is the model's own texture-weight
-        /// track — byte-read off `UI-Cooldown-Indicator.m2` (linear 0→1 over the first third,
-        /// hold to the half, 1→0 over the back half) — applied app-side.
-        flash: Option<f32>,
-    },
     /// A `Model` / `PlayerModel` widget's own draw slot: the 3D pane's content hole. The engine
     /// core carries the resolved rect and the pane's identity; the app renderer puts pixels in it
-    /// — the same division of labour [`QuadContent::Minimap`] and [`QuadContent::Cooldown`] use,
-    /// and for the same reason (the scene state is [`crate::widget::ModelState`]; the render is
-    /// not this crate's).
+    /// — the same division of labour [`QuadContent::Minimap`] uses, and for the same reason (the
+    /// scene state is [`crate::widget::ModelState`]; the render is not this crate's).
+    ///
+    /// **The clock is deliberately NOT here.** A pane's play head moves every tick, and the
+    /// host memoizes its whole quad conversion on the extracted list being unchanged — a
+    /// cursor in this variant would re-convert the entire interface every frame a cooldown or a
+    /// ping is showing. The host reads the play heads straight off the engine instead
+    /// (`UiScript::visible_model_panes`, decision 2008); this variant carries only what the
+    /// layout and the Lua setters decide.
     ///
     /// **Why the NAME travels rather than the scene.** benilla draws a body pane by sampling an
     /// off-screen bake the app already keeps per *window* (the paper doll's, the inspect window's,
@@ -112,9 +105,43 @@ pub enum QuadContent {
     /// invent a meaning for. A pane with no name, or one no window has claimed, draws nothing;
     /// that is also what a `SetModel` pane does today, and it is honest rather than a white slab.
     ModelPane {
+        /// The pane's frame handle — the renderer's key for the tile it keeps per pane (a name
+        /// is optional and shared by nothing; the handle is neither). Decision 2007.
+        handle: crate::widget::FrameHandle,
         /// The pane's global frame name (`$parent`-expanded), or `None` for an anonymous
         /// `CreateFrame("Model")` — pfUI's autocast shine is the corpus example of the latter.
         name: Option<String>,
+        /// The `SetModel` path the pane holds (`None` for a unit pane or an empty one) — what the
+        /// host's tile renderer draws (decision 2013), the map arrow's `crate::script::ARROW_MODEL`
+        /// among them since 2015.
+        model: Option<String>,
+        /// `SetFacing`'s radians (0 default).
+        facing: f32,
+        /// `SetModelScale`'s factor (1 default).
+        model_scale: f32,
+        /// `SetPosition`'s offset, in the ortho leg's layout units (render law §2: the root is
+        /// `T(pos · layoutScale) · R(facing) · S(…)`).
+        position: (f32, f32, f32),
+        /// The frame's **own** alpha — what the model instance draws at. The reference re-pushes
+        /// `[widget+0xc8]/255` into the instance on every `Frame:SetAlpha` (`0x76d120`), and
+        /// nothing folds the parent chain in: a pane under a faded parent draws at its own
+        /// alpha (render law §4.4). [`ExtractedQuad::alpha`] carries the effective one.
+        own_alpha: f32,
+        /// `ReplaceIconTexture`'s path — the type-14 texture override, or `None` for the file's
+        /// own textures.
+        icon: Option<String>,
+        /// The installed camera as a RAW index into the file's camera table, or `None` for the
+        /// NULL camera. **This is the render leg** (decision 2027): `None` is the orthographic
+        /// one — the model laid flat over the pane's rect — and `Some(n)` the perspective one,
+        /// framed by the file's own record `n`.
+        camera: Option<u32>,
+        /// The pane's embedded `CGLight`. Disabled on every shipped pane, which is why an
+        /// unlit-on-every-material UI M2 never notices; a LIT batch under a disabled light draws
+        /// black, and that is the reference's answer, not a gap.
+        light: crate::widget::ModelLight,
+        /// The pane's fog, only when armed — colour, near and far as the fill callback stages
+        /// them. Per-batch from there: a material with the UNFOGGED bit ignores it.
+        fog: Option<crate::widget::ModelFog>,
     },
     /// A `Texture` region: a BLP path *or* a solid/vertex color (or both — a tinted texture).
     Texture {
@@ -140,10 +167,15 @@ pub enum QuadContent {
         /// only carries the token; resolving it to a rendered image is the app's job (the modern
         /// 2D portrait is a high-res model bake).
         portrait_unit: Option<String>,
-        /// On-screen rotation about the quad center, radians, **counterclockwise-positive** (the
-        /// `SetRotation` texture API — a later-era method benilla ships early: the world-map
-        /// player arrow spins by it, standing in for the reference's engine arrow model; 0203
-        /// flags the stand-in). `0.0` for the overwhelmingly common unrotated case.
+        /// On-screen rotation about the quad center, radians, **counterclockwise-positive**.
+        ///
+        /// **Always `0.0` now — nothing writes it any more.** It carried a later-era
+        /// `Texture:SetRotation` benilla shipped early so the world-map player arrow could spin,
+        /// standing in for the reference's engine arrow model (0203 flags the stand-in). That arrow
+        /// became a real Model frame driven by `ModelState::facing` (`script::worldmap_arrow`), and
+        /// the verb has since come off the Texture map — 1.12 registers `SetRotation` on PlayerModel
+        /// alone (`0x84f1fc`). The plumbing is left standing rather than pruned in the same change,
+        /// because it runs into the app's quad emit; see [`RegionData::rotation`].
         rotation: f32,
         /// `Texture:SetDesaturated(1)` — draw the sampled texel as its **luminance** instead of
         /// its colour (decision 1327). The renderer greys the texel and *then* modulates by
@@ -224,6 +256,17 @@ pub enum QuadContent {
         /// renderer multiplies each glyph's alpha by the ramp at its character position (before
         /// `start` opaque, the next `length` chars 1→0, beyond invisible). `None` = draw whole.
         alpha_gradient: Option<(f32, f32)>,
+        /// **Seat this block exactly where `rect` puts it**, skipping the UI grid's vertical
+        /// block-top snap — true for a FontString owned by a V-plate, false for every other one
+        /// (`super::nameplate::is_world_seated`, decision 2172).
+        ///
+        /// Not a client concept: in the reference the whole interface *is* the pixel grid, so the
+        /// snap and the rect agree by construction. benilla has one family of frames that lives
+        /// outside it — the WorldFrame overlays that slide continuously over the 3-D scene, whose
+        /// seat law is a DEVICE-pixel snap (`vplates::device_snap`, 0188/1398) rather than the
+        /// UI's logical-pixel one. Snapping their text on the coarser UI grid makes it *beat*
+        /// against the art it is supposed to be rigid to: two quantizers on one sliding object.
+        world_seat: bool,
     },
 }
 
@@ -250,6 +293,67 @@ pub enum JustifyV {
     #[default]
     Middle,
     Bottom,
+}
+
+/// A Texture's blend mode — the client's shared `alphaMode` enum, the `{value, name}` table at
+/// `0x811aa8`: `DISABLE=0 · ALPHAKEY=1 · BLEND=2 · ADD=3 · MOD=4` (wow-re
+/// `system/ui/ui.md:1383`, `scratch/rf28-typed-widget-loadxml.md:22`). It is one enum reached two
+/// ways — the XML `alphaMode=` attribute and `Texture:SetBlendMode` — and read back by
+/// `Texture:GetBlendMode`.
+///
+/// **`Blend` is the default because the CSimpleTexture ctor writes it**: `0x76fc64 mov
+/// [esi+0xd0],2`, which `ActionButtonTemplate.xml`'s `<NormalTexture>` keeps by declaring no
+/// `alphaMode` (wow-re `scratch/button-state-texture-path-setter.md`, where the value is
+/// load-bearing for a different question and therefore evidence rather than assertion — mode 1
+/// would alpha-test a half-alpha vertex colour away entirely, mode 2 ghosts it). It is the answer
+/// every ordinary texture gives `ShaguTweaks/mods/dark-ui-elements.lua:169`'s
+/// `region:GetBlendMode() == "ADD"` guard, so getting it wrong is the same recolouring bug one
+/// branch over.
+///
+/// **Only ADD changes what this engine draws.** The renderer takes the ADD/not-ADD bit
+/// ([`QuadContent::Texture::additive`]); `DISABLE`, `ALPHAKEY` and `MOD` are carried faithfully
+/// through the setter and the getter and drawn as straight alpha — the stated v1 gap, unchanged by
+/// storing the whole mode instead of a bool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlendMode {
+    /// `DISABLE` = 0 — `GL_ONE, GL_ZERO`, alpha reference 0. Drawn as straight alpha here.
+    Disable,
+    /// `ALPHAKEY` = 1 — `GL_ONE, GL_ZERO` with alpha reference 224/255. Drawn as straight alpha here.
+    AlphaKey,
+    /// `BLEND` = 2 — `GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA`. The ctor's value, hence the default.
+    #[default]
+    Blend,
+    /// `ADD` = 3 — `GL_SRC_ALPHA, GL_ONE`. The one mode the renderer acts on.
+    Add,
+    /// `MOD` = 4 — `GL_DST_COLOR, GL_ZERO`. Drawn as straight alpha here.
+    Mod,
+}
+
+impl BlendMode {
+    /// Parse the enum's own spelling, as `SetBlendMode` and the XML `alphaMode=` attribute take it.
+    /// Case-insensitive (the Lua binding coerces through the shared string-arg law); `None` for a
+    /// name outside the table's five.
+    pub fn parse(s: &str) -> Option<BlendMode> {
+        match s.to_ascii_uppercase().as_str() {
+            "DISABLE" => Some(BlendMode::Disable),
+            "ALPHAKEY" => Some(BlendMode::AlphaKey),
+            "BLEND" => Some(BlendMode::Blend),
+            "ADD" => Some(BlendMode::Add),
+            "MOD" => Some(BlendMode::Mod),
+            _ => None,
+        }
+    }
+
+    /// The reference's own spelling, as `GetBlendMode()` answers it (the name column of `0x811aa8`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            BlendMode::Disable => "DISABLE",
+            BlendMode::AlphaKey => "ALPHAKEY",
+            BlendMode::Blend => "BLEND",
+            BlendMode::Add => "ADD",
+            BlendMode::Mod => "MOD",
+        }
+    }
 }
 
 /// A `FontString`'s glyph outline (the XML `outline`/`<Font outline=>` attr, OUTLINETYPE): `NONE`
@@ -483,9 +587,17 @@ pub(crate) struct RegionData {
     /// opaque, the next `length` ramp 1→0, the rest invisible. `None` = no gradient (every
     /// FontString but an armed quest description). Cleared by `SetText` — fresh text draws whole.
     pub(crate) alpha_gradient: Option<(f32, f32)>,
-    /// WoW `ADD` blend (`SetBlendMode("ADD")` / XML `alphaMode` — the shared enum `0x811aa8`).
-    /// Highlight state textures default to it (the client's `SetHighlightTexture` contract).
-    pub(crate) additive: bool,
+    /// The region's blend mode (`SetBlendMode` / XML `alphaMode` — the reference's `[texture+0xd0]`,
+    /// the shared enum `0x811aa8`). Highlight state textures are created at
+    /// [`BlendMode::Add`] (the client's `SetHighlightTexture` contract); everything else starts at
+    /// the ctor's [`BlendMode::Blend`].
+    ///
+    /// **The whole mode is kept, not just "is it ADD"**, because `GetBlendMode` answers it back as
+    /// a string and a getter that could only ever say `"BLEND"` or `"ADD"` would answer `"BLEND"`
+    /// to a texture the caller set to `"MOD"`. The renderer still reads only the ADD/not-ADD
+    /// distinction ([`QuadContent::Texture::additive`]) — that is unchanged, and the three modes it
+    /// flattens are the stated gap they always were.
+    pub(crate) blend: BlendMode,
     /// Explicit region size (`SetWidth`/`SetHeight`/XML `<Size>`); `None` = derive. Size fills the
     /// axis the anchors don't pin (the client's "0 = derive") — so under a texture's implicit
     /// SetAllPoints (two corners pin everything) an authored size is structurally unread, which is
@@ -523,8 +635,24 @@ pub(crate) struct RegionData {
     /// The `<TexCoords>`/`SetTexCoord` UV mapping ([`TexCoords`]: the 4-edge crop, or the 8-arg
     /// affine quad). `None` = the full texture. Slices the quadrant/atlas art (decision 0084).
     pub(crate) tex_coords: Option<TexCoords>,
-    /// On-screen rotation about the region center (`SetRotation`, radians, counterclockwise-
-    /// positive) — see [`QuadContent::Texture::rotation`].
+    /// `Texture:SetTexCoordModifiesRect(flag)` / `GetTexCoordModifiesRect()` — the reference's
+    /// `[texture+0x124]`, whose sole writer is `SetTexCoordModifiesRect 0x79c080`
+    /// (`0x79c113 mov [edi+0x124],eax`) and which is BSS-zero otherwise (wow-re
+    /// `scratch/taxiroute-widget-type.md`, `ui.md:5594`).
+    ///
+    /// **State only, and the geometry half is NOT wired.** In the reference the flag gates a
+    /// rect-recompute leg (`ui.md:4619`, `0x770462`): with it set, a `SetTexCoord` re-derives the
+    /// region's own rect from the UV quad rather than leaving the rect alone and merely resampling
+    /// inside it. Honouring that here means `region::layout`'s resolve reading this flag and
+    /// deriving the region's rect from [`Self::tex_coords`] instead of from its anchors and size —
+    /// a resolve-order change, not a paint one, and nothing in either addon corpus or the stock UI
+    /// calls the SETTER, so there is no measured case to build it against. Stored and answered
+    /// truthfully, unread by layout; stated here rather than left to be discovered.
+    pub(crate) tex_coord_modifies_rect: bool,
+    /// On-screen rotation about the region center, radians, counterclockwise-positive.
+    /// **Unwritable: the `Texture:SetRotation` that was its only setter is gone** (1.12 registers
+    /// the name on PlayerModel alone) — see [`QuadContent::Texture::rotation`] for why it is still
+    /// here.
     pub(crate) rotation: f32,
     /// The named font object this FontString last resolved (`inherits=`/`SetFontObject`) — our
     /// `FONTINSTANCE+0x028 parentFontObject`, and a **live** link: mutating that object

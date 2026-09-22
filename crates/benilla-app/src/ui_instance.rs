@@ -97,7 +97,7 @@
 //! maps it ever names are raids, and a raid is `InstanceType == 2`, which `0x495d33`'s
 //! `cmp [rec+8],1` rejects. (1) is the only live writer here, which is why it is also the one
 //! that answers term 1. (1) is [`track_instance_state`]'s `CurrentMap` flip; (2) is
-//! [`apply::update_last_instance`]'s queue, drained through the same helper so the two cannot
+//! [`net::update_last_instance`]'s queue, drained through the same helper so the two cannot
 //! drift — [`LatchWriter`] is which of them is speaking.
 //!
 //! **(2) is therefore unreachable on our server by construction, and no live probe can cover it**
@@ -113,7 +113,7 @@ use bevy::prelude::*;
 
 use crate::net::{ClientCommand, NetCommands};
 use crate::ui_chat::{ChatEvent, ChatEventKind, ChatLog};
-use crate::ui_script::UiInput;
+use crate::ui_script::{UiFeed, UiInput};
 
 /// The window `CanShowResetInstances()` offers the row in, in seconds — `cmp eax, 0x15f90` at
 /// `0x495ce6` against `time(0) - <when we left>`, unsigned, so the boundary is inclusive.
@@ -291,65 +291,6 @@ impl InstanceState {
     }
 }
 
-/// The GlobalStrings token `GetText(token, nil, ordinal)` actually reads — `LocaleProperties.lua`
-/// (`GetPluralTag` → `GetPluralIndex`), which the reference calls into through `0x703bf0`.
-///
-/// Absent or exactly 1 → the bare token; **anything else, zero included** → `token .. "_P1"`, with
-/// `GetText`'s own fall-back to the bare token when the twin does not resolve.
-fn plural_token(token: &str, ordinal: Option<u32>, get: &dyn Fn(&str) -> Option<String>) -> String {
-    if ordinal.is_some_and(|n| n != 1) {
-        let plural = format!("{token}_P1");
-        if get(&plural).is_some_and(|s| !s.is_empty()) {
-            return plural;
-        }
-    }
-    token.to_string()
-}
-
-/// Fill a 1.12 message template the way `SStrPrintf` does: `%s` and `%d` consumed **in order**,
-/// left to right, from the argument list the caller built in the template's own order.
-///
-/// `%%` collapses to one `%`, because that is what `SStrPrintf` does — no 1.12 lockout template
-/// contains one, but leaving it doubled would be the deviation, not collapsing it. Any other
-/// specifier is copied through, and so is one whose argument has run out: a template we
-/// mis-modelled should look wrong, not look plausible.
-fn fill_template(template: &str, map_name: Option<&str>, numbers: &[u32]) -> String {
-    let mut out = String::with_capacity(template.len() + 16);
-    let mut strings = map_name.into_iter();
-    let mut nums = numbers.iter();
-    let mut chars = template.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
-            continue;
-        }
-        match chars.peek() {
-            Some('s') => {
-                if let Some(s) = strings.next() {
-                    chars.next();
-                    out.push_str(s);
-                } else {
-                    out.push(c);
-                }
-            }
-            Some('d') => {
-                if let Some(n) = nums.next() {
-                    chars.next();
-                    out.push_str(&n.to_string());
-                } else {
-                    out.push(c);
-                }
-            }
-            Some('%') => {
-                chars.next();
-                out.push('%');
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 /// Resolve one queued line to its displayed text — `GetText` + the `%s`/`%d` fills, then the
 /// debug wrapper if the save-created flag asked for it.
 ///
@@ -361,9 +302,18 @@ fn lockout_text(
     map_name: Option<&str>,
     get: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    let token = plural_token(line.token, line.ordinal, get);
-    let template = get(&token).filter(|s| !s.is_empty())?;
-    let text = fill_template(&template, map_name, &line.numbers);
+    // `GetText(token, nil, ordinal)`'s own plural pick, through the shared primitive.
+    let template = benilla_ui::strings::plural(line.token, line.ordinal, get)?;
+    // Arguments in the template's own order — every lockout template takes its `%s` before its
+    // `%d`s (checked against all fourteen tokens), which is what makes one ordered list exact.
+    let mut args: Vec<benilla_ui::strings::Arg<'_>> = Vec::new();
+    args.extend(map_name.map(benilla_ui::strings::Arg::S));
+    args.extend(
+        line.numbers
+            .iter()
+            .map(|n| benilla_ui::strings::Arg::D(i64::from(*n))),
+    );
+    let text = benilla_ui::strings::fill(&template, &args);
     if text.is_empty() {
         return None;
     }
@@ -432,11 +382,48 @@ fn raid_instance_line(message: &RaidInstanceMessage) -> Option<LockoutLine> {
     })
 }
 
-/// The net drain's six arms, factored here so the wire law lives beside the state it drives.
-pub(crate) mod apply {
+/// The instance/raid lockout family's six packet handlers (decision 1748; in the net handler
+/// table since 2312), beside the state they drive: four lines the client composes itself out of
+/// GlobalStrings, and the two-packet latch behind the SELF menu's reset row. The lines are
+/// QUEUED — resolving them needs the VM, which a packet handler leaves to the feed (decision
+/// 0669's split).
+pub(crate) mod net {
     use super::*;
 
     use benilla_protocol::messages::InstanceResetFailed;
+    use benilla_protocol::{SessionEvent, SessionEventKind};
+
+    use crate::net::NetHandlerApp;
+
+    /// Register the six handlers — called from [`UiInstancePlugin`].
+    pub(super) fn register(app: &mut App) {
+        use SessionEventKind as K;
+        app.net_handler(K::RaidInstanceMessage, on_packet)
+            .net_handler(K::InstanceSaveCreated, on_packet)
+            .net_handler(K::InstanceReset, on_packet)
+            .net_handler(K::InstanceResetFailed, on_packet)
+            .net_handler(K::UpdateLastInstance, on_packet)
+            .net_handler(K::UpdateInstanceOwnership, on_packet);
+    }
+
+    /// One handler for the six: each is a one-line fold into the same state.
+    fn on_packet(In(ev): In<SessionEvent>, mut state: ResMut<InstanceState>) {
+        match ev {
+            SessionEvent::RaidInstanceMessage { message } => {
+                raid_instance_message(&mut state, message)
+            }
+            SessionEvent::InstanceSaveCreated { flag } => instance_save_created(&mut state, flag),
+            SessionEvent::InstanceReset { map } => instance_reset(&mut state, map),
+            SessionEvent::InstanceResetFailed { failure } => {
+                instance_reset_failed(&mut state, failure)
+            }
+            SessionEvent::UpdateLastInstance { map } => update_last_instance(&mut state, map),
+            SessionEvent::UpdateInstanceOwnership { owns } => {
+                update_instance_ownership(&mut state, owns)
+            }
+            _ => {}
+        }
+    }
 
     /// `SMSG_RAID_INSTANCE_MESSAGE` — one of four `RAID_INSTANCE_*` lines (`0x49e1c0`).
     pub(crate) fn raid_instance_message(state: &mut InstanceState, message: RaidInstanceMessage) {
@@ -633,6 +620,7 @@ pub(crate) struct UiInstancePlugin;
 
 impl Plugin for UiInstancePlugin {
     fn build(&self, app: &mut App) {
+        net::register(app);
         app.init_resource::<InstanceState>().add_systems(
             Update,
             (
@@ -640,7 +628,7 @@ impl Plugin for UiInstancePlugin {
                 // a map change and its answer should not be a frame apart.
                 clear_witness_on_logout.before(track_instance_state),
                 track_instance_state.before(feed_instance),
-                feed_instance.before(UiInput),
+                feed_instance.in_set(UiFeed),
                 drain_instance.after(UiInput),
             ),
         );
@@ -773,7 +761,7 @@ mod tests {
     #[test]
     fn reset_lines_fill_the_map_name() {
         let mut state = InstanceState::default();
-        apply::instance_reset(&mut state, 36);
+        net::instance_reset(&mut state, 36);
         let lines = state.take_lines();
         assert_eq!(lines.len(), 1);
         assert_eq!(
@@ -797,7 +785,7 @@ mod tests {
             ),
         ] {
             let mut state = InstanceState::default();
-            apply::instance_reset_failed(
+            net::instance_reset_failed(
                 &mut state,
                 benilla_protocol::messages::InstanceResetFailed { reason, map: 36 },
             );
@@ -812,7 +800,7 @@ mod tests {
         // INSTANCERESET_FAIL_SILENTLY and above: no line, rather than the reference's
         // uninitialized-buffer print.
         let mut state = InstanceState::default();
-        apply::instance_reset_failed(
+        net::instance_reset_failed(
             &mut state,
             benilla_protocol::messages::InstanceResetFailed { reason: 3, map: 36 },
         );
@@ -824,21 +812,21 @@ mod tests {
     #[test]
     fn save_created_has_three_arms() {
         let mut state = InstanceState::default();
-        apply::instance_save_created(&mut state, 0);
+        net::instance_save_created(&mut state, 0);
         let lines = state.take_lines();
         assert_eq!(
             line_text(&lines[0], None).as_deref(),
             Some("You are now saved to this instance")
         );
 
-        apply::instance_save_created(&mut state, 1);
+        net::instance_save_created(&mut state, 1);
         let lines = state.take_lines();
         assert_eq!(
             line_text(&lines[0], None).as_deref(),
             Some("(Debug-Only Lock Notice) You are now saved to this instance")
         );
 
-        apply::instance_save_created(&mut state, 2);
+        net::instance_save_created(&mut state, 2);
         assert!(state.take_lines().is_empty());
     }
 
@@ -860,26 +848,37 @@ mod tests {
     /// `if ( not string )` arm. Modelled with a locale that has the singular only.
     #[test]
     fn a_missing_plural_twin_falls_back_to_the_bare_token() {
+        // Marked stand-ins rather than the shipped wording: the primitive returns a *template*,
+        // so the assertion has to be readable as "which key did it reach", which is the thing
+        // worth asserting (decision 2045).
         let sparse = |key: &str| match key {
-            "RAID_INSTANCE_WARNING_HOURS" => Some("in %d hour.".to_string()),
+            "RAID_INSTANCE_WARNING_HOURS" => Some("<bare>".to_string()),
             _ => None,
         };
+        let both = |key: &str| match key {
+            "RAID_INSTANCE_WARNING_HOURS" => Some("<bare>".to_string()),
+            "RAID_INSTANCE_WARNING_HOURS_P1" => Some("<twin>".to_string()),
+            "RAID_INSTANCE_WELCOME" => Some("<welcome>".to_string()),
+            _ => None,
+        };
+        let plural = benilla_ui::strings::plural;
         assert_eq!(
-            plural_token("RAID_INSTANCE_WARNING_HOURS", Some(5), &sparse),
-            "RAID_INSTANCE_WARNING_HOURS"
+            plural("RAID_INSTANCE_WARNING_HOURS", Some(5), &sparse).as_deref(),
+            Some("<bare>"),
+            "no twin: GetText's own `if ( not string )` arm"
         );
         assert_eq!(
-            plural_token("RAID_INSTANCE_WARNING_HOURS", Some(5), &globals),
-            "RAID_INSTANCE_WARNING_HOURS_P1"
+            plural("RAID_INSTANCE_WARNING_HOURS", Some(5), &both).as_deref(),
+            Some("<twin>")
         );
         assert_eq!(
-            plural_token("RAID_INSTANCE_WARNING_HOURS", Some(1), &globals),
-            "RAID_INSTANCE_WARNING_HOURS",
+            plural("RAID_INSTANCE_WARNING_HOURS", Some(1), &both).as_deref(),
+            Some("<bare>"),
             "exactly 1 is the bare token"
         );
         assert_eq!(
-            plural_token("RAID_INSTANCE_WELCOME", None, &globals),
-            "RAID_INSTANCE_WELCOME",
+            plural("RAID_INSTANCE_WELCOME", None, &both).as_deref(),
+            Some("<welcome>"),
             "no ordinal is the bare token"
         );
     }
@@ -1015,7 +1014,7 @@ mod tests {
             (s.last_dungeon, s.saw_own_dungeon)
         };
         let queue = |app: &mut App, map: u32| {
-            apply::update_last_instance(&mut app.world_mut().resource_mut::<InstanceState>(), map);
+            net::update_last_instance(&mut app.world_mut().resource_mut::<InstanceState>(), map);
         };
 
         // Writer 1 — we walk out of the Deadmines ourselves. The first tick only OBSERVES map 36
@@ -1127,17 +1126,21 @@ mod tests {
             );
         }
 
-        // The three plural twins exist, so `plural_token` really has something to select.
+        // The three plural twins exist, so the pick really has something to select — asserted by
+        // the twin's own shipped text, which differs from the bare token's.
         for token in [
             "RAID_INSTANCE_WARNING_HOURS",
             "RAID_INSTANCE_WARNING_MIN",
             "RAID_INSTANCE_WARNING_MIN_SOON",
         ] {
+            let twin = real(&format!("{token}_P1"));
+            assert!(twin.is_some(), "{token} has a shipped plural twin");
             assert_eq!(
-                plural_token(token, Some(2), &real),
-                format!("{token}_P1"),
-                "{token} has a shipped plural twin"
+                benilla_ui::strings::plural(token, Some(2), &real),
+                twin,
+                "{token} at two takes its twin"
             );
+            assert_ne!(twin, real(token), "{token}'s two forms differ");
         }
         // …and the welcome does not, which is why the reference passes it no ordinal at all.
         assert!(
@@ -1148,7 +1151,7 @@ mod tests {
         // Every warning template names the instance and takes exactly the fills we hand it.
         for (ty, fills) in [(1u32, 1usize), (2, 1), (3, 1), (4, 3)] {
             let line = warning(ty, 409, 3_600).expect("a template");
-            let template = real(&plural_token(line.token, line.ordinal, &real)).unwrap();
+            let template = benilla_ui::strings::plural(line.token, line.ordinal, &real).unwrap();
             assert!(template.contains("%s"), "{} names the instance", line.token);
             assert_eq!(
                 template.matches("%d").count(),
@@ -1166,7 +1169,7 @@ mod tests {
             Some("Welcome to Molten Core. This raid instance is scheduled to reset in 3d 2h 5m.")
         );
         let mut state = InstanceState::default();
-        apply::instance_reset_failed(
+        net::instance_reset_failed(
             &mut state,
             benilla_protocol::messages::InstanceResetFailed { reason: 0, map: 36 },
         );
@@ -1180,9 +1183,13 @@ mod tests {
     /// than fills keeps the leftovers literally rather than eating the next argument.
     #[test]
     fn fill_is_positional_and_never_borrows_the_wrong_argument() {
-        assert_eq!(fill_template("%s: %d/%d", Some("MC"), &[2, 5]), "MC: 2/5");
-        assert_eq!(fill_template("%s: %d/%d", Some("MC"), &[2]), "MC: 2/%d");
-        assert_eq!(fill_template("100%% sure", None, &[]), "100% sure");
-        assert_eq!(fill_template("no fills", None, &[7]), "no fills");
+        use benilla_ui::strings::{fill, Arg};
+        assert_eq!(
+            fill("%s: %d/%d", &[Arg::S("MC"), Arg::D(2), Arg::D(5)]),
+            "MC: 2/5"
+        );
+        assert_eq!(fill("%s: %d/%d", &[Arg::S("MC"), Arg::D(2)]), "MC: 2/%d");
+        assert_eq!(fill("100%% sure", &[]), "100% sure");
+        assert_eq!(fill("no fills", &[Arg::D(7)]), "no fills");
     }
 }

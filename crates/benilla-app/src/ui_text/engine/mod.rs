@@ -141,7 +141,15 @@ const MAX_PPEM: u16 = 256;
 /// One registered face.
 struct Face {
     id: fontdb::ID,
+    /// The path the caller asked for — carried so the substitution WARN can name it (2123).
+    path: String,
     family: String,
+    /// The three CSS axes `cosmic-text` matches on, read off the face itself. See
+    /// [`faces::Registered`]: naming only the family asks for a normal-weight, normal-style face
+    /// and silently gets a different one when the named face is not that.
+    weight: fontdb::Weight,
+    style: fontdb::Style,
+    stretch: fontdb::Stretch,
     /// `hhea.asc / (asc + |desc|)` — see [`hhea_ascent_ratio`]. Friz's ≈ 0.794 is the fallback for
     /// a face whose tables would not parse (never the four shipped client fonts).
     ascent_ratio: f32,
@@ -205,13 +213,33 @@ struct CacheStats {
 // The engine
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
+/// The two stores a font path can come from — the same pair, in the same order, that
+/// [`benilla_assets::WorldAssets`]'s sprite decoder walks (decision 1322, generalised by 2103).
+///
+/// Chain first: no MPQ holds an `Interface\AddOns\` path, so the order is unobservable and every
+/// client path stays on exactly the code it always ran.
+struct FontSource {
+    chain: Arc<Mutex<benilla_formats::Chain>>,
+    /// The ONE AddOns root, from `ui_script::addons::root()` — `None` under `$WOW_CAPTURE`, which
+    /// is what keeps a capture hermetic for free.
+    loose_root: Option<std::path::PathBuf>,
+}
+
 /// The font engine: faces, the two caches, and the texture pages.
 pub(crate) struct TextEngine {
     font_system: FontSystem,
     swash: SwashCache,
     faces: Vec<Face>,
-    /// Blizzard font path (lowercased) → index into [`Self::faces`].
+    /// Font path (lowercased) → index into [`Self::faces`]. Seeded with the four client faces and
+    /// grown on demand by [`Self::face_for`] — an addon's own TTF is a path like any other.
     path_to_face: HashMap<String, usize>,
+    /// Where a face the map does not carry is read from: the patch chain, then the one AddOns
+    /// folder for `Interface\AddOns\…` paths ([`FontSource`], decision 2103). `None` in a VM
+    /// with no install, which is the only state in which a font path cannot resolve at all.
+    source: Option<FontSource>,
+    /// Paths that failed to load, so a miss costs one read and one WARN rather than one per
+    /// measure. Cleared by nothing: a font file does not appear mid-session.
+    missing_fonts: HashSet<String>,
     /// The fallback face (Friz Quadrata) for a FontString with no/unknown font path.
     default_face: usize,
     /// The window's `scale_factor` — physical px per logical px. Every raster size derives from it
@@ -236,8 +264,34 @@ pub(crate) struct TextEngine {
     /// Characters no face could shape, and sizes past the ceiling — reported once each rather than
     /// once per frame.
     complained: HashSet<char>,
+    /// Faces the shaper answered for with a different font — warned once each (2123).
+    substituted: HashSet<usize>,
     over_ceiling: bool,
     stats: CacheStats,
+}
+
+/// A `cosmic-text` font system over an **empty** database — the client's faces are the only faces.
+///
+/// `FontSystem::new()` and `new_with_fonts()` both call `fontdb::Database::load_system_fonts()`
+/// (`cosmic-text-0.16.0/src/font/system.rs:400`), which puts every font on the machine into the
+/// same pool as the four client TTFs. That is not a harmless extra: `get_font_matches` does not
+/// select a face, it *orders* every face in the database and shapes with the first one that can
+/// draw the character (`system.rs:326-369`), so a family the query cannot match — or a single
+/// character the client face happens to lack — is answered by whatever the machine has. It is
+/// invisible by construction: the text draws, at the right size, in a face nobody asked for.
+/// Measured on this machine (decision 2123): the reference's own `Fonts\ARIALN.TTF` was being
+/// shaped by macOS's Arial Narrow, and Friz Quadrata by `.SFNS-Regular`, the system UI font.
+///
+/// So the pool holds exactly what a 1.12 client has: the four TTFs out of `fonts.MPQ`, plus
+/// whatever faces an addon ships (decision 2103). A character none of them carries draws nothing
+/// and warns once — which is both what the reference does and what our own width law already
+/// says ("a character no face can shape contributes 0"): with a system fallback in the pool the
+/// shaper-less measure and the shaped draw silently disagreed about that character's width.
+///
+/// The locale is `en-US` because everything else about our string data is (the `WORDS` table, the
+/// GlobalStrings fallbacks); it only picks which *language's* family name a face answers to.
+fn client_font_system() -> FontSystem {
+    FontSystem::new_with_locale_and_db("en-US".to_string(), fontdb::Database::new())
 }
 
 impl TextEngine {
@@ -246,7 +300,7 @@ impl TextEngine {
     /// which case text simply will not render — the same graceful-absence posture
     /// [`crate::ui_script`]'s extraction takes.
     fn load(world_assets: &WorldAssets, images: &Assets<Image>, dpi: f32) -> Option<Self> {
-        let mut font_system = FontSystem::new_with_fonts(std::iter::empty());
+        let mut font_system = client_font_system();
         let mut faces: Vec<Face> = Vec::new();
         let mut path_to_face = HashMap::new();
         for &path in CLIENT_FONTS {
@@ -262,11 +316,15 @@ impl TextEngine {
             };
             let ascent_ratio = hhea_ascent_ratio(&bytes).unwrap_or(0.794);
             match register_font(&mut font_system, bytes) {
-                Ok((id, family)) => {
+                Ok(r) => {
                     path_to_face.insert(path.to_ascii_lowercase(), faces.len());
                     faces.push(Face {
-                        id,
-                        family,
+                        id: r.id,
+                        path: path.to_string(),
+                        family: r.family,
+                        weight: r.weight,
+                        style: r.style,
+                        stretch: r.stretch,
                         ascent_ratio,
                     });
                 }
@@ -286,6 +344,11 @@ impl TextEngine {
             swash: SwashCache::new(),
             faces,
             path_to_face,
+            source: Some(FontSource {
+                chain: world_assets.chain.clone(),
+                loose_root: crate::ui_script::addons::root(),
+            }),
+            missing_fonts: HashSet::new(),
             default_face,
             dpi,
             chars: HashMap::new(),
@@ -294,16 +357,71 @@ impl TextEngine {
             generation: 0,
             reset_pending: false,
             complained: HashSet::new(),
+            substituted: HashSet::new(),
             over_ceiling: false,
             stats: CacheStats::default(),
         })
     }
 
-    /// The face a Blizzard font path resolves to, or the fallback.
-    pub(super) fn face_for(&self, path: Option<&str>) -> usize {
-        path.and_then(|p| self.path_to_face.get(&p.to_ascii_lowercase()))
-            .copied()
-            .unwrap_or(self.default_face)
+    /// The face a font path resolves to, loading it on first use, or the fallback.
+    ///
+    /// **The four client TTFs are the ones we know the names of, not the ones that exist**
+    /// (decision 2103). `SetFont`/`<FontString font=>`/`CreateFont` take an arbitrary path, and an
+    /// addon that ships its own faces — Mik's Scrolling Battle Text ships thirty-one — names them
+    /// `Interface\Addons\<Addon>\Fonts\<x>.ttf`. Before this, every one of those silently
+    /// resolved to Friz Quadrata: the text drew, in the wrong face, with nothing anywhere saying
+    /// so. So a path the map does not carry is READ (chain, then the loose AddOns folder — the
+    /// same two stores in the same order 1322 gave textures) and registered.
+    ///
+    /// A path that will not load is remembered in [`Self::missing_fonts`] and warns once, then
+    /// falls back to Friz exactly as before — the reference degrades the same way (a `CGxFont`
+    /// that fails to build leaves the string on the font object it inherits).
+    pub(super) fn face_for(&mut self, path: Option<&str>) -> usize {
+        let Some(p) = path.filter(|p| !p.is_empty()) else {
+            return self.default_face;
+        };
+        let key = p.to_ascii_lowercase();
+        if let Some(&i) = self.path_to_face.get(&key) {
+            return i;
+        }
+        if self.missing_fonts.contains(&key) {
+            return self.default_face;
+        }
+        match self.load_face(p, &key) {
+            Some(i) => i,
+            None => {
+                warn!(
+                    "ui_text: font miss: '{p}' does not resolve in the patch chain or the AddOns \
+                     folder — falling back to {}",
+                    CLIENT_FONTS[0]
+                );
+                self.missing_fonts.insert(key);
+                self.default_face
+            }
+        }
+    }
+
+    /// Read and register one font path. `None` if no store has it or the bytes are not a face.
+    fn load_face(&mut self, path: &str, key: &str) -> Option<usize> {
+        let source = self.source.as_ref()?;
+        let bytes = read_font_bytes(source, path)?;
+        let ascent_ratio = hhea_ascent_ratio(&bytes).unwrap_or(0.794);
+        let r = register_font(&mut self.font_system, bytes)
+            .inspect_err(|e| warn!("ui_text: failed to register {path}: {e:#}"))
+            .ok()?;
+        let index = self.faces.len();
+        self.faces.push(Face {
+            id: r.id,
+            path: path.to_string(),
+            family: r.family,
+            weight: r.weight,
+            style: r.style,
+            stretch: r.stretch,
+            ascent_ratio,
+        });
+        self.path_to_face.insert(key.to_string(), index);
+        info!("ui_text: loaded font face {path}");
+        Some(index)
     }
 
     /// **The size law.** A logical height becomes the exact integer device-pixel size it will be
@@ -361,8 +479,9 @@ impl TextEngine {
 
     /// The baseline-ascender fraction for a font path — the `[CGxFont+0x17c]` load_param, for a
     /// caller that already holds the lock.
-    pub(crate) fn ascent_ratio(&self, path: Option<&str>) -> f32 {
-        self.ascent_ratio_of(self.face_for(path))
+    pub(crate) fn ascent_ratio(&mut self, path: Option<&str>) -> f32 {
+        let face = self.face_for(path);
+        self.ascent_ratio_of(face)
     }
 
     /// Make sure every character of `text` is in the caches at this `(face, ppem, radius)`,
@@ -428,14 +547,37 @@ impl TextEngine {
             }
             return;
         }
+        // **A control character is not a missing glyph.** `\n` reaches here because the pre-warm
+        // walks raw text (`ensure_str`), and no face shapes it — so it used to pay a full shape,
+        // then warn as if a face were missing one. Caching the miss stopped the repeat work but
+        // still left the warn, which is noise about a character that is SUPPOSED to have no glyph:
+        // the markup parser consumes `\n` as a line break and it never reaches a draw. Answered
+        // here, before the shape, so the warn stays meaningful for a real missing glyph.
+        if ch.is_control() {
+            self.chars.insert(
+                (face, ppem, ch),
+                CharCell {
+                    glyphs: Vec::new(),
+                    floor_sum: 0.0,
+                },
+            );
+            return;
+        }
         let Some(f) = self.faces.get(face) else {
             return;
         };
-        let (face_id, family) = (f.id, f.family.clone());
-        let attrs = Attrs::new().family(Family::Name(&family));
+        // Owned, because the buffer below borrows `self.font_system` mutably.
+        let (face_id, family, weight, style, stretch) =
+            (f.id, f.family.clone(), f.weight, f.style, f.stretch);
+        let attrs = Attrs::new()
+            .family(Family::Name(&family))
+            .weight(weight)
+            .style(style)
+            .stretch(stretch);
         let px = f32::from(ppem);
         let mut glyphs: Vec<GlyphRef> = Vec::new();
         let mut floor_sum = 0.0f32;
+        let mut shaped_by = None;
         {
             let mut buf = Buffer::new(&mut self.font_system, Metrics::new(px, px));
             buf.set_wrap(&mut self.font_system, Wrap::None);
@@ -453,6 +595,7 @@ impl TextEngine {
                     // A lone first glyph on the line has x == y == 0.0, so this is the
                     // zero-subpixel canonical rasterization for (face, glyph, ppem).
                     let physical = g.physical((0.0, 0.0), 1.0);
+                    shaped_by.get_or_insert(g.font_id);
                     glyphs.push(GlyphRef {
                         glyph_id: g.glyph_id,
                         key: physical.cache_key,
@@ -463,12 +606,49 @@ impl TextEngine {
                 }
             }
         }
+        // **The shaper's answer is checked against the ask** (decision 2123). Naming a face to
+        // `cosmic-text` is a *query*, not a selection: it walks every registered face and takes
+        // the first that can draw the character, so a family it cannot match is answered by some
+        // other face — correct-looking text in the wrong one, which is exactly the silent failure
+        // 2103 set out to end and did not, because it never compared what came back. The glyph
+        // ids and the advances below are then that other face's, so the string measures wrong
+        // too. Once per face, naming both sides.
+        if let Some(got) = shaped_by.filter(|&got| got != face_id) {
+            if self.substituted.insert(face) {
+                let got_name = self
+                    .font_system
+                    .db()
+                    .face(got)
+                    .map_or_else(|| format!("{got:?}"), |i| i.post_script_name.clone());
+                let want = self.faces.get(face).map_or("?", |f| f.path.as_str());
+                warn!(
+                    "ui_text: '{want}' loaded as family {family:?} (weight {}, style {style:?}) \
+                     but {ch:?} shaped in {got_name} instead — text in this face draws and \
+                     measures in the wrong one",
+                    weight.0
+                );
+            }
+        }
         if glyphs.is_empty() {
             // No face shaped it — it draws nothing and, per the width law's own note, measures
             // nothing. Report once, not once per frame.
             if self.complained.insert(ch) {
                 warn!("ui_text: no glyph for {ch:?} in any registered face");
             }
+            // **Cache the miss.** `complained` only silenced the WARNING; the shape itself was
+            // re-run on every call, because the insert below was never reached. The pre-warm walks
+            // `text.chars()` raw (`ensure_str`), so every `\n` in a drawn multi-line string paid a
+            // full `Buffer::new` + `set_text` + `shape_until_scroll` per FontString per frame,
+            // forever — `RAID_DESCRIPTION` alone carries three. An empty cell is exactly what the
+            // consumers already do with the `None` they used to get: `char_cell` hands back zero
+            // glyphs, so the pen steps nothing and draws nothing, and `floor_sum` sums nothing.
+            self.chars.insert(
+                (face, ppem, ch),
+                CharCell {
+                    glyphs,
+                    floor_sum: 0.0,
+                },
+            );
             return;
         }
         self.stats.chars_shaped += 1;
@@ -642,6 +822,17 @@ impl UiFontAtlas {
     }
 }
 
+/// Read one font path from the two stores, chain first —
+/// [`benilla_assets::read_chain_or_loose`], the one rule every by-path addon asset resolves by.
+///
+/// It inherits that rule whole rather than restating it: only `Interface\AddOns\` paths reach the
+/// folder, the component walk is case-insensitive (MSBT names its own files `Interface\Addons\…`
+/// with a lowercase `d`, and ships `mailrays.TTF` while its table says `mailrays.ttf`), and a
+/// dot-component is refused before any filesystem call.
+fn read_font_bytes(source: &FontSource, path: &str) -> Option<Vec<u8>> {
+    benilla_assets::read_chain_or_loose(&source.chain, source.loose_root.as_deref(), path)
+}
+
 /// A real-font engine for a test: the client faces, read through the app's own patch chain. `None`
 /// when there is no install, or the chain or a face will not open — every caller **skips** rather
 /// than fails (`wow_data_or_skip!`).
@@ -649,7 +840,7 @@ impl UiFontAtlas {
 pub(super) fn test_engine(dpi: f32) -> Option<TextEngine> {
     let data = benilla_formats::wow_data()?;
     let chain = benilla_formats::open_chain(&data).ok()?;
-    let mut font_system = FontSystem::new_with_fonts(std::iter::empty());
+    let mut font_system = client_font_system();
     let mut faces: Vec<Face> = Vec::new();
     let mut path_to_face = HashMap::new();
     for &path in CLIENT_FONTS {
@@ -657,11 +848,15 @@ pub(super) fn test_engine(dpi: f32) -> Option<TextEngine> {
             continue;
         };
         let ascent_ratio = hhea_ascent_ratio(&bytes).unwrap_or(0.794);
-        let (id, family) = register_font(&mut font_system, bytes).ok()?;
+        let r = register_font(&mut font_system, bytes).ok()?;
         path_to_face.insert(path.to_ascii_lowercase(), faces.len());
         faces.push(Face {
-            id,
-            family,
+            id: r.id,
+            path: path.to_string(),
+            family: r.family,
+            weight: r.weight,
+            style: r.style,
+            stretch: r.stretch,
             ascent_ratio,
         });
     }
@@ -671,6 +866,12 @@ pub(super) fn test_engine(dpi: f32) -> Option<TextEngine> {
         swash: SwashCache::new(),
         faces,
         path_to_face,
+        // The same chain the four client faces were just read from, so a test can ask for a fifth.
+        source: Some(FontSource {
+            chain: Arc::new(Mutex::new(chain)),
+            loose_root: None,
+        }),
+        missing_fonts: HashSet::new(),
         default_face,
         dpi,
         chars: HashMap::new(),
@@ -679,6 +880,7 @@ pub(super) fn test_engine(dpi: f32) -> Option<TextEngine> {
         generation: 0,
         reset_pending: false,
         complained: HashSet::new(),
+        substituted: HashSet::new(),
         over_ceiling: false,
         stats: CacheStats::default(),
     })
@@ -974,10 +1176,35 @@ mod ppem_tests {
         assert_eq!(e.stats.cells_rasterized, raster, "the miss is paid once");
     }
 
+    /// **A character no face shapes is asked once too.** The sibling above pins that for a
+    /// character that DOES shape; this one pins the miss, which was the leak: `complained`
+    /// silenced the warning and nothing cached the result, so the shape re-ran on every ask. The
+    /// pre-warm walks raw text (`ensure_str`), so a drawn multi-line FontString re-shaped every
+    /// `\n` it held, every frame, for the life of the session.
+    #[test]
+    fn an_unshapeable_character_is_cached_as_a_miss() {
+        let Some(mut e) = engine_or_skip() else {
+            return;
+        };
+        let face = e.face_for(None);
+        let shaped = e.stats.chars_shaped;
+        e.ensure_str(face, 14, 0, "\n");
+        let c = e
+            .char_cell(face, 14, '\n')
+            .expect("the miss is cached, so the second ask short-circuits");
+        // An empty cell is what every consumer already did with the `None` it used to get.
+        assert!(c.glyphs.is_empty(), "a newline draws nothing");
+        assert_eq!(c.floor_sum, 0.0, "…and steps nothing");
+        assert_eq!(
+            e.stats.chars_shaped, shaped,
+            "a control character is answered before the shape, not by failing one"
+        );
+    }
+
     /// Each face resolves to itself, and an unknown path falls back to Friz.
     #[test]
     fn a_font_path_resolves_to_its_own_face() {
-        let Some(e) = engine_or_skip() else {
+        let Some(mut e) = engine_or_skip() else {
             return;
         };
         let friz = e.face_for(Some(TEST_FACES[0]));
@@ -985,5 +1212,221 @@ mod ppem_tests {
         assert_eq!(friz, e.face_for(Some("Fonts\\NOSUCH.TTF")));
         assert_eq!(friz, e.face_for(Some("fonts\\frizqt__.ttf")), "case-folded");
         assert_ne!(friz, e.face_for(Some(TEST_FACES[1])), "ARIALN is its own");
+    }
+
+    /// Overwrite `OS/2.usWeightClass` (offset 4 in the table) in a raw sfnt, in place. `false` if
+    /// the table directory has no `OS/2`. Test-only: it makes a *bold* face out of a face we
+    /// already have, so the weight axis can be exercised without shipping a second TTF.
+    fn set_weight_class(bytes: &mut [u8], weight: u16) -> bool {
+        let Some(num) = bytes.get(4..6) else {
+            return false;
+        };
+        let num = u16::from_be_bytes(num.try_into().unwrap()) as usize;
+        for i in 0..num {
+            let Some(rec) = bytes.get(12 + 16 * i..12 + 16 * i + 16) else {
+                return false;
+            };
+            if &rec[0..4] != b"OS/2" {
+                continue;
+            }
+            let off = u32::from_be_bytes(rec[8..12].try_into().unwrap()) as usize;
+            let Some(slot) = bytes.get_mut(off + 4..off + 6) else {
+                return false;
+            };
+            slot.copy_from_slice(&weight.to_be_bytes());
+            return true;
+        }
+        false
+    }
+    /// **The font pool is the CLIENT's faces and nothing else** (decision 2123).
+    ///
+    /// `cosmic-text`'s two convenience constructors both call `load_system_fonts()`, and its
+    /// shaper does not *select* a face — it orders every face in the database and takes the first
+    /// that can draw the character. So one `FontSystem::new()` anywhere in this file puts every
+    /// font on the developer's machine in front of the four the client actually has, and the only
+    /// symptom is text in a face nobody asked for. The count is the pin: four faces registered,
+    /// four faces in the database.
+    #[test]
+    fn the_font_pool_holds_only_the_clients_own_faces() {
+        let Some(e) = engine_or_skip() else {
+            return;
+        };
+        assert_eq!(
+            e.font_system.db().len(),
+            e.faces.len(),
+            "the database must hold exactly the faces we registered — a system font in the pool \
+             is a face the shaper can silently substitute"
+        );
+    }
+
+    /// **A face the client names is the face that shapes — including a BOLD one** (decision 2123).
+    ///
+    /// The report was MSBT drawing in a plain sans instead of its own Porky. Porky declares
+    /// `OS/2.usWeightClass = 700`; the attrs we handed the shaper were `Attrs::new()`, i.e. weight
+    /// 400, so `fontdb::Database::query` never matched it and `get_font_matches`' weight-sorted
+    /// walk put every normal-weight face ahead of it. The face loaded, the WARN never fired, the
+    /// text drew — in the wrong face, at the wrong widths.
+    ///
+    /// The fixture is a real client TTF with its `usWeightClass` patched to 700, so the only thing
+    /// that differs from the face beside it is the axis that broke.
+    #[test]
+    fn a_bold_addon_face_is_the_face_that_shapes() {
+        let Some(mut e) = engine_or_skip() else {
+            return;
+        };
+        let mut bytes = {
+            let source = e.source.as_ref().expect("the test engine carries a chain");
+            let chain = source.chain.lock_recover();
+            chain.read(TEST_FACES[2]).expect("MORPHEUS is in the chain")
+        };
+        assert!(
+            set_weight_class(&mut bytes, 700),
+            "patched OS/2 usWeightClass"
+        );
+        let root = std::env::temp_dir().join(format!("benilla-bold-font-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let fonts = root.join("Bolded").join("Fonts");
+        std::fs::create_dir_all(&fonts).unwrap();
+        std::fs::write(fonts.join("heavy.ttf"), &bytes).unwrap();
+        e.source.as_mut().unwrap().loose_root = Some(root.clone());
+
+        let bold = e.face_for(Some("Interface\\AddOns\\Bolded\\Fonts\\heavy.ttf"));
+        assert_ne!(bold, e.default_face, "the bold face registered");
+        assert_eq!(
+            e.faces[bold].weight,
+            fontdb::Weight(700),
+            "and fontdb read the patched weight — otherwise this test proves nothing"
+        );
+        e.ensure_metrics(bold, 18, "Rage");
+        assert!(
+            e.substituted.is_empty(),
+            "the shaper answered with a different face for a face we named"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **An addon-shipped TTF loads out of the ONE AddOns root** (decision 2103) — the leg the bug
+    /// was: MSBT ships thirty-one faces and names them `Interface\\Addons\\…\\Fonts\\<x>.ttf`,
+    /// a shape no MPQ carries, and every one of them silently drew as Friz Quadrata.
+    ///
+    /// The file is a real TTF (a client face, copied) because the assertion is that it REGISTERED,
+    /// not merely that a path matched; the reference spelling deliberately mismatches the folder's
+    /// case on every component, as the ecosystem's do (MSBT writes `Addons`, ships `mailrays.TTF`
+    /// and asks for `mailrays.ttf`).
+    #[test]
+    fn an_addon_shipped_font_loads_out_of_the_addons_root() {
+        let Some(mut e) = engine_or_skip() else {
+            return;
+        };
+        let bytes = {
+            let source = e.source.as_ref().expect("the test engine carries a chain");
+            let chain = source.chain.lock_recover();
+            chain.read(TEST_FACES[2]).expect("MORPHEUS is in the chain")
+        };
+        let root = std::env::temp_dir().join(format!("benilla-addon-font-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let fonts = root.join("MikScrollingBattleText").join("Fonts");
+        std::fs::create_dir_all(&fonts).unwrap();
+        std::fs::write(fonts.join("porky.TTF"), &bytes).unwrap();
+        e.source.as_mut().unwrap().loose_root = Some(root.clone());
+
+        let friz = e.face_for(Some(TEST_FACES[0]));
+        let addon = e.face_for(Some(
+            "Interface\\Addons\\mikscrollingbattletext\\fonts\\porky.ttf",
+        ));
+        assert_ne!(
+            friz, addon,
+            "an addon's own face must not fall back to Friz"
+        );
+        assert!(
+            e.missing_fonts.is_empty(),
+            "and it must not be recorded as a miss"
+        );
+        // A sibling path under the same root that is not there is still a miss — the folder is a
+        // store, not a wildcard.
+        assert_eq!(
+            friz,
+            e.face_for(Some(
+                "Interface\\Addons\\MikScrollingBattleText\\Fonts\\nope.ttf"
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **An addon-shipped face wears an OUTLINE like any other** — the two halves of the MSBT
+    /// look, together, which nothing pinned (decision 2112). 2103 pins that the face LOADS;
+    /// [`super::outline`]'s own tests pin the composite recipe on a synthetic bitmap; the cell
+    /// arithmetic was only ever exercised on the fallback face. This runs a face read out of the
+    /// AddOns root through the outline path and asserts the composite cell it produces: the same
+    /// glyph, one cell per radius, each grown by `pad` on every side with its bearings moved out
+    /// to match, and the plain cell untouched.
+    #[test]
+    fn an_addon_shipped_face_rasterizes_an_outlined_cell() {
+        let Some(mut e) = engine_or_skip() else {
+            return;
+        };
+        let bytes = {
+            let source = e.source.as_ref().expect("the test engine carries a chain");
+            let chain = source.chain.lock_recover();
+            chain.read(TEST_FACES[2]).expect("MORPHEUS is in the chain")
+        };
+        let root =
+            std::env::temp_dir().join(format!("benilla-addon-outline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let fonts = root.join("MikScrollingBattleText").join("Fonts");
+        std::fs::create_dir_all(&fonts).unwrap();
+        std::fs::write(fonts.join("porky.ttf"), &bytes).unwrap();
+        e.source.as_mut().unwrap().loose_root = Some(root.clone());
+
+        let face = e.face_for(Some(
+            "Interface\\Addons\\MikScrollingBattleText\\Fonts\\porky.ttf",
+        ));
+        assert_ne!(face, e.face_for(None), "the addon's own face, not Friz");
+        // MSBT's default master size, and its default flag — `SetFont(porky, 18, "OUTLINE")`
+        // resolves to radius 1 (`super::outline::radius_of`).
+        let ppem = e.ppem(18.0);
+        e.ensure_str(face, ppem, 0, "6");
+        e.ensure_str(face, ppem, 1, "6");
+        let g = e.char_cell(face, ppem, '6').expect("shaped").glyphs[0].glyph_id;
+        let plain = e.cell(face, ppem, 0, g).expect("a plain cell");
+        let ringed = e.cell(face, ppem, 1, g).expect("an outlined cell");
+        // `dpi` is 1 here, so NORMAL is one dilation pass: `pad` = 1 texel every side.
+        assert_eq!(
+            (ringed.px_w, ringed.px_h),
+            (plain.px_w + 2.0, plain.px_h + 2.0),
+            "the ring grows the cell by pad on every side"
+        );
+        assert_eq!(
+            (ringed.bearing_x, ringed.bearing_top),
+            (plain.bearing_x - 1.0, plain.bearing_top + 1.0),
+            "…and the bearings move out with it, so the ink sits where it did"
+        );
+        // THICK is the second pass, and is a THIRD cell — not a re-use of either.
+        e.ensure_str(face, ppem, 2, "6");
+        let thick = e.cell(face, ppem, 2, g).expect("a THICK cell");
+        assert_eq!(
+            (thick.px_w, thick.px_h),
+            (plain.px_w + 4.0, plain.px_h + 4.0)
+        );
+        assert_ne!(thick.uv, ringed.uv, "each radius packs its own cell");
+        assert_ne!(plain.uv, ringed.uv);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path that resolves nowhere falls back to Friz and is remembered, so the read and the WARN
+    /// happen once rather than once per measure.
+    #[test]
+    fn an_unresolvable_font_path_is_remembered_as_missing() {
+        let Some(mut e) = engine_or_skip() else {
+            return;
+        };
+        let friz = e.face_for(Some(TEST_FACES[0]));
+        let bogus = "Interface\\Addons\\NoSuchAddon\\Fonts\\nope.ttf";
+        assert_eq!(friz, e.face_for(Some(bogus)));
+        assert!(e.missing_fonts.contains(&bogus.to_ascii_lowercase()));
+        assert_eq!(friz, e.face_for(Some(bogus)), "and the second ask is free");
+        // An empty path is the `SetFont("")` case and is not a miss — it is "no face named".
+        assert_eq!(friz, e.face_for(Some("")));
+        assert!(!e.missing_fonts.contains(""));
     }
 }

@@ -71,6 +71,7 @@
 
 use mlua::{Lua, Table, Value};
 
+use super::binding_abi;
 use super::object::publish_global;
 use crate::justify;
 
@@ -293,9 +294,22 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "GetObjectType",
         lua.create_function(|_, _this: Table| Ok("Font"))?,
     )?;
+    // **`1`/`nil`, never a Lua boolean** (decision 2118's law; 2142 found this copy). The
+    // reference's Font object has its OWN `IsObjectType` (`0x79fe60`, table `0x87c7c8`) distinct
+    // from the Region base's (`0x7a1290`, `0x87c9b8`), and the shapes table types both
+    // `(nil) | (number)`. This one answered a Rust `bool` — the fourth copy of a house rule that
+    // three neighbours got right, which is exactly the drift 2118 consolidated `flag` to stop, and
+    // it was invisible until the shape gate learned to probe the Font object at all.
+    //
+    // The ARGUMENT contract is a separate question and is not claimed here: `region.rs`'s twin
+    // documents the reference's `Usage: %s:IsObjectType("TYPE")` raise and its number-stringifying
+    // arm from a byte read of `0x7a1290`; nobody has read `0x79fe60`'s, so this copy keeps mlua's
+    // own coercion rather than pretending to that finding.
     m.set(
         "IsObjectType",
-        lua.create_function(|_, (_this, ty): (Table, String)| Ok(ty.eq_ignore_ascii_case("font")))?,
+        lua.create_function(|_, (_this, ty): (Table, String)| {
+            Ok(binding_abi::flag(ty.eq_ignore_ascii_case("font")))
+        })?,
     )?;
     m.set(
         "GetName",
@@ -368,7 +382,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         )?,
     )?;
     // GetFont() → path, height, flags. `Tablet-2.0.lua:289`'s `_, headerSize =
-    // GameTooltipHeaderText:GetFont()` is the corpus's single biggest font-object read (268 sites).
+    // GameTooltipHeaderText:GetFont()` is the corpus's single biggest font-object read (268 sites),
+    // and it does arithmetic on the second value.
+    //
+    // **An unset Font answers `(nil, 0, "")`, all three ctor-determined** — `0x783a40` writes
+    // `[esi+0x48]` and `[esi+0x4c]` from a zeroed register, and its `0x41e3a0(NULL)` stores the
+    // shared empty record whose `char*` is NULL, which `lua_pushstring` turns into nil. So the
+    // height is the NUMBER zero, not nil (wow-re `font-object-lua-surface.md` §9.3,
+    // §5-cross-checked; decision 2129).
     m.set(
         "GetFont",
         lua.create_function(|lua, this: Table| {
@@ -377,15 +398,22 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 Some(p) => Value::String(lua.create_string(&p)?),
                 None => Value::Nil,
             };
-            Ok((path, fo.height, fo.outline.as_str()))
+            Ok((path, fo.height.unwrap_or(0.0), fo.outline.as_str()))
         })?,
     )?;
 
     // ── colour, and the alpha that is its fourth channel ────────────────────────────────────
+    // Shape C on the three channels (`SetTextColor 0x79f4d0`, `2=C 3=C 4=C 5=B`, wow-re
+    // `numeric-arg-coercion-law.md`): a nil or non-number is 0.0, never a raise (1973).
     m.set(
         "SetTextColor",
         lua.create_function(
-            |lua, (this, r, g, b, a): (Table, f32, f32, f32, Option<f32>)| {
+            |lua, (this, r, g, b, a): (Table, Value, Value, Value, Option<f32>)| {
+                let (r, g, b) = (
+                    super::object::as_f32(&r),
+                    super::object::as_f32(&g),
+                    super::object::as_f32(&b),
+                );
                 edit(lua, &this, |fo| {
                     let keep = fo.color.map_or(1.0, |c| c[3]);
                     fo.color = Some([r, g, b, a.unwrap_or(keep)]);
@@ -425,7 +453,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     m.set(
         "SetShadowColor",
         lua.create_function(
-            |lua, (this, r, g, b, a): (Table, f32, f32, f32, Option<f32>)| {
+            // Shape C on r, g, b (`Font:SetShadowColor 0x79f730`, `2=C 3=C 4=C 5=B`, wow-re
+            // `numeric-arg-coercion-law.md`) — bare `lua_tonumber`, no gate, never raises.
+            |lua, (this, r, g, b, a): (Table, Value, Value, Value, Option<f32>)| {
+                let (r, g, b) = (
+                    crate::script::object::as_f32(&r),
+                    crate::script::object::as_f32(&g),
+                    crate::script::object::as_f32(&b),
+                );
                 edit(lua, &this, |fo| {
                     let offset = fo.shadow.map_or([0.0, 0.0], |s| s.offset);
                     fo.shadow = Some(FontShadow {
@@ -515,14 +550,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    lua.set_named_registry_value(REG_FONT_METHODS, m)?;
-
     let meta = lua.create_table()?;
-    let index = lua.create_function(|lua, (_this, key): (Table, Value)| {
-        let methods: Table = lua.named_registry_value(REG_FONT_METHODS)?;
-        methods.get::<Value>(key)
-    })?;
-    meta.set("__index", index)?;
+    // **`__index` is the method TABLE, not a dispatcher function** (decision 2310). A Rust
+    // `__index` turns every `fo.GetFont` — a plain table index in the source — into a Lua→Rust→Lua
+    // round trip plus a named-registry string lookup; measured at ~200 ns against ~9 ns for the
+    // table form, on a path every widget call in the client begins with. The table is mutated in
+    // place by nothing after this point, so pointing at it cannot go stale.
+    meta.set("__index", m.clone())?;
+    lua.set_named_registry_value(REG_FONT_METHODS, m)?;
     lua.set_named_registry_value(REG_FONT_META, meta)?;
 
     lua.globals()

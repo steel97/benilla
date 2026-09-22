@@ -23,12 +23,25 @@
 //! (PetMeleeDamage cvar); pet spell → GOLD (PetSpellDamage cvar); **any OTHER source is
 //! suppressed entirely** — another unit's fight floats nothing (the emitter returns before
 //! submitting; it was never "white"). Crit does NOT recolor (it only picks the pop row); there
-//! is NO school coloring. The bit-15 flip is implemented at the spell-packet emitters
-//! (`net/apply/combat_log.rs::melee_styled`, decision 0376): the flag is
-//! `SPELL_ATTR3_NORMAL_RANGED_ATTACK` — set on exactly the ranged basic shots on the real DBC —
-//! so a Throw/Auto Shot number floats white off `SMSG_SPELLNONMELEEDAMAGELOG`. Remaining
-//! divergence: the `SMSG_SPELLLOGMISS` word site's record push is unpinned — those outcome
-//! words stay the row-default white (open).
+//! is NO school coloring. The bit-15 flip is [`melee_styled`] (decision 0376): the flag is
+//! `SPELL_ATTR3_NORMAL_RANGED_ATTACK` — set on exactly 8 rows of the real DBC, the ranged
+//! auto-attack family — so a Throw/Auto Shot number floats white off
+//! `SMSG_SPELLNONMELEEDAMAGELOG`.
+//!
+//! **The WORD emitter runs that same law** (decision 2229, closing what phase 2 left open). The
+//! two emitters are separate functions — `0x607140` takes three stack args and `0x6128b0` four,
+//! so they are not the "byte-identical twins" the first reading called them — but they compute
+//! `B` and `K` identically, and **seven of the eight `0x607140` call sites push a resolved
+//! SpellRec**. Only the melee swing's word site (`0x624511`, every one of its seven predecessors
+//! a `6a 00 push 0x0`) pushes NULL. So a spell's "Miss"/"Resist"/"Immune" is spell-GOLD exactly
+//! like its number, and only a white hit's miss is white. The three CVar gates live *inside*
+//! `0x607140`, so `CombatDamage 0` silences words as well as numbers, on every path.
+//!
+//! **A travelling spell's word is DEFERRED to the projectile's arrival.** `SMSG_SPELL_GO`'s
+//! inline emit is skipped whenever `Spell.dbc` Speed is nonzero (`0x6e7d4e`), and the missile's
+//! own arrival handlers re-resolve the record and call the same emitter: a resisted Fireball
+//! reads "Resist" when the ball lands, a missed Sinister Strike at packet receive.
+//! [`missile_miss_text`] is that arrival half, fed by [`crate::entities::MissileMiss`].
 //!
 //! **The render geometry** (wow-re `worldtext-geometry-law.md`, §5-verified, 9af65294 — zero free
 //! parameters; the anchor-seat half corrected here, see the seating comment in
@@ -47,8 +60,13 @@
 //! first reading hardcoded its 4:3 value 0.6 — see [`text_px`]), the round being the gx
 //! `ScreenToPixelHeight` law (`0x5c6fa0`, wow-re `crates/font/src/screen_pixel.rs`, bit-exact
 //! difftested). At 1024×768 (diag 1280): normal number 23 px, crit settles 35 px, pop peaks ~70 px.
-//! The font is **DAMAGE_TEXT_FONT** (`0x6c8470` reads the FrameScript global; shipped Fonts.xml:
-//! `Fonts\FRIZQT__.TTF` — our atlas default), created flags 0 (`6c8498 xor edx,edx`): no outline.
+//! The font is **whatever the Lua global `DAMAGE_TEXT_FONT` holds** when `0x6c8470` reads it —
+//! see [`DamageTextFont`] for the binding law (a plain `lua_gettable`, evaluated once, at the tail
+//! of the world-entry UI load, i.e. after every addon's `ADDON_LOADED`). `Fonts\FRIZQT__.TTF` is
+//! only the value the shipped `Fonts.xml` assigns, not a default the engine knows; there is in
+//! fact **no fallback face at all** in the reference — a global that resolves to nothing yields a
+//! NULL handle and the combat text simply does not draw. Created flags 0 (`6c8493 xor edx,edx` —
+//! not `6c8498`, which is `mov ecx,esi`): no outline.
 //!
 //! **The ALPHA + SHADOW law** (`time_alpha_fade 0x6c82e0` — wow-re
 //! `playername/scratch/worldtext-alpha-shadow-law.md`, §5 pair + the emulated bit-exact difftest,
@@ -102,11 +120,17 @@
 
 mod law;
 
+/// The spell-gold override, re-exported so the emitter arms' own tests can assert the colour they
+/// now pass through (decision 2229). Live code never names it — [`damage_color`] picks it.
+#[cfg(test)]
+pub(crate) use law::COLOR_SPELL_GOLD;
 use law::{
     argb, claimed_box_px, fade_alpha, melee_text, scale_value, shadow_offset_px, text_px,
     CATEGORIES,
 };
-pub(crate) use law::{damage_color, miss_word, spell_text, DamageSource};
+pub(crate) use law::{
+    damage_color, melee_styled, miss_word, spell_text, DamageSource, DamageTextGates,
+};
 
 use bevy::prelude::*;
 
@@ -153,6 +177,42 @@ struct WorldText {
 #[derive(Resource, Default)]
 pub(crate) struct WorldTexts(Vec<WorldText>);
 
+/// **The face the floating numbers draw in — the Lua global `DAMAGE_TEXT_FONT`, resolved once per
+/// world session** (decision 2156).
+///
+/// `0x6c8470` reads the global's *value* eagerly and hands it straight to the font factory:
+/// `6c847c mov ecx,0x86c9ac` ("DAMAGE_TEXT_FONT") → `0x703bf0` `FrameScript_GetText`'s fast arm
+/// (ordinal −1, gender 0) → `0x704350` `GetGlobalString`, which is a plain
+/// `lua_gettable(LUA_GLOBALSINDEX)` — the string is read *now*, not deferred, and the returned
+/// pointer is a borrowed `const char*` into the Lua TString, consumed before the call returns.
+/// `0x6c847c` is the **only** instruction in the image that reads this global.
+///
+/// **When** is the whole finding. `0x6c8470` is not CRT init, as three wow-re notes had it — it
+/// runs from `0x401570 + 0x1620`, *after* the UI load `0x401602`, so after FrameXML has run
+/// `Fonts.xml` and after every non-LoadOnDemand addon's `ADDON_LOADED`. That is exactly where
+/// MikScrollingBattleText (`MikScrollingBattleText.lua:255`) and pfUI (`pfUI.lua:179`) assign it,
+/// and it is why their assignment reaches the real client's damage numbers.
+///
+/// And it is **once**: the handle `[0xce8820]` has exactly one writer image-wide, there is no
+/// invalidation hook and no per-string re-resolution, and `/reloadui` does **not** re-run
+/// `0x6c8470` (it only sets the deferred flag `[0xb4b3f4]`, whose reader rebuilds the UI through
+/// `0x48fbf0` — a different function). So an assignment made after world-enter lands at the next
+/// world-enter and not before. Hence a resource seated on the load edge rather than a global read
+/// per string.
+#[derive(Resource, Default)]
+pub(crate) struct DamageTextFont(pub(crate) Option<String>);
+
+/// Read `DAMAGE_TEXT_FONT` out of the VM — the `0x6c8481` call, at the moment the reference makes
+/// it (the tail of the world-entry UI load; see [`DamageTextFont`]).
+///
+/// `0x704350` accepts a Lua **string or number** (`lua_isstring`) and reports failure by leaving
+/// `0x703bf0`'s pre-seeded `""` in place, so an absent, nil or non-string global reads as empty —
+/// which is the same thing the factory's own name guard rejects. Empty folds to `None` here.
+pub(crate) fn read_damage_text_font(script: &benilla_ui::script::UiScript) -> DamageTextFont {
+    let value: Option<String> = script.lua().globals().get("DAMAGE_TEXT_FONT").ok();
+    DamageTextFont(value.filter(|v| !v.is_empty()))
+}
+
 /// The client's per-unit slot count (`PLAYERNAMEDESC` +0x20..+0x2c): a 5th concurrent text over
 /// one unit is dropped outright.
 const MAX_PER_UNIT: usize = 4;
@@ -173,7 +233,6 @@ fn free_slot(texts: &[WorldText], anchor: Entity) -> Option<u8> {
 /// living into glyph quads appended to [`UiQuads`] after the script extract. Ordering (the
 /// [`UiQuadAppend`] set, after [`UiInput`]) guarantees the mesh rebuild never lands between the
 /// script's replace and our append — see `ui_pass`.
-#[allow(clippy::too_many_arguments)] // one Bevy system's full input set
 pub(crate) fn float_combat_text(
     mut spawns: MessageReader<CombatTextSpawn>,
     mut texts: ResMut<WorldTexts>,
@@ -196,6 +255,9 @@ pub(crate) fn float_combat_text(
     // The frame's claim bucket 1 (worldtext) — cleared and rebuilt every pass; plates own
     // bucket 0 in `vplates` and the two never interact.
     mut bucket: Local<crate::smart_rect::SmartBucket>,
+    // The face, bound once on the world-entry load edge ([`DamageTextFont`]). Absent in a bare
+    // test world, where the fallback face is what the reference's stock `Fonts.xml` names anyway.
+    font: Option<Res<DamageTextFont>>,
 ) {
     let now = time.elapsed_secs_f64();
     // Headless (captures/tests) the camera is None — spawns/expiry still run, nothing draws.
@@ -314,11 +376,17 @@ pub(crate) fn float_combat_text(
             },
             Z_WORLD_TEXT,
             FontSpec {
-                path: None, // DAMAGE_TEXT_FONT = Friz Quadrata (the default face), no outline
+                // The bound face, and NOT a hardcoded Friz: `Fonts\\FRIZQT__.TTF` is only what
+                // the stock `Fonts.xml` happens to assign, and an addon that assigns something
+                // else before the load edge closes is what the reference draws.
+                path: font.as_ref().and_then(|f| f.0.as_deref()),
                 height: Some(target_px),
                 outline: Outline::None,
                 alpha_gradient: None,
             },
+            // A world overlay riding its own rise/fade seat — the UI grid never applied (the
+            // degenerate rect above already skipped it; this says so out loud).
+            crate::ui_text::TextSeat::Exact,
         );
         drop(e);
         let (alpha_text, alpha_shadow) = fade_alpha(cat, elapsed_ms);
@@ -409,6 +477,67 @@ fn drop_indices<T>(v: &mut Vec<T>, mut idx: Vec<usize>) {
     });
 }
 
+/// The `0x5efea0` source-ownership class (`K`) over an attacker **entity** — the ECS-side twin of
+/// `net/apply/combat_log.rs::classify_source`, which does the same job from a guid. `None` is the
+/// classifier's "every other source", which suppresses the emit outright.
+fn source_class(
+    attacker: Entity,
+    self_player: &Query<(), With<crate::net::SelfPlayer>>,
+    self_guid: &crate::net::SelfGuid,
+    stores: &Query<&crate::net::ObjectStore>,
+) -> Option<DamageSource> {
+    if self_player.contains(attacker) {
+        return Some(DamageSource::Player);
+    }
+    let me = self_guid.0?;
+    stores
+        .get(attacker)
+        .is_ok_and(|st| st.0.unit_summoned_by() == Some(me) || st.0.unit_created_by() == Some(me))
+        .then_some(DamageSource::Pet)
+}
+
+/// The **deferred** outcome-word producer: a travelling spell's miss word, floated when the
+/// projectile lands rather than when `SMSG_SPELL_GO` arrives (decision 2229).
+///
+/// `0x6e7a70`'s inline word emit is skipped whenever the spell's `Spell.dbc` Speed is nonzero
+/// (`0x6e7d4e fld [SpellRec+0x94]; fcomp 0.0; test ah,0x44; jp 0x6e7e71`); the projectile's own
+/// arrival handlers re-resolve the record from `[missile+0x18]` and call the same word emitter
+/// `0x607140`. So a resisted Fireball reads "Resist" when the ball reaches the target, while a
+/// Speed-0 ability's word prints at packet receive. The colour law is the same one the inline
+/// site runs — the arrival pushes a real record, so a bit-15-clear spell's word is spell-GOLD.
+fn missile_miss_text(
+    mut arrivals: MessageReader<crate::entities::MissileMiss>,
+    self_player: Query<(), With<crate::net::SelfPlayer>>,
+    self_guid: Res<crate::net::SelfGuid>,
+    stores: Query<&crate::net::ObjectStore>,
+    gates: Res<DamageTextGates>,
+    spells: Option<Res<crate::ui_action::Spells>>,
+    mut text: MessageWriter<CombatTextSpawn>,
+) {
+    for arrival in arrivals.read() {
+        if self_player.contains(arrival.anchor) {
+            continue; // Gate A: never over your own head
+        }
+        let Some(source) = source_class(arrival.caster, &self_player, &self_guid, &stores) else {
+            continue; // K = other: never drawn
+        };
+        let display = spells
+            .as_ref()
+            .and_then(|s| s.catalog.get(arrival.spell_id));
+        let Some(color) = damage_color(*gates, source, melee_styled(display)) else {
+            continue; // the CombatDamage / Pet* gates, read inside `0x607140` itself
+        };
+        if let Some((word, category)) = miss_word(arrival.code) {
+            text.write(CombatTextSpawn {
+                anchor: arrival.anchor,
+                text: word.to_string(),
+                category,
+                color,
+            });
+        }
+    }
+}
+
 /// The MELEE number/word producer: consumes [`SwingImpact`] (the swing clip's impact keyframe —
 /// `creature_anim::impact`, the client's `0x6247d0 → 0x624530` deferral) rather than the packet,
 /// so the number pops when the blow lands, with the blood and the flinch. Gate A on entities: a
@@ -420,27 +549,25 @@ fn melee_impact_text(
     self_player: Query<(), With<crate::net::SelfPlayer>>,
     self_guid: Res<crate::net::SelfGuid>,
     stores: Query<&crate::net::ObjectStore>,
+    gates: Res<DamageTextGates>,
     mut text: MessageWriter<CombatTextSpawn>,
 ) {
     for crate::creature_anim::SwingImpact { swing: s, .. } in impacts.read() {
+        // `0x62440d` — the FIRST thing `0x6243e0` does, before the self gate and before the
+        // colour law: a swing from a spell that did not land plainly floats nothing. It is the
+        // same `0x625e40` verdict that suppresses the chat line, and it stops here and nowhere
+        // else — the flinch, the blood and the impact sounds all still fire.
+        if !s.displayed {
+            continue;
+        }
         let Some(victim) = s.victim else { continue };
         if self_player.contains(victim) {
             continue; // Gate A: never over your own head
         }
-        // The source-ownership class over the attacker ENTITY (the guid-side twin lives in
-        // `net/apply/combat_log.rs::classify_source` for the packet emitters).
-        let source = if self_player.contains(s.attacker) {
-            DamageSource::Player
-        } else if self_guid.0.is_some()
-            && stores.get(s.attacker).is_ok_and(|st| {
-                st.0.unit_summoned_by() == self_guid.0 || st.0.unit_created_by() == self_guid.0
-            })
-        {
-            DamageSource::Pet
-        } else {
+        let Some(source) = source_class(s.attacker, &self_player, &self_guid, &stores) else {
             continue; // K = other: never drawn
         };
-        let Some(color) = damage_color(source, true) else {
+        let Some(color) = damage_color(*gates, source, true) else {
             continue; // the CombatDamage / PetMeleeDamage gates
         };
         if let Some((category, body)) = melee_text(s.hit_info, s.victim_state, s.damage) {
@@ -458,15 +585,28 @@ fn melee_impact_text(
 /// inside the append window the mesh rebuild waits on).
 pub(crate) struct CombatTextPlugin;
 
+/// The damage-text rows' change callback (decision 2303): three flags.
+pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut gates: ResMut<DamageTextGates>) {
+    match ev.key().as_str() {
+        "combatdamage" => gates.combat_damage = ev.flag(),
+        "petmeleedamage" => gates.pet_melee = ev.flag(),
+        "petspelldamage" => gates.pet_spell = ev.flag(),
+        _ => {}
+    }
+}
+
 impl Plugin for CombatTextPlugin {
     fn build(&self, app: &mut App) {
         // The Update append window (see [`UiQuadAppend`]): after the camera controller, and
         // projecting through the camera's FRESH Transform (not the stale propagated global).
+        app.add_observer(on_cvar);
         app.init_resource::<WorldTexts>()
+            .init_resource::<DamageTextFont>()
+            .init_resource::<DamageTextGates>()
             .add_message::<CombatTextSpawn>()
             .add_systems(
                 Update,
-                (melee_impact_text, float_combat_text)
+                (melee_impact_text, missile_miss_text, float_combat_text)
                     .chain()
                     .in_set(UiQuadAppend),
             );
@@ -520,6 +660,111 @@ mod tests {
         assert_eq!(texts.0[0].color, 0xFFFF_FFFF);
         let gold = texts.0.iter().find(|t| t.anchor == other).unwrap();
         assert_eq!(gold.color, COLOR_SPELL_GOLD);
+    }
+
+    /// **A travelling spell's outcome word is DEFERRED, and it is GOLD** (decision 2229) — the
+    /// arrival half of the miss text, and the case the whole round came from: a resisted Fireball
+    /// reads "Resist" in spell gold when the ball lands, not white at GO.
+    ///
+    /// Four legs, each an independent branch of the law `0x607140` runs for every one of its
+    /// callers:
+    /// - my spell's word takes the **gold** override — `B=0` (Fireball's `AttributesEx3` bit 15 is
+    ///   clear) and `K=self`;
+    /// - a **ranged basic shot** carries that bit, so a missed Auto Shot floats melee-**white**
+    ///   even though it travels too — decision 0376's number pairing, now reaching the words;
+    /// - **Gate A** — a word never floats over your own head, whatever the colour;
+    /// - **`CombatDamage 0`** silences it, because that gate is read inside the word emitter
+    ///   itself and so binds every word path, not just the numbers.
+    #[test]
+    fn a_travelling_spells_miss_word_is_gold_and_deferred_to_arrival() {
+        use crate::entities::MissileMiss;
+        use crate::net::{ObjectStore, SelfGuid, SelfPlayer};
+
+        const FIREBALL: u32 = 133;
+        const AUTO_SHOT: u32 = 75;
+
+        let catalog = || {
+            benilla_formats::SpellCatalog::from_displays(
+                [
+                    (
+                        FIREBALL,
+                        benilla_formats::SpellDisplay {
+                            name: "Fireball".into(),
+                            speed: 24.0,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        AUTO_SHOT,
+                        benilla_formats::SpellDisplay {
+                            name: "Auto Shot".into(),
+                            speed: 40.0,
+                            attributes_ex3: 0x8000,
+                            ..Default::default()
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )
+        };
+
+        // `(spell, anchor-is-me, CombatDamage)` → the words the arrival floats.
+        let fire = |spell: u32, over_self: bool, combat_damage: bool| {
+            let mut app = App::new();
+            app.add_message::<MissileMiss>()
+                .add_message::<CombatTextSpawn>()
+                .init_resource::<SelfGuid>()
+                .insert_resource(DamageTextGates {
+                    combat_damage,
+                    ..Default::default()
+                })
+                .insert_resource(crate::ui_action::Spells {
+                    catalog: catalog(),
+                    forms: Default::default(),
+                    ranges: Default::default(),
+                    cast_times: Default::default(),
+                    durations: Default::default(),
+                    radii: Default::default(),
+                })
+                .add_systems(Update, missile_miss_text);
+            let me = app
+                .world_mut()
+                .spawn((SelfPlayer, ObjectStore::default()))
+                .id();
+            let victim = app.world_mut().spawn(ObjectStore::default()).id();
+            app.world_mut().write_message(MissileMiss {
+                caster: me,
+                anchor: if over_self { me } else { victim },
+                spell_id: spell,
+                code: 2, // RESIST
+            });
+            app.update();
+            app.world_mut()
+                .resource_mut::<Messages<CombatTextSpawn>>()
+                .drain()
+                .map(|s| (s.text, s.category, s.color))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            fire(FIREBALL, false, true),
+            vec![("Resist".to_string(), 3, Some(law::COLOR_SPELL_GOLD))],
+            "my Fireball's resist word is spell gold, category 3, over the victim"
+        );
+        assert_eq!(
+            fire(AUTO_SHOT, false, true),
+            vec![("Resist".to_string(), 3, None)],
+            "AttributesEx3 bit 15 keeps a ranged basic shot's word melee-white"
+        );
+        assert!(
+            fire(FIREBALL, true, true).is_empty(),
+            "Gate A: never over your own head"
+        );
+        assert!(
+            fire(FIREBALL, false, false).is_empty(),
+            "CombatDamage 0 is read inside the word emitter — it silences words too"
+        );
     }
 
     /// The destroy half of the off-screen cull (1344): the walk collects indices out of order,

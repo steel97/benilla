@@ -17,13 +17,14 @@
 //!   reports "not yet". Negative answers are cached — a bad entry never becomes a query loop.
 //!   Templates survive disconnect: item definitions are stable across sessions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use bevy::prelude::*;
 
 use benilla_protocol::{ItemInfo, ObjectFields};
 
-use crate::net::{ClientCommand, NetCommands};
+use crate::net::{ClientCommand, NetCommands, ObjectStore};
+use crate::query_cache::QueryCache;
 
 /// The slice of an item template that equipment rendering + combat animation consume (decisions
 /// 0072/0073): the ItemDisplayInfo key, the two placement inputs, and the weapon class pair the
@@ -291,28 +292,19 @@ impl RollCatalogs<'_> {
 #[derive(Resource, Default)]
 pub(crate) struct Items {
     objects: HashMap<u64, ObjectFields>,
-    /// `None` = the server flagged the entry unknown (the top-bit miss branch) — cached negative.
-    templates: HashMap<u32, Option<ItemInfo>>,
-    pending: HashSet<u32>,
+    /// The template cache — ask-once through [`QueryCache`] (decision 2288); a `None` answer is
+    /// the server's "unknown entry" (the top-bit miss branch), cached so it is never re-asked.
+    templates: QueryCache<u32, ItemInfo>,
     /// Entries whose template landed since the last [`Self::take_fresh`] drain — the push half of
     /// the tooltip store (every landed template goes to the UI unprompted, so the first hover of
     /// an item whose name is already on screen never misses).
     fresh: Vec<u32>,
-    /// Bumped by every landed answer ([`Self::insert_template`]), positive or negative. The
-    /// **broadcast** twin of [`Self::fresh`]: `fresh` is a DRAIN (exactly one consumer can take
-    /// it — the tooltip feed does), so a second consumer that caches a template-derived view
-    /// needs its own signal. A consumer keeps the epoch it last resolved at and re-resolves when
-    /// it advances — the modern stand-in for the ref's `DBCACHECALLBACK` redisplay (`0x6e29b0`),
-    /// which is how the real client repaints a view that was drawn while the item cache was still
-    /// answering. Any cache that gates a template read behind a change-flag needs this: the read
-    /// itself is what ISSUES the ask-once query, so the first resolve of a cold entry ALWAYS
-    /// misses (decision 0660).
-    template_epoch: u64,
     /// [`Self::template_epoch`]'s twin for the INSTANCE side (decision 1439): bumped by every
     /// object create/merge/destroy and every enchant-deadline write — everything wire-driven
-    /// that can change what a bag/equipment view reads. The pair exists because `is_changed` on
-    /// this resource says nothing: the feeds' own lazy `template()` resolves take `&mut self`
-    /// every frame, so the resource reads as changed even when nothing landed.
+    /// that can change what a bag/equipment view reads. The pair was born because `is_changed`
+    /// on this resource said nothing while the feeds' lazy `template()` resolves took `&mut
+    /// self` every frame; 2288 made those reads `&self`, and the counters stay as the finer
+    /// signal (a view keyed on one side does not rebuild for the other).
     object_epoch: u64,
     /// The **temporary-enchant deadlines**, keyed `(item guid, enchant slot)` — the reference's
     /// per-item `[obj + slot*4 + 0x324]` array (wow-re `tooltip-content-law.md` §E3), whose only
@@ -320,6 +312,13 @@ pub(crate) struct Items {
     /// duration field, which the reference's tooltip never reads. Session state, so it clears with
     /// the objects (decision 0920).
     enchant_deadlines: HashMap<(u64, u32), std::time::Instant>,
+    /// The **item-lifetime deadlines**, keyed by item guid — a duration-limited instance's
+    /// remaining life (a conjured stone, a holiday gift, a timed quest item). Its only feed is
+    /// `SMSG_ITEM_TIME_UPDATE`; the instance's own `ITEM_FIELD_DURATION` carries the same number
+    /// and is sent to the owner, but vmangos's writer says in as many words that the field is not
+    /// what the client displays from (`Item::SendTimeUpdate`, `Objects/Item.cpp:1094`). Same shape
+    /// as [`Self::enchant_deadlines`] one field up, for the same reason (decision 1933).
+    duration_deadlines: HashMap<u64, std::time::Instant>,
 }
 
 impl Items {
@@ -353,6 +352,7 @@ impl Items {
             self.object_epoch = self.object_epoch.wrapping_add(1);
         }
         self.enchant_deadlines.retain(|&(g, _), _| g != guid);
+        self.duration_deadlines.remove(&guid);
     }
 
     /// The instance-side broadcast counter — see the [`Self::object_epoch`] field.
@@ -404,23 +404,27 @@ impl Items {
     }
 
     /// The counter a gated feed watches instead of holding its gate open per-frame: moves exactly
-    /// when some [`Self::enchant_remaining_display_ms`] can move. Each live deadline contributes
-    /// `floor(seconds left) + 1` — the `+1` makes the final `Some(0) → None` collapse (the tooltip
-    /// reverting to the plain enchant name) its own step, one frame after the deadline elapses.
+    /// when some displayable countdown can — [`Self::enchant_remaining_display_ms`] or
+    /// [`Self::duration_remaining_display_ms`], the two per-second timers a bag/equipment
+    /// snapshot renders. Each live deadline contributes `floor(seconds left) + 1` — the `+1`
+    /// makes the final `Some(0) → None` collapse (the tooltip reverting to the plain enchant
+    /// name, the duration line vanishing) its own step, one frame after the deadline elapses.
     /// Landings and removals move [`Self::object_epoch`] on their own. Empty — the overwhelmingly
-    /// common case — costs an empty iteration.
-    pub(crate) fn enchant_display_epoch(&self) -> u64 {
+    /// common case — costs two empty iterations.
+    pub(crate) fn countdown_display_epoch(&self) -> u64 {
         let now = std::time::Instant::now();
+        let step = |at: &std::time::Instant| {
+            let left = at.saturating_duration_since(now);
+            if left.is_zero() {
+                0
+            } else {
+                left.as_secs() + 1
+            }
+        };
         self.enchant_deadlines
             .values()
-            .map(|&at| {
-                let left = at.saturating_duration_since(now);
-                if left.is_zero() {
-                    0
-                } else {
-                    left.as_secs() + 1
-                }
-            })
+            .chain(self.duration_deadlines.values())
+            .map(step)
             .sum()
     }
 
@@ -442,6 +446,56 @@ impl Items {
         )
     }
 
+    /// `SMSG_ITEM_TIME_UPDATE` landed: park the absolute deadline for that item instance's
+    /// remaining lifetime. Same store shape as the enchant path one field up
+    /// ([`Self::set_enchant_deadline`]) — byte-confirmed as such, not assumed (decision 1933's
+    /// fold-back).
+    ///
+    /// Three rules, each the reference's:
+    ///
+    /// - **A non-POSITIVE duration clears.** `0x5d9c0c` tests the wire value **signed** (`jle`),
+    ///   so `0` and anything with the top bit set both zero the cell rather than parking a
+    ///   68-year deadline. An expired countdown is an absent line, not a line reading `0`.
+    /// - **An item we do not hold is DROPPED — no queue, no retry.** `0x1EA`'s arm resolves the
+    ///   guid and returns on a miss. This is the load-bearing asymmetry with its sibling: the
+    ///   `0x1EB` enchant arm *does* enqueue an unresolved update and replays it when the item
+    ///   appears (`0x5ebd40` → `0x5ebde0`); this one does not. Following the sibling would also
+    ///   grow this map without bound for items that never arrive.
+    /// - The cell dies with the object, so a relog or a zone destroy loses it; the server re-sends
+    ///   for everything carried on world enter (`Player::SendItemDurations`).
+    pub(crate) fn set_item_duration(&mut self, guid: u64, seconds: u32) {
+        if !self.objects.contains_key(&guid) {
+            debug!("item duration: {guid:#x} names an item we do not hold — dropped");
+            return;
+        }
+        if seconds == 0 || seconds as i32 <= 0 {
+            if self.duration_deadlines.remove(&guid).is_some() {
+                self.object_epoch = self.object_epoch.wrapping_add(1);
+            }
+            return;
+        }
+        let at = std::time::Instant::now() + std::time::Duration::from_secs(u64::from(seconds));
+        self.duration_deadlines.insert(guid, at);
+        self.object_epoch = self.object_epoch.wrapping_add(1);
+        debug!("item duration: item {guid:#x} → {seconds}s");
+    }
+
+    /// Milliseconds left on an item instance's lifetime, or `None` when it carries no timer —
+    /// including an elapsed one. Recomputed on read from the parked deadline, never ticked (the
+    /// enchant path's `0x5d9d00` shape).
+    pub(crate) fn duration_remaining_ms(&self, guid: u64) -> Option<u64> {
+        let at = self.duration_deadlines.get(&guid)?;
+        let left = at.saturating_duration_since(std::time::Instant::now());
+        (!left.is_zero()).then_some(left.as_millis() as u64)
+    }
+
+    /// [`Self::duration_remaining_ms`] at **display granularity** — floored to the whole second,
+    /// for the same reason [`Self::enchant_remaining_display_ms`] is: a raw per-ms read makes
+    /// every snapshot differ every frame and fires the inventory feeds at frame rate.
+    pub(crate) fn duration_remaining_display_ms(&self, guid: u64) -> Option<u64> {
+        self.duration_remaining_ms(guid).map(|ms| ms - ms % 1000)
+    }
+
     /// A tracked item object's merged descriptor fields.
     pub(crate) fn object(&self, guid: u64) -> Option<&ObjectFields> {
         self.objects.get(&guid)
@@ -452,19 +506,15 @@ impl Items {
     /// template-only) and returns `None` — call again after the answer lands. A cached negative
     /// (server doesn't know the entry) is also `None`, without a re-ask.
     pub(crate) fn template(
-        &mut self,
+        &self,
         entry: u32,
         guid: u64,
         commands: &NetCommands,
     ) -> Option<&ItemInfo> {
-        if !self.templates.contains_key(&entry) {
-            if self.pending.insert(entry) {
-                debug!("items: asking template (entry {entry})");
-                let _ = commands.0.send(ClientCommand::ItemQuery { entry, guid });
-            }
-            return None;
-        }
-        self.templates.get(&entry).and_then(|t| t.as_ref())
+        self.templates.get_or_ask(entry, || {
+            debug!("items: asking template (entry {entry})");
+            let _ = commands.0.send(ClientCommand::ItemQuery { entry, guid });
+        })
     }
 
     /// Whether the server has ANSWERED the `entry` query with "unknown item" — the cached
@@ -473,13 +523,13 @@ impl Items {
     /// answer (the ref's `DBCACHECALLBACK` redisplay), negative → give up and show the ref's
     /// `"UNKNOWN"` fallback instead of waiting forever.
     pub(crate) fn template_answered_unknown(&self, entry: u32) -> bool {
-        self.templates.get(&entry).is_some_and(|t| t.is_none())
+        self.templates.answered_unknown(entry)
     }
 
     /// The held/worn display head for `entry` — the [`HeldTemplate`] view of [`Self::template`]
     /// (same ask-once discipline, template-only ask). Equipment rendering + the swing selector
     /// consume this Copy slice instead of borrowing the full info.
-    pub(crate) fn held(&mut self, entry: u32, commands: &NetCommands) -> Option<HeldTemplate> {
+    pub(crate) fn held(&self, entry: u32, commands: &NetCommands) -> Option<HeldTemplate> {
         self.template(entry, 0, commands).map(|i| HeldTemplate {
             display_info_id: i.display_info_id,
             inventory_type: i.inventory_type,
@@ -490,24 +540,34 @@ impl Items {
         })
     }
 
+    /// [`Self::template`]'s **read-only** twin: the record for `entry` only if it is already
+    /// cached, and never an ask. For callers holding `&Items` — the cast ladder's equipped-item
+    /// rung runs inside a `&Items` borrow, and by the time a button is pressed the greying feed
+    /// that shares its search has had the template for many frames.
+    pub(crate) fn template_cached(&self, entry: u32) -> Option<&ItemInfo> {
+        self.templates.get(entry)
+    }
+
     /// Record a template answer (`SMSG_ITEM_QUERY_SINGLE_RESPONSE`); `None` = unknown entry.
     pub(crate) fn insert_template(&mut self, entry: u32, info: Option<ItemInfo>) {
-        self.pending.remove(&entry);
         if info.is_some() {
             self.fresh.push(entry);
         }
+        // A NEGATIVE answer moves the generation too: it flips the entry from "still asking" to
+        // "answered unknown", which is a real display transition for anything that waits on the
+        // ask (the cast-fail redisplay's `"UNKNOWN"` literal, [`Self::template_answered_unknown`]).
         self.templates.insert(entry, info);
-        // A NEGATIVE answer bumps too: it flips the entry from "still asking" to "answered
-        // unknown", which is a real display transition for anything that waits on the ask (the
-        // cast-fail redisplay's `"UNKNOWN"` literal, [`Self::template_answered_unknown`]).
-        self.template_epoch = self.template_epoch.wrapping_add(1);
     }
 
-    /// The landed-template broadcast counter — see the [`Self::template_epoch`] field. Advances on
-    /// every answer; a consumer that caches a template-derived view compares it against the value
-    /// it last resolved at and re-resolves when they differ.
+    /// The landed-template broadcast counter — the cache's own generation, bumped by every
+    /// landed answer, positive or negative. The **broadcast** twin of [`Self::fresh`]: `fresh`
+    /// is a DRAIN (exactly one consumer can take it — the tooltip feed does), so a second
+    /// consumer that caches a template-derived view needs its own signal; it keeps the epoch it
+    /// last resolved at and re-resolves when it advances — the modern stand-in for the ref's
+    /// `DBCACHECALLBACK` redisplay (`0x6e29b0`), which is how the real client repaints a view
+    /// drawn while the item cache was still answering (decision 0660).
     pub(crate) fn template_epoch(&self) -> u64 {
-        self.template_epoch
+        self.templates.generation()
     }
 
     /// Drain the entries whose template landed since the last drain (see the `fresh` field).
@@ -526,11 +586,33 @@ impl Items {
 
     /// Disconnect: drop the instances (the server re-streams inventory at login) and the in-flight
     /// asks (a query dropped by a dead writer must be re-askable); keep the templates (static).
+    /// Release the ask-once latch without dropping what the cache LEARNED — the world-enter
+    /// counterpart to [`Self::clear_session`]'s disconnect teardown.
+    ///
+    /// `template` marks an entry pending *before* the send, and a send made while the io thread
+    /// holds no writer evaporates. Nothing told the cache, so the entry stayed pending for the
+    /// life of the process and was never re-asked. That is not hypothetical: `feed_mail` carries
+    /// no run condition, so on 2026-09-06 it asked all five `Stationery.dbc` templates at the
+    /// login screen, every one was dropped "not connected", and the send tab's stationery list
+    /// was empty for the whole session — which the stock `SendMailFrame_Reset` turns into every
+    /// send silently unsent. The ask site is fixed; this makes the CLASS harmless, because the
+    /// cost of a wrong latch (a feature dead all session, in silence) is nothing like the cost of
+    /// a redundant re-ask.
+    pub(crate) fn clear_pending(&mut self) {
+        self.templates.clear_pending();
+    }
+
     pub(crate) fn clear_session(&mut self) {
         self.objects.clear();
         self.enchant_deadlines.clear();
-        self.pending.clear();
+        self.templates.clear_pending();
         self.object_epoch = self.object_epoch.wrapping_add(1);
+    }
+}
+
+impl crate::query_cache::AskOnce for Items {
+    fn clear_pending(&mut self) {
+        Items::clear_pending(self);
     }
 }
 
@@ -572,6 +654,63 @@ impl TestDeps {
             })
             .collect()
     }
+}
+
+/// Equipment slots 15/16 — `EQUIPMENT_SLOT_MAINHAND` / `_OFFHAND` (vmangos `EquipmentSlots`).
+pub(crate) const EQUIPMENT_SLOT_MAINHAND: u8 = 15;
+pub(crate) const EQUIPMENT_SLOT_OFFHAND: u8 = 16;
+
+/// One equipment slot's item class, through the guid → entry → template walk. `None` for an empty
+/// slot or a template still in flight.
+fn equipped_class(
+    store: &ObjectStore,
+    items: &Items,
+    commands: &NetCommands,
+    slot: u8,
+) -> Option<u8> {
+    let guid = store.0.player_inv_slot(slot).filter(|&g| g != 0)?;
+    let entry = items.object(guid).and_then(|o| o.object_entry())?;
+    Some(items.template(entry, guid, commands)?.class as u8)
+}
+
+/// **Which equipment slot this character's disarm hides** — the ladder
+/// ([`crate::creature_anim::disarmed_hand`]) asked of the raw inventory rather than of the
+/// resolved hands, which is the form the two *item*-side consumers need: the action bar's
+/// equipped-item requirement (`0x5f0c50`, which strips the bit out of its slot mask) and the
+/// item-use refusal (`CGItem::Use`'s rung 15, which compares it against the clicked item's own
+/// worn position). `None` while the flag is down or neither hand holds a weapon.
+///
+/// It lives here, next to the cache it reads, so the ladder is stated once and asked twice rather
+/// than re-derived per consumer — the failure decision 0664 names, and the reason the quest fork
+/// was once missing from all three of its call sites.
+pub(crate) fn disarmed_equipment_slot(
+    store: &ObjectStore,
+    items: &Items,
+    commands: &NetCommands,
+) -> Option<u8> {
+    if store.0.unit_flags() & crate::creature_anim::UNIT_FLAG_DISARMED == 0 {
+        return None;
+    }
+    let main = equipped_class(store, items, commands, EQUIPMENT_SLOT_MAINHAND);
+    let off = equipped_class(store, items, commands, EQUIPMENT_SLOT_OFFHAND);
+    crate::creature_anim::disarmed_hand(main, off).map(|hand| EQUIPMENT_SLOT_MAINHAND + hand as u8)
+}
+
+/// [`disarmed_equipment_slot`]'s read-only twin — same ladder, no ask (decision 1925).
+pub(crate) fn disarmed_equipment_slot_cached(store: &ObjectStore, items: &Items) -> Option<u8> {
+    if store.0.unit_flags() & crate::creature_anim::UNIT_FLAG_DISARMED == 0 {
+        return None;
+    }
+    let class_of = |slot: u8| -> Option<u8> {
+        let guid = store.0.player_inv_slot(slot).filter(|&g| g != 0)?;
+        let entry = items.object(guid).and_then(|o| o.object_entry())?;
+        Some(items.template_cached(entry)?.class as u8)
+    };
+    crate::creature_anim::disarmed_hand(
+        class_of(EQUIPMENT_SLOT_MAINHAND),
+        class_of(EQUIPMENT_SLOT_OFFHAND),
+    )
+    .map(|hand| EQUIPMENT_SLOT_MAINHAND + hand as u8)
 }
 
 /// A minimal, VALID item template named `name` — the shared test seam for every module that
@@ -722,12 +861,12 @@ mod tests {
     /// to the whole second, and clearing the deadline zeroes the epoch (the `Some(0) → None`
     /// collapse is the term's own last step).
     #[test]
-    fn the_enchant_display_epoch_steps_by_displayable_seconds() {
+    fn the_countdown_display_epoch_steps_by_displayable_seconds() {
         let mut items = Items::default();
-        assert_eq!(items.enchant_display_epoch(), 0, "no deadlines, no epoch");
+        assert_eq!(items.countdown_display_epoch(), 0, "no deadlines, no epoch");
 
         items.set_enchant_deadline(0x42, 1, 90);
-        let epoch = items.enchant_display_epoch();
+        let epoch = items.countdown_display_epoch();
         assert!(
             (90..=91).contains(&epoch),
             "a 90 s deadline contributes floor(secs)+1, got {epoch}"
@@ -738,11 +877,69 @@ mod tests {
 
         items.set_enchant_deadline(0x42, 1, 0);
         assert_eq!(
-            items.enchant_display_epoch(),
+            items.countdown_display_epoch(),
             0,
             "cleared deadline, term gone"
         );
         assert_eq!(items.enchant_remaining_display_ms(0x42, 1), None);
+    }
+
+    /// The item-lifetime store (decision 1933) — the enchant timer's shape, one key narrower:
+    /// `seconds == 0` stores ABSENCE, the read is second-floored, the deadline joins the shared
+    /// display epoch, and destroying the item takes its timer with it.
+    #[test]
+    fn an_item_duration_parks_a_deadline_and_dies_with_the_item() {
+        let mut items = Items::default();
+        assert_eq!(
+            items.duration_remaining_ms(0x42),
+            None,
+            "no timer by default"
+        );
+
+        items.insert_object(0x42, ObjectFields::default());
+        items.set_item_duration(0x42, 1800);
+        let shown = items.duration_remaining_display_ms(0x42).expect("parked");
+        assert_eq!(shown % 1000, 0, "the display read is second-floored");
+        assert!(shown <= 1_800_000);
+        let epoch = items.countdown_display_epoch();
+        assert!(
+            (1800..=1801).contains(&epoch),
+            "the lifetime deadline joins the same per-second epoch as the enchant one, got {epoch}"
+        );
+
+        // `0` is the wire's "no timer", never a zero-second timer — the same store the enchant
+        // path takes for the same reason (an expired countdown is an absent line).
+        items.set_item_duration(0x42, 0);
+        assert_eq!(items.duration_remaining_ms(0x42), None);
+        assert_eq!(items.countdown_display_epoch(), 0);
+
+        // A destroyed item takes its timer with it: the guid can be reissued by the server, and a
+        // stale deadline would print a countdown on whatever lands there next.
+        items.insert_object(0x99, ObjectFields::default());
+        items.set_item_duration(0x99, 600);
+        items.remove_object(0x99);
+        assert_eq!(items.duration_remaining_ms(0x99), None);
+
+        // **An item we do not hold is dropped outright** — no queue, no retry, and nothing
+        // parked. `0x1EA`'s arm resolves the guid and returns on a miss; its enchant sibling
+        // `0x1EB` is the one that enqueues and replays, and copying that here would grow the map
+        // without bound for guids that never arrive.
+        items.set_item_duration(0xdead, 600);
+        assert_eq!(items.duration_remaining_ms(0xdead), None);
+        assert_eq!(items.countdown_display_epoch(), 0);
+
+        // **A non-POSITIVE duration clears** — the reference's test is SIGNED (`0x5d9c0c jle`),
+        // so a wire value with the top bit set zeroes the cell instead of parking a 68-year
+        // deadline.
+        items.insert_object(0x7, ObjectFields::default());
+        items.set_item_duration(0x7, 600);
+        assert!(items.duration_remaining_ms(0x7).is_some());
+        items.set_item_duration(0x7, 0x8000_0000);
+        assert_eq!(
+            items.duration_remaining_ms(0x7),
+            None,
+            "a negative-as-signed duration clears, it does not park a far future"
+        );
     }
 
     /// The push half of the tooltip store: a landed template is marked fresh exactly once (the

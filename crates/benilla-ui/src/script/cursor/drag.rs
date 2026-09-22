@@ -72,6 +72,13 @@ pub(crate) fn maybe_start_drag(model: &mut Model, pos: (f32, f32)) -> Option<(u3
         (g.source, g.button.clone())
     };
     model.drag.as_mut().expect("checked Some above").started = true;
+    // **The button's drag-start edge** — `CSimpleButton` overrides `+0x74` with `0x7793f0`, which
+    // un-presses (`0x779410`, guarded on `locked == 0 && state != DISABLED`) and then forwards to
+    // the base notify that fires `<OnDragStart>`. So a button you drag off releases its pushed art
+    // at the THRESHOLD crossing, which is here — not when the cursor leaves its rect, and not for
+    // a frame that never registered for drag (wow-re `scratch/button-state-edge-set.md`;
+    // decision 2134).
+    super::super::button::edge(model, source, crate::widget::ButtonState::on_drag_start);
     let id = model
         .arena
         .frame(source)
@@ -130,13 +137,13 @@ mod tests {
             click_a, click_b = 0, 0
             drag_button = nil
             local a = CreateFrame("Frame", "A")
-            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetSize(400, 600); a:EnableMouse(true)
+            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetWidth(400); a:SetHeight(600); a:EnableMouse(true)
             a:RegisterForDrag("LeftButton")
             a:SetScript("OnDragStart", function(self, button) drag_starts = drag_starts + 1; drag_button = button end)
             a:SetScript("OnDragStop", function(self) drag_stops = drag_stops + 1 end)
             a:SetScript("OnClick", function(self) click_a = click_a + 1 end)
             local b = CreateFrame("Frame", "B")
-            b:SetPoint("BOTTOMLEFT", 400, 0); b:SetSize(400, 600); b:EnableMouse(true)
+            b:SetPoint("BOTTOMLEFT", 400, 0); b:SetWidth(400); b:SetHeight(600); b:EnableMouse(true)
             b:SetScript("OnReceiveDrag", function(self) receives = receives + 1 end)
             b:SetScript("OnClick", function(self) click_b = click_b + 1 end)
             "#,
@@ -194,7 +201,7 @@ mod tests {
             r#"
             clicks = 0
             local a = CreateFrame("Frame", "A")
-            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetSize(400, 600); a:EnableMouse(true)
+            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetWidth(400); a:SetHeight(600); a:EnableMouse(true)
             a:RegisterForDrag("LeftButton")
             a:SetScript("OnClick", function(self) clicks = clicks + 1 end)
             "#,
@@ -216,7 +223,7 @@ mod tests {
             r#"
             clicks = 0
             local a = CreateFrame("Frame", "A")
-            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetSize(400, 600); a:EnableMouse(true)
+            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetWidth(400); a:SetHeight(600); a:EnableMouse(true)
             a:RegisterForDrag("LeftButton")
             a:SetScript("OnClick", function(self) clicks = clicks + 1 end)
             "#,
@@ -245,7 +252,7 @@ mod tests {
             r#"
             heard = 0
             local a = CreateFrame("Frame", "A")
-            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetSize(400, 600); a:EnableMouse(true)
+            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetWidth(400); a:SetHeight(600); a:EnableMouse(true)
             a:RegisterForDrag("LeftButton")
             local f = CreateFrame("Frame", "Listener")
             f:RegisterEvent("DELETE_ITEM_CONFIRM")
@@ -326,6 +333,125 @@ mod tests {
         assert!(s.cursor_item().is_some(), "the payload stays held");
     }
 
+    /// **The world frame IS the world** — B380 / decision 2089, the regression this file's
+    /// other world-drop tests were structurally blind to.
+    ///
+    /// Every one of them clicks at `(-50, -50)`, where the hit test answers `None`, and the gate
+    /// used to be spelled `hit_id.is_none() && pressed.is_none()`. Decision 1983 put the stock
+    /// `WorldFrame` on the manifest — full-screen, mouse-enabled, `SetAllPoints` — so from that
+    /// day every click a player makes on the world hits a frame, the gate went permanently false
+    /// and dropping an item on the ground stopped doing anything at all. It is exactly the
+    /// reference's own click target for a world click (1984: "the press runs the frame's Lua
+    /// `OnMouseDown` (never consuming), then the `BUTTON1`/`BUTTON2` binding — which **is** the
+    /// world click"), so it belongs on the yes side of the predicate.
+    #[test]
+    fn a_click_on_the_world_frame_is_a_world_drop() {
+        let mut s = drag_script();
+        s.run(
+            r#"
+            WorldFrame = CreateFrame("WorldFrame", "WorldFrame") WorldFrame:SetAllPoints()
+            heard = 0
+            local f = CreateFrame("Frame", "Listener")
+            f:RegisterEvent("DELETE_ITEM_CONFIRM")
+            f:SetScript("OnEvent", function() heard = heard + 1 end)
+            "#,
+        )
+        .unwrap();
+        s.resolve();
+        s.set_cursor_for_test(CursorPayload::Item(CursorItem {
+            bar_placeable: true,
+            bag: 0,
+            slot: 1,
+            item_id: 117,
+            texture: None,
+            link: None,
+            count: None,
+            quality: None,
+            equip_slots: Vec::new(),
+        }));
+
+        // The fixture's own premise: the click really does land on the world frame.
+        let hit = s
+            .hit_test(400.0, 300.0)
+            .expect("the world frame is full-screen");
+        assert!(s.is_world_frame(hit));
+
+        s.mouse_button(400.0, 300.0, "LeftButton", true);
+        let consumed = s.mouse_button(400.0, 300.0, "LeftButton", false);
+        assert!(consumed, "a world drop consumes the completed click");
+        s.tick(0.01);
+        assert_eq!(s.eval::<i64>("return heard").unwrap(), 1, "the popup fires");
+        assert!(s.cursor_item().is_some(), "the payload stays held");
+    }
+
+    /// …and a UI frame ON TOP of the world frame is still the UI: press and release both land on
+    /// the plate, so no drop — the other half of [`super::over_world`]'s gate, which a predicate
+    /// that merely asked "is a world frame anywhere under the cursor" would get wrong.
+    #[test]
+    fn a_click_on_a_frame_above_the_world_frame_is_not_a_world_drop() {
+        let mut s = drag_script();
+        s.run(
+            r#"
+            WorldFrame = CreateFrame("WorldFrame", "WorldFrame") WorldFrame:SetAllPoints()
+            heard = 0
+            local a = CreateFrame("Frame", "A")
+            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetWidth(400); a:SetHeight(600); a:EnableMouse(true)
+            local f = CreateFrame("Frame", "Listener")
+            f:RegisterEvent("DELETE_ITEM_CONFIRM")
+            f:SetScript("OnEvent", function() heard = heard + 1 end)
+            "#,
+        )
+        .unwrap();
+        s.resolve();
+        s.set_cursor_for_test(CursorPayload::Item(CursorItem {
+            bar_placeable: true,
+            bag: 0,
+            slot: 1,
+            item_id: 117,
+            texture: None,
+            link: None,
+            count: None,
+            quality: None,
+            equip_slots: Vec::new(),
+        }));
+
+        s.mouse_button(100.0, 300.0, "LeftButton", true);
+        let consumed = s.mouse_button(100.0, 300.0, "LeftButton", false);
+        s.tick(0.01);
+        assert_eq!(s.eval::<i64>("return heard").unwrap(), 0, "no popup");
+        assert!(s.cursor_item().is_some());
+        assert!(
+            consumed,
+            "the plate ate the click — that IS the UI consuming it"
+        );
+
+        // The mixed pair, both ways round: a press on the plate released over the world, and a
+        // press on the world released over the plate. Neither is a completed world click.
+        s.mouse_button(100.0, 300.0, "LeftButton", true);
+        s.mouse_button(600.0, 300.0, "LeftButton", false);
+        s.mouse_button(600.0, 300.0, "LeftButton", true);
+        s.mouse_button(100.0, 300.0, "LeftButton", false);
+        s.tick(0.01);
+        assert_eq!(s.eval::<i64>("return heard").unwrap(), 0, "still no popup");
+        assert!(s.cursor_item().is_some());
+    }
+
+    /// A click on the world frame with an EMPTY cursor is not the UI consuming anything — the
+    /// return the app's arbiter would read if it ever asked. 1984: the world frame's press
+    /// "never consum[es]".
+    #[test]
+    fn a_world_frame_click_with_no_payload_consumes_nothing() {
+        let mut s = drag_script();
+        s.run(r#"WorldFrame = CreateFrame("WorldFrame", "WorldFrame") WorldFrame:SetAllPoints()"#)
+            .unwrap();
+        s.resolve();
+        s.mouse_button(400.0, 300.0, "LeftButton", true);
+        assert!(
+            !s.mouse_button(400.0, 300.0, "LeftButton", false),
+            "a bare world click is the world's, not the interface's"
+        );
+    }
+
     /// A world object (unit/GameObject) under the cursor suppresses the world drop entirely
     /// (decisions 0571 + 0574): the reference's object-leg dispatcher (`0x492ce0`) keeps every
     /// real payload and runs SELECT — no `DELETE_ITEM_CONFIRM`, payload untouched. The app
@@ -376,7 +502,7 @@ mod tests {
             r#"
             heard = 0
             local a = CreateFrame("Frame", "A")
-            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetSize(400, 600); a:EnableMouse(true)
+            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetWidth(400); a:SetHeight(600); a:EnableMouse(true)
             local f = CreateFrame("Frame", "Listener")
             f:RegisterEvent("DELETE_ITEM_CONFIRM")
             f:SetScript("OnEvent", function() heard = heard + 1 end)
@@ -412,7 +538,7 @@ mod tests {
             r#"
             heard = 0
             local a = CreateFrame("Frame", "A")
-            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetSize(400, 600); a:EnableMouse(true)
+            a:SetPoint("BOTTOMLEFT", 0, 0); a:SetWidth(400); a:SetHeight(600); a:EnableMouse(true)
             a:RegisterForDrag("LeftButton")
             local f = CreateFrame("Frame", "Listener")
             f:RegisterEvent("DELETE_ITEM_CONFIRM")
@@ -461,7 +587,7 @@ mod tests {
             r#"
             stops = 0
             local a = CreateFrame("Frame", "A")
-            a:SetPoint("BOTTOMLEFT", 100, 100); a:SetSize(200, 100)
+            a:SetPoint("BOTTOMLEFT", 100, 100); a:SetWidth(200); a:SetHeight(100)
             a:EnableMouse(true); a:SetMovable(true)
             a:RegisterForDrag("LeftButton")
             a:SetScript("OnDragStart", function() this:StartMoving() end)
@@ -511,7 +637,7 @@ mod tests {
             r#"
             stops, starts = 0, 0
             local a = CreateFrame("Frame", "A")
-            a:SetPoint("BOTTOMLEFT", 100, 100); a:SetSize(200, 100)
+            a:SetPoint("BOTTOMLEFT", 100, 100); a:SetWidth(200); a:SetHeight(100)
             a:EnableMouse(true); a:SetMovable(true)
             a:RegisterForDrag("LeftButton")
             a:SetScript("OnDragStart", function() starts = starts + 1; this:StartMoving() end)

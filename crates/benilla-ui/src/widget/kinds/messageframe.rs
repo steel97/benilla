@@ -12,6 +12,10 @@ pub struct MessageLine {
     /// The RGB the line draws at, **byte-quantized** at insert (`AddMessage` `trunc(x*255+0.5)`,
     /// round-half-up; alpha is never stored — it is forced opaque and then driven by the fade).
     pub color: [u8; 3],
+    /// `AddMessage`'s fifth argument — the chat-type index the line was printed under
+    /// (`GetChatTypeIndex`), so `UpdateColorByID` can find every line of a type when
+    /// `UPDATE_CHAT_COLOR` lands. 0 for a line printed without one.
+    pub id: u32,
     /// Remaining phase-1 countdown (the `timeVisible` snapshot ticking down); while `> 0` the line
     /// holds full alpha.
     pub time_left: f32,
@@ -120,10 +124,52 @@ impl ScrollingMessageState {
     /// `timeVisible`/`fadeDuration` onto the new line, and push it at the ring's newest slot,
     /// dropping the oldest when over `max_lines`. A view scrolled up stays anchored on the same
     /// content (the ring cursor is a slot, not an offset — msgframe-runtime.md).
+    /// `ScrollingMessageFrame:UpdateColorByID(id, r, g, b)` (`0x7932b0` → `0x788250`) — every line
+    /// tagged `id` takes the new colour, quantised the way `AddMessage` quantised the old one.
+    /// Returns how many lines moved; a recolour bumps the generation so a settled frame redraws.
+    ///
+    /// **`id == 0` matches nothing, and that is a guard the reference opens with, not a
+    /// consequence** (decision 2125; wow-re `system/ui/scratch/login-chat-colour-pipeline.md`).
+    /// `0x788250` is `mov edi,[ebp+8]; test edi,edi; je 0x7882a4` → `ret 8`: zero never reaches a
+    /// comparison and the record walk is not entered at all.
+    ///
+    /// Without it this was a live repaint of every line ever printed with no explicit colour,
+    /// because `AddMessage`'s absent-id case stores an explicit literal `0` (`0x7929b7 xor edi,edi`
+    /// → `0x78821d mov [edi+0x14],ecx`) and `ChatTypeInfo["REPLY"].id` is 0 too — FrameXML declares
+    /// REPLY and the engine's 94-row registry does not carry it. So `ChatFrame_OnEvent`'s
+    /// `UPDATE_CHAT_COLOR` arm mirroring WHISPER into REPLY (`ChatFrame.lua` l.1357-1365) called
+    /// `UpdateColorByID(0, 1.0, 0.5, 1.0)` and turned every `AceConsole:Print` in the window
+    /// whisper-pink. Measured `(255,128,255)` on Bartender2's login line where the reference reads
+    /// `(255,255,255)`.
+    pub fn update_color_by_id(&mut self, id: u32, r: f32, g: f32, b: f32) -> usize {
+        if id == 0 {
+            return 0;
+        }
+        let rgb = [quantize_u8(r), quantize_u8(g), quantize_u8(b)];
+        let mut moved = 0;
+        for line in self.lines.iter_mut().filter(|l| l.id == id) {
+            if line.color != rgb {
+                line.color = rgb;
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            self.lines_gen = self.lines_gen.wrapping_add(1);
+        }
+        moved
+    }
+
     pub fn add(&mut self, text: String, r: f32, g: f32, b: f32) {
+        self.add_with_id(text, r, g, b, 0);
+    }
+
+    /// `AddMessage(text, r, g, b, id)` — the line, tagged with the chat-type index it was
+    /// printed under so a later `UpdateColorByID(id, …)` can recolour it.
+    pub fn add_with_id(&mut self, text: String, r: f32, g: f32, b: f32, id: u32) {
         self.lines_gen = self.lines_gen.wrapping_add(1);
         let line = MessageLine {
             text,
+            id,
             color: [quantize_u8(r), quantize_u8(g), quantize_u8(b)],
             time_left: self.time_visible,
             fade_left: self.fade_duration,
@@ -466,6 +512,7 @@ impl MessageFrameState {
         self.lines_gen = self.lines_gen.wrapping_add(1);
         self.lines.push_back(MessageLine {
             text,
+            id: 0,
             color: [quantize_u8(r), quantize_u8(g), quantize_u8(b)],
             time_left: self.time_visible,
             fade_left: self.fade_duration,

@@ -41,47 +41,10 @@ mod mat_anim;
 pub(crate) use lazy::{LazyRig, SkinnedTwin};
 use mat_anim::tick_anim_materials;
 pub use mat_anim::{
-    playing_seq, register_tint, register_uv, sample_mat_anim, AnimMatPart, MatAnim,
-    TintAnimMaterials, TintLoop, UvAnimMaterials, UvLoop,
+    playing_seq, register_entity_uv, register_fx_uv, register_tint, sample_mat_anim, AnimMatPart,
+    MatAnim, TintAnimMaterials, TintLoop, UvAnimMaterials, UvLoops,
 };
-
-/// The client's single global `rand()` stream — the MSVC LCG at `0x7400e5`, returning `[0, 32767]`
-/// (wow-re `doodad-anim-host.md` §5, decision 0768). Every doodad's variation roll draws from **one**
-/// shared stream, which is what de-syncs a stand of identical props: not a per-placement seed, just
-/// consecutive draws off one sequence.
-///
-/// This replaced a position-derived hash. The hash de-synced instances correctly but was *permanent* —
-/// the same placement rolled the same variation on every re-stream and every run — which is exactly
-/// how the Blasted Lands lightning ended up striking from one fixed spot for ever instead of wandering
-/// the Tainted Scar (bug B63's residual). Captures are unaffected: [`spawn_anim_host`] returns `None`
-/// under a capture scenario, so no doodad animates in a golden frame and determinism is untouched.
-#[derive(Resource)]
-pub(crate) struct AnimRng(u32);
-
-impl Default for AnimRng {
-    fn default() -> Self {
-        Self(1) // the CRT's own initial seed
-    }
-}
-
-impl AnimRng {
-    /// One `rand()` draw: `seed = seed·214013 + 2531011`, result `(seed >> 16) & 0x7fff`.
-    fn draw(&mut self) -> u16 {
-        self.0 = self.0.wrapping_mul(214_013).wrapping_add(2_531_011);
-        ((self.0 >> 16) & 0x7fff) as u16
-    }
-
-    /// The play-window's replay count `R = max(1, min + ((rand()·(max−min)) >> 15))` — the reference's
-    /// `windowHi = now + span·R` (wow-re §5). `replay = (0, 0)`, the overwhelming majority and the
-    /// lightning's own value, always yields `R = 1`: one loop per window, so the variation re-rolls
-    /// every single pass. The draw is taken unconditionally — it is one sub-expression of the
-    /// reference's formula, so the shared stream advances the same way whatever the span.
-    fn replay_count(&mut self, replay: (u32, u32)) -> u32 {
-        let (lo, hi) = replay;
-        let r = lo + ((u32::from(self.draw()) * hi.saturating_sub(lo)) >> 15);
-        r.max(1)
-    }
-}
+pub(crate) use mat_anim::{register_uv, UvLoop};
 
 /// What a placed doodad model animates — decision 0130's content gate, decided per model at spawn.
 pub enum DoodadAnimTier<'a> {
@@ -113,7 +76,8 @@ pub(crate) const SOUND_EVENT_TAGS: [&[u8; 4]; 4] = [b"$DSL", b"$DSO", b"$DSE", b
 /// This is deliberately NOT part of [`classify`]: the tier answers "what does this model *render*",
 /// and 0130's whole point is that a bind-posed sequence renders as the static mesh. That stays true.
 /// What it never meant is that the sequence does not *run* — the reference arms every placed doodad
-/// and cycles it on residency (module docs, §1/§5), and the event track rides that clock. A humming
+/// it creates (`0x695100` → `0x7121a0`, module docs §1/§4a) and cycles it whenever the doodad is in
+/// the frame's animate set, and the event track rides that clock. A humming
 /// lamp is the proof: `KalidarStreetLamp01.m2` is one looping 3.333 s Stand that keys no bone at all
 /// and carries exactly one event, `$DSL` → `NightElfStreetLampLoop`. Gating its clock on the *rig*
 /// is what made every world doodad silent (bug B345), and the corpus says the class is not marginal
@@ -343,12 +307,21 @@ pub struct DoodadAnimHost {
     /// The placement's skinned submesh entities — animation runs iff ANY of them is drawn (their
     /// `Visibility` is the composed far-clip + distance-fade + portal-cull verdict).
     pub(crate) meshes: Vec<Entity>,
-    /// The placement's fade sphere (radius, WORLD center) — the draw-set gate for a MESHLESS
-    /// host (a particles-only model like the InstancePortal swirl: 0 render batches, so no
-    /// submesh carries a `Visibility` verdict). Same law the placement's emitters gate on
-    /// (decision 0171: fade alpha > 0 + frustum sphere), so joints and particle pools
-    /// freeze/resume in lockstep.
-    pub(crate) fade: (f32, Vec3),
+    /// The placement's **draw-set gate** — the draw-set answer for a MESHLESS host (a
+    /// particles-only model like the InstancePortal swirl or Stratholme's burning-building fire:
+    /// 0 render batches, so no submesh carries a `Visibility` verdict). Not a fade sphere any
+    /// more but the whole [`crate::particles::EmitterFade`], **the same value the placement's
+    /// emitters, ribbons and glow lights were built with** (`terrain_stream::spawn::emitter_fade`,
+    /// one expression at one call site), so every rider of a placement freezes and resumes
+    /// together.
+    ///
+    /// It used to be `(radius, world_center)`, and [`gate_doodad_anim`] rebuilt the rest as
+    /// `instance: None, room: None` on the reasoning that a particles-only model is not a
+    /// building's prop. Stratholme's fire is 88 particles-only props of `stratholme_b.wmo`, and
+    /// with no instance the exterior-window term asks `ExteriorGate::admits_sphere` — which,
+    /// standing in a sealed room, is `Windows([])` and admits **nothing**. Every meshless prop of
+    /// the building the camera stood in was parked (decision 2059).
+    pub(crate) fade: crate::particles::EmitterFade,
     /// The looping first-sequence graph node + its duration (secs); `None` on the gseq-only tier.
     pub(crate) clip: Option<(AnimationNodeIndex, f32)>,
     /// `Time::elapsed_secs` at the current **arm** — the player's clock origin: the variation
@@ -377,14 +350,17 @@ impl DoodadAnimHost {
     /// `(now − armed_at) mod duration`. `None` when nothing is armed (the gseq-only tier without a
     /// sound arm — free-running channels have no window at all).
     ///
-    /// The **shared clock, never the `AnimationPlayer`**, and that is the point rather than a
-    /// convenience. The player is paused by [`gate_doodad_anim`] whenever none of the placement's
-    /// submeshes is drawn; the reference's animation cycle is gated on **linkage — residency, not
-    /// the draw** (module docs §5, the same reasoning [`reroll_doodad_variation`] runs over every
-    /// host for). A campfire behind you keeps crackling in the real client, and reading the paused
-    /// player here would stop it the moment you turned around. It also gives the two arms one
-    /// answer: a clock-only host has no player to read, and a rigged one's resume seeks to exactly
-    /// this value, so the two never disagree while drawn.
+    /// The **shared clock, never the `AnimationPlayer`**, because it is the one answer both arms
+    /// can give: a clock-only host has no player to read at all, and a rigged one's resume seeks
+    /// the player to exactly this value, so the two never disagree while the host is drawn.
+    ///
+    /// It is **not** a claim that the cycle runs while the host is parked. This doc used to say the
+    /// reference gates the cycle on "linkage — residency, not the draw", and that read
+    /// `doodad-anim-host.md` §5b's *linkage* as "loaded": the note means spliced into the per-frame
+    /// scene worklist `[CM2Scene+0x20]`, which **is** the drawn/faded set — "a doodad culled out of
+    /// the drain stops advancing and resumes on re-link". Consumers that must honour that read
+    /// [`DoodadAnimHost::active`] beside this clock; the placed-doodad sound scanner
+    /// (`benilla_app::doodad_events`) does, and decision 2059 is what it cost not to.
     pub fn arm_clock(&self, now: f32) -> Option<(AnimationNodeIndex, f32)> {
         let (node, duration) = self.clip?;
         // A zero-length clip has no phase to compute; it sits at its own t = 0.
@@ -407,19 +383,25 @@ impl DoodadAnimHost {
 /// Two details that are easy to get wrong, both byte-pinned:
 /// - **The re-arm is a snap, not a blend** (`blendFlag = 0` at `0x6951c8`) — hence `stop_all` before
 ///   the play rather than a cross-fade.
-/// - **The window advances on linkage, not on the draw.** The reference's per-frame walk covers
-///   every model spliced into the scene list, which the doodad drain does per *in-range* doodad, so
-///   a doodad behind the camera keeps cycling. This system therefore runs over ALL hosts and never
-///   consults [`DoodadAnimHost::active`] — gating it on the draw instead would freeze the whole
-///   field while you looked away and then re-roll all 31 placements on the same frame you turned
-///   back, a burst of simultaneous strikes that the reference cannot produce.
+/// - **This system runs over ALL hosts and never consults [`DoodadAnimHost::active`] — a
+///   DELIBERATE divergence, not a reading of the bytes.** The reference's per-frame walk covers
+///   exactly the models spliced into `[CM2Scene+0x20]`, and the doodad drain splices only what
+///   survived frustum + occlusion + the radius-tiered fade cutoff — so in the real client a doodad
+///   behind you *stops* advancing and, on re-link, finds `now ≥ windowHi` and re-arms at once
+///   (wow-re `animation/scratch/doodad-anim-host.md` §5b,
+///   `terrain/scratch/doodad-emitter-drawset-gate.md` §1c/§2b). Gating this here would therefore be
+///   the faithful shape, and it is left ungated on purpose: it would freeze the whole field while
+///   you looked away and re-roll all 31 of the Tainted Scar's placements on the frame you turned
+///   back, and that burst is an approved *look* to weigh with the director rather than a silent
+///   change (decision 2059 names it as the open follow-up). The sound lane is gated; this one is
+///   not, and the difference is recorded rather than smoothed over.
 ///
 /// A host that is not currently drawn still re-rolls; it just updates [`DoodadAnimHost::clip`] and
 /// leaves the (stopped) player alone, so [`gate_doodad_anim`]'s resume arms whatever the latest
 /// window rolled.
 fn reroll_doodad_variation(
     time: Res<Time>,
-    mut rng: ResMut<AnimRng>,
+    mut rng: ResMut<benilla_assets::AnimRng>,
     mut hosts: Query<(
         &mut DoodadAnimHost,
         &ModelAnimations,
@@ -459,7 +441,7 @@ fn reroll_doodad_variation(
 /// both clocks to the shared-clock position — when one is again. Runs before [`AnimationSystems`] so
 /// a resume's seek lands the same frame. Steady state (nothing flipped) is one `Visibility` read per
 /// mesh, no writes.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)] // one Bevy system's full input set
+#[allow(clippy::type_complexity)] // one Bevy system's full input set
 fn gate_doodad_anim(
     time: Res<Time>,
     mut hosts: Query<(
@@ -474,19 +456,29 @@ fn gate_doodad_anim(
     vis: Query<&Visibility>,
     cam: Query<
         (
-            &GlobalTransform,
+            Ref<GlobalTransform>,
             &bevy::camera::primitives::Frustum,
-            &bevy::camera::Projection,
+            Ref<bevy::camera::Projection>,
+            // The seat's own write, visible THIS frame: `GlobalTransform` only changes after
+            // propagation, which runs after this system — so on a teleport frame the global
+            // reads still while the camera has already moved. Reading the local too is what
+            // keeps the verdict reuse below from carrying a pre-snap verdict across a snap
+            // (the over-bright lamppost glow after a .tele, 2026-09-04).
+            Option<Ref<Transform>>,
         ),
         With<crate::view::WorldCamera>,
     >,
-    // The far-clip wall — the meshless host's draw-set gate needs the same depth bound the
-    // emitters and the doodad meshes use…
-    view: Res<crate::view::ViewDistance>,
-    // …and the same exterior-window term, for the same reason: a meshless prop OUTSIDE, seen from a
-    // WMO interior, is not in the frame's worklist and must not tick its bones either (0786).
-    exterior_windows: Res<crate::wmo_portal::ExteriorWindows>,
-    camera_claim: Res<crate::wmo_portal::CameraInteriorClaim>,
+    // A meshed host's verdict is its meshes' `Visibility`; when none moved this frame and the
+    // camera stood still, every host's verdict is last frame's (decision 1979's floor: ~1.5 k
+    // hosts × their submesh lookups on every still frame).
+    changed_vis: Query<(), (Changed<Visibility>, With<crate::model_render::ModelPart>)>,
+    // The frame's draw-set inputs, as ONE bundle: the far-clip wall, the exterior-window gate
+    // (a meshless prop OUTSIDE, seen from a WMO interior, is not in the frame's worklist and must
+    // not tick its bones either — 0786), the room the camera stands in, and the portal instances
+    // a prop's own rooms resolve through (0689/1289). The same `SystemParam` the particle and
+    // ribbon sims read, so the three riders of one placement cannot answer the draw-set question
+    // differently (2059).
+    scene: crate::particles::sim::SceneGates,
     // The lazy-rig lane's wake half (decision 0863, [`lazy`]): a drawn host without a slot
     // promotes here — allocation, row seed, part swap.
     mut palettes: ResMut<crate::rig_palette::RigPalettes>,
@@ -504,46 +496,43 @@ fn gate_doodad_anim(
     }
     let now = time.elapsed_secs();
     let world_cam = cam.single().ok();
-    let exterior_gate = crate::exterior_cull::ExteriorGate::build(
-        &exterior_windows,
-        world_cam.map(|(tf, _, proj)| (tf, proj)),
-    );
-    let camera_instance = camera_claim.0.map(|c| c.room.instance);
+    let (farclip, exterior_gate, camera_instance) =
+        scene.scene(world_cam.as_ref().map(|(tf, _, proj, _)| (&**tf, &**proj)));
+    let verdicts_still = world_cam.as_ref().is_some_and(|(tf, _, proj, local)| {
+        !tf.is_changed() && !proj.is_changed() && !local.as_ref().is_some_and(|l| l.is_changed())
+    }) && !scene.changed()
+        && changed_vis.is_empty();
     for (entity, mut host, lazy, pose, has_rig, player, drive) in &mut hosts {
-        let drawn = if host.meshes.is_empty() {
+        // A host born this frame has no verdict to reuse (`active` starts false): a meshless one
+        // spawned under a parked camera stayed parked until the camera moved (review
+        // 2026-09-04). Read off the host's own tick — a second query on the component would
+        // conflict with this one's `&mut`.
+        let drawn = if verdicts_still && !host.is_added() {
+            host.active
+        } else if host.meshes.is_empty() {
             // Meshless (particles-only) host: the emitters' own draw-set law (see the `fade`
             // field doc) — the reference ticks animation for any model in the draw set, and a
             // 0-batch model is admitted on its fade sphere exactly like its emitters are.
-            // "Exactly like" is now literal: this calls `EmitterFade::in_draw_set`, the single
-            // spelling of the rule, rather than a second copy of it. The copy is how the far-clip
-            // term went missing here as well as in the emitters (decision 0678 / bug B39) — a
-            // meshless fire prop kept animating its bones at any distance past the wall.
-            let (radius, center) = host.fade;
-            world_cam.is_some_and(|(cam_tf, frustum, _)| {
-                let cam_pos = cam_tf.translation();
-                // A meshless host is a placement's own particles-only model; it carries no building
-                // instance of its own, so the honest answer here is "test my sphere".
-                let fade = crate::particles::EmitterFade {
-                    radius,
-                    center,
-                    instance: None,
-                    // …and no rooms either, for the same reason: a placement's particles-only
-                    // model is not a building's prop, so nothing gates it on a portal PVS.
-                    room: None,
-                };
+            // "Exactly like" is literal: this asks the placement's OWN `EmitterFade` — the very
+            // value its emitters and ribbons were handed — through `in_draw_set`, the single
+            // spelling of the rule. A second copy of it is how the far-clip term went missing
+            // here as well as in the emitters (0678/B39), and how a particles-only WMO prop lost
+            // its building identity and was culled from inside its own room (2059).
+            let fade = &host.fade;
+            world_cam.as_ref().is_some_and(|(cam_tf, frustum, _, _)| {
                 fade.in_draw_set(
-                    cam_pos,
+                    cam_tf.translation(),
                     Vec3::from(cam_tf.forward()),
-                    view.farclip,
+                    farclip,
                     frustum.intersects_sphere(
                         &bevy::camera::primitives::Sphere {
-                            center: center.into(),
-                            radius,
+                            center: fade.center.into(),
+                            radius: fade.radius,
                         },
                         false,
                     ),
                     fade.exterior_admitted(&exterior_gate, camera_instance),
-                    fade.room_admitted(None), // no rooms ⇒ admitted; the single spelling, not `true`
+                    scene.room_admits(fade),
                 )
             })
         } else {
@@ -627,7 +616,16 @@ impl Plugin for DoodadAnimPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UvAnimMaterials>();
         app.init_resource::<TintAnimMaterials>();
-        app.init_resource::<AnimRng>();
+        // The client's ONE `rand()` stream (`benilla_assets::AnimRng`), seeded here because this
+        // is where the engine boots and where `deterministic_run` is knowable — the reference's
+        // own `srand(GetTickCount())` runs once per process from CRT static init, pre-`WinMain`
+        // (wow-re `net/scratch/crt-rand-stream-seeding.md`; decision 2301). A capture keeps the
+        // CRT's pre-`srand` value, so golden frames stay reproducible.
+        app.init_resource::<benilla_assets::AnimRng>();
+        let deterministic = crate::dev_state::deterministic_run();
+        app.world_mut()
+            .resource_mut::<benilla_assets::AnimRng>()
+            .seed_for_session(deterministic);
         // The re-roll runs BEFORE the draw gate: a window that expires this frame must arm its new
         // clip before the gate decides what to resume, or a host re-appearing on the same frame
         // resumes the previous window's variation for one frame.
@@ -649,6 +647,9 @@ impl Plugin for DoodadAnimPlugin {
             (
                 sample_mat_anim.before(crate::model_render::ModelVisSet),
                 tick_anim_materials.after(crate::model_render::ModelVisSet),
+                // The readout of everything that lane just decided (`WOW_MATANIM_PROBE`), after
+                // it, so the `row` column is this frame's write and not the previous one's.
+                mat_anim::matanim_probe.after(tick_anim_materials),
             ),
         );
     }
@@ -880,33 +881,6 @@ mod tests {
         ));
     }
 
-    /// The client's `rand()` is the MSVC LCG, and its seed-1 stream is the textbook one. Pinning the
-    /// first draws keeps the weighted roll on the reference's actual sequence rather than on "some
-    /// uniform generator" (wow-re `_rand 0x7400e5`, decision 0768).
-    #[test]
-    fn the_anim_rng_is_the_reference_msvc_stream() {
-        let mut rng = AnimRng::default();
-        let first: Vec<u16> = (0..6).map(|_| rng.draw()).collect();
-        assert_eq!(first, vec![41, 18467, 6334, 26500, 19169, 15724]);
-        assert!(first.iter().all(|&v| v <= 0x7fff), "range is [0, 32767]");
-    }
-
-    /// `R = max(1, min + ((rand()·(max−min)) >> 15))`. `(0, 0)` — the overwhelming majority, and the
-    /// lightning's own value — pins to 1, so the window is exactly one loop and the variation
-    /// re-rolls every pass.
-    #[test]
-    fn the_replay_window_is_one_loop_for_the_common_case() {
-        let mut rng = AnimRng::default();
-        for _ in 0..32 {
-            assert_eq!(rng.replay_count((0, 0)), 1);
-        }
-        // A real range stays inside it, and never degenerates to 0 windows.
-        for _ in 0..64 {
-            let r = rng.replay_count((2, 5));
-            assert!((2..=5).contains(&r), "R = {r} outside [2, 5]");
-        }
-    }
-
     /// The lightning's own chain, read off the bytes (`benilla-extract m2seq` on
     /// `World\Generic\PassiveDoodads\ParticleEmitters\BlastedLandsLightningbolt01.M2`): two
     /// variations of animation id 0, weights 31129 / 1638 — so slot 1, which is where all four
@@ -925,7 +899,7 @@ mod tests {
         // would clobber the manual advance these tests need to step whole play-windows.
         let mut app = App::new();
         app.init_resource::<Time>();
-        app.init_resource::<AnimRng>();
+        app.init_resource::<benilla_assets::AnimRng>();
         app.add_systems(Update, reroll_doodad_variation);
         app
     }
@@ -935,7 +909,7 @@ mod tests {
             .spawn((
                 DoodadAnimHost {
                     meshes: Vec::new(),
-                    fade: (1.0, Vec3::ZERO),
+                    fade: crate::particles::EmitterFade::sphere(1.0, Vec3::ZERO),
                     clip: None,
                     armed_at: 0.0,
                     window_hi: f32::NEG_INFINITY,
@@ -1023,7 +997,7 @@ mod tests {
             .spawn((
                 DoodadAnimHost {
                     meshes: Vec::new(),
-                    fade: (1.0, Vec3::ZERO),
+                    fade: crate::particles::EmitterFade::sphere(1.0, Vec3::ZERO),
                     clip: None,
                     armed_at: 0.0,
                     window_hi: f32::NEG_INFINITY,
@@ -1131,7 +1105,7 @@ mod tests {
             .spawn((
                 DoodadAnimHost {
                     meshes: vec![mesh],
-                    fade: (1.0, Vec3::ZERO),
+                    fade: crate::particles::EmitterFade::sphere(1.0, Vec3::ZERO),
                     clip: Some((node, 2.0)),
                     armed_at: 0.0,
                     // Far future: this test exercises the DRAW gate, so no window may expire
@@ -1193,17 +1167,234 @@ mod tests {
     /// [`DoodadAnimHost::arm_clock`] — the sound lane's phase, which must be the SHARED clock's,
     /// never the (draw-gated) player's. Three claims: it wraps with the clip, it is unaffected by
     /// the host being parked, and an unarmed host has no phase at all.
+    /// **A meshless prop of the building the camera stands in keeps animating** — decision 2059's
+    /// wiring, pinned where it broke.
+    ///
+    /// `EmitterFade`'s own tests already pin the LAW (`particles`:
+    /// `a_sealed_room_keeps_its_own_props_burning_and_stops_everything_else`). What was wrong here
+    /// was the wiring: this gate built its meshless host a fresh `EmitterFade` with
+    /// `instance: None, room: None`, so the exterior-window term fell through to
+    /// `ExteriorGate::admits_sphere` — and a sealed room is `Windows([])`, which "admits nothing".
+    /// Every particles-only WMO prop of the camera's OWN building was therefore parked, which is
+    /// Stratholme's 88 burning-building fires: 0 render batches each, so nothing but this branch
+    /// ever judged them, and their `$DSL` never fired.
+    ///
+    /// The control is the second host: same sphere, same place, no building — an ADT map doodad,
+    /// which a sealed room really must stop.
+    #[test]
+    fn a_sealed_room_keeps_its_own_meshless_props_animating() {
+        use crate::wmo_portal::{
+            CameraInteriorClaim, ExteriorWindows, InteriorClaim, WmoGroupVis, WmoPortalInstance,
+            WmoRoom,
+        };
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_resource::<crate::view::ViewDistance>();
+        app.init_resource::<crate::rig_palette::RigPalettes>();
+        app.init_asset::<SkinnedMeshInverseBindposes>();
+        app.add_systems(Update, gate_doodad_anim);
+
+        // The camera stands inside a sealed room of `building` — no exterior window at all.
+        let building = app
+            .world_mut()
+            .spawn(WmoPortalInstance {
+                handle: Handle::default(),
+                world_from_local: bevy::math::Affine3A::IDENTITY,
+                name_set: 0,
+                visible: vec![true],
+                interior_fog: vec![false],
+                liquid_visited: vec![false],
+                flooded: vec![None],
+            })
+            .id();
+        app.insert_resource(ExteriorWindows::Windows(Vec::new()));
+        app.insert_resource(CameraInteriorClaim(Some(InteriorClaim {
+            room: WmoRoom {
+                instance: building,
+                group: 0,
+            },
+            exterior_visible: false,
+        })));
+
+        // Looking straight at both hosts, 20 yd out and well inside the wall.
+        let seat =
+            Transform::from_xyz(0.0, 0.0, 0.0).looking_at(Vec3::new(0.0, 0.0, -20.0), Vec3::Y);
+        let projection = bevy::camera::Projection::from(bevy::camera::PerspectiveProjection {
+            far: 5000.0,
+            ..default()
+        });
+        let frustum = bevy::camera::primitives::Frustum::from_clip_from_world(
+            &(projection.get_clip_from_view() * GlobalTransform::from(seat).affine().inverse()),
+        );
+        app.world_mut().spawn((
+            crate::view::WorldCamera,
+            GlobalTransform::from(seat),
+            seat,
+            frustum,
+            projection,
+        ));
+
+        let node = AnimationNodeIndex::new(1);
+        let mut meshless = |fade: crate::particles::EmitterFade| {
+            app.world_mut()
+                .spawn(DoodadAnimHost {
+                    meshes: Vec::new(), // 0 render batches — the whole point
+                    fade,
+                    clip: Some((node, 2.0)),
+                    armed_at: 0.0,
+                    window_hi: f32::INFINITY,
+                    anim_id: Some(0),
+                    active: false,
+                    parked_at: 0.0,
+                })
+                .id()
+        };
+        let center = Vec3::new(0.0, 0.0, -20.0);
+        let prop = meshless(crate::particles::EmitterFade {
+            instance: Some(building),
+            room: Some(WmoGroupVis {
+                instance: building,
+                groups: [0u16].as_slice().into(),
+            }),
+            ..crate::particles::EmitterFade::sphere(2.0, center)
+        });
+        let map_doodad = meshless(crate::particles::EmitterFade::sphere(2.0, center));
+
+        app.update();
+        let active = |app: &App, e: Entity| {
+            app.world()
+                .entity(e)
+                .get::<DoodadAnimHost>()
+                .unwrap()
+                .active
+        };
+        assert!(
+            active(&app, prop),
+            "a prop of the camera's OWN building is not exterior to it — it keeps animating, and \
+             its $DSL keeps firing"
+        );
+        assert!(
+            !active(&app, map_doodad),
+            "the control: a map doodad carries no building, so the sealed room stops it"
+        );
+    }
+
+    /// The teleport frame (2026-09-04): this system runs before transform propagation, so the
+    /// camera's `GlobalTransform` still reads still on the frame its `Transform` was re-seated,
+    /// and the verdict reuse carried every host's pre-snap verdict across the snap — a lamppost
+    /// glow that should have parked kept its clock, a host that should have woken stayed parked.
+    /// The gate must read the seat's own write.
+    #[test]
+    fn a_reseated_camera_is_not_a_still_scene() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_resource::<crate::view::ViewDistance>();
+        app.init_resource::<crate::wmo_portal::ExteriorWindows>();
+        app.init_resource::<crate::wmo_portal::CameraInteriorClaim>();
+        app.init_resource::<crate::rig_palette::RigPalettes>();
+        app.init_asset::<SkinnedMeshInverseBindposes>();
+        app.add_systems(Update, gate_doodad_anim);
+
+        // A camera 1000 yd from the host, looking away: the host's frustum verdict is "not
+        // drawn". No propagation plugin, so `GlobalTransform` never follows `Transform` —
+        // exactly the ordering the gate sees on the real snap frame.
+        let far =
+            Transform::from_xyz(1000.0, 0.0, 0.0).looking_at(Vec3::new(2000.0, 0.0, 0.0), Vec3::Y);
+        let projection = bevy::camera::Projection::from(bevy::camera::PerspectiveProjection {
+            far: 5000.0,
+            ..default()
+        });
+        let frustum = bevy::camera::primitives::Frustum::from_clip_from_world(
+            &(projection.get_clip_from_view() * GlobalTransform::from(far).affine().inverse()),
+        );
+        let cam = app
+            .world_mut()
+            .spawn((
+                crate::view::WorldCamera,
+                GlobalTransform::from(far),
+                far,
+                frustum,
+                projection,
+            ))
+            .id();
+        let node = AnimationNodeIndex::new(1);
+        let mut player = AnimationPlayer::default();
+        player.play(node).repeat();
+        let joint = app.world_mut().spawn(Transform::default()).id();
+        let drive = GlobalSeqDrive::new(
+            &anims(Vec::new(), None, true).global_bones,
+            &[Entity::PLACEHOLDER, joint],
+        )
+        .expect("one gseq bone maps");
+        let host = app
+            .world_mut()
+            .spawn((
+                DoodadAnimHost {
+                    meshes: Vec::new(),
+                    fade: crate::particles::EmitterFade::sphere(1.0, Vec3::ZERO),
+                    clip: Some((node, 2.0)),
+                    armed_at: 0.0,
+                    window_hi: f32::INFINITY,
+                    anim_id: Some(0),
+                    active: true,
+                    parked_at: 0.0,
+                },
+                player,
+                drive,
+            ))
+            .id();
+        let active = |app: &App| {
+            app.world()
+                .entity(host)
+                .get::<DoodadAnimHost>()
+                .unwrap()
+                .active
+        };
+        app.update();
+        assert!(!active(&app), "far and facing away ⇒ parked");
+        app.update();
+        app.update();
+        assert!(!active(&app), "still ⇒ the verdict is reused, still parked");
+
+        // The snap: the seat writes the camera's local next to the host, facing it. The global
+        // (and the frustum built from it) stay stale this frame — and the host must still be
+        // re-judged rather than reused.
+        let near = Transform::from_xyz(0.0, 0.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y);
+        let near_frustum = bevy::camera::primitives::Frustum::from_clip_from_world(
+            &(bevy::camera::Projection::from(bevy::camera::PerspectiveProjection {
+                far: 5000.0,
+                ..default()
+            })
+            .get_clip_from_view()
+                * GlobalTransform::from(near).affine().inverse()),
+        );
+        {
+            let mut e = app.world_mut().entity_mut(cam);
+            *e.get_mut::<Transform>().unwrap() = near;
+            *e.get_mut::<bevy::camera::primitives::Frustum>().unwrap() = near_frustum;
+            // The propagated frame, written WITHOUT a change tick: on the real snap frame it is
+            // last frame's value (propagation has not run), and this is the closest a test can
+            // stand to that — the only "moved" signal on this frame is the local.
+            *e.get_mut::<GlobalTransform>()
+                .unwrap()
+                .bypass_change_detection() = GlobalTransform::from(near);
+        }
+        app.update();
+        assert!(active(&app), "the snap frame re-judges the host: drawn");
+    }
+
     #[test]
     fn arm_clock_wraps_on_the_shared_clock() {
         let mut host = DoodadAnimHost {
             meshes: Vec::new(),
-            fade: (0.0, Vec3::ZERO),
+            fade: crate::particles::EmitterFade::sphere(0.0, Vec3::ZERO),
             clip: Some((AnimationNodeIndex::new(1), 3.333)),
             armed_at: 10.0,
             window_hi: f32::NEG_INFINITY,
             anim_id: Some(0),
-            // PARKED — the whole point: a campfire behind you keeps crackling, because the
-            // reference gates the cycle on residency, not on the draw.
+            // PARKED — and the clock still answers, which is the point: `arm_clock` is a pure
+            // function of the shared clock, so the phase is defined whether or not the host is in
+            // the animate set. Honouring that membership is the CALLER's job (decision 2059).
             active: false,
             parked_at: 0.0,
         };

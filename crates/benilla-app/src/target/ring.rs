@@ -124,6 +124,14 @@ impl Factions {
     pub(crate) fn catalog(&self) -> &FactionCatalog {
         &self.0
     }
+
+    /// Wrap a catalog — **tests only**. A sibling module exercising a reaction gate needs a real
+    /// `Factions` in its world, and the field stays private otherwise: in a running client the
+    /// resource is built exactly once, from the DBC, by the loader below.
+    #[cfg(test)]
+    pub(crate) fn from_catalog(catalog: FactionCatalog) -> Self {
+        Self(catalog)
+    }
 }
 
 /// The colour `GetSelectionCircleColor` resolves — the pure classification half of the
@@ -250,7 +258,7 @@ pub(super) fn load_factions(mut commands: Commands, world_assets: Option<Res<Wor
 /// merges `Values` deltas), the handle swapped only on change. No pulse — the reference's unit ring
 /// is steady. If the target's entity is gone (destroyed / streamed out) the selection clears and the
 /// server is told — the reference's teardown clear sends `CMSG_SET_SELECTION 0` on both paths.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub(super) fn update_ring(
     mut selection: ResMut<Selection>,
     factions: Option<Res<Factions>>,

@@ -153,9 +153,7 @@ pub(crate) fn defense_targets(
     player_zone: Option<u32>,
 ) -> Vec<String> {
     channels
-        .joined
-        .iter()
-        .flatten()
+        .iter_names()
         .filter(|name| {
             let Some(row) = channels.channels.row_for_name(name) else {
                 return false; // a custom channel — no DBC row, no defense flag
@@ -165,7 +163,7 @@ pub(crate) fn defense_targets(
             }
             row.flags & chan_flags::ZONE_DEP == 0 || player_zone == Some(subject_zone)
         })
-        .cloned()
+        .map(str::to_string)
         .collect()
 }
 
@@ -337,8 +335,12 @@ mod tests {
 
     fn state(joined: &[&str]) -> ChannelState {
         ChannelState {
-            joined: joined.iter().map(|n| Some((*n).to_string())).collect(),
+            joined: joined
+                .iter()
+                .map(|n| Some(crate::ui_chat::edit::ChannelSlot::joined(n)))
+                .collect(),
             channels: catalog(),
+            ..Default::default()
         }
     }
 
@@ -433,7 +435,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            super::super::frames::compose(&event, ChatEventKind::Channel, "Common").unwrap(),
+            crate::ui_chat::tests::compose(&event, ChatEventKind::Channel, "Common").unwrap(),
             "[3. LocalDefense] : |cffffff00Sentinel Hill is under attack!|r"
         );
     }

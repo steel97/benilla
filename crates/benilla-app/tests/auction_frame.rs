@@ -1,4 +1,5 @@
-//! Drives the REAL `assets/ui/AuctionFrame.xml` through the engine (decision 1511) — the auction
+//! Drives the reference's own `Blizzard_AuctionUI` addon through the engine (decision 1511; 1971
+//! put it on the player's chain) — the auction
 //! twin of `mail_frame.rs`: it loads the same file chain the app does (cut to the auction window's
 //! dependency prefix), pushes a synthetic `AuctionState`, opens the window with the app's own
 //! `AUCTION_HOUSE_SHOW`/`AUCTION_ITEM_LIST_UPDATE` events, and asserts the transcribed Lua actually
@@ -17,20 +18,57 @@ mod common;
 /// Every one of these is a real dependency: UiPanels for the panel manager + tab kit + StaticPopup
 /// engine, ScrollTemplates for the faux lists, UIPanelTemplates for the button/input/checkbox
 /// templates, UIDropDownMenu for the rarity capsule, MoneyFrame for `SmallMoneyFrameTemplate` +
-/// the `MoneyTypeInfo` table this window registers `AUCTION_DEPOSIT` into, The `BenillaMoneyInput_*` money-entry
+/// the `MoneyTypeInfo` table this window registers `AUCTION_DEPOSIT` into, The `MoneyInputFrame_*` money-entry
 /// helpers used to mean loading MerchantFrame.xml as well; 1751 moved that kit to MoneyFrame.xml
 /// on its way to the chain, so the dependency is gone.
-const FILES: [&str; 9] = [
-    "Fonts.xml",
-    "MoneyFrame.xml",
-    "UiPanels.xml",
-    "GameTooltip.xml",
+const FILES: &[&str] = &[
+    "Interface\\FrameXML\\Fonts.xml",
+    r"Interface\FrameXML\MoneyFrame.lua",
+    r"Interface\FrameXML\MoneyFrame.xml",
+    // The four money-entry frames come off the chain since 1882 — `MoneyInputFrameTemplate` and
+    // the `MoneyInputFrame_*` verbs, replacing our own verbatim copy of both.
+    r"Interface\FrameXML\MoneyInputFrame.lua",
+    r"Interface\FrameXML\MoneyInputFrame.xml",
+    r"Interface\FrameXML\UIParent.xml",
+    // `auctionRowName` colours each row from ITEM_QUALITY_COLORS, whose declarer is
+    // UIParent (ref UIParent.lua:65) since 1888 put the font registry on the chain.
+    "Interface\\FrameXML\\GameTooltip.xml",
     "Interface\\FrameXML\\UIDropDownMenu.xml",
     "ScrollTemplates.xml",
     r"Interface\FrameXML\UIPanelTemplates.lua",
     r"Interface\FrameXML\UIPanelTemplates.xml",
-    "AuctionFrame.xml",
+    // `AuctionTabTemplate` inherits `CharacterFrameTabButtonTemplate`, and `inherits=`
+    // resolves at LOAD (1993).
+    r"Interface\FrameXML\CharacterFrameTemplates.xml",
+    "Interface\\FrameXML\\GlobalStrings.lua",
+    "Interface\\FrameXML\\BasicControls.xml",
+    "Interface\\FrameXML\\LocaleProperties.lua",
+    "Interface\\FrameXML\\StaticPopup.xml", // the dialog engine (1960)
+    // The reference's own addon (1971), its toc order: the window (which <Include>s its
+    // templates) and the embedded dress-up pane. An integration test has no addon registry, so
+    // the files load as chain files, the way the manifest's own entries do.
+    // The embedded dress-up pane's OnLoad calls the dressing room's own `DressUpTexturePath`
+    // (stock DressUpFrame.lua, on the chain since 1969) — the manifest seats that window above.
+    "Interface\\FrameXML\\DressUpFrame.xml",
+    "Interface\\AddOns\\Blizzard_AuctionUI\\Blizzard_AuctionUI.xml",
+    "Interface\\AddOns\\Blizzard_AuctionUI\\Blizzard_AuctionDressUp.xml",
 ];
+
+/// [`load_ui`] with the Browse tab's class tree seated first: the stock addon reads
+/// `GetAuctionItemClasses()` at its LOAD (`AuctionFrameBrowse_OnLoad`), before any session, so
+/// the classes are login-scoped and must be there before the files are (1971).
+fn load_ui_with_classes(s: &mut UiScript) {
+    s.set_auction_item_classes(vec![AuctionCategory {
+        class_id: 4,
+        name: "Armor".into(),
+        subclasses: vec![AuctionSubCategory {
+            sub_id: 1,
+            name: "Cloth".into(),
+            has_inv_types: true,
+        }],
+    }]);
+    load_ui(s);
+}
 
 fn load_ui(script: &UiScript) {
     // `common::load_ui`, not a local read: a manifest entry carrying a path separator is the
@@ -83,15 +121,6 @@ fn state(mut rows: Vec<AuctionItemRow>) -> AuctionState {
     lists[OWNER] = AuctionListState::default();
     AuctionState {
         lists,
-        categories: vec![AuctionCategory {
-            class_id: 4,
-            name: "Armor".into(),
-            subclasses: vec![AuctionSubCategory {
-                sub_id: 1,
-                name: "Cloth".into(),
-                has_inv_types: true,
-            }],
-        }],
         deposit_percent: 5,
     }
 }
@@ -114,8 +143,8 @@ fn seat_player(s: &mut UiScript, money: u64) {
 #[test]
 fn auction_frame_loads_and_key_regions_exist() {
     let _data = benilla_formats::wow_data_or_skip!();
-    let s = UiScript::new().unwrap();
-    load_ui(&s);
+    let mut s = UiScript::new().unwrap();
+    load_ui_with_classes(&mut s);
     for name in [
         // The window, its three panes and its three tabs.
         "AuctionFrame",
@@ -161,8 +190,8 @@ fn auction_frame_loads_and_key_regions_exist() {
 #[test]
 fn the_window_is_registered_doublewide() {
     let _data = benilla_formats::wow_data_or_skip!();
-    let s = UiScript::new().unwrap();
-    load_ui(&s);
+    let mut s = UiScript::new().unwrap();
+    load_ui_with_classes(&mut s);
     assert_eq!(
         s.eval::<String>("return UIPanelWindows['AuctionFrame'].area")
             .unwrap(),
@@ -174,7 +203,7 @@ fn the_window_is_registered_doublewide() {
 fn auction_house_show_opens_the_window_on_the_browse_tab() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
-    load_ui(&s);
+    load_ui_with_classes(&mut s);
     seat_player(&mut s, 500_000);
     s.set_auction(Some(state(vec![row(
         "Linen Cloth",
@@ -227,12 +256,215 @@ fn auction_house_show_opens_the_window_on_the_browse_tab() {
     assert!(s.errors().is_empty(), "clean open: {:?}", s.errors());
 }
 
+/// **The bug the per-list fires were made for** (decision 2308), in the stock addon's own Lua.
+///
+/// `AuctionFrameAuctions_Update` computes `offset + i + (NUM_AUCTION_ITEMS_PER_PAGE *
+/// AuctionFrameAuctions.page)` on its very first line of loop body, and `AuctionFrameAuctions.page`
+/// is assigned in exactly one place in the whole addon: that tab's `OnShow`, three lines below its
+/// `GetOwnerAuctionItems()`. So the event is only safe to fire *after* the Auctions tab has been
+/// shown at least once — which the reference guarantees structurally, because every caller of
+/// `GetOwnerAuctionItems` lives *inside* that pane (the `OnShow`, and the two page-turner buttons,
+/// which pass `AuctionFrameAuctions.page` as their argument).
+///
+/// The feed used to fire all three list events on any change, so the first browse result of the
+/// session ran this repaint on a tab nobody had opened and put
+/// `attempt to perform arithmetic on field 'page' (a nil value)` on the player's screen. This test
+/// is the hazard itself, pinned: it fails the day the stock Lua stops caring, and `ui_auction`'s
+/// own `a_result_owes_only_its_own_lists_event` is the guarantee that we never hand it that event.
+#[test]
+fn the_auctions_tab_cannot_repaint_before_it_has_been_shown() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = UiScript::new().unwrap();
+    load_ui_with_classes(&mut s);
+    seat_player(&mut s, 500_000);
+    s.set_auction(Some(state(vec![row(
+        "Linen Cloth",
+        1000,
+        5000,
+        0,
+        "Seller",
+    )])));
+
+    // Open, and land a browse result — the whole of what a search does. Clean.
+    s.fire_event("AUCTION_HOUSE_SHOW", vec![]);
+    s.fire_event("AUCTION_ITEM_LIST_UPDATE", vec![]);
+    assert!(
+        s.take_errors().is_empty(),
+        "a browse result on the Browse tab is clean"
+    );
+
+    // The same result also announcing the *owned* list is what crashed: the Auctions tab has never
+    // been shown, so its `page` is nil and the repaint does arithmetic on it.
+    s.fire_event("AUCTION_OWNED_LIST_UPDATE", vec![]);
+    let errors = s.take_errors();
+    assert!(
+        errors.iter().any(|e| e.contains("page")),
+        "the never-shown Auctions tab raises the nil-page error: {errors:?}"
+    );
+
+    // And the same event is harmless the moment the tab has been shown once — which is the only
+    // state the app can now produce it in, since the owned list is only ever asked for from there.
+    s.run("AuctionFrameTab_OnClick(3)").unwrap();
+    assert!(s.take_errors().is_empty(), "opening the tab is clean");
+    s.fire_event("AUCTION_OWNED_LIST_UPDATE", vec![]);
+    assert!(
+        s.take_errors().is_empty(),
+        "and now the owned list may announce itself"
+    );
+}
+
+/// Why only the Auctions tab was in the screenshot — and why that is an accident of the XML.
+///
+/// All three panes read their `page` field in `_Update`, and each assigns it in exactly one place:
+/// its own `OnShow`. What differs is *when* that `OnShow` first runs, and it is decided by one
+/// attribute in the stock file — `AuctionFrameBrowse` and `AuctionFrameAuctions` are declared
+/// `hidden="true"`, `AuctionFrameBid` is declared **`hidden="false"`**. So the Bids pane becomes
+/// visible with the window itself, its `OnShow` runs on the very first `AUCTION_HOUSE_SHOW` —
+/// before `AuctionFrameTab_OnClick(1)` hides it again — and `AuctionFrameBid.page` is `0` while
+/// the player is still looking at Browse. The Auctions pane gets nothing at all until tab 3.
+///
+/// That is the whole reason a mis-aimed `AUCTION_OWNED_LIST_UPDATE` crashed and a mis-aimed
+/// `AUCTION_BIDDER_LIST_UPDATE` did not — and the reason the fix is the rule (an event names one
+/// list) rather than a guard on the one tab that happened to be reported.
+#[test]
+fn only_the_bids_pane_gets_its_page_without_being_opened() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = UiScript::new().unwrap();
+    load_ui_with_classes(&mut s);
+
+    let page = |s: &UiScript, pane: &str| {
+        s.eval::<String>(&format!("return tostring({pane}.page)"))
+            .unwrap()
+    };
+
+    // At load, with no session: no pane has been shown, so none has a page.
+    for pane in [
+        "AuctionFrameBrowse",
+        "AuctionFrameBid",
+        "AuctionFrameAuctions",
+    ] {
+        assert_eq!(page(&s, pane), "nil", "{pane} before the window opens");
+    }
+
+    // The window opens on tab 1. Browse is shown by the tab click; Bid is shown by the window
+    // itself and hidden again a moment later, keeping the page its OnShow assigned.
+    seat_player(&mut s, 500_000);
+    s.set_auction(Some(state(vec![row(
+        "Linen Cloth",
+        1000,
+        5000,
+        0,
+        "Seller",
+    )])));
+    s.fire_event("AUCTION_HOUSE_SHOW", vec![]);
+    assert_eq!(page(&s, "AuctionFrameBrowse"), "0");
+    assert_eq!(
+        page(&s, "AuctionFrameBid"),
+        "0",
+        "hidden=\"false\": the Bids pane rode the window up and back down"
+    );
+    assert!(
+        !s.eval::<bool>("return AuctionFrameBid:IsShown()").unwrap(),
+        "and it is not the visible tab"
+    );
+    assert_eq!(
+        page(&s, "AuctionFrameAuctions"),
+        "nil",
+        "the Auctions pane is the one an unowed event can still kill"
+    );
+    assert!(s.take_errors().is_empty());
+}
+
+/// The show cascade, against the reference's own order — the mechanism the Bids pane's `page`
+/// rests on, checked rather than assumed. **Every outcome matches; the order does not** (2317).
+///
+/// wow-re (`system/ui/scratch/propagation.md`, "The show/hide visibility cascade") reads
+/// `0x76ae10` as **post-order**: a frame marks itself visible (`0x76ae7b`), walks its children, and
+/// fires its **own** `OnShow` last (`0x76aef5`, past both child loops), with no snapshot anywhere —
+/// each loop re-reads the live links, so a `Hide()` issued from a sibling's handler suppresses a
+/// later sibling by clearing its shown flag before the walk reaches it.
+///
+/// benilla fires the parent's own handler **first** and still notifies the descendant the parent's
+/// handler just hid. For this window the two routes land on the same state, which is why the
+/// assertions below are the reference's outcomes and only the order line is ours: the
+/// `hidden="false"` Bids pane gets exactly one `OnShow`, on the first open, taking the `page` its
+/// repaint needs and sending the one `GetBidderAuctionItems()` that pane's handler owes — and the
+/// reopen notifies neither, because the tab click left its own shown flag clear.
+///
+/// If the cascade is ever made post-order, the `ShowOrder` assertions are what should change here;
+/// nothing else in this test should have to.
+#[test]
+fn the_show_cascade_notifies_the_bids_pane_once_and_keeps_its_page() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = UiScript::new().unwrap();
+    load_ui_with_classes(&mut s);
+    seat_player(&mut s, 500_000);
+    s.set_auction(Some(state(vec![row(
+        "Linen Cloth",
+        1000,
+        5000,
+        0,
+        "Seller",
+    )])));
+
+    // Both handlers are called by global name from their `<OnShow>`, so wrapping the globals
+    // records the order the cascade actually fired them in.
+    s.run(
+        "ShowOrder = {}          local pane, window = AuctionFrameBid_OnShow, AuctionFrame_OnShow          AuctionFrameBid_OnShow = function() table.insert(ShowOrder, \"pane\") pane() end          AuctionFrame_OnShow = function() table.insert(ShowOrder, \"window\") window() end",
+    )
+    .unwrap();
+    let order = |s: &UiScript| {
+        s.eval::<String>("return table.concat(ShowOrder, \",\")")
+            .unwrap()
+    };
+    let page = |s: &UiScript| {
+        s.eval::<String>("return tostring(AuctionFrameBid.page)")
+            .unwrap()
+    };
+
+    s.fire_event("AUCTION_HOUSE_SHOW", vec![]);
+    assert_eq!(
+        order(&s),
+        "window,pane",
+        "OURS, and a known deviation (2317): the reference's cascade is post-order, \"pane,window\""
+    );
+    assert_eq!(
+        page(&s),
+        "0",
+        "the pane the XML leaves shown takes its page riding the window up — this is what keeps a \
+         mis-aimed AUCTION_BIDDER_LIST_UPDATE off the nil-page path"
+    );
+    assert_eq!(
+        s.take_auction_bidder_query(),
+        Some(0),
+        "and that OnShow is what asks for the bids list"
+    );
+
+    // Close and reopen. The tab click left the pane's own shown flag clear, so it is skipped:
+    // the page is kept from the first open rather than re-assigned, and nothing new goes out.
+    s.run("HideUIPanel(AuctionFrame)").unwrap();
+    let _ = s.take_auction_close();
+    s.fire_event("AUCTION_HOUSE_SHOW", vec![]);
+    assert_eq!(
+        order(&s),
+        "window,pane,window",
+        "the reopen notifies the window and not the pane it left hidden"
+    );
+    assert_eq!(page(&s), "0", "kept from the first open, not re-assigned");
+    assert_eq!(
+        s.take_auction_bidder_query(),
+        None,
+        "and the reopen puts no second bids query on the wire"
+    );
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
 /// The part that proves it works: a fed snapshot paints the Browse rows.
 #[test]
 fn the_browse_list_populates_from_the_fed_snapshot() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
-    load_ui(&s);
+    load_ui_with_classes(&mut s);
     seat_player(&mut s, 500_000);
     s.set_auction(Some(state(vec![
         // No bids yet: the row shows the seller's opening price as the current bid.
@@ -332,7 +564,7 @@ fn the_browse_list_populates_from_the_fed_snapshot() {
 fn the_bid_and_buyout_gates_read_the_purse() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
-    load_ui(&s);
+    load_ui_with_classes(&mut s);
     // 2 gold. Row 1 costs 10s to bid and 50s to buy out — affordable. Row 2 wants 5 gold.
     seat_player(&mut s, 20_000);
     s.set_auction(Some(state(vec![
@@ -368,7 +600,7 @@ fn the_bid_and_buyout_gates_read_the_purse() {
         "50s is affordable on 2g"
     );
     assert_eq!(
-        s.eval::<i64>("return BenillaMoneyInput_GetCopper('BrowseBidPrice')")
+        s.eval::<i64>("return MoneyInputFrame_GetCopper(BrowseBidPrice)")
             .unwrap(),
         1000,
         "with no bids the required bid IS the minimum bid"
@@ -416,7 +648,7 @@ fn the_bid_and_buyout_gates_read_the_purse() {
 fn you_cannot_bid_on_your_own_auction() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
-    load_ui(&s);
+    load_ui_with_classes(&mut s);
     seat_player(&mut s, 10_000_000);
     s.set_auction(Some(state(vec![row(
         "Linen Cloth",
@@ -447,7 +679,7 @@ fn you_cannot_bid_on_your_own_auction() {
 fn search_reads_the_filters_and_nothing_queries_before_it() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
-    load_ui(&s);
+    load_ui_with_classes(&mut s);
     seat_player(&mut s, 0);
     s.set_auction(Some(state(vec![])));
     s.set_auction_can_query(true);
@@ -497,7 +729,7 @@ fn search_reads_the_filters_and_nothing_queries_before_it() {
 fn the_create_gate_and_the_deposit() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
-    load_ui(&s);
+    load_ui_with_classes(&mut s);
     seat_player(&mut s, 100_000);
     s.set_auction(Some(state(vec![])));
     s.fire_event("AUCTION_HOUSE_SHOW", vec![]);
@@ -529,9 +761,9 @@ fn the_create_gate_and_the_deposit() {
     );
 
     // With no item, the form does not even reach the price checks — the buyout error stays hidden.
-    s.run("BenillaMoneyInput_SetCopper('StartPrice', 10000)")
+    s.run("MoneyInputFrame_SetCopper(StartPrice, 10000)")
         .unwrap();
-    s.run("BenillaMoneyInput_SetCopper('BuyoutPrice', 5000)")
+    s.run("MoneyInputFrame_SetCopper(BuyoutPrice, 5000)")
         .unwrap();
     s.run("AuctionsFrameAuctions_ValidateAuction()").unwrap();
     assert!(!s
@@ -577,6 +809,9 @@ fn the_create_gate_and_the_deposit() {
     // this exercises.
     s.run("SplitContainerItem(0, 1, 2)").unwrap();
     s.run("AuctionsItemButton:Click()").unwrap();
+    // The stock create pane paints the slot on NEW_AUCTION_UPDATE, which the app fires the frame
+    // the sell slot changes (`ui_auction`'s feed); a harness with no app fires it itself.
+    s.fire_event("NEW_AUCTION_UPDATE", vec![]);
     assert_eq!(
         s.eval::<String>("return AuctionsItemButtonName:GetText()")
             .unwrap(),
@@ -592,6 +827,13 @@ fn the_create_gate_and_the_deposit() {
         .eval::<bool>("return AuctionsItemButtonCount:IsShown()")
         .unwrap());
 
+    // Dropping an item RESETS the form — the stock handler seeds the start price from the item's
+    // sell price and zeroes the buyout (`AuctionSellItemButton_OnEvent`) — so the prices are typed
+    // after the drop, as a player types them.
+    s.run("MoneyInputFrame_SetCopper(StartPrice, 10000)")
+        .unwrap();
+    s.run("MoneyInputFrame_SetCopper(BuyoutPrice, 5000)")
+        .unwrap();
     // With an item in the slot, the buyout-under-start error is the one the form explains out loud.
     s.run("AuctionsFrameAuctions_ValidateAuction()").unwrap();
     assert!(
@@ -604,8 +846,7 @@ fn the_create_gate_and_the_deposit() {
         .unwrap());
 
     // Clear the buyout and the form opens; pressing Create sends exactly what is on screen.
-    s.run("BenillaMoneyInput_SetCopper('BuyoutPrice', 0)")
-        .unwrap();
+    s.run("MoneyInputFrame_SetCopper(BuyoutPrice, 0)").unwrap();
     s.run("AuctionsFrameAuctions_ValidateAuction()").unwrap();
     assert!(
         s.eval::<bool>("return AuctionsCreateAuctionButton:IsEnabled() ~= 0")
@@ -640,7 +881,7 @@ fn the_create_gate_and_the_deposit() {
 fn hiding_the_window_closes_the_session() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
-    load_ui(&s);
+    load_ui_with_classes(&mut s);
     seat_player(&mut s, 0);
     s.set_auction(Some(state(vec![])));
     s.fire_event("AUCTION_HOUSE_SHOW", vec![]);
@@ -669,7 +910,7 @@ fn hiding_the_window_closes_the_session() {
 fn paging_shows_the_turners_only_at_the_end_of_the_list() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
-    load_ui(&s);
+    load_ui_with_classes(&mut s);
     seat_player(&mut s, 0);
     let mut rows = Vec::new();
     for i in 0..50 {
@@ -725,7 +966,7 @@ fn paging_shows_the_turners_only_at_the_end_of_the_list() {
 fn a_row_hover_goes_through_the_reference_tooltip_verb() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
-    load_ui(&s);
+    load_ui_with_classes(&mut s);
     s.set_auction(Some(state(vec![row("Copper Bar", 100, 500, 0, "Someone")])));
     s.fire_event("AUCTION_HOUSE_SHOW", vec![]);
     s.fire_event("AUCTION_ITEM_LIST_UPDATE", vec![]);

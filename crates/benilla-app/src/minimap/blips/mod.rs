@@ -116,8 +116,12 @@ pub(super) const BLIP_BASIS_PX: f32 = 140.8;
 /// quad rendered at 1280 px per model unit — 33.6 px at stock. Its authored centre sits
 /// (+0.0004, +0.00135) model units off the frame origin: ≈(+0.5 right, 1.7 up) screen px,
 /// rotating with the facing (model +y = screen-up at zero rotation).
-pub(super) const PLAYER_ARROW_QUAD_PX: f32 = 33.6;
-pub(super) const PLAYER_ARROW_OFFSET_PX: bevy::math::Vec2 = bevy::math::Vec2::new(0.51, -1.73);
+/// The player arrow's art — the minimap ring's and, since decision 1980, the world map's: the stock
+/// `WorldMapFrame.lua` `SetModel`s an anonymous pane to the same M2 and the app draws that pane as
+/// this sprite (`ui_script::extract`).
+pub(crate) const PLAYER_ARROW_TEXTURE: &str = "Interface\\Minimap\\MinimapArrow";
+pub(crate) const PLAYER_ARROW_QUAD_PX: f32 = 33.6;
+pub(crate) const PLAYER_ARROW_OFFSET_PX: bevy::math::Vec2 = bevy::math::Vec2::new(0.51, -1.73);
 /// The rim arrow's on-screen quad: the `Rotating-MinimapArrow.m2` geometry is a stack of six
 /// full-texture 0.0500-unit quads (measured from the real M2's 24 vertices, z 0/0.0145/0.0291),
 /// and the frame renders at 768 px per model unit (modelScale 0.6 × 1280 px/unit):
@@ -267,7 +271,7 @@ pub(super) type BlipInputs<'w, 's> = (
     Res<'w, crate::ui_script::UiScaleCvar>,
     Res<'w, crate::ui_party::GroupState>,
     TrackedCandidates<'w, 's>,
-    Query<'w, 's, &'static ObjectStore, With<SelfPlayer>>,
+    Query<'w, 's, (&'static ObjectStore, &'static Guid), With<SelfPlayer>>,
     Res<'w, NameCache>,
     Res<'w, GameObjectTemplates>,
     Option<Res<'w, crate::go_templates::Locks>>,
@@ -394,7 +398,6 @@ fn poi_icon_cell(icon: u32) -> Option<[f32; 4]> {
 /// Draw the landmark layer: in-range POI icons at position, then the nearest-3 rim arrows,
 /// each rotated to point at its POI. Records a hover hit (later-drawn wins, matching draw
 /// order).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_landmarks(
     ctx: &BlipCtx,
     cat: Option<&AreaPoiCatalog>,
@@ -562,7 +565,7 @@ pub(super) fn emit_party_arrows(
 pub(super) fn drive_blip_tooltip(
     script: Option<NonSendMut<UiScript>>,
     hover: Res<MinimapBlipHover>,
-    mut names: ResMut<NameCache>,
+    names: Res<NameCache>,
     commands: Res<NetCommands>,
     mut last: Local<crate::ui_script::VmMemo<Option<(String, Vec2)>>>,
 ) {

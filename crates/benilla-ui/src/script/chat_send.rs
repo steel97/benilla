@@ -65,7 +65,57 @@ pub struct ChatSend {
     pub target: Option<String>,
 }
 
+impl super::UiScript {
+    /// The languages this character **knows**, in `Languages.dbc` row order — what
+    /// `GetNumLaguages`/`GetLanguageByIndex` walk. The app folds it the reference's way:
+    /// `0x4b25b0` stores `[languageId] = spellId` for every known spell whose `Effect_1 == 39`,
+    /// and `0x5ec720` answers non-zero only when that spell's skill line is in the player's
+    /// skill block (wow-re `chat-language-scramble.md` §8, C6). Fires `LANGUAGE_LIST_CHANGED`
+    /// (`0x49b970`, event 0x102) when the list moves.
+    pub fn set_known_languages(&mut self, names: Vec<String>) {
+        let changed = {
+            let mut model = self.model_mut();
+            if model.known_languages == names {
+                false
+            } else {
+                model.known_languages = names;
+                true
+            }
+        };
+        if changed {
+            self.fire_event("LANGUAGE_LIST_CHANGED", vec![]);
+        }
+    }
+}
+
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
+    // GetNumLaguages() — `0x49fb30`, the binary's own spelling (wow-re
+    // `bag-language-combat-action-bindings.md` §2). Walks `Languages.dbc` and counts the rows
+    // `0x5ec720` answers non-zero for; **one number**.
+    lua.globals().set(
+        "GetNumLaguages",
+        lua.create_function(|lua, _ignored: MultiValue| {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            Ok(model.known_languages.len() as i64)
+        })?,
+    )?;
+    // GetLanguageByIndex(i) — `0x49fbe0`: the same walk, pushing **one string** — the
+    // `Name_lang` of the i-th (1-based) *known* language. Positional among the known rows,
+    // never a row number or a language id; past the end it pushes nothing.
+    lua.globals().set(
+        "GetLanguageByIndex",
+        lua.create_function(|lua, index: Option<i64>| {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let name = index
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| model.known_languages.get(i));
+            Ok(match name {
+                Some(n) => MultiValue::from_vec(vec![Value::String(lua.create_string(n)?)]),
+                None => MultiValue::new(),
+            })
+        })?,
+    )?;
     // GetDefaultLanguage() → **exactly ONE value, a string** — or **zero values**, which is not
     // the same thing (`0x49fcd0`, wow-re `bag-language-combat-action-bindings.md` §2).
     //
@@ -80,9 +130,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // and not an id. All **four** failure edges — no player object, a negative id, an id past the
     // language count, a null record — converge on `0x49fd2a xor eax,eax; ret`, i.e. **zero Lua
     // values**. That is shape 2 of the argument ABI ([`super::binding_abi`]) and it is the one
-    // place in this repo where the distinction is observable: `select('#', GetDefaultLanguage())`
-    // is `0` outside the world and `1` inside it, while a single-value caller reads `nil` either
-    // way. Returning `nil` here would be a quiet divergence, so we do not.
+    // place in this repo where the distinction is observable: the call's return-list COUNT is `0`
+    // outside the world and `1` inside it, while a single-value caller reads `nil` either way.
+    // Returning `nil` here would be a quiet divergence, so we do not.
     //
     // **Its sibling is misspelled in the binary, and is deliberately NOT registered here.** The
     // `.data` `{const char* name, void* fn}` record at `0x843628` names `0x49fb30`
@@ -210,23 +260,21 @@ mod tests {
 
     /// **One string, or ZERO values — never `nil`.** The four failure edges reach
     /// `0x49fd2a xor eax,eax; ret` *without* passing through `luaL_error`, which is the only place
-    /// the "returns nothing" shape is real. A single-value caller cannot tell the two apart;
-    /// `select('#', …)` can, and both corpus callers feed the result straight to
+    /// the "returns nothing" shape is real. A single-value caller cannot tell the two apart; the
+    /// return-list count can ([`UiScript::arity`]), and both corpus callers feed the result straight to
     /// `SendChatMessage`, where the difference is an argument that exists versus one that does not.
     #[test]
     fn get_default_language_is_one_string_or_zero_values() {
         let mut s = UiScript::new().unwrap();
         assert_eq!(
-            s.eval::<i64>("return select('#', GetDefaultLanguage())")
-                .unwrap(),
+            s.arity("GetDefaultLanguage()").unwrap(),
             0,
             "no player object → ZERO values, not nil"
         );
 
         s.set_default_language(Some("Common".into()));
         assert_eq!(
-            s.eval::<i64>("return select('#', GetDefaultLanguage())")
-                .unwrap(),
+            s.arity("GetDefaultLanguage()").unwrap(),
             1,
             "one value — not (name, id)"
         );
@@ -239,6 +287,39 @@ mod tests {
             s.eval::<String>(r#"return GetDefaultLanguage("player")"#)
                 .unwrap(),
             "Common"
+        );
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use crate::script::UiScript;
+
+    #[test]
+    fn the_language_walk_is_positional_over_the_known_rows() {
+        let mut s = UiScript::new().unwrap();
+        assert_eq!(s.eval::<i64>("return GetNumLaguages()").unwrap(), 0);
+        assert_eq!(
+            s.arity("GetLanguageByIndex(1)").unwrap(),
+            0,
+            "past the end pushes nothing, not nil"
+        );
+        s.run(
+            "local f = CreateFrame('Frame') f:RegisterEvent('LANGUAGE_LIST_CHANGED') \
+             f:SetScript('OnEvent', function() FIRED = (FIRED or 0) + 1 end)",
+        )
+        .unwrap();
+        s.set_known_languages(vec!["Orcish".into(), "Common".into()]);
+        s.set_known_languages(vec!["Orcish".into(), "Common".into()]);
+        assert_eq!(s.eval::<i64>("return GetNumLaguages()").unwrap(), 2);
+        assert_eq!(
+            s.eval::<String>("return GetLanguageByIndex(2)").unwrap(),
+            "Common"
+        );
+        assert_eq!(
+            s.eval::<i64>("return FIRED").unwrap(),
+            1,
+            "the list changing fires once; the same list again is silent"
         );
     }
 }

@@ -4,7 +4,10 @@
 //! - [`look_input`] — the both-button state and the reference's own **camera command word**
 //!   (1.12's `[InputControl+0x4]`, decision 1502), which the auto-follow is armed by. Read
 //!   *before* the look session, because both camera seats want it — including the one on the
-//!   not-driving path, which returns before the axes below are ever computed.
+//!   not-driving path, which returns before the axes below are ever computed. Its two mouse
+//!   terms come off [`camera::WorldMouse`], never `ButtonInput`: the reference's mouse bits are
+//!   two *bindings* the UI can eat, and reading the device instead swung the camera on every
+//!   right-click of a UI row (ledger B364).
 //! - [`move_axes`] — the **netted** forward/back and strafe axes plus the modes that select
 //!   between them (mouselook, keyboard turn), and the autorun latch with its cancel set. Netted
 //!   once here so that the direction we move, the speed we pick, the swim amounts and the flags we
@@ -27,19 +30,24 @@ pub(super) struct LookInput {
 
 /// The mouse/binding state the camera needs, built before the look session so the not-driving
 /// path (which returns without ever reaching [`move_axes`]) can seat its camera from the same word.
+///
+/// Takes the rig for one field only — [`camera::WorldMouse`], already latched this frame by
+/// [`camera::latch_world_mouse`]. There is deliberately no `ButtonInput` parameter left: every
+/// mouse fact here is one the UI gets first refusal on.
 pub(super) fn look_input(
-    buttons: &ButtonInput<MouseButton>,
     binds: &crate::bindings::BindingsState,
     player: &Player,
+    rig: &CameraControl,
 ) -> LookInput {
     // Both mouse buttons held together = vanilla's "both-button run": the avatar runs forward while
     // the character steers with the mouse (turns like a right-drag), regardless of which button went
-    // down first. Checked directly here rather than through the controller's single-button look mode.
+    // down first. Off the world-owned pair, not the device's: both primaries pressed over a bag are
+    // two clicks the UI took, and the reference's run is its two *bindings* held, neither of which
+    // a captured press dispatches.
     // MOVEANDSTEER (default Middle Mouse) is the same state through a binding — 1.12's own body
     // runs the identical CameraOrSelectOrMove + TurnOrAction pair a both-button press does.
     let steer_held = binds.pressed(crate::bindings::cmd::MOVE_AND_STEER);
-    let both_buttons =
-        (buttons.pressed(MouseButton::Left) && buttons.pressed(MouseButton::Right)) || steer_held;
+    let both_buttons = rig.world_mouse.both() || steer_held;
 
     // The camera's **input command word** (decision 1502) — 1.12's `[InputControl+0x4]`, bit for
     // bit. The auto-follow is armed by *edges on this word* and its state is classified from it, so
@@ -55,11 +63,11 @@ pub(super) fn look_input(
             }
         };
         set(
-            buttons.pressed(MouseButton::Right) || steer_held,
+            rig.world_mouse.held(LookButton::Right) || steer_held,
             bit::RIGHT_MOUSE,
         );
         set(
-            buttons.pressed(MouseButton::Left) || steer_held,
+            rig.world_mouse.held(LookButton::Left) || steer_held,
             bit::LEFT_MOUSE,
         );
         // `/follow` is the forward bit in the reference too — the same setter the W key drives
@@ -145,8 +153,10 @@ pub(super) fn move_axes(
     // BUTTON4 — the latter is winit's `Forward`, the thumb button this toggle lived on before
     // the table existed, kept by the codec's BUTTON4 mapping). A latched mode, not a held key:
     // the keyboard chord is typing-gated at dispatch like every binding, the mouse chord is
-    // not — and the reference agrees, its focus-loss handler releasing every direction bit
-    // while preserving `0x1000` (`0x514490`'s `and eax,0xfffff00f`, VERIFIED).
+    // not — and the reference agrees, its **OS window-deactivate** handler releasing every
+    // direction bit while preserving `0x1000` (`0x514490`'s `and eax,0xfffff00f`, VERIFIED;
+    // "window-deactivate" and not "focus-loss", which read as *UI* focus and cost us 2196 —
+    // its sole caller `0x493058` hangs off the WM_ACTIVATE callback slot).
     let mut autorun_armed = false;
     if binds.fired(crate::bindings::cmd::TOGGLE_AUTORUN) {
         player.autorun = !player.autorun;
@@ -186,8 +196,12 @@ pub(super) fn move_axes(
     //
     // Deliberately absent, each VERIFIED as a *survivor*: a jump, a chat EditBox taking focus, and
     // a zone change. Mounting is genuinely unsettled in the reference and left alone here.
+    //
+    // A chat box taking focus survives *more* than autorun, note: it releases nothing at all —
+    // the movement handlers simply become no-ops and the direction bits are frozen (2196), which
+    // is why holding W through an ENTER keeps you running.
     let both_buttons_engaged = (both_buttons
-        && (buttons.just_pressed(MouseButton::Left) || buttons.just_pressed(MouseButton::Right)))
+        && (rig.world_mouse.down(LookButton::Left) || rig.world_mouse.down(LookButton::Right)))
         || binds.just_pressed(crate::bindings::cmd::MOVE_AND_STEER);
     if state::autorun_cancelled(
         binds.just_pressed(crate::bindings::cmd::MOVE_FORWARD),

@@ -59,10 +59,7 @@ impl Plugin for UiCraftPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CraftOpen>().add_systems(
             Update,
-            (
-                feed_craft.in_set(UnitFeed).before(UiInput),
-                drain_craft.after(UiInput),
-            ),
+            (feed_craft.in_set(UnitFeed), drain_craft.after(UiInput)),
         );
     }
 }
@@ -131,7 +128,6 @@ fn craft_tooltip(spell_id: u32, d: &benilla_formats::SpellDisplay) -> CraftToolt
 }
 
 /// Build the craft snapshot — `None` when the window is closed or the catalogs haven't loaded.
-#[allow(clippy::too_many_arguments)] // a Bevy system's full input set (the feed precedent)
 fn feed_craft(
     script: Option<NonSendMut<UiScript>>,
     open: Res<CraftOpen>,
@@ -141,7 +137,7 @@ fn feed_craft(
     focus: Option<Res<SpellFocus>>,
     icons: Option<Res<ItemDisplays>>,
     self_store: Query<&ObjectStore, With<SelfPlayer>>,
-    mut items: ResMut<Items>,
+    items: Res<Items>,
     commands: Res<NetCommands>,
     mut last: Local<crate::ui_script::VmMemo<Option<CraftState>>>,
 ) {
@@ -162,11 +158,13 @@ fn feed_craft(
             .line(line)
             .map(|l| l.name.clone())
             .unwrap_or_else(|| format!("Skill {line}"));
+        let text = crate::ui_script::token_text(&script);
         let ctx = benilla_formats::TokenContext {
             durations: &spells.durations,
             radii: &spells.radii,
             lookup: &|id| spells.catalog.get(id),
             home_area: None,
+            text: &text,
         };
         // The **admission law** — `0x5e9c20`, byte-verified (decision 1124): the player knows the
         // spell, it is not hidden (`Attributes & 0x20`), and its `castUI` **equals this window's
@@ -216,19 +214,24 @@ fn feed_craft(
                 if reagents.is_empty() {
                     num_available = 0;
                 }
+                // **Focus first, then the totems** — `0x4ff980`'s own push order, and
+                // `GetCraftSpellFocus 0x4f78b0` returns the very same pair list despite its name
+                // (wow-re `tradeskill-tools-and-spell-focus.md`). The focus's flag is the literal
+                // `1.0` with no predicate: the reference never reddens it. See
+                // [`crate::ui_tradeskill`]'s twin, where the law is written out.
                 let mut tools = Vec::new();
-                for &t in d.totems.iter().filter(|&&t| t != 0) {
-                    let have = count_of(&store.0, &items, t, InventoryScope::CARRIED) > 0;
-                    if let Some(info) = items.template(t, 0, &commands) {
-                        tools.push((info.name.clone(), have));
-                    }
-                }
                 if d.requires_spell_focus != 0 {
                     if let Some(n) = focus
                         .as_deref()
                         .and_then(|f| f.catalog.name(d.requires_spell_focus))
                     {
                         tools.push((n.to_string(), true));
+                    }
+                }
+                for &t in d.totems.iter().filter(|&&t| t != 0) {
+                    let have = count_of(&store.0, &items, t, InventoryScope::CARRIED) > 0;
+                    if let Some(info) = items.template(t, 0, &commands) {
+                        tools.push((info.name.clone(), have));
                     }
                 }
                 let needs_item_target = matches!(
@@ -280,6 +283,15 @@ fn feed_craft(
         return;
     }
     script.set_craft(fresh.clone());
+    // The reagent templates `GetCraftReagentItemLink` reads, pre-asked as the trade-skill feed
+    // pre-asks its own (1973).
+    if let Some(f) = &fresh {
+        script.ask_item_templates(
+            f.recipes
+                .iter()
+                .flat_map(|r| r.reagents.iter().map(|re| re.item)),
+        );
+    }
     match (&*last, &fresh) {
         (None, Some(f)) => {
             debug!("ui_craft: window opens — {} recipe(s)", f.recipes.len());

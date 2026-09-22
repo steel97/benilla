@@ -42,6 +42,7 @@
 
 use mlua::{Lua, MultiValue, Value};
 
+use super::binding_abi::flag;
 use super::cursor::{self, CursorPayload};
 use super::Model;
 
@@ -170,8 +171,6 @@ pub struct AuctionSubCategory {
 pub struct AuctionState {
     /// Browse / Bids / Auctions, indexed by [`LIST`], [`BIDDER`], [`OWNER`].
     pub lists: [AuctionListState; 3],
-    /// The Browse tab's category tree.
-    pub categories: Vec<AuctionCategory>,
     /// `GetAuctionHouseDepositRate()` — the percentage this house charges, read from
     /// `AuctionHouse.dbc` at the `houseId` the hello reply carried.
     pub deposit_percent: u32,
@@ -221,6 +220,14 @@ impl super::UiScript {
     /// **clears that list's selection**, which is why this is one call and not two: the reference's
     /// selection is C-side state that cannot survive the batch it indexes into, and a stale index
     /// would silently address a different auction.
+    /// Push the Browse tab's class tree — `GetAuctionItemClasses` and its two siblings read it.
+    /// Login-scoped, not the session's: the stock `AuctionFrameBrowse_OnLoad` reads the classes at
+    /// the addon's LOAD, before any auctioneer, and in the client they are `ItemClass.dbc` names
+    /// with no session behind them (1971).
+    pub fn set_auction_item_classes(&mut self, classes: Vec<AuctionCategory>) {
+        self.model_mut().auction_item_classes = classes;
+    }
+
     pub fn set_auction(&mut self, state: Option<AuctionState>) {
         let mut model = self.model_mut();
         // Only opening or closing the session drops the selection. A new PAGE does not, and
@@ -291,15 +298,6 @@ impl super::UiScript {
     /// Empty the sell slot — the app calls this once the auction is away, and on session close.
     pub fn clear_auction_sell_item(&mut self) {
         self.model_mut().auction_sell_item = None;
-    }
-}
-
-/// A `1`/`nil` boolean the way the client pushes flags.
-fn flag(b: bool) -> Value {
-    if b {
-        Value::Integer(1)
-    } else {
-        Value::Nil
     }
 }
 
@@ -558,15 +556,18 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     // GetAuctionItemClasses() → the class names, in the reference's own menu order. The ORDER and
     // the set are structural (ten auctionable classes); every string is the player's own
-    // ItemClass.dbc row, so none of Blizzard's text ships with us (decisions 1234/1260).
+    // ItemClass.dbc row, so none of Blizzard's text ships with us (decisions 1234/1260). Static —
+    // pushed at login, read by the stock addon at its load (1971), no session required.
     g.set(
         "GetAuctionItemClasses",
         lua.create_function(|lua, ()| {
             let names: Vec<String> = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model.auction.as_ref().map_or_else(Vec::new, |a| {
-                    a.categories.iter().map(|c| c.name.clone()).collect()
-                })
+                model
+                    .auction_item_classes
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect()
             };
             let mut out = Vec::with_capacity(names.len());
             for n in &names {
@@ -583,10 +584,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, class_index: usize| {
             let names: Vec<String> = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model
-                    .auction
-                    .as_ref()
-                    .and_then(|a| class_index.checked_sub(1).and_then(|i| a.categories.get(i)))
+                class_index
+                    .checked_sub(1)
+                    .and_then(|i| model.auction_item_classes.get(i))
                     .map_or_else(Vec::new, |c| {
                         c.subclasses.iter().map(|s| s.name.clone()).collect()
                     })
@@ -608,10 +608,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, (class_index, sub_index): (usize, usize)| {
             let offers = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model
-                    .auction
-                    .as_ref()
-                    .and_then(|a| class_index.checked_sub(1).and_then(|i| a.categories.get(i)))
+                class_index
+                    .checked_sub(1)
+                    .and_then(|i| model.auction_item_classes.get(i))
                     .and_then(|c| sub_index.checked_sub(1).and_then(|i| c.subclasses.get(i)))
                     .is_some_and(|s| s.has_inv_types)
             };
@@ -998,9 +997,7 @@ mod tests {
     #[test]
     fn a_missing_row_still_answers_twelve_values() {
         let s = UiScript::new().unwrap();
-        let n: i64 = s
-            .eval(r##"return select("#", GetAuctionItemInfo("list", 99))"##)
-            .unwrap();
+        let n = s.arity(r#"GetAuctionItemInfo("list", 99)"#).unwrap();
         assert_eq!(n, 12, "twelve, even with no session open at all");
         let (count, quality): (i64, i64) = s
             .eval(r#"local _, _, c, q = GetAuctionItemInfo("list", 99) return c, q"#)
@@ -1008,9 +1005,7 @@ mod tests {
         assert_eq!((count, quality), (1, -1));
 
         // The link, by contrast, answers with NO values on a miss — not a nil.
-        let n: i64 = s
-            .eval(r##"return select("#", GetAuctionItemLink("list", 99))"##)
-            .unwrap();
+        let n = s.arity(r#"GetAuctionItemLink("list", 99)"#).unwrap();
         assert_eq!(n, 0, "zero values, not one nil");
     }
 

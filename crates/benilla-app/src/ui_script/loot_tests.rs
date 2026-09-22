@@ -478,7 +478,8 @@ fn shipped_loot_pushed_to_center_by_merchant() {
         load_xml(&s, f);
     }
     load_xml(&s, "Interface\\FrameXML\\LootFrame.xml");
-    load_xml(&s, "GameTooltip.xml"); // app load order: tooltip before merchant
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kit + the placeholder icon
+    load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
     load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
 
     // Loot opens onto the empty left slot.
@@ -594,11 +595,11 @@ fn the_loot_window_draws_over_the_party_frames() {
 /// previews the row's item in the dressing room (decision 1060), SHIFT posts its link into an open
 /// chat edit box (decision 1059) — and **neither loots**.
 ///
-/// That last clause is the whole point of the test, and it is ours to get right rather than the
-/// reference's: in the real client the loot itself is the C `LootButton` widget's click behaviour
-/// (l.94's `button:SetSlot(slot)`), so its Lua arms fall through harmlessly; ours owns the
-/// `LootSlot` call, so the arms had to grow a `return` the reference does not have. The unmodified
-/// click still loots — the regression that would otherwise ship silently.
+/// That last clause is the whole point of the test, and it is the WIDGET's to get right: the loot
+/// itself is the `LootButton` kind's click behaviour (`benilla-ui` `script/button.rs`, decision
+/// 1799 — `l.94`'s `button:SetSlot(slot)` is what arms it), gated on no shift/ctrl/alt, which is
+/// why the stock `LootFrameItem_OnClick` never calls a take itself and needs no `return`. The
+/// unmodified click still loots — the regression that would otherwise ship silently.
 #[test]
 fn ctrl_and_shift_on_a_loot_row_preview_and_post_without_looting() {
     const WOOL_LINK: &str = "|cffffffff|Hitem:2589:0:0:0|h[Wool Cloth]|h|r";
@@ -608,11 +609,18 @@ fn ctrl_and_shift_on_a_loot_row_preview_and_post_without_looting() {
         load_xml(&s, f);
     }
     for file in [
-        "UIParent.xml", // BenillaChatEdit_InsertLink, the shared shift-insert helper
+        r"Interface\FrameXML\UIParent.xml", // UIParent + UIParent.lua, the reference's own (1988)
         "Interface\\FrameXML\\LootFrame.xml",
-        "DressUpFrame.xml",
+        "Interface\\FrameXML\\DressUpFrame.xml",
         "Interface\\FrameXML\\UIMenu.xml", // the kit ChatMenu/EmoteMenu/VoiceMacroMenu build from
-        "ChatFrame.xml",
+        "Interface\\FrameXML\\GlobalStrings.lua",
+        "Interface\\FrameXML\\BasicControls.xml",
+        "Interface\\FrameXML\\ChatFrame.xml",
+        "Interface\\FrameXML\\UIDropDownMenu.xml",
+        "Interface\\FrameXML\\UIPanelTemplates.lua",
+        "Interface\\FrameXML\\UIPanelTemplates.xml",
+        "Interface\\FrameXML\\LocaleProperties.lua",
+        "Interface\\FrameXML\\FloatingChatFrame.xml",
     ] {
         load_xml(&s, file);
     }
@@ -1132,8 +1140,11 @@ fn loot_row_awaiting_its_template_opens_clean() {
         .unwrap();
     assert_eq!((item.as_str(), quantity, quality), ("", 1, -1));
     assert!(
-        s.eval::<bool>("return ITEM_QUALITY_COLORS[select(4, GetLootSlotInfo(1))] ~= nil")
-            .unwrap(),
+        s.eval::<bool>(
+            "local _, _, _, quality = GetLootSlotInfo(1) \
+             return ITEM_QUALITY_COLORS[quality] ~= nil"
+        )
+        .unwrap(),
         "the cache-miss quality must be a real row of ITEM_QUALITY_COLORS"
     );
 
@@ -1189,5 +1200,93 @@ fn loot_row_awaiting_its_template_opens_clean() {
             && (white[1] - 1.0).abs() < 0.02
             && (white[2] - 1.0).abs() < 0.02,
         "the resolved row is white, got {white:?}"
+    );
+}
+
+/// **A `<LootButton>` wears `ItemButtonTemplate`'s three state textures, and the highlight tracks
+/// the cursor.** The loader's Button leg used to gate on the two tags `Button`/`CheckButton`, so
+/// the stock rows — whose tag is `LootButton` — were built with no `<NormalTexture>`, no
+/// `<PushedTexture>` and no `<HighlightTexture>` at all: no Quickslot border on the icons, and
+/// nothing to light under the mouse. The gate is wrong about the reference: `CLootButton`'s
+/// geometry vtable differs from `CSimpleButton`'s in exactly one slot — the destructor thunk — and
+/// `LoadXML` is not it, so `0x7788c0` parses a `<LootButton>` element verbatim (wow-re
+/// `ui/scratch/lootbutton-widget-type.md` §4).
+///
+/// Asserted through the ENGINE's hover path rather than off the state: what a player sees is the
+/// emitted quad, and the quad is what was missing.
+#[test]
+fn stock_loot_rows_wear_the_item_button_art_and_light_under_the_cursor() {
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    for f in super::test_ui::LOOT_UI {
+        load_xml(&s, f);
+    }
+    load_xml(&s, "Interface\\FrameXML\\LootFrame.xml");
+    s.set_loot(Some(coin_and_two_items()));
+    s.fire_event("LOOT_OPENED", vec![]);
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+
+    // The inherited template's own art reached every visible row.
+    s.resolve();
+    let border = |quads: &[ExtractedQuad]| {
+        quads
+            .iter()
+            .filter(|q| {
+                matches!(&q.content, QuadContent::Texture { path: Some(p), .. }
+                    if p.contains("UI-Quickslot2"))
+            })
+            .count()
+    };
+    assert_eq!(
+        border(&s.extract()),
+        3,
+        "ItemButtonTemplate's <NormalTexture> is the Quickslot border on each of the three rows"
+    );
+
+    // The highlight is not on screen until the cursor is on a row.
+    let hilite = |quads: &[ExtractedQuad]| {
+        quads
+            .iter()
+            .filter_map(|q| match &q.content {
+                QuadContent::Texture { path: Some(p), .. }
+                    if p.contains("ButtonHilight-Square") =>
+                {
+                    q.rect
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        hilite(&s.extract()).is_empty(),
+        "no row is lit with the mouse away"
+    );
+
+    // Hover the second row: exactly one highlight, over THAT row's icon.
+    let icon = |quads: &[ExtractedQuad], needle: &str| {
+        quads
+            .iter()
+            .find(|q| {
+                matches!(&q.content, QuadContent::Texture { path: Some(p), .. } if p.contains(needle))
+            })
+            .and_then(|q| q.rect)
+            .unwrap_or_else(|| panic!("no icon quad for {needle}"))
+    };
+    let wool = icon(&s.extract(), "INV_Fabric_Wool_01");
+    super::test_ui::hover(&mut s, "LootButton2");
+    s.resolve();
+    let lit = hilite(&s.extract());
+    assert_eq!(lit.len(), 1, "one row lights, not three: {lit:?}");
+    assert_eq!(
+        lit[0], wool,
+        "the highlight covers the hovered row's icon square"
+    );
+
+    // And it leaves with the cursor.
+    super::test_ui::unhover(&mut s);
+    s.resolve();
+    assert!(
+        hilite(&s.extract()).is_empty(),
+        "the highlight is not latched: it goes out when the cursor leaves"
     );
 }
